@@ -149,7 +149,7 @@ GuiApp::GuiApp() {
     if (!builtin_sfm_available()) _engine = Engine::Colmap;
     _compare.set_pick_file([this] {
         _pick = PickAction::AddSplatFile;
-        _dialog.open(msg::viewer_pick_file.get(), FileDialog::Mode::File,
+        open_dialog(msg::viewer_pick_file.get(), FileDialog::Mode::File,
                      kViewableExtensions);
     });
 }
@@ -178,12 +178,65 @@ void GuiApp::shutdown() {
     reset_dataset_preview();
     _download.cancel();
     _geom_download.cancel();
+    _feat_download.cancel();
     _font_download.cancel();
     _runner.shutdown();
 }
 
 std::string GuiApp::settings_path() {
     return (fs::path(config_dir()) / "gui.conf").string();
+}
+
+const char* GuiApp::pick_key(PickAction what) {
+    switch (what) {
+        case PickAction::OpenDataset:     return "open_dataset";
+        case PickAction::SourceImages:    return "source_images";
+        case PickAction::SourceVideo:     return "source_video";
+        case PickAction::SourceReplace:   return "source_replace";
+        case PickAction::Workspace:       return "workspace";
+        case PickAction::OutputPrefix:    return "output_prefix";
+        case PickAction::VocabTree:       return "vocab_tree";
+        case PickAction::MaskModelFile:   return "mask_model";
+        case PickAction::SplatFile:       return "splat_file";
+        case PickAction::AddSplatFile:    return "add_splat_file";
+        case PickAction::PresetFile:      return "preset_file";
+        case PickAction::PresetSaveFolder:return "preset_save_folder";
+        case PickAction::BatchDataset:    return "batch_dataset";
+        case PickAction::BatchOutput:     return "batch_output";
+        case PickAction::BatchPresetFile: return "batch_preset_file";
+        case PickAction::MeshSource:      return "mesh_source";
+        case PickAction::MeshPhotos:      return "mesh_photos";
+        case PickAction::MeshOutput:      return "mesh_output";
+        case PickAction::None:            return "";
+    }
+    return "";
+}
+
+std::string GuiApp::last_dir(PickAction what) const {
+    const char* key = pick_key(what);
+    auto it = _last_dirs.find(key);
+    if (it == _last_dirs.end()) return "";
+    // A stored folder outlives the drive it was on and the run that made it,
+    // and a picker opened on one that is gone is worse than one opened where
+    // it always used to open.
+    std::error_code ec;
+    return fs::is_directory(it->second, ec) ? it->second : std::string();
+}
+
+void GuiApp::remember_dir(PickAction what, const std::string& path) {
+    const char* key = pick_key(what);
+    if (!*key || path.empty()) return;
+    std::error_code ec;
+    fs::path dir = fs::path(path).parent_path();
+    if (dir.empty() || !fs::is_directory(dir, ec)) return;
+    _last_dirs[key] = dir.string();
+}
+
+void GuiApp::open_dialog(const std::string& title, FileDialog::Mode mode,
+                         const std::vector<std::string>& extensions,
+                         const std::string& start_dir, bool multi_select) {
+    _dialog.open(title, mode, extensions,
+                 start_dir.empty() ? last_dir(_pick) : start_dir, multi_select);
 }
 
 void GuiApp::load_settings() {
@@ -207,6 +260,8 @@ void GuiApp::load_settings() {
                  std::find(_model_recents.begin(), _model_recents.end(), v) ==
                      _model_recents.end())
             _model_recents.push_back(v);
+        else if (k.rfind("last_dir_", 0) == 0 && !v.empty())
+            _last_dirs[k.substr(9)] = v;
         else if (k == "colmap_exe" && !v.empty()) _colmap_exe = v;
         else if (k == "ffmpeg_exe" && !v.empty()) _ffmpeg_exe = v;
         else if (k == "python_exe" && !v.empty()) _python_exe = v;
@@ -250,6 +305,8 @@ void GuiApp::save_settings() {
         std::fprintf(f, "recent=%s\n", r.c_str());
     for (const auto& r : _model_recents)
         std::fprintf(f, "recent_model=%s\n", r.c_str());
+    for (const auto& [key, dir] : _last_dirs)
+        std::fprintf(f, "last_dir_%s=%s\n", key.c_str(), dir.c_str());
     std::fprintf(f, "colmap_exe=%s\n", _colmap_exe.c_str());
     std::fprintf(f, "ffmpeg_exe=%s\n", _ffmpeg_exe.c_str());
     std::fprintf(f, "python_exe=%s\n", _python_exe.c_str());
@@ -1300,6 +1357,7 @@ void GuiApp::adopt_exr_color_space() {
 
 void GuiApp::handle_dialog_result(const std::vector<std::string>& paths) {
     const std::string path = paths.empty() ? std::string() : paths[0];
+    remember_dir(_pick, path);
     switch (_pick) {
         case PickAction::OpenDataset:
             request_open_dataset(path);
@@ -1416,9 +1474,10 @@ void GuiApp::frame() {
 
     append_logs();
     run_pending_if_stopped();
-    // vit-giant2 is two files, so the fetch is a queue that has to be stepped
-    // on from somewhere that runs whatever screen is up.
-    pump_geometry_download();
+    // vit-giant2 is two files, and so is ALIKED with LightGlue: both fetches
+    // are queues, stepped on from somewhere that runs whatever screen is up.
+    _geom_download.pump();
+    _feat_download.pump();
     // Before the reload check below: between two batch rows the runner is
     // briefly idle, and a stale _parse_dirty would start a dataset parse right
     // where the next row wants the engine.
@@ -1509,12 +1568,12 @@ void GuiApp::draw_menu_bar() {
     if (ui::BeginMenu(msg::menu_file)) {
         if (ui::MenuItem(msg::menu_open_dataset)) {
             _pick = PickAction::OpenDataset;
-            _dialog.open(msg::menu_open_dataset.get(), FileDialog::Mode::Folder);
+            open_dialog(msg::menu_open_dataset.get(), FileDialog::Mode::Folder);
         }
         if (ui::MenuItem(msg::menu_new_dataset)) _screen = Screen::NewDataset;
         if (ui::MenuItem(msg::menu_open_splat)) {
             _pick = PickAction::SplatFile;
-            _dialog.open(msg::viewer_pick_file.get(), FileDialog::Mode::File,
+            open_dialog(msg::viewer_pick_file.get(), FileDialog::Mode::File,
                          {".ply"});
         }
         ImGui::Separator();
@@ -1743,7 +1802,7 @@ void GuiApp::draw_home() {
 
     if (ui::Button(msg::home_open_dataset, ImVec2(-1, bh))) {
         _pick = PickAction::OpenDataset;
-        _dialog.open(msg::menu_open_dataset.get(), FileDialog::Mode::Folder);
+        open_dialog(msg::menu_open_dataset.get(), FileDialog::Mode::Folder);
     }
     ui::help_on_hover(msg::home_open_dataset_help);
 
@@ -1756,7 +1815,7 @@ void GuiApp::draw_home() {
 
     if (ui::Button(msg::home_open_splat, ImVec2(-1, bh))) {
         _pick = PickAction::SplatFile;
-        _dialog.open(msg::viewer_pick_file.get(), FileDialog::Mode::File,
+        open_dialog(msg::viewer_pick_file.get(), FileDialog::Mode::File,
                      kViewableExtensions);
     }
     ui::help_on_hover(msg::home_open_splat_help);
@@ -2031,10 +2090,10 @@ void GuiApp::draw_dataset_source() {
             _pick = PickAction::SourceReplace;
             _pick_source = (int)i;
             if (s.is_video)
-                _dialog.open(msg::pick_video_file.get(), FileDialog::Mode::File,
+                open_dialog(msg::pick_video_file.get(), FileDialog::Mode::File,
                              video_dialog_filters());
             else
-                _dialog.open(msg::pick_photo_folder.get(), FileDialog::Mode::Folder);
+                open_dialog(msg::pick_photo_folder.get(), FileDialog::Mode::Folder);
         }
         ImGui::SameLine();
         if (ui::Button(dmsg::remove)) remove = (int)i;
@@ -2068,14 +2127,14 @@ void GuiApp::draw_dataset_source() {
 
     if (ui::Button(dmsg::add_video)) {
         _pick = PickAction::SourceVideo;
-        _dialog.open(msg::pick_videos.get(), FileDialog::Mode::File,
+        open_dialog(msg::pick_videos.get(), FileDialog::Mode::File,
                      video_dialog_filters(), "", /*multi_select=*/true);
     }
     ui::help_on_hover(dmsg::add_video_help);
     ImGui::SameLine();
     if (ui::Button(dmsg::add_photos)) {
         _pick = PickAction::SourceImages;
-        _dialog.open(msg::pick_photo_folder.get(), FileDialog::Mode::Folder);
+        open_dialog(msg::pick_photo_folder.get(), FileDialog::Mode::Folder);
     }
     ui::help_on_hover(dmsg::add_photos_help);
     if (_sources.empty()) {
@@ -2103,7 +2162,7 @@ void GuiApp::draw_dataset_source() {
     ImGui::PushID("ws");
     if (ui::Button(dmsg::browse)) {
         _pick = PickAction::Workspace;
-        _dialog.open(msg::pick_output_folder.get(), FileDialog::Mode::Folder);
+        open_dialog(msg::pick_output_folder.get(), FileDialog::Mode::Folder);
     }
     ImGui::PopID();
     ImGui::SameLine();
@@ -2674,22 +2733,7 @@ bool GuiApp::geometry_model_missing() const {
 }
 
 void GuiApp::request_geometry_download() {
-    if (_geom_download.state() == FileDownload::State::Running) return;
-    _geom_queue = geometry_model_downloads(_geometry.model);
-    pump_geometry_download();
-}
-
-void GuiApp::pump_geometry_download() {
-    if (_geom_download.state() == FileDownload::State::Running) return;
-    // A failed part means the rest is pointless: vit-giant2's weights are
-    // useless without the sibling the graph names.
-    if (_geom_download.state() == FileDownload::State::Failed ||
-        _geom_download.state() == FileDownload::State::Cancelled)
-        _geom_queue.clear();
-    if (_geom_queue.empty()) return;
-    const GeometryDownload d = _geom_queue.front();
-    _geom_queue.erase(_geom_queue.begin());
-    _geom_download.start(d.url, d.dest, d.bytes);
+    _geom_download.start(geometry_model_downloads(_geometry.model));
 }
 
 void GuiApp::open_geometry_preview() {
@@ -2743,26 +2787,23 @@ void GuiApp::draw_geometry_options() {
     }
     ui::TextDisabled(*catalog[(size_t)model_idx].blurb);
 
-    const bool downloading = _geom_download.state() == FileDownload::State::Running;
-    if (downloading) {
+    FileDownload& geom_dl = _geom_download.current();
+    if (_geom_download.running()) {
         // The overlay is a byte count from curl, not a sentence.
-        ui::ProgressBarRaw(std::max(_geom_download.progress(), 0.0f),
-                           ImVec2(px(260.0f), 0), _geom_download.status().c_str());
+        ui::ProgressBarRaw(std::max(geom_dl.progress(), 0.0f),
+                           ImVec2(px(260.0f), 0), geom_dl.status().c_str());
         ImGui::SameLine();
         // The mask download's Stop button carries the same message; two of
         // them can be on screen at once, so this one needs its own ID.
         ImGui::PushID("geomdl");
-        if (ui::Button(dmsg::stop)) {
-            _geom_queue.clear();
-            _geom_download.cancel();
-        }
+        if (ui::Button(dmsg::stop)) _geom_download.cancel();
         ImGui::PopID();
     } else if (geometry_model_missing()) {
         if (ui::Button(dmsg::geom_get_model)) request_geometry_download();
         ImGui::SameLine();
         ui::TextDisabledRaw(human_bytes(catalog[(size_t)model_idx].bytes));
-        if (_geom_download.state() == FileDownload::State::Failed)
-            ui::TextColoredWrappedRaw(kErr, _geom_download.status());
+        if (geom_dl.state() == FileDownload::State::Failed)
+            ui::TextColoredWrappedRaw(kErr, geom_dl.status());
     } else {
         ui::TextColored(kOk, dmsg::geom_model_ready);
     }
@@ -2775,14 +2816,28 @@ void GuiApp::draw_geometry_options() {
     if (!_geometry.want_normal && !_geometry.want_depth)
         ui::TextColoredWrapped(kWarn, dmsg::geom_nothing_to_write);
 
+    // Behind the checkpoint, unlike "Try the mask": there is no half of this
+    // panel that works without one, and opening it would have the panel fetch
+    // the weights itself.
+    ImGui::BeginDisabled(geometry_model_missing());
     if (ui::Button(dmsg::geom_try)) open_geometry_preview();
-    ui::help_on_hover(dmsg::geom_try_help);
+    ImGui::EndDisabled();
+    ui::help_on_hover_disabled(geometry_model_missing() ? dmsg::geom_model_first
+                                                        : dmsg::geom_try_help);
 
     if (ui::CollapsingHeader(dmsg::geom_advanced)) {
         ImGui::SetNextItemWidth(px(220.0f));
         if (ui::InputInt(dmsg::geom_max_size, &_geometry.max_size))
             _geometry.max_size = std::clamp(_geometry.max_size, 224, 4096);
         ui::help_on_hover(gmsg::opt_max_size);
+
+        // Enabled whatever the checkpoint is: a Metric3D run passes it and
+        // ignores it, and disabling it would need this screen to know which
+        // family an .onnx the user pointed at belongs to.
+        ImGui::SetNextItemWidth(px(220.0f));
+        if (ui::InputInt(dmsg::geom_num_tokens, &_geometry.num_tokens))
+            _geometry.num_tokens = std::clamp(_geometry.num_tokens, 256, 8192);
+        ui::help_on_hover(gmsg::opt_num_tokens);
 
         // png / jpg / relative / mm are what config.json and the flag spell,
         // so the values stay as they are and the label carries the meaning.
@@ -3113,34 +3168,53 @@ void GuiApp::draw_dataset_rerun(const WorkspaceState& prior) {
     ImGui::Indent();
     ui::TextDisabledWrapped(dmsg::rerun_section_help);
 
+    // Each button starts a run of its own, so each is behind exactly the
+    // checkpoints its steps read -- a missing geometry model must not stop a
+    // rerun of the masks.
+    const bool need_mask_model = mask_model_missing();
+    const bool need_feat_model = feature_model_missing();
+
     bool go = false;
     if (prior.frames) {
+        ImGui::BeginDisabled(need_mask_model || need_feat_model);
         if (ui::Button(dmsg::rerun_frames)) {
             _redo_frames = _redo_masks = true;   // the masks describe the frames
             _redo_model = go = true;
         }
+        ImGui::EndDisabled();
+        if (need_mask_model || need_feat_model)
+            ui::help_on_hover_disabled(need_mask_model ? dmsg::mask_model_first
+                                                       : dmsg::feat_model_first);
         ImGui::SameLine();
     }
     if (prior.masks) {
+        ImGui::BeginDisabled(need_mask_model);
         if (ui::Button(dmsg::rerun_masks)) {
             _redo_masks = true;
             _redo_model = go = true;
         }
+        ImGui::EndDisabled();
+        if (need_mask_model) ui::help_on_hover_disabled(dmsg::mask_model_first);
         ImGui::SameLine();
     }
+    ImGui::BeginDisabled(need_feat_model);
     if (ui::Button(dmsg::rerun_model)) {
         _redo_model = go = true;
     }
+    ImGui::EndDisabled();
+    if (need_feat_model) ui::help_on_hover_disabled(dmsg::feat_model_first);
     // Depth and normals are the one step that reruns on its own: they are read
     // off the finished dataset and nothing downstream of them exists.
     if (prior.geometry) {
         ImGui::SameLine();
-        ImGui::BeginDisabled(!_geometry.enable);
+        const bool need_geom_model = geometry_model_missing();
+        ImGui::BeginDisabled(!_geometry.enable || need_geom_model);
         if (ui::Button(dmsg::rerun_geometry)) {
             _redo_geometry = go = true;
         }
         ImGui::EndDisabled();
-        ui::help_on_hover_disabled(dmsg::rerun_geometry_help);
+        ui::help_on_hover_disabled(need_geom_model ? dmsg::geom_model_first
+                                                   : dmsg::rerun_geometry_help);
     }
     ImGui::NewLine();
     ImGui::Unindent();
@@ -3199,6 +3273,46 @@ void GuiApp::draw_color_space_options(bool with_point_color) {
 // Advanced: built-in SfM
 // ---------------------------------------------------------------------------
 
+// Would the reconstruction reach the learned frontend and find no checkpoint?
+// The same question mask_model_missing() asks, of the other download.
+bool GuiApp::feature_model_missing() const {
+    if (effective_engine() != Engine::BuiltIn) return false;
+    return !sfm_features_cached(_sfm_job.features, _sfm_job.matcher);
+}
+
+void GuiApp::request_feature_download() {
+    _feat_download.start(
+        sfm_feature_downloads(_sfm_job.features, _sfm_job.matcher));
+}
+
+// The detector and, with LightGlue, the matcher: what they cost and a button
+// that gets them. Under the two combos that chose them.
+void GuiApp::draw_feature_download() {
+    FileDownload& dl = _feat_download.current();
+    if (_feat_download.running()) {
+        ui::ProgressBarRaw(std::max(dl.progress(), 0.0f), ImVec2(px(260.0f), 0),
+                           dl.status().c_str());
+        ImGui::SameLine();
+        ImGui::PushID("featdl");
+        if (ui::Button(dmsg::stop)) _feat_download.cancel();
+        ImGui::PopID();
+        return;
+    }
+    if (!feature_model_missing()) {
+        ui::TextColored(kOk, dmsg::feat_model_ready);
+        return;
+    }
+    uint64_t bytes = 0;
+    for (const PendingDownload& d :
+         sfm_feature_downloads(_sfm_job.features, _sfm_job.matcher))
+        bytes += d.bytes;
+    if (ui::Button(dmsg::feat_get_model)) request_feature_download();
+    ImGui::SameLine();
+    ui::TextDisabledRaw(human_bytes(bytes));
+    if (dl.state() == FileDownload::State::Failed)
+        ui::TextColoredWrappedRaw(kErr, dl.status());
+}
+
 void GuiApp::draw_sfm_advanced() {
     if (!ui::CollapsingHeader(dmsg::section_advanced)) return;
 
@@ -3228,6 +3342,7 @@ void GuiApp::draw_sfm_advanced() {
         ImGui::EndDisabled();
         ui::help_on_hover(learned ? dmsg::matcher_help
                                   : dmsg::matcher_needs_learned);
+        if (learned) draw_feature_download();
     }
 
     ImGui::SetNextItemWidth(px(260.0f));
@@ -3402,7 +3517,7 @@ void GuiApp::draw_colmap_options() {
         ImGui::PushID("vt");
         if (ui::Button(dmsg::browse)) {
             _pick = PickAction::VocabTree;
-            _dialog.open(msg::pick_vocab_tree.get(), FileDialog::Mode::File,
+            open_dialog(msg::pick_vocab_tree.get(), FileDialog::Mode::File,
                          {".bin"});
         }
         ImGui::PopID();
@@ -3506,11 +3621,13 @@ void GuiApp::draw_dataset_form(float height, bool running) {
         bool ready = !_sources.empty() && !_workspace.empty();
         for (const PrepInput& s : _sources) ready = ready && !s.path.empty();
         const bool need_mask_model = mask_model_missing();
+        const bool need_feat_model = feature_model_missing();
         const bool need_geom_model = geometry_model_missing();
+        const bool need_model = need_mask_model || need_feat_model || need_geom_model;
         // The button names what pressing it does: a folder that already holds
         // a reconstruction is added to, not built.
         const bool adding = workspace_state().model && !_redo_model;
-        ImGui::BeginDisabled(!ready || need_mask_model || need_geom_model);
+        ImGui::BeginDisabled(!ready || need_model);
         if (ui::Button(adding ? dmsg::update_dataset : dmsg::create_dataset,
                        ImVec2(px(200.0f), px(34.0f))))
             start_dataset_job();
@@ -3518,21 +3635,27 @@ void GuiApp::draw_dataset_form(float height, bool running) {
         if (!ready) {
             ImGui::SameLine();
             ui::TextDisabled(dmsg::pick_input_first);
-        } else if (need_mask_model || need_geom_model) {
+        } else if (need_model) {
             // The options above carry the same buttons, but they are a scroll
-            // away by the time somebody is reaching for this one.
-            FileDownload& dl = need_mask_model ? _download : _geom_download;
+            // away by the time somebody is reaching for this one. One missing
+            // checkpoint at a time; the next takes its place once this lands.
+            FileDownload& dl = need_mask_model ? _download
+                               : need_feat_model ? _feat_download.current()
+                                                 : _geom_download.current();
             ImGui::SameLine();
-            ui::TextDisabled(need_mask_model ? dmsg::mask_model_first
-                                             : dmsg::geom_model_first);
+            ui::TextDisabled(need_mask_model   ? dmsg::mask_model_first
+                             : need_feat_model ? dmsg::feat_model_first
+                                               : dmsg::geom_model_first);
             ImGui::SameLine();
             if (dl.state() == FileDownload::State::Running)
                 ui::ProgressBarRaw(std::max(dl.progress(), 0.0f),
                                    ImVec2(px(200.0f), 0), dl.status().c_str());
-            else if (ui::Button(need_mask_model ? dmsg::mask_get_model
-                                                : dmsg::geom_get_model)) {
-                if (need_mask_model) request_model_download();
-                else                 request_geometry_download();
+            else if (ui::Button(need_mask_model   ? dmsg::mask_get_model
+                                : need_feat_model ? dmsg::feat_get_model
+                                                  : dmsg::geom_get_model)) {
+                if (need_mask_model)      request_model_download();
+                else if (need_feat_model) request_feature_download();
+                else                      request_geometry_download();
             }
         }
         if (ready) draw_dataset_rerun(workspace_state());
@@ -3824,7 +3947,7 @@ void GuiApp::draw_viewer() {
     ImGui::SameLine();
     if (ui::Button(msg::viewer_open_another)) {
         _pick = PickAction::SplatFile;
-        _dialog.open(msg::viewer_pick_file.get(), FileDialog::Mode::File,
+        open_dialog(msg::viewer_pick_file.get(), FileDialog::Mode::File,
                      kViewableExtensions);
     }
     ImGui::SameLine();
@@ -3951,12 +4074,12 @@ void GuiApp::draw_mesh_options() {
     ImGui::SameLine();
     if (ui::ButtonRaw("...##meshsrcdir", ImVec2(60, 0))) {
         _pick = PickAction::MeshSource;
-        _dialog.open(msg::mesh_pick_model.get(), FileDialog::Mode::Folder);
+        open_dialog(msg::mesh_pick_model.get(), FileDialog::Mode::Folder);
     }
     ImGui::SameLine();
     if (ui::ButtonRaw(".ply##meshsrcfile", ImVec2(60, 0))) {
         _pick = PickAction::MeshSource;
-        _dialog.open(msg::mesh_pick_model.get(), FileDialog::Mode::File,
+        open_dialog(msg::mesh_pick_model.get(), FileDialog::Mode::File,
                      {".ply"});
     }
     ui::help_on_hover(msg::mesh_source_help);
@@ -3978,7 +4101,7 @@ void GuiApp::draw_mesh_options() {
         ImGui::SameLine();
         if (ui::ButtonRaw("...##meshdatapick", ImVec2(60, 0))) {
             _pick = PickAction::MeshPhotos;
-            _dialog.open(msg::mesh_pick_photos.get(), FileDialog::Mode::Folder);
+            open_dialog(msg::mesh_pick_photos.get(), FileDialog::Mode::Folder);
         }
         ImGui::SameLine();
         ui::TextDisabled(msg::mesh_photos_dir);
@@ -4054,7 +4177,7 @@ void GuiApp::draw_mesh_options() {
     ImGui::SameLine();
     if (ui::ButtonRaw("...##meshoutpick", ImVec2(60, 0))) {
         _pick = PickAction::MeshOutput;
-        _dialog.open(msg::mesh_pick_output.get(), FileDialog::Mode::Folder);
+        open_dialog(msg::mesh_pick_output.get(), FileDialog::Mode::Folder);
     }
     ImGui::SameLine();
     ui::TextDisabled(msg::mesh_output);
@@ -4191,7 +4314,7 @@ void GuiApp::draw_batch() {
     if (ui::Button(msg::batch_add_row)) {
         _pick = PickAction::BatchDataset;
         _pick_row = -1;   // append
-        _dialog.open(msg::batch_pick_dataset.get(), FileDialog::Mode::Folder);
+        open_dialog(msg::batch_pick_dataset.get(), FileDialog::Mode::Folder);
     }
     ImGui::SameLine();
     // The datasets already opened in the trainer, which is where a queue is
@@ -4306,7 +4429,7 @@ void GuiApp::draw_batch_table() {
         if (ui::ButtonRaw("...##ds")) {
             _pick = PickAction::BatchDataset;
             _pick_row = i;
-            _dialog.open(msg::batch_pick_dataset.get(),
+            open_dialog(msg::batch_pick_dataset.get(),
                          FileDialog::Mode::Folder, {}, j.dataset);
         }
 
@@ -4344,7 +4467,7 @@ void GuiApp::draw_batch_table() {
         if (ui::ButtonRaw("...##out")) {
             _pick = PickAction::BatchOutput;
             _pick_row = i;
-            _dialog.open(msg::batch_pick_output.get(), FileDialog::Mode::Folder,
+            open_dialog(msg::batch_pick_output.get(), FileDialog::Mode::Folder,
                          {}, j.output_dir);
         }
         ImGui::EndDisabled();
@@ -4437,7 +4560,7 @@ void GuiApp::draw_batch_preset_combo(BatchJob& job, int row) {
     if (ui::Selectable(msg::batch_preset_from_file)) {
         _pick = PickAction::BatchPresetFile;
         _pick_row = row;
-        _dialog.open(msg::preset_pick_file.get(), FileDialog::Mode::File,
+        open_dialog(msg::preset_pick_file.get(), FileDialog::Mode::File,
                      {".json"}, preset_dir());
     }
     ImGui::EndCombo();
@@ -4490,7 +4613,7 @@ void GuiApp::draw_train_settings() {
     ImGui::BeginDisabled(busy && ph != TrainRunner::Phase::Loading);
     if (ui::Button(msg::change_dataset)) {
         _pick = PickAction::OpenDataset;
-        _dialog.open(msg::menu_open_dataset.get(), FileDialog::Mode::Folder);
+        open_dialog(msg::menu_open_dataset.get(), FileDialog::Mode::Folder);
     }
     ImGui::EndDisabled();
 
@@ -4623,7 +4746,7 @@ void GuiApp::draw_preset_picker() {
     ImGui::SameLine();
     if (ui::Button(msg::preset_load)) {
         _pick = PickAction::PresetFile;
-        _dialog.open(msg::preset_pick_file.get(), FileDialog::Mode::File,
+        open_dialog(msg::preset_pick_file.get(), FileDialog::Mode::File,
                      {".json"}, preset_dir());
     }
     ui::help_on_hover(msg::preset_load_help);
@@ -4737,7 +4860,7 @@ void GuiApp::draw_preset_save_modal() {
     if (ui::ButtonRaw("...##preset_dir")) {
         _pick = PickAction::PresetSaveFolder;
         _preset_path_edited = true;
-        _dialog.open(msg::preset_pick_folder.get(), FileDialog::Mode::Folder,
+        open_dialog(msg::preset_pick_folder.get(), FileDialog::Mode::Folder,
                      {}, fs::path(_preset_save_path).parent_path().string());
         // ImGui shows one modal at a time and the dialog is one too, so this
         // one steps aside and is re-armed when the pick comes back. Nothing is
@@ -4867,7 +4990,7 @@ void GuiApp::draw_basic_options() {
     ImGui::SameLine();
     if (ui::ButtonRaw("...##outdir")) {
         _pick = PickAction::OutputPrefix;
-        _dialog.open(msg::pick_output_folder.get(), FileDialog::Mode::Folder,
+        open_dialog(msg::pick_output_folder.get(), FileDialog::Mode::Folder,
                      {}, _cfg.output_dir_prefix);
     }
     ImGui::SameLine();

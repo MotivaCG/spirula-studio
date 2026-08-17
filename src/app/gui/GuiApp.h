@@ -86,13 +86,21 @@ private:
         None, GoHome, OpenDataset, OpenSplat, Quit, StartBatch, StopHere
     };
 
-    // ---- persistence (recents + tool paths) ----
+    // ---- persistence (recents + tool paths + where each picker was last) ----
     static std::string settings_path();
     void load_settings();
     void save_settings();
     // By value: callers pass elements of _recents, which this mutates.
     void add_recent(std::string path);
     void add_model_recent(std::string path);
+    // The folder a pick came out of, not the thing picked: reopening inside
+    // the dataset just chosen shows its images/, never its siblings, which is
+    // where the next dataset is.
+    std::string last_dir(PickAction what) const;
+    void remember_dir(PickAction what, const std::string& path);
+    // What the settings file calls a pick. Spelled out rather than taken from
+    // the enum, so reordering PickAction cannot repoint a stored path.
+    static const char* pick_key(PickAction what);
 
     // ---- actions ----
     // By value: callers pass elements of _recents, which open_dataset
@@ -219,8 +227,11 @@ private:
     // CC0 and BSD (src/metric3d/model/Fetch.h), unlike the SAM weights. The
     // largest is two files, so what is pending is a queue.
     void request_geometry_download();
-    void pump_geometry_download();
     bool geometry_model_missing() const;
+    // The same for the learned frontend, whose detector and matcher are two
+    // downloads of their own (src/aliked/model/Fetch.h).
+    void request_feature_download();
+    bool feature_model_missing() const;
     // The step list and its bars, in place of the one stage line.
     void draw_dataset_steps();
     // The form and the button that acts on it, `height` tall.
@@ -247,6 +258,7 @@ private:
     void open_mask_preview();
     void draw_color_space_options(bool with_point_color);
     void draw_sfm_advanced();
+    void draw_feature_download();
     void draw_colmap_options();
     void draw_tool_locations();
     void draw_license_modal();
@@ -298,6 +310,14 @@ private:
     void draw_log_panel(float height);
     void draw_confirm_modal();
     void handle_dialog_result(const std::vector<std::string>& paths);
+
+    // Arms the picker for the `_pick` just set, in that pick's own last
+    // directory unless the caller names one. Every picker here goes through
+    // it, so none of them can be armed without a `_pick` to answer for it.
+    void open_dialog(const std::string& title, FileDialog::Mode mode,
+                     const std::vector<std::string>& extensions = {},
+                     const std::string& start_dir = "",
+                     bool multi_select = false);
     // Take paths onto the input list, `replace` clearing what was there (a
     // fresh pick from Home) rather than adding to it (the panel's Add buttons).
     // Sets the per-input defaults and, unless the user has edited it, the
@@ -400,6 +420,10 @@ private:
     ColmapJob _colmap_job;
     SfmRunner _sfm;
     SfmJob _sfm_job;
+    // ALIKED and LightGlue, when the advanced options ask for them. Fetched
+    // here rather than by the run's child process, whose download nobody
+    // asked for and nobody can see.
+    DownloadQueue _feat_download;
     // ---- what a running job shows about itself ----
     // One reel per step that produces pictures: the frames as they are
     // written, the masks as they are made, and the frames again with the
@@ -465,8 +489,7 @@ private:
     // that tries it on one frame, and the checkpoint fetch.
     GeometryJob _geometry;
     GeometryPanel _geometry_panel;
-    FileDownload _geom_download;
-    std::vector<GeometryDownload> _geom_queue;
+    DownloadQueue _geom_download;
     // input_pixel_size()'s cache, keyed by input path. A zero pair is a
     // remembered "could not tell", so nothing is probed twice.
     std::map<std::string, std::pair<int, int>> _input_size;
@@ -509,6 +532,7 @@ private:
     int _pick_row = -1;
 
     // Settings (persisted).
+    std::map<std::string, std::string> _last_dirs;  // pick_key() -> folder
     std::vector<std::string> _recents;
     std::string _colmap_exe = "colmap";
     std::string _ffmpeg_exe = "ffmpeg";
