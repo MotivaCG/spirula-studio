@@ -2593,6 +2593,29 @@ SS_MSG(cfg_unchecked_is_auto,
     RU("без флажка — авто"),
     TR("işaretsiz = otomatik"));
 
+// For the optional fields whose unset state switches the feature off rather
+// than deriving a value: "auto" would promise something the trainer does not do.
+SS_MSG(cfg_none,
+    EN("(none)"),        JA("（なし）"),      ZH_HANS("（无）"),    ZH_HANT("（無）"),
+    KO("(없음)"),         DE("(keine)"),      FR("(aucun)"),     ES("(ninguno)"),
+    PT("(nenhum)"),      IT("(nessuno)"),    NL("(geen)"),      RU("(нет)"),
+    TR("(yok)"));
+
+SS_MSG(cfg_unchecked_is_none,
+    EN("unchecked = none"),
+    JA("チェックを外すとなし"),
+    ZH_HANS("未勾选 = 无"),
+    ZH_HANT("未勾選 = 無"),
+    KO("체크 해제 = 없음"),
+    DE("nicht angehakt = keine"),
+    FR("décoché = aucun"),
+    ES("sin marcar = ninguno"),
+    PT("desmarcado = nenhum"),
+    IT("deselezionato = nessuno"),
+    NL("niet aangevinkt = geen"),
+    RU("без флажка — нет"),
+    TR("işaretsiz = yok"));
+
 // ===========================================================================
 // File dialog
 // ===========================================================================

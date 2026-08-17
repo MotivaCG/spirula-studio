@@ -21,6 +21,7 @@
 #include <cstring>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace msg = spirula::i18n::msg::gui;
@@ -134,22 +135,56 @@ bool draw_value(const char*, std::optional<bool>& v, const char*) {
     return changed;
 }
 
+// Unset derives a value for most optional fields but switches others off --
+// a different promise, so it reads differently. Listed per field here rather
+// than as another column on every row of the field table.
+bool unset_is_none(const char* key) {
+    return !std::strcmp(key, "darkness_boost") ||
+           !std::strcmp(key, "opacity_boost");
+}
+
+template <typename T>
+T optional_seed(const char* key) {
+    if constexpr (std::is_arithmetic_v<T>) {
+        if (!std::strcmp(key, "darkness_boost")) return (T)2;
+        if (!std::strcmp(key, "opacity_boost")) return (T)1.5;
+    }
+    return T{};
+}
+
+// Applied once the user is done typing rather than per keystroke, which would
+// fight anyone clearing the field to retype it.
+template <typename T>
+bool clamp_to_min(const char* key, std::optional<T>& v) {
+    if constexpr (std::is_arithmetic_v<T>) {
+        if (!std::strcmp(key, "opacity_boost") && v.has_value() && *v < (T)1) {
+            v = (T)1;
+            return true;
+        }
+    }
+    return false;
+}
+
 template <typename T>
 bool draw_value(const char* key, std::optional<T>& v, const char* choices) {
     bool has = v.has_value();
     bool changed = false;
     if (ui::CheckboxRaw("##has", &has)) {
-        v = has ? std::optional<T>(T{}) : std::nullopt;
+        v = has ? std::optional<T>(optional_seed<T>(key)) : std::nullopt;
         changed = true;
     }
+    const bool none = unset_is_none(key);
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
-        ui::SetTooltip(msg::cfg_unchecked_is_auto);
+        ui::SetTooltip(none ? msg::cfg_unchecked_is_none
+                            : msg::cfg_unchecked_is_auto);
     ImGui::SameLine();
     if (v.has_value()) {
         T tmp = *v;
         if (draw_value(key, tmp, choices)) { v = tmp; changed = true; }
+        if (ImGui::IsItemDeactivatedAfterEdit() && clamp_to_min(key, v))
+            changed = true;
     } else {
-        ui::TextDisabled(msg::cfg_auto);
+        ui::TextDisabled(none ? msg::cfg_none : msg::cfg_auto);
     }
     return changed;
 }

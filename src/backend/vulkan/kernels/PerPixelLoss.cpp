@@ -27,9 +27,14 @@ namespace {
 
 using backend::MemcpyKind;
 
-constexpr int kNRaw = (int)RawLossIndex::length;   // 31
-constexpr int kNW = (int)LossWeightIndex::length;  // 19
+constexpr int kNRaw = (int)RawLossIndex::length;   // 32
+constexpr int kNW = (int)LossWeightIndex::length;  // 20
 constexpr int kNL = (int)LossIndex::length;        // 14
+
+// The uint64 pointers align these structs to 8, so their trailing scalars are
+// padded out to it. Where that padding lands moves with kNW, which is why the
+// layout asserts below compute it instead of spelling it out.
+constexpr size_t pad8(size_t bytes) { return (bytes + 7) / 8 * 8; }
 
 // ---------------------------------------------------------------------------
 // Param-struct mirrors (shaders/multi_scale_loss.slang etc.)
@@ -55,7 +60,7 @@ struct PplParams {
     int32_t has_mask;
     uint32_t in_flags, out_flags, wgs_per_row;
 };
-static_assert(sizeof(PplParams) == 30 * 8 + (kNW + 14) * 4 + 4, "layout");
+static_assert(sizeof(PplParams) == 30 * 8 + pad8((kNW + 14) * 4), "layout");
 
 // in_flags bits (mirror multi_scale_loss.slang)
 constexpr uint32_t kInCam = 1u << 0;
@@ -72,7 +77,7 @@ struct PplReduceParams {
     float weights[kNW];
     int32_t batch_size;
 };
-static_assert(sizeof(PplReduceParams) == 3 * 8 + (kNW + 1) * 4, "layout");
+static_assert(sizeof(PplReduceParams) == 3 * 8 + pad8((kNW + 1) * 4), "layout");
 
 struct MsPoolParams {
     uint64_t hs, ls;

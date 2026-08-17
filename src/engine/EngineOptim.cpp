@@ -4,6 +4,7 @@
 #include "engine/EngineCommon.h"
 #include "engine/EngineState.h"
 
+#include <cmath>
 #include <stdexcept>
 #include <variant>
 #include <vector>
@@ -705,4 +706,32 @@ void engine_optim_step(int step, const OptimConfig& cfg) {
             cfg.sh_reg_weight, 0.0f,
             grad_scale, zero_grad);
     }
+}
+
+// Opacity is a logit, so the factor applies in probability space: sigmoid ->
+// scale -> clamp -> logit. Unclamped, p*factor hits 1 and the logit is +inf.
+// Host round trip: twice a run, so no kernel earns its keep.
+void engine_scale_opacities(float factor) {
+    if (!(factor > 1.0f)) return;
+    const int64_t N = engine().cur_num_splats;
+    float* d_opac = engine().world.opacities.data_ptr();
+    if (N <= 0 || d_opac == nullptr) return;
+
+    backend::device_synchronize();
+    std::vector<float> opac((size_t)N);
+    backend::memcpy_sync(opac.data(), d_opac, (size_t)N * sizeof(float),
+                         backend::MemcpyKind::DeviceToHost);
+
+    // Past 1 - 1/255 the extra opacity cannot show in an 8-bit render, and
+    // sigmoid' is down to ~0.004, so a splat parked there barely trains back.
+    const float kMaxOpacity = 1.0f - 1.0f / 255.0f;
+    const float kMaxLogit = std::log(kMaxOpacity / (1.0f - kMaxOpacity));
+    for (float& logit : opac) {
+        if (!std::isfinite(logit)) continue;
+        const float p = 1.0f / (1.0f + std::exp(-logit)) * factor;
+        logit = p >= kMaxOpacity ? kMaxLogit : std::log(p / (1.0f - p));
+    }
+
+    backend::memcpy_sync(d_opac, opac.data(), (size_t)N * sizeof(float),
+                         backend::MemcpyKind::HostToDevice);
 }

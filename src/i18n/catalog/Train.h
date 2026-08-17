@@ -362,6 +362,14 @@ inline const PresetText* preset_text(const char* name) {
 // table, shown by `spirula train --help` and by the GUI's options editor.
 // ===========================================================================
 
+// A product name, so it is the same string in every language -- the tags are
+// there because a Msg has one slot per language, not because it varies.
+SS_MSG(section_smn,
+    EN("SMN"),           JA("SMN"),           ZH_HANS("SMN"),      ZH_HANT("SMN"),
+    KO("SMN"),           DE("SMN"),           FR("SMN"),
+    ES("SMN"),           PT("SMN"),           IT("SMN"),
+    NL("SMN"),           RU("SMN"),           TR("SMN"));
+
 SS_MSG(section_run,
     EN("Run & Output"),  JA("実行と出力"),     ZH_HANS("运行与输出"), ZH_HANT("執行與輸出"),
     KO("실행과 출력"),    DE("Lauf & Ausgabe"), FR("Exécution et sortie"),
@@ -474,6 +482,7 @@ struct SectionText {
 };
 
 inline constexpr SectionText kSectionText[] = {
+    {"smn",        &section_smn},
     {"run",        &section_run},
     {"dataset",    &section_dataset},
     {"scene",      &section_scene},

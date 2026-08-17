@@ -58,7 +58,7 @@ inline constexpr float kTrainInf = std::numeric_limits<float>::infinity();
 // The headings, in the order they are listed. Their labels live in
 // i18n/catalog/Train.h (section_*), which this header must not include.
 inline constexpr const char* kTrainSections[] = {
-    "run", "dataset", "scene", "splats", "detail", "loss",
+    "smn", "run", "dataset", "scene", "splats", "detail", "loss",
     "geometry", "shape", "correction", "colorspace", "perf", "rates",
 };
 inline constexpr int kTrainNumSections =
@@ -89,6 +89,10 @@ inline int train_tier_rank(const char* tier) {
 // ===========================================================================
 
 #define SS_CONFIG_FIELDS(X) \
+                                                                             \
+    /* ==== smn -- SMN pipeline options ==== */                              \
+    X(std::optional<float>, darkness_boost, std::nullopt, "smn", "basic", "")\
+    X(std::optional<float>, opacity_boost, std::nullopt, "smn", "basic", "") \
                                                                              \
     /* ==== run -- run control: where output goes, how long, checkpoints, viewer ==== */ \
     X(std::string, data, {}, "run", "basic", "")                             \

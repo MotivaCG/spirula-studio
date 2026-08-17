@@ -23,8 +23,8 @@
 #include "shaders/per_pixel_losses.slang"
 #undef CudaDeviceExport
 
-static const int kNRaw = int(RawLossIndex::length);        // 31
-static const int kNW = int(LossWeightIndex::length);       // 19
+static const int kNRaw = int(RawLossIndex::length);        // 32
+static const int kNW = int(LossWeightIndex::length);       // 20
 static const int kNL = int(LossIndex::length);             // 14
 
 // in_flags bits (buffer present)

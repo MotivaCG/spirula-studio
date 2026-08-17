@@ -85,6 +85,10 @@ enum RawLossIndex {
     MedianDepthNormalMaskTotal,
     MedianNormalMaskTotal,
     MedianRenderNormalMaskTotal,
+    // MaskTotal with each pixel counted as heavily as its RgbLoss was, so the
+    // mean below keeps the scale it had without the boost. Equals MaskTotal
+    // exactly at boost 0.
+    DarknessWeightTotal,
     length
 };
 
@@ -111,6 +115,8 @@ enum LossWeightIndex {
     MedianDepthNormalReg,
     MedianNormalSup,
     MedianRenderNormalReg,
+    // 0 = off. Scales how much a dark GT pixel outweighs a bright one.
+    DarknessBoost,
     length
 };
 
@@ -167,7 +173,12 @@ float[RawLossIndex::length] per_pixel_losses(
     float dY = render_yuv.x - ref_yuv.x;
     float dU = render_yuv.y - ref_yuv.y;
     float dV = render_yuv.z - ref_yuv.z;
-    losses[RawLossIndex::RgbLoss] = float(mask) * (
+    // Darkness boost: the GT's own luma decides how much this pixel counts.
+    // no_diff because the weight is a fixed per-pixel importance -- letting it
+    // differentiate would push a gradient into ref_rgb that means nothing.
+    float dark_w = 1.0f + weights[LossWeightIndex::DarknessBoost] *
+                          clamp(1.0f - detach(ref_yuv.x), 0.0f, 1.0f);
+    losses[RawLossIndex::RgbLoss] = float(mask) * dark_w * (
         weights[LossWeightIndex::RgbSupL1] * l1_loss(render_rgb, ref_rgb) +
         weights[LossWeightIndex::RgbSupL2] * l2_loss(render_rgb, ref_rgb) +
         weights[LossWeightIndex::YSupL1]  * abs(dY) +
@@ -250,6 +261,7 @@ float[RawLossIndex::length] per_pixel_losses(
     losses[RawLossIndex::MedianDepthNormalMaskTotal] = float(median_normal_mask & depth_normal_mask);
     losses[RawLossIndex::MedianNormalMaskTotal] = float(median_normal_mask & normal_mask);
     losses[RawLossIndex::MedianRenderNormalMaskTotal] = float(median_normal_mask & render_normal_mask);
+    losses[RawLossIndex::DarknessWeightTotal] = float(mask) * dark_w;
 
     return losses;
 }
@@ -360,9 +372,11 @@ float[LossIndex::length] per_pixel_losses_reduce(
 ) {
     float[LossIndex::length] losses;
 
-    // image loss
-    losses[LossIndex::RgbLoss] = 
-        raw_losses[RawLossIndex::RgbLoss] / max(raw_losses[RawLossIndex::MaskTotal], 1);
+    // image loss -- weighted mean, the divisor carrying the same darkness
+    // weights as the numerator. PSNR stays on the plain pixel count: it has to
+    // remain comparable across runs.
+    losses[LossIndex::RgbLoss] =
+        raw_losses[RawLossIndex::RgbLoss] / max(raw_losses[RawLossIndex::DarknessWeightTotal], 1);
     losses[LossIndex::RgbPSNR] = -10.0 * log10(
         raw_losses[RawLossIndex::RgbL2] / max(raw_losses[RawLossIndex::MaskTotal], 1));
 

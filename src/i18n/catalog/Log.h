@@ -1041,6 +1041,21 @@ SS_MSG(resumed_from,
     RU("Продолжено с {0}, шаг {1}"),
     TR("{0} konumundan {1}. adımda sürdürüldü"));
 
+SS_MSG(opacity_boosted,
+    EN("Step {0}: splat opacity multiplied by {1}"),
+    JA("ステップ {0}: スプラットの不透明度を {1} 倍しました"),
+    ZH_HANS("第 {0} 步：泼溅不透明度已乘以 {1}"),
+    ZH_HANT("第 {0} 步：潑濺不透明度已乘以 {1}"),
+    KO("{0} 단계: 스플랫 불투명도에 {1}을(를) 곱했습니다"),
+    DE("Schritt {0}: Splat-Deckkraft mit {1} multipliziert"),
+    FR("Étape {0} : opacité des splats multipliée par {1}"),
+    ES("Paso {0}: opacidad de los splats multiplicada por {1}"),
+    PT("Passo {0}: opacidade dos splats multiplicada por {1}"),
+    IT("Passo {0}: opacità degli splat moltiplicata per {1}"),
+    NL("Stap {0}: dekking van de splats vermenigvuldigd met {1}"),
+    RU("Шаг {0}: непрозрачность сплатов умножена на {1}"),
+    TR("Adım {0}: splat opaklığı {1} ile çarpıldı"));
+
 SS_MSG(checkpoint_saved,
     EN("Checkpoint saved to: {0}"),
     JA("チェックポイントを保存しました: {0}"),

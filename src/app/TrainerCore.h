@@ -207,6 +207,11 @@ public:
     // caller must hold engine_mutex.
     std::map<std::string, float> train_step(int step);
 
+    // SMN opacity boost: on the two steps that mark 40% and 85% of the run,
+    // multiplies every splat's opacity by cfg.opacity_boost. Called by
+    // train_step(), so a front-end with its own loop gets it as well.
+    void maybe_boost_opacity(int step);
+
     void save_checkpoint(int step);
 
     // Held-out eval: render every frame of the eval split, score it, and write

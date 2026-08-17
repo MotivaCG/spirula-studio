@@ -284,6 +284,10 @@ build_loss_weights(const TrainConfig& c, int step) {
     w[(int)LossWeightIndex::MedianDepthNormalReg]  = median_factor * c.median_depth_normal_reg_weight;
     w[(int)LossWeightIndex::MedianNormalSup]       = median_factor * c.median_normal_supervision_weight;
     w[(int)LossWeightIndex::MedianRenderNormalReg] = median_factor * c.median_render_normal_reg_weight;
+    // Unset or negative is off, and off must be 0 rather than a small number:
+    // at 0 the kernel's weight is exactly 1 and the run is bit-identical to
+    // one built before the boost existed.
+    w[(int)LossWeightIndex::DarknessBoost] = std::max(0.0f, c.darkness_boost.value_or(0.0f));
     return w;
 }
 
@@ -847,9 +851,23 @@ void TrainerSession::save_checkpoint(int step) {
     }
 }
 
+// SMN opacity boost, at 40% and 85% of the run. In train_step() rather than
+// train() so a front-end driving the loop itself gets it too; a run resumed
+// past a mark misses it, as with any step-keyed event.
+void TrainerSession::maybe_boost_opacity(int step) {
+    const float k = cfg.opacity_boost.value_or(1.0f);
+    if (k <= 1.0f) return;
+    const int marks[] = {(int)(0.40f * cfg.num_iterations),
+                         (int)(0.85f * cfg.num_iterations)};
+    if (step != marks[0] && step != marks[1]) return;
+    engine_scale_opacities(k);
+    log(lfmt(lmsg::opacity_boosted, {step, k}));
+}
+
 // One step. Split out of train() so a front-end that keeps its own loop
 // shares this per-step config rather than rebuilding it.
 std::map<std::string, float> TrainerSession::train_step(int step) {
+    maybe_boost_opacity(step);
     int sh_degree_to_use = step / std::max(cfg.sh_degree_warmup_every, 1);
     EngineStepConfig sc = build_step_config(cfg, st, step);
     return engine_train_step_managed(

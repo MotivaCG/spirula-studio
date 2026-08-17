@@ -35,6 +35,109 @@ namespace field {
 
 
 // ===========================================================================
+// SMN
+// ===========================================================================
+
+SS_MSG(darkness_boost,
+    EN("Darkness boost"), JA("暗部ブースト"),
+    ZH_HANS("暗部提升"), ZH_HANT("暗部提升"), KO("어두운 영역 부스트"),
+    DE("Darkness-Boost"), FR("Renfort des zones sombres"),
+    ES("Refuerzo de zonas oscuras"), PT("Reforço de zonas escuras"),
+    IT("Aumento delle zone scure"), NL("Donkerteboost"),
+    RU("Усиление тёмных областей"), TR("Karanlık güçlendirme"));
+SS_MSG(darkness_boost_help,
+    EN("Makes dark pixels count for more in the photometric loss: each is "
+       "weighted by 1 + boost x its darkness in the ground truth, and the mean "
+       "is renormalized so the loss keeps its scale. Unset or 0 is off."),
+    JA("測光損失で暗い画素を重く扱います。各画素は 1 + ブースト × 正解画像での"
+       "暗さで重み付けされ、平均は再正規化されるので損失の大きさは変わりません。"
+       "未設定または 0 で無効です。"),
+    ZH_HANS("让暗部像素在光度损失中占更大比重：每个像素按 1 + 提升值 × 其在真值"
+            "中的暗度加权，均值会重新归一化，损失的量级不变。不设置或 0 表示"
+            "关闭。"),
+    ZH_HANT("讓暗部像素在光度損失中佔更大比重：每個像素按 1 + 提升值 × 其在真值"
+            "中的暗度加權，平均值會重新正規化，損失的量級不變。不設定或 0 表示"
+            "關閉。"),
+    KO("측광 손실에서 어두운 픽셀의 비중을 키웁니다. 각 픽셀은 1 + 부스트 × 정답"
+       "에서의 어두움으로 가중되고, 평균은 다시 정규화되어 손실의 크기는 그대로"
+       "입니다. 설정하지 않거나 0이면 꺼집니다."),
+    DE("Dunkle Pixel zählen im photometrischen Verlust mehr: jedes wird mit "
+       "1 + Boost x seiner Dunkelheit in der Referenz gewichtet, der Mittelwert "
+       "wird renormiert, der Verlust behält seine Größenordnung. Nicht gesetzt "
+       "oder 0 ist aus."),
+    FR("Les pixels sombres pèsent davantage dans la perte photométrique : "
+       "chacun est pondéré par 1 + renfort x son obscurité dans la référence, "
+       "et la moyenne est renormalisée pour que la perte garde son échelle. "
+       "Non défini ou 0 désactive."),
+    ES("Hace que los píxeles oscuros pesen más en la pérdida fotométrica: cada "
+       "uno se pondera por 1 + refuerzo x su oscuridad en la referencia, y la "
+       "media se renormaliza para que la pérdida mantenga su escala. Sin "
+       "definir o 0 lo desactiva."),
+    PT("Faz os pixels escuros pesarem mais na perda fotométrica: cada um é "
+       "ponderado por 1 + reforço x a sua escuridão na referência, e a média é "
+       "renormalizada para a perda manter a sua escala. Sem definir ou 0 "
+       "desativa."),
+    IT("Fa pesare di più i pixel scuri nella perdita fotometrica: ognuno è "
+       "pesato per 1 + aumento x la sua oscurità nel riferimento, e la media è "
+       "rinormalizzata perché la perdita mantenga la sua scala. Non impostato "
+       "o 0 disattiva."),
+    NL("Donkere pixels tellen zwaarder mee in het fotometrische verlies: elke "
+       "pixel weegt 1 + boost x zijn donkerte in de referentie, en het "
+       "gemiddelde wordt genormaliseerd zodat het verlies zijn schaal houdt. "
+       "Niet ingesteld of 0 is uit."),
+    RU("Тёмные пиксели весят больше в фотометрической ошибке: каждый берётся с "
+       "весом 1 + усиление x его темнота в эталоне, а среднее перенормируется, "
+       "так что масштаб ошибки не меняется. Без значения или 0 — выключено."),
+    TR("Karanlık pikseller fotometrik kayıpta daha çok sayılır: her piksel "
+       "1 + güçlendirme x referanstaki karanlığı ile ağırlıklandırılır, "
+       "ortalama yeniden normalleştirilir ve kaybın ölçeği korunur. "
+       "Ayarlanmazsa veya 0 ise kapalıdır."));
+
+SS_MSG(opacity_boost,
+    EN("Opacity boost"), JA("不透明度ブースト"),
+    ZH_HANS("不透明度提升"), ZH_HANT("不透明度提升"), KO("불투명도 부스트"),
+    DE("Deckkraft-Boost"), FR("Renfort d'opacité"),
+    ES("Refuerzo de opacidad"), PT("Reforço de opacidade"),
+    IT("Aumento dell'opacità"), NL("Dekkingsboost"),
+    RU("Усиление непрозрачности"), TR("Opaklık güçlendirme"));
+SS_MSG(opacity_boost_help,
+    EN("Multiplies every splat's opacity by this factor twice during the run, "
+       "at 40% and 85% of the steps. Unset or 1 changes nothing."),
+    JA("学習の 40% と 85% の時点で、全スプラットの不透明度をこの倍率で 2 回"
+       "掛けます。未設定または 1 なら何も変わりません。"),
+    ZH_HANS("在训练进行到 40% 和 85% 时，把所有泼溅的不透明度乘以这个倍数，共"
+            "两次。不设置或为 1 则不改变任何东西。"),
+    ZH_HANT("在訓練進行到 40% 和 85% 時，把所有潑濺的不透明度乘以這個倍數，共"
+            "兩次。不設定或為 1 則不改變任何東西。"),
+    KO("학습의 40%와 85% 지점에서 모든 스플랫의 불투명도에 이 배수를 두 번 "
+       "곱합니다. 설정하지 않거나 1이면 아무것도 바뀌지 않습니다."),
+    DE("Multipliziert die Deckkraft aller Splats zweimal im Lauf mit diesem "
+       "Faktor, bei 40% und 85% der Schritte. Nicht gesetzt oder 1 ändert "
+       "nichts."),
+    FR("Multiplie l'opacité de tous les splats par ce facteur deux fois pendant "
+       "l'entraînement, à 40% et 85% des étapes. Non défini ou 1 ne change "
+       "rien."),
+    ES("Multiplica la opacidad de todos los splats por este factor dos veces "
+       "durante el entrenamiento, al 40% y al 85% de los pasos. Sin definir o "
+       "1 no cambia nada."),
+    PT("Multiplica a opacidade de todos os splats por este fator duas vezes "
+       "durante o treino, aos 40% e aos 85% dos passos. Sem definir ou 1 não "
+       "muda nada."),
+    IT("Moltiplica l'opacità di tutti gli splat per questo fattore due volte "
+       "durante l'addestramento, al 40% e all'85% dei passi. Non impostato o 1 "
+       "non cambia nulla."),
+    NL("Vermenigvuldigt de dekking van alle splats twee keer met deze factor "
+       "tijdens de training, bij 40% en 85% van de stappen. Niet ingesteld of "
+       "1 verandert niets."),
+    RU("Дважды за прогон умножает непрозрачность всех сплатов на этот "
+       "коэффициент — на 40% и 85% шагов. Без значения или 1 ничего не "
+       "меняет."),
+    TR("Eğitim sırasında iki kez, adımların %40 ve %85'inde, tüm splatların "
+       "opaklığını bu çarpanla çarpar. Ayarlanmazsa veya 1 ise hiçbir şey "
+       "değişmez."));
+
+
+// ===========================================================================
 // Run & Output
 // ===========================================================================
 

@@ -36,6 +36,8 @@ enum class RawLossIndex {
     MedianDepthNormalMaskTotal,
     MedianNormalMaskTotal,
     MedianRenderNormalMaskTotal,
+    // Divisor for RgbLoss: MaskTotal weighted by the darkness boost.
+    DarknessWeightTotal,
     length
 };
 
@@ -63,6 +65,8 @@ enum class LossWeightIndex {
     MedianDepthNormalReg,
     MedianNormalSup,
     MedianRenderNormalReg,
+    // 0 = off; scales how much a dark GT pixel outweighs a bright one.
+    DarknessBoost,
     length
 };
 

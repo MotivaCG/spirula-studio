@@ -174,6 +174,11 @@ void engine_backward_from_render_grad(
 
 void engine_optim_step(int step, const OptimConfig& cfg);
 
+// Multiplies every live splat's opacity by `factor`, clamped to the visible
+// range (see the definition). A factor <= 1 is a no-op. Adam's moments are
+// gradient statistics rather than parameter values, so they are left alone.
+void engine_scale_opacities(float factor);
+
 // --- Bilagrid (RGB / depth / normal) ---
 // Allocates and identity-initializes a bilagrid per camera. Must be called
 // after set_camera_params. RGB applies to the rendered prediction; depth and
