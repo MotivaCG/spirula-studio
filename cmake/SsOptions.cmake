@@ -116,6 +116,24 @@ if(NOT SS_BACKEND STREQUAL "cuda" AND NOT SS_BACKEND STREQUAL "vulkan")
     message(FATAL_ERROR "SS_BACKEND must be 'cuda' or 'vulkan', got '${SS_BACKEND}'")
 endif()
 
+# A multi-arch fatbin pushes libcsrc.a past 2 GB, overflowing PIE's 32-bit
+# relocations. The large code model uses 64-bit addressing instead (needs
+# -no-pie); set before SsI18n's target so every object in the link agrees.
+if(SS_BACKEND STREQUAL "cuda" AND DEFINED TORCH_CUDA_ARCH_LIST AND NOT MSVC AND NOT APPLE)
+    separate_arguments(SS_ARCH_PROBE UNIX_COMMAND "${TORCH_CUDA_ARCH_LIST}")
+    list(LENGTH SS_ARCH_PROBE SS_ARCH_PROBE_COUNT)
+    if(SS_ARCH_PROBE_COUNT GREATER 1)
+        message(STATUS "Multiple CUDA architectures: linking non-PIE with -mcmodel=large "
+            "to avoid relocation overflow in the large fatbin")
+        add_compile_options(
+            $<$<COMPILE_LANGUAGE:CXX>:-mcmodel=large>
+            $<$<COMPILE_LANGUAGE:CXX>:-fno-pie>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-mcmodel=large,-fno-pie>
+        )
+        add_link_options(-no-pie)
+    endif()
+endif()
+
 # ---------------------------------------------------------------------------
 # How macOS gets Vulkan (cmake/SsVulkan.cmake)
 #
