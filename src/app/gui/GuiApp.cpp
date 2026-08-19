@@ -1227,7 +1227,8 @@ static PrepInput make_source(const std::string& path,
     s.camera_model = "opencv";
     if (is_dual_fisheye_path(path)) {
         s.camera_model = "thin-prism-fisheye";
-        s.focal_factor = kInsta360FocalFactor;
+        // Commented - We don't assume every camera is Insta360 X5
+        // s.focal_factor = kInsta360FocalFactor;
     }
     return s;
 }
@@ -1559,6 +1560,7 @@ void GuiApp::frame() {
     draw_preset_save_modal();
     draw_preset_delete_modal();
     draw_confirm_modal();
+    draw_data_error_modal();
 
     ImGui::End();
 }
@@ -5440,6 +5442,45 @@ void GuiApp::draw_log_panel(float height) {
         }
         ImGui::End();
     }
+}
+
+// The training thread is blocked inside its step until one of these buttons
+// answers, so Esc puts the modal straight back rather than stranding the run.
+void GuiApp::draw_data_error_modal() {
+    const std::string what = _runner.data_error();
+    if (!what.empty() && !_data_error_shown) {
+        ui::OpenPopup(msg::data_error_title);
+        _data_error_shown = true;
+    }
+    if (!_data_error_shown) return;
+    if (!ui::BeginPopupModal(msg::data_error_title, nullptr,
+                             ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (!what.empty()) ui::OpenPopup(msg::data_error_title);
+        else               _data_error_shown = false;
+        return;
+    }
+    if (what.empty()) {                  // answered elsewhere (a stop request)
+        _data_error_shown = false;
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+    ui::TextWrappedRaw(what);
+    ImGui::Spacing();
+    ui::Text(msg::data_error_intro);
+    ImGui::Spacing();
+    auto answer = [&](bool retry) {
+        _runner.resolve_data_error(retry);
+        _data_error_shown = false;
+        ImGui::CloseCurrentPopup();
+    };
+    const float bw = px(190.0f);
+    if (ui::Button(msg::data_error_retry, ImVec2(bw, 0))) answer(true);
+    ui::help_on_hover(msg::data_error_retry_help);
+    ImGui::SameLine();
+    if (ui::Button(msg::stop_and_save, ImVec2(bw, 0))) answer(false);
+    ui::help_on_hover(msg::stop_and_save_help);
+    ImGui::EndPopup();
 }
 
 void GuiApp::draw_confirm_modal() {

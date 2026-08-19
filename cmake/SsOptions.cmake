@@ -65,7 +65,7 @@ set(SS_VK_SHADERS ${SS_SRC}/backend/vulkan/shaders)   # Vulkan-only entry points
 
 # The version the apps report with --version. Declared here and nowhere else;
 # it used to be read out of pyproject.toml, back when there was a package.
-set(SS_VERSION "2026.8.14")
+set(SS_VERSION "2026.8.19")
 
 # ---------------------------------------------------------------------------
 # Options
@@ -263,14 +263,21 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 #
 # Backend modules may append to it (OpenMP, for one).
 # ---------------------------------------------------------------------------
+
+# SPLAT_C_FLAGS exists because $<COMPILE_LANGUAGE:CXX> skips the one C file in
+# the tree, external/miniz.c -- the DEFLATE codec behind depth-PNG I/O and EXR
+# decode, which is not something to run interpreted.
+
 if(MSVC)
     # /utf-8: the i18n catalogs are UTF-8 source. Without it MSVC reads them in
     # the machine's ANSI codepage and every non-ASCII string is silently
     # mojibake -- on the developer's machine as well as the user's.
     set(SPLAT_CXX_FLAGS "/O2" "/utf-8")
+    set(SPLAT_C_FLAGS "/O2")
 else()
     set(SPLAT_CXX_FLAGS "-O3")
     list(APPEND SPLAT_CXX_FLAGS "-Wno-sign-compare")
+    set(SPLAT_C_FLAGS "-O3")
 endif()
 
 if(WIN32)

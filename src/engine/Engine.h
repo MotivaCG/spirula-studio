@@ -155,6 +155,11 @@ std::map<std::string, float> engine_compute_loss_backward(
     float color_shift_reg_beta    = 0.0f
 );
 
+// The densification error map for the last forward -- the buffer
+// engine_compute_loss_backward hands the raster backward -- into a host
+// [C, H, W, 1]. Touches no gradient, optimizer or colour-transform state.
+bool engine_preview_loss_map(const LossConfig& loss, TorchTensorView out);
+
 // --- Backward from supplied output cotangents (no loss) ---
 //
 // Seeds the rasterization backward with caller-supplied per-pixel cotangents
@@ -423,6 +428,10 @@ std::map<std::string, float> engine_train_step_managed(
     bool packed,
     const EngineStepConfig& cfg);
 
+// Answer the DataDecodeError a managed step threw: true re-runs the decode
+// the worker is parked on, false abandons the pipeline. See DataManager.h.
+void engine_resolve_data_error(bool retry);
+
 // Pull the next batch from the DataManager, install it as GT + camera params,
 // and run the forward pass only -- no loss, no backward, no optimizer, no
 // densification. What an eval pass needs: it reuses the same decode, mask and
@@ -448,7 +457,8 @@ int engine_eval_forward(std::string primitive, int sh_degree, bool packed);
 // -- take the same mutex the trainer does. Returns the POST-split view count
 // (K) for that image.
 int engine_preview_forward(int index, std::string primitive, int sh_degree,
-                           bool packed, bool apply_color_correction);
+                           bool packed, bool apply_color_correction,
+                           const LossConfig& loss);
 
 // --- Debug rendering ---
 

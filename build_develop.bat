@@ -99,9 +99,9 @@ set "CUDAARG="
 rem ---------------------------------------------------------------------------
 rem Configure + build (RAM-aware job count, mirrors build_develop.bash)
 rem ---------------------------------------------------------------------------
-if not defined SS_BUILD_DIR set "SS_BUILD_DIR=build"
+if not defined SS_BUILD_DIR set "SS_BUILD_DIR=build"
 cmake -G Ninja -B "%SS_BUILD_DIR%" -DCMAKE_BUILD_TYPE=Release %CUDAARG% %FATBINARG% %*
-if errorlevel 1 exit /b 1
+if %ERRORLEVEL% neq 0 exit /b 1
 
 rem ---------------------------------------------------------------------------
 rem Repair the ninja dependency log. build_develop.bash carries the long form:
@@ -138,8 +138,10 @@ echo CPU cores     : %NUMBER_OF_PROCESSORS%
 echo Using jobs    : %JOBS%
 echo.
 
+rem `if errorlevel 1` is a >= test on a SIGNED value, so it reads a negative
+rem exit code as success -- a failed link returning -1 printed "Build complete".
 cmake --build "%SS_BUILD_DIR%" -j %JOBS%
-if errorlevel 1 exit /b 1
+if %ERRORLEVEL% neq 0 exit /b 1
 
 echo.
 echo Build complete: %SS_BUILD_DIR%\spirula.exe

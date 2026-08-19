@@ -17,7 +17,7 @@
 #include "app/webviewer/Viewer.h"
 
 #include <atomic>
-#include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -85,14 +85,25 @@ public:
     // Latest per-step progress (copy).
     spirula::TrainerProgress latest_progress();
     double eta_seconds();         // < 0 when unknown
-    // Since the step loop began
-    double elapsed_seconds();       //< 0 before training, and frozen once the loop ends.
+    // Time spent in the step loop, pauses excluded: < 0 before a session
+    // exists, 0 until the loop starts, frozen once it ends.
+    double elapsed_seconds();
     void get_metrics(std::vector<MetricPoint>& out);
     std::vector<std::string> drain_log();
+
+    // ---- Unreadable dataset file ------------------------------------------
+
+    // Non-empty while the training thread is blocked on a file it could not
+    // read. The GUI shows it and answers with resolve_data_error().
+    std::string data_error();
+    // true retries the decode and the run picks up where it stopped; false
+    // stops the run, which still saves a checkpoint.
+    void resolve_data_error(bool retry);
 
 private:
     void push_log(const std::string& s);
     void join_worker();
+    bool await_data_decision(const std::string& what);
 
     std::unique_ptr<spirula::TrainerSession> _session;
     std::unique_ptr<ViewerServer> _web_viewer;
@@ -100,10 +111,13 @@ private:
     std::atomic<Phase> _phase{Phase::Idle};
     std::atomic<bool> _engine_ready{false};
 
+    std::mutex              _data_mu;
+    std::condition_variable _data_cv;
+    std::string             _data_err;     // non-empty while awaiting an answer
+    int                     _data_answer = 0;   // 0 pending, 1 retry, 2 stop
+
     mutable std::mutex _mu;       // guards everything below
     std::string _error;
-    std::chrono::steady_clock::time_point _train_start{};  // {} = not started
-    std::chrono::steady_clock::time_point _train_end{};    // {} = still running
     spirula::TrainerProgress _latest;
     std::deque<double> _latencies;
     std::vector<MetricPoint> _metrics;

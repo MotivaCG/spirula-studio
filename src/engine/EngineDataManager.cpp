@@ -230,6 +230,11 @@ std::map<std::string, float> engine_train_step_managed(
 }
 
 
+void engine_resolve_data_error(bool retry) {
+    if (engine().dm) engine().dm->resolve_data_error(retry);
+}
+
+
 // ---------------------------------------------------------------------------
 // Forward-only paths: take a batch, install it, render it. See Engine.h.
 // ---------------------------------------------------------------------------
@@ -240,7 +245,9 @@ static TorchTensorView _tv_null() { return {0, 0, {}}; }
 // depth and normal GT too, which costs the linear->ray conversion.
 static void _install_and_forward(const DecodedBatch& b, std::string primitive,
                                  int sh_degree, bool packed,
-                                 bool with_geometry = false) {
+                                 bool with_geometry = false,
+                                 bool input_depth_is_ray_depth = true,
+                                 int dist_type = 0) {
     const bool geom = with_geometry;
     if (b.K <= 1 && b.input_source_models.empty()) {
         set_camera_params((int)b.width, (int)b.height,
@@ -250,7 +257,7 @@ static void _install_and_forward(const DecodedBatch& b, std::string primitive,
         set_training_data(b.rgb_view,
                           geom ? b.depth_view : _tv_null(),
                           geom ? b.normal_view : _tv_null(),
-                          b.mask_view, true);
+                          b.mask_view, input_depth_is_ray_depth);
     } else {
         // b.model / b.distortion are already PINHOLE / NONE when K > 1; at
         // K == 1 (re-distort) they are the camera the parser fitted.
@@ -268,13 +275,14 @@ static void _install_and_forward(const DecodedBatch& b, std::string primitive,
             geom ? (int)b.depth_height : 0, geom ? (int)b.depth_width : 0,
             geom ? b.normal_view : _tv_null(),
             geom ? (int)b.normal_height : 0, geom ? (int)b.normal_width : 0,
-            true,
+            input_depth_is_ray_depth,
             b.input_intrins_view, b.input_dist_coeffs_view,
             b.input_source_models_view, b.input_source_params_view,
             (uint64_t)b.axes_dev);
     }
 
-    forward_3dgs(std::move(primitive), sh_degree, packed);
+    forward_3dgs(std::move(primitive), sh_degree, packed,
+                 /*output_median=*/false, dist_type);
 }
 
 int engine_eval_forward(std::string primitive, int sh_degree, bool packed) {
@@ -296,7 +304,8 @@ int engine_eval_forward(std::string primitive, int sh_degree, bool packed) {
 }
 
 int engine_preview_forward(int index, std::string primitive, int sh_degree,
-                           bool packed, bool apply_color_correction) {
+                           bool packed, bool apply_color_correction,
+                           const LossConfig& loss) {
     if (!engine().dm)
         throw std::runtime_error(
             "engine_preview_forward: DataManager not configured — call "
@@ -306,10 +315,17 @@ int engine_preview_forward(int index, std::string primitive, int sh_degree,
     // a preview is one call at a time under the engine mutex.
     static DecodedBatch b;
     engine().dm->fetch_one((int32_t)index, b);
-    // With the geometry GT: this is the panel that shows what the loss
-    // compares, and the depth and normal rows are half of that.
+    // With the geometry GT and the training step's distortion channels: this
+    // renders what the loss compares, so a loss map read off this forward
+    // carries the same terms the trainer's does.
+    const DistortionType dist_type = engine_distortion_type(
+        engine_primitive_pixel_type(primitive),
+        loss.weights[(int)LossWeightIndex::RgbDistReg],
+        loss.weights[(int)LossWeightIndex::DepthDistReg],
+        loss.weights[(int)LossWeightIndex::NormalDistReg]);
     _install_and_forward(b, std::move(primitive), sh_degree, packed,
-                         /*with_geometry=*/true);
+                         /*with_geometry=*/true, loss.input_depth_is_ray_depth,
+                         (int)dist_type);
 
     if (apply_color_correction) {
         // POST-split camera ids, the same ones the training step hands the

@@ -132,11 +132,16 @@ struct TrainerProgress {
 struct TrainerCallbacks {
     // Called after every completed step, engine mutex released.
     std::function<void(const TrainerProgress&)> on_step;
+
+    // A dataset file went unreadable mid-run; blocks as long as the front end
+    // needs. true retries the decode, false stops the run (still saving a
+    // checkpoint). Unset fails the run outright, which is what a script wants.
+    std::function<bool(const std::string&)> on_data_error;
 };
 
 class TrainerSession {
 public:
-    TrainerSession() : _start_time(std::chrono::steady_clock::now()) {}
+    TrainerSession() = default;
     TrainerSession(const TrainerSession&) = delete;
     TrainerSession& operator=(const TrainerSession&) = delete;
 
@@ -228,6 +233,10 @@ public:
     // setup_engine().
     void restore_checkpoint();
 
+    // Wall clock of the step loop, with paused spans excluded. 0 before
+    // train() starts, frozen once it returns.
+    double elapsed_seconds() const;
+
     // The /progress response body.
     std::string progress_json();
 
@@ -238,7 +247,16 @@ public:
     void log(const std::string& msg);
 
 private:
-    std::chrono::steady_clock::time_point _start_time;
+    // Bracket the train loop's pause gate so paused time stays out of
+    // elapsed_seconds().
+    void pause_clock_start();
+    void pause_clock_stop();
+
+    mutable std::mutex _time_mutex;                        // guards the clock
+    std::chrono::steady_clock::time_point _start_time{};   // {} = not started
+    std::chrono::steady_clock::time_point _end_time{};     // {} = running
+    std::chrono::steady_clock::time_point _pause_start{};  // {} = not paused
+    double _paused_s = 0.0;
     std::mutex _progress_mutex;            // guards the latency window
     std::deque<double> _step_latencies;    // last 100, seconds
 };
