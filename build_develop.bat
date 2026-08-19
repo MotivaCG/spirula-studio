@@ -99,7 +99,8 @@ set "CUDAARG="
 rem ---------------------------------------------------------------------------
 rem Configure + build (RAM-aware job count, mirrors build_develop.bash)
 rem ---------------------------------------------------------------------------
-cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release %CUDAARG% %FATBINARG% %*
+if not defined SS_BUILD_DIR set "SS_BUILD_DIR=build"
+cmake -G Ninja -B "%SS_BUILD_DIR%" -DCMAKE_BUILD_TYPE=Release %CUDAARG% %FATBINARG% %*
 if errorlevel 1 exit /b 1
 
 rem ---------------------------------------------------------------------------
@@ -108,18 +109,18 @@ rem a record with a mismatched node index survives ninja's own recovery, and
 rem from then on every build discards its header dependencies and the next one
 rem recompiles every object. `-t recompact` rewrites the log and drops it.
 rem ---------------------------------------------------------------------------
-if not exist build\.ninja_deps goto :deps_done
-cmake --build build -- -t recompact >"%TEMP%\ss_ninja_deps.log" 2>&1
+if not exist "%SS_BUILD_DIR%\.ninja_deps" goto :deps_done
+cmake --build "%SS_BUILD_DIR%" -- -t recompact >"%TEMP%\ss_ninja_deps.log" 2>&1
 findstr /c:"premature end of file" /c:"bad deps log" "%TEMP%\ss_ninja_deps.log" >nul
 if errorlevel 1 goto :deps_checked
 rem The rewrite is what heals it, so a second pass is what confirms it.
-cmake --build build -- -t recompact >"%TEMP%\ss_ninja_deps.log" 2>&1
+cmake --build "%SS_BUILD_DIR%" -- -t recompact >"%TEMP%\ss_ninja_deps.log" 2>&1
 findstr /c:"premature end of file" /c:"bad deps log" "%TEMP%\ss_ninja_deps.log" >nul
 if errorlevel 1 (
-    echo repaired a corrupt build\.ninja_deps ^(this build recompiles everything once^)
+    echo repaired a corrupt %SS_BUILD_DIR%\.ninja_deps ^(this build recompiles everything once^)
 ) else (
-    echo build\.ninja_deps did not survive a recompact -- removing it
-    del /q build\.ninja_deps
+    echo %SS_BUILD_DIR%\.ninja_deps did not survive a recompact -- removing it
+    del /q "%SS_BUILD_DIR%\.ninja_deps"
 )
 :deps_checked
 del /q "%TEMP%\ss_ninja_deps.log" >nul 2>&1
@@ -137,8 +138,8 @@ echo CPU cores     : %NUMBER_OF_PROCESSORS%
 echo Using jobs    : %JOBS%
 echo.
 
-cmake --build build -j %JOBS%
+cmake --build "%SS_BUILD_DIR%" -j %JOBS%
 if errorlevel 1 exit /b 1
 
 echo.
-echo Build complete: build\spirula.exe
+echo Build complete: %SS_BUILD_DIR%\spirula.exe

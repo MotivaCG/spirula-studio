@@ -2,6 +2,9 @@
 
 # Development build for Linux. Extra arguments are passed to CMake, e.g.
 #   ./build_develop.bash -DSS_BUILD_CLI=ON -DSS_BUILD_GUI=ON
+# SS_BUILD_DIR picks the tree (default "build"), so a second backend does
+# not have to reconfigure the first one away. See build_presets/.
+: "${SS_BUILD_DIR:=build}"
 
 # Regenerate headers. Skipped when python3 is unavailable -- the generated
 # files are committed, so the build still works without it.
@@ -65,10 +68,10 @@ case " $* " in
         ;;
 esac
 
-cmake -G Ninja -B build "${ss_fatbin_args[@]}" "$@" || exit $?
+cmake -G Ninja -B "${SS_BUILD_DIR}" "${ss_fatbin_args[@]}" "$@" || exit $?
 
 # Repair the ninja dependency log.
-if [ -f build/.ninja_deps ]; then
+if [ -f "${SS_BUILD_DIR}/.ninja_deps" ]; then
     ss_deps_broken() {
         case "$1" in
             *"premature end of file"*|*"bad deps log signature"*|\
@@ -76,13 +79,13 @@ if [ -f build/.ninja_deps ]; then
         esac
         return 1
     }
-    if ss_deps_broken "$(cmake --build build -- -t recompact 2>&1)"; then
+    if ss_deps_broken "$(cmake --build "${SS_BUILD_DIR}" -- -t recompact 2>&1)"; then
         # The rewrite is what heals it, so a second pass is what confirms it.
-        if ss_deps_broken "$(cmake --build build -- -t recompact 2>&1)"; then
-            echo "build/.ninja_deps did not survive a recompact -- removing it"
-            rm -f build/.ninja_deps
+        if ss_deps_broken "$(cmake --build "${SS_BUILD_DIR}" -- -t recompact 2>&1)"; then
+            echo "${SS_BUILD_DIR}/.ninja_deps did not survive a recompact -- removing it"
+            rm -f "${SS_BUILD_DIR}/.ninja_deps"
         else
-            echo "repaired a corrupt build/.ninja_deps (this build recompiles everything once)"
+            echo "repaired a corrupt ${SS_BUILD_DIR}/.ninja_deps (this build recompiles everything once)"
         fi
     fi
 fi
@@ -109,7 +112,7 @@ echo "CPU cores     : ${CPU_CORES}"
 echo "Using jobs    : ${JOBS}"
 echo ""
 # Propagate the build's exit status.
-if ! cmake --build build --verbose -j"${JOBS}"; then
+if ! cmake --build "${SS_BUILD_DIR}" --verbose -j"${JOBS}"; then
     echo "BUILD FAILED" >&2
     exit 1
 fi
