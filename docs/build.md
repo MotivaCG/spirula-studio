@@ -71,7 +71,7 @@ without reconfiguring, e.g. `-B build_cuda` and `-B build`.
 | `SS_SEPARATE_TOOLS` | `OFF` | *also* build `spirula-sfm` and `spirula-sam` standalone — same code, but neither links the engine (24 MB vs the combined 61 MB) |
 | `SS_BUILD_BACKEND_TESTS` | `OFF` | build `backend/tests/*` (CUDA branch; Vulkan always builds them) |
 | `SS_DEBUG_SYMBOLS` | `OFF` | host `-g`, CUDA cubin lineinfo, `slangc -g2`. Bloats binaries substantially — profiling/debugging only. |
-| `SS_CUDA_EMBED_PTX` | `OFF` | embed PTX beside the cubin in the CUDA fatbin. Only buys JIT onto an architecture the binary was not built for, and costs about a third of every object; the build already detects the local GPU. Turn on for a redistributable binary. |
+| `SS_CUDA_EMBED_PTX` | `OFF` | embed PTX beside the cubin in the CUDA fatbin, for the newest architecture only — that is the one a card above the list JITs from. Costs about a third of that architecture's objects; the build otherwise targets just the local GPU. Turn on for a redistributable binary, or use `SS_CUDA_FATBIN=1` below. |
 | `SS_SLANGC` | *(empty)* | path to a `slangc` to use; empty means find on PATH and fetch the pinned release on miss/mismatch |
 | `SS_BUILD_SFM` | `ON` for `vulkan`, `OFF` for `cuda` | `ss_sfm` + `spirula sfm` + `sfm_*_test`. Vulkan-only; a CUDA build can opt in if the Vulkan SDK is present. |
 | `SS_BUILD_SAM` | `ON` for `vulkan`, `OFF` for `cuda` | `ss_nn` + `ss_sam` + `spirula sam` + `nn_ops_test` / `sam_pipeline_test`, and the GUI's in-process masking. Same rule as SfM. |
@@ -222,6 +222,21 @@ at an unpacked `MoltenVK-macos` release for an offline build.
 ```bash
 export CXXFLAGS="-nostdinc++ -isystem $(xcrun --show-sdk-path)/usr/include/c++/v1"
 ```
+
+**Redistributable builds.** `SS_CUDA_FATBIN=1` in the environment makes either
+build script target `7.5 8.0 8.6 8.9 9.0 10.0 12.0` — Turing (RTX 20xx / GTX
+16xx / T4) through Blackwell (RTX 50xx) — rather than the card in the build
+machine, and embeds PTX for the newest so anything above the list JITs instead
+of refusing to start. Nothing BELOW 7.5 runs: JIT only goes forward, so a
+Pascal target has to be named. Override with `SS_CUDA_ARCHS="6.1 7.5 8.6"`.
+Off by default: seven architectures is seven compilations of every kernel.
+
+**Linux.** `build_develop.bash` points CMake at CUDA `SS_CUDA_VERSION` (12.8),
+falling back to the newest `/usr/local/cuda-*`, unless the command line names a
+`-DCMAKE_CUDA_COMPILER`. The distro's `nvidia-cuda-toolkit` package installs an
+`/usr/bin/nvcc` that is often several releases behind the system GCC, and that
+pair fails on CMake's own compiler-id probe with `_Float32 does not name a
+type` out of `<stdlib.h>` -- before compiling a line of this repository.
 
 **Windows.** `build_develop.bat` always calls `vcvars64` even when `cl` is
 already on PATH (an ambient `cl`/`INCLUDE` may reference an uninstalled SDK),

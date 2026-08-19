@@ -51,16 +51,21 @@ list(REMOVE_DUPLICATES TORCH_CUDA_ARCH_LIST)
 
 message(STATUS "CUDA architecture(s): ${TORCH_CUDA_ARCH_LIST}")
 
-# "<arch>-real" emits cubin only; the bare form also emits PTX. See
-# SS_CUDA_EMBED_PTX in SsOptions.cmake for why the default drops it.
+# "<arch>-real" emits cubin only; the bare form also emits PTX. Only the
+# NEWEST arch keeps its PTX: JIT is what a card newer than anything built for
+# falls back to, and one copy answers that for every card above the list.
 set(CMAKE_CUDA_ARCHITECTURES "")
-foreach(arch ${TORCH_CUDA_ARCH_LIST})
-    if(SS_CUDA_EMBED_PTX)
+set(SS_SORTED_ARCHS ${TORCH_CUDA_ARCH_LIST})
+list(SORT SS_SORTED_ARCHS COMPARE NATURAL)
+list(GET SS_SORTED_ARCHS -1 SS_NEWEST_ARCH)
+foreach(arch ${SS_SORTED_ARCHS})
+    if(SS_CUDA_EMBED_PTX AND arch STREQUAL SS_NEWEST_ARCH)
         list(APPEND CMAKE_CUDA_ARCHITECTURES "${arch}")
     else()
         list(APPEND CMAKE_CUDA_ARCHITECTURES "${arch}-real")
     endif()
 endforeach()
+message(STATUS "CUDA fatbin: ${CMAKE_CUDA_ARCHITECTURES}")
 
 # ---------------------------------------------------------------------------
 # Compiler flags

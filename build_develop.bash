@@ -36,7 +36,36 @@ if command -v python3 >/dev/null 2>&1; then
     python3 tools/check_comment_length.py || exit 1
 fi
 
-cmake -G Ninja -B build "$@" || exit $?
+# SS_CUDA_FATBIN=1 builds Turing through Blackwell instead of the card in
+# this machine, plus PTX so anything newer JITs rather than refusing to start.
+# Needs CUDA 12.8 (sm_120); costs build time, which is why it is opt-in.
+ss_fatbin_args=()
+if [ "${SS_CUDA_FATBIN:-0}" != "0" ]; then
+    ss_fatbin_args=(-DSS_CUDA_EMBED_PTX=ON
+                      "-DTORCH_CUDA_ARCH_LIST=${SS_CUDA_ARCHS:-7.5 8.0 8.6 8.9 9.0 10.0 12.0}")
+fi
+
+# CUDA toolkit: SS_CUDA_VERSION, else the newest /usr/local/cuda-*. The
+# distro nvcc in /usr/bin is usually several releases behind the system GCC,
+# and that pair fails CMake's own compiler-id probe. Mirrors build_develop.bat.
+: "${SS_CUDA_VERSION:=12.8}"
+case " $* " in
+    *BACKEND=vulkan*|*CMAKE_CUDA_COMPILER*) ;;   # named one, or never asks for one
+    *)
+        ss_cuda=/usr/local/cuda-${SS_CUDA_VERSION}
+        [ -x "${ss_cuda}/bin/nvcc" ] ||
+            ss_cuda=$(ls -d /usr/local/cuda-* 2>/dev/null | sort -V | tail -1)
+        [ -x "${ss_cuda}/bin/nvcc" ] || ss_cuda=/usr/local/cuda
+        if [ -x "${ss_cuda}/bin/nvcc" ]; then
+            export CUDA_PATH="${ss_cuda}"
+            export PATH="${ss_cuda}/bin:${PATH}"
+            set -- "$@" -DCMAKE_CUDA_COMPILER="${ss_cuda}/bin/nvcc"
+            echo "CUDA toolkit: ${ss_cuda}"
+        fi
+        ;;
+esac
+
+cmake -G Ninja -B build "${ss_fatbin_args[@]}" "$@" || exit $?
 
 # Repair the ninja dependency log.
 if [ -f build/.ninja_deps ]; then

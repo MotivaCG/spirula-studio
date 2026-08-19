@@ -61,15 +61,29 @@ where ninja >nul 2>&1
 if errorlevel 1 set "PATH=%PATH%;%VSROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja"
 
 rem ---------------------------------------------------------------------------
-rem CUDA toolkit: newest installed version. An ambient CUDA_PATH is NOT
-rem trusted by default (it may pin a toolkit older than the MSVC in use);
-rem pass a trailing -DCMAKE_CUDA_COMPILER=... to pick a specific one.
+rem SS_CUDA_FATBIN=1 builds Turing through Blackwell instead of the card in
+rem this machine, plus PTX so anything newer JITs rather than refusing to start.
+rem Needs CUDA 12.8 (sm_120); costs build time, which is why it is opt-in.
+rem ---------------------------------------------------------------------------
+set "FATBINARG="
+if not "%SS_CUDA_FATBIN%"=="" if not "%SS_CUDA_FATBIN%"=="0" (
+    if not defined SS_CUDA_ARCHS set "SS_CUDA_ARCHS=7.5 8.0 8.6 8.9 9.0 10.0 12.0"
+    set FATBINARG=-DSS_CUDA_EMBED_PTX=ON -DTORCH_CUDA_ARCH_LIST="%SS_CUDA_ARCHS%"
+)
+
+rem ---------------------------------------------------------------------------
+rem CUDA toolkit: SS_CUDA_VERSION, else the newest installed. An ambient
+rem CUDA_PATH is NOT trusted by default (it may pin a toolkit older than the
+rem MSVC in use); pass a trailing -DCMAKE_CUDA_COMPILER=... to pick another.
 rem A Vulkan build never enables the CUDA language, so passing the compiler
 rem there only earns a "manually-specified variables were not used" warning.
 rem ---------------------------------------------------------------------------
 echo %* | findstr /i /c:"BACKEND=vulkan" >nul && goto :no_cuda
+if not defined SS_CUDA_VERSION set "SS_CUDA_VERSION=12.8"
 set "_CUDA_ROOT="
-for /d %%d in ("%ProgramFiles%\NVIDIA GPU Computing Toolkit\CUDA\v*") do set "_CUDA_ROOT=%%d"
+set "_CUDA_WANT=%ProgramFiles%\NVIDIA GPU Computing Toolkit\CUDA\v%SS_CUDA_VERSION%"
+if exist "%_CUDA_WANT%\bin\nvcc.exe" set "_CUDA_ROOT=%_CUDA_WANT%"
+if not defined _CUDA_ROOT for /d %%d in ("%ProgramFiles%\NVIDIA GPU Computing Toolkit\CUDA\v*") do set "_CUDA_ROOT=%%d"
 if not defined _CUDA_ROOT set "_CUDA_ROOT=%CUDA_PATH%"
 set "CUDAARG="
 if defined _CUDA_ROOT (
@@ -85,7 +99,7 @@ set "CUDAARG="
 rem ---------------------------------------------------------------------------
 rem Configure + build (RAM-aware job count, mirrors build_develop.bash)
 rem ---------------------------------------------------------------------------
-cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release %CUDAARG% %*
+cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release %CUDAARG% %FATBINARG% %*
 if errorlevel 1 exit /b 1
 
 rem ---------------------------------------------------------------------------
