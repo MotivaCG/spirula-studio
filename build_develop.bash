@@ -39,13 +39,13 @@ if command -v python3 >/dev/null 2>&1; then
     python3 tools/check_comment_length.py || exit 1
 fi
 
-# SS_CUDA_FATBIN=1 builds Turing through Blackwell instead of the card in
-# this machine, plus PTX so anything newer JITs rather than refusing to start.
-# Needs CUDA 12.8 (sm_120); costs build time, which is why it is opt-in.
+# SS_CUDA_FATBIN=1 builds Turing-Blackwell (consumer archs) plus PTX, instead
+# of the one card in this machine. Datacenter-only 8.0/10.0 are left out --
+# with those the static link exceeds the 2GB GNU ld can relocate (SsOptions.cmake).
 ss_fatbin_args=()
 if [ "${SS_CUDA_FATBIN:-0}" != "0" ]; then
     ss_fatbin_args=(-DSS_CUDA_EMBED_PTX=ON
-                      "-DTORCH_CUDA_ARCH_LIST=${SS_CUDA_ARCHS:-7.5 8.0 8.6 8.9 9.0 10.0 12.0}")
+                      "-DTORCH_CUDA_ARCH_LIST=${SS_CUDA_ARCHS:-7.5 8.6 8.9 9.0 12.0}")
 fi
 
 # CUDA toolkit: SS_CUDA_VERSION, else the newest /usr/local/cuda-*. The
