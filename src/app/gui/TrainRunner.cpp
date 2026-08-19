@@ -43,12 +43,8 @@ double TrainRunner::eta_seconds() {
 }
 
 double TrainRunner::elapsed_seconds() {
-    using Clock = std::chrono::steady_clock;
-    std::lock_guard<std::mutex> lk(_mu);
-    if (_train_start == Clock::time_point{}) return -1.0;
-    const Clock::time_point end =
-        _train_end == Clock::time_point{} ? Clock::now() : _train_end;
-    return std::chrono::duration<double>(end - _train_start).count();
+    if (!_session) return -1.0;
+    return _session->elapsed_seconds();
 }
 
 void TrainRunner::get_metrics(std::vector<MetricPoint>& out) {
@@ -72,6 +68,7 @@ void TrainRunner::request_stop(bool save) {
     if (!_session) return;
     if (!save) _session->save_on_stop = false;
     _session->stop_requested = true;
+    _data_cv.notify_all();   // the step loop may be parked on a file error
 }
 
 void TrainRunner::shutdown() {
@@ -113,7 +110,6 @@ void TrainRunner::start_training(const TrainConfig& cfg, const std::string& pres
         std::lock_guard<std::mutex> lk(_mu);
         _error.clear();
         _latest = {};
-        _train_start = _train_end = {};
         _latencies.clear();
         _metrics.clear();
     }
@@ -143,12 +139,11 @@ void TrainRunner::start_training(const TrainConfig& cfg, const std::string& pres
                     {(long long)s->cfg.viewer_port}));
             }
 
-            {
-                std::lock_guard<std::mutex> lk(_mu);
-                _train_start = std::chrono::steady_clock::now();
-            }
             _phase = Phase::Training;
             spirula::TrainerCallbacks cb;
+            cb.on_data_error = [this](const std::string& what) {
+                return await_data_decision(what);
+            };
             cb.on_step = [this](const spirula::TrainerProgress& p) {
                 std::lock_guard<std::mutex> lk(_mu);
                 _latest = p;
@@ -167,20 +162,39 @@ void TrainRunner::start_training(const TrainConfig& cfg, const std::string& pres
                 _metrics.push_back(m);
             };
             s->train(cb);
-            // Stamped before the phase flips, so a strip that sees Done never
-            // reads a clock still running.
-            {
-                std::lock_guard<std::mutex> lk(_mu);
-                _train_end = std::chrono::steady_clock::now();
-            }
             _phase = Phase::Done;
         } catch (const std::exception& e) {
             std::lock_guard<std::mutex> lk(_mu);
-            _train_end = std::chrono::steady_clock::now();
             _error = e.what();
             _phase = Phase::TrainError;
         }
     });
+}
+
+bool TrainRunner::await_data_decision(const std::string& what) {
+    std::unique_lock<std::mutex> lk(_data_mu);
+    _data_err    = what;
+    _data_answer = 0;
+    _data_cv.wait(lk, [&]{
+        return _data_answer != 0 ||
+               (_session && _session->stop_requested.load());
+    });
+    _data_err.clear();
+    return _data_answer == 1;
+}
+
+std::string TrainRunner::data_error() {
+    std::lock_guard<std::mutex> lk(_data_mu);
+    return _data_err;
+}
+
+void TrainRunner::resolve_data_error(bool retry) {
+    {
+        std::lock_guard<std::mutex> lk(_data_mu);
+        if (_data_err.empty()) return;
+        _data_answer = retry ? 1 : 2;
+    }
+    _data_cv.notify_all();
 }
 
 }  // namespace gui

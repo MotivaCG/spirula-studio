@@ -103,16 +103,22 @@ ColorResolution resolve_color(const TrainConfig& c) {
 // a depth field bent by a secant.
 bool resolve_ray_depth(const TrainConfig& c, const ParsedDataset& ds) {
     if (c.input_depth_is_ray_depth.has_value()) return *c.input_depth_is_ray_depth;
-    int64_t wide = 0;
-    for (int64_t i = 0; i < ds.num_cameras; i++)
-        if (camhost::pinhole_coverage(ds.camera_models[(size_t)i],
-                                      ds.widths[(size_t)i], ds.heights[(size_t)i],
-                                      ds.intrins[(size_t)i * 4 + 0],
-                                      ds.intrins[(size_t)i * 4 + 1]) <= 0.75)
+    int64_t wide = 0, voters = 0;
+    for (int64_t i = 0; i < ds.num_cameras; i++) {
+        // A frame with no depth map has no opinion on what the depth maps are.
+        if (!ds.depth_filenames.empty() && ds.depth_filenames[(size_t)i].empty())
+            continue;
+        voters++;
+        if (camhost::splits_to_pinhole_faces(ds.camera_models[(size_t)i],
+                                             ds.widths[(size_t)i],
+                                             ds.heights[(size_t)i],
+                                             ds.intrins[(size_t)i * 4 + 0],
+                                             ds.intrins[(size_t)i * 4 + 1]))
             wide++;
+    }
     // A dataset that mixes the two has no right answer; the majority is the
     // one that leaves fewer frames misread.
-    return wide * 2 > ds.num_cameras;
+    return wide * 2 > voters;
 }
 
 
@@ -485,6 +491,18 @@ std::string train_config_unsupported(const TrainConfig& c) {
     if (c.quantization_level != 0 && c.quantization_level != 1)
         return lmsg::bad_quantization_level.get();
     return {};
+}
+
+std::string format_duration(double seconds) {
+    if (seconds < 0) return "--:--";
+    int t = (int)(seconds + 0.5);
+    char buf[32];
+    if (t >= 3600)
+        std::snprintf(buf, sizeof buf, "%d:%02d:%02d", t / 3600, (t / 60) % 60,
+                      t % 60);
+    else
+        std::snprintf(buf, sizeof buf, "%d:%02d", t / 60, t % 60);
+    return buf;
 }
 
 // Unported-feature guards: fail early rather than ignore a flag.
@@ -875,26 +893,97 @@ std::map<std::string, float> TrainerSession::train_step(int step) {
         cfg.packed || cfg.use_bvh, sc);
 }
 
+void TrainerSession::pause_clock_start() {
+    std::lock_guard<std::mutex> lk(_time_mutex);
+    _pause_start = std::chrono::steady_clock::now();
+}
+
+void TrainerSession::pause_clock_stop() {
+    std::lock_guard<std::mutex> lk(_time_mutex);
+    if (_pause_start == std::chrono::steady_clock::time_point{}) return;
+    _paused_s += std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - _pause_start).count();
+    _pause_start = {};
+}
+
+double TrainerSession::elapsed_seconds() const {
+    using Clock = std::chrono::steady_clock;
+    std::lock_guard<std::mutex> lk(_time_mutex);
+    if (_start_time == Clock::time_point{}) return 0.0;
+    const Clock::time_point now =
+        _end_time == Clock::time_point{} ? Clock::now() : _end_time;
+    double s = std::chrono::duration<double>(now - _start_time).count() -
+               _paused_s;
+    if (_pause_start != Clock::time_point{})
+        s -= std::chrono::duration<double>(now - _pause_start).count();
+    return std::max(0.0, s);
+}
+
+double TrainerSession::avg_step_latency() const {
+    std::lock_guard<std::mutex> lk(_progress_mutex);
+    if (_step_latencies.empty()) return -1.0;
+    double sum = 0.0;
+    for (double v : _step_latencies) sum += v;
+    return sum / (double)_step_latencies.size();
+}
+
+double TrainerSession::eta_seconds() const {
+    const double avg = avg_step_latency();
+    const int step = cur_step.load();
+    if (avg < 0.0 || step <= 0) return -1.0;
+    return std::max(0, cfg.num_iterations - step) * avg;
+}
+
 void TrainerSession::train(const TrainerCallbacks& cb) {
-    _start_time = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lk(_time_mutex);
+        _start_time = std::chrono::steady_clock::now();
+        _end_time = _pause_start = {};
+        _paused_s = 0.0;
+    }
 
     int step = start_step;
     for (; step < cfg.num_iterations; step++) {
         // Pause gate + render-fairness yield: give viewer render workers an
         // uncontended window to take the engine mutex.
-        while (paused.load() && !stop_requested.load())
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        if (paused.load() && !stop_requested.load()) {
+            pause_clock_start();
+            while (paused.load() && !stop_requested.load())
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            pause_clock_stop();
+        }
         if (stop_requested.load()) break;
         while (render_pending.load())
             std::this_thread::sleep_for(std::chrono::microseconds(500));
 
         auto step_start = std::chrono::steady_clock::now();
         std::map<std::string, float> losses;
+        std::string data_error;
         {
             std::lock_guard<std::mutex> lk(engine_mutex);
             if (step > 0 && cfg.steps_per_save > 0 && step % cfg.steps_per_save == 0)
                 save_checkpoint(step);
-            losses = train_step(step);
+            try {
+                losses = train_step(step);
+            } catch (const DataDecodeError& e) {
+                data_error = e.what();
+            }
+        }
+        // Asking outside the lock: the front end may sit on this for minutes
+        // while the user puts the dataset back, and the viewport still wants
+        // to render.
+        if (!data_error.empty()) {
+            if (!cb.on_data_error) {
+                engine_resolve_data_error(false);
+                throw std::runtime_error(data_error);
+            }
+            pause_clock_start();          // waiting on a human is not run time
+            const bool retry = cb.on_data_error(data_error);
+            pause_clock_stop();
+            engine_resolve_data_error(retry);
+            if (!retry) break;
+            --step;                      // this step never ran
+            continue;
         }
         cur_step = step + 1;
         double latency = std::chrono::duration<double>(
@@ -916,8 +1005,11 @@ void TrainerSession::train(const TrainerCallbacks& cb) {
         }
     }
 
-    training_time_s = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - _start_time).count();
+    {
+        std::lock_guard<std::mutex> lk(_time_mutex);
+        _end_time = std::chrono::steady_clock::now();
+    }
+    training_time_s = elapsed_seconds();
     // Pool capacities are a monotonic high-water mark, so reading them after
     // the loop gives the training-time peak.
     {
@@ -935,19 +1027,11 @@ void TrainerSession::train(const TrainerCallbacks& cb) {
 
 std::string TrainerSession::progress_json() {
     int step = cur_step.load();
-    double elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - _start_time).count();
-    double avg = 0.0;
-    size_t nlat = 0;
-    {
-        std::lock_guard<std::mutex> lk(_progress_mutex);
-        for (double v : _step_latencies) avg += v;
-        nlat = _step_latencies.size();
-    }
-    if (nlat) avg /= (double)nlat;
+    double elapsed = elapsed_seconds();
+    double avg = avg_step_latency();
+    double eta = eta_seconds();
     char buf[256];
-    if (nlat && step > 0) {
-        double eta = (cfg.num_iterations - step) * avg;
+    if (eta >= 0.0) {
         std::snprintf(buf, sizeof buf,
             "{\"step\": %d, \"total_steps\": %d, \"elapsed_time\": %.3f, "
             "\"eta\": %.3f, \"latency_ms\": %.3f, \"paused\": %s}",

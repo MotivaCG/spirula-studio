@@ -44,6 +44,7 @@ namespace fld = spirula::i18n::msg::field;
 namespace dmsg = spirula::i18n::msg::dataset;
 namespace gmsg = spirula::i18n::msg::geometry;
 using spirula::i18n::Msg;
+using spirula::format_duration;
 
 namespace gui {
 
@@ -57,15 +58,6 @@ const ImVec4 kDim(0.6f, 0.6f, 0.6f, 1.0f);
 std::string format_gib(uint64_t bytes) {
     char buf[32];
     std::snprintf(buf, sizeof buf, "%.2f", (double)bytes / (1024.0 * 1024.0 * 1024.0));
-    return buf;
-}
-
-std::string format_duration(double s) {
-    if (s < 0) return "--:--";
-    int t = (int)(s + 0.5);
-    char buf[32];
-    if (t >= 3600) std::snprintf(buf, sizeof buf, "%d:%02d:%02d", t/3600, (t/60)%60, t%60);
-    else           std::snprintf(buf, sizeof buf, "%d:%02d", t/60, t%60);
     return buf;
 }
 
@@ -1227,7 +1219,8 @@ static PrepInput make_source(const std::string& path,
     s.camera_model = "opencv";
     if (is_dual_fisheye_path(path)) {
         s.camera_model = "thin-prism-fisheye";
-        s.focal_factor = kInsta360FocalFactor;
+        // Commented - We don't assume every camera is Insta360 X5
+        // s.focal_factor = kInsta360FocalFactor;
     }
     return s;
 }
@@ -1559,6 +1552,7 @@ void GuiApp::frame() {
     draw_preset_save_modal();
     draw_preset_delete_modal();
     draw_confirm_modal();
+    draw_data_error_modal();
 
     ImGui::End();
 }
@@ -5214,7 +5208,7 @@ void GuiApp::draw_status_strip() {
     if (ph == TrainRunner::Phase::Training && p.total_steps > 0) {
         float frac = (float)(p.step + 1) / (float)p.total_steps;
         ui::ProgressBar(frac, ImVec2(-8, 0), msg::status_step,
-                        {p.step + 1, p.total_steps});
+                        {p.step + 1, p.total_steps, (int)(frac * 100.0f)});
         char ms[32];
         std::snprintf(ms, sizeof ms, "%.0f", p.step_latency * 1000.0);
         ui::Text(_runner.paused() ? msg::status_rate_paused : msg::status_rate,
@@ -5440,6 +5434,45 @@ void GuiApp::draw_log_panel(float height) {
         }
         ImGui::End();
     }
+}
+
+// The training thread is blocked inside its step until one of these buttons
+// answers, so Esc puts the modal straight back rather than stranding the run.
+void GuiApp::draw_data_error_modal() {
+    const std::string what = _runner.data_error();
+    if (!what.empty() && !_data_error_shown) {
+        ui::OpenPopup(msg::data_error_title);
+        _data_error_shown = true;
+    }
+    if (!_data_error_shown) return;
+    if (!ui::BeginPopupModal(msg::data_error_title, nullptr,
+                             ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (!what.empty()) ui::OpenPopup(msg::data_error_title);
+        else               _data_error_shown = false;
+        return;
+    }
+    if (what.empty()) {                  // answered elsewhere (a stop request)
+        _data_error_shown = false;
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+    ui::TextWrappedRaw(what);
+    ImGui::Spacing();
+    ui::Text(msg::data_error_intro);
+    ImGui::Spacing();
+    auto answer = [&](bool retry) {
+        _runner.resolve_data_error(retry);
+        _data_error_shown = false;
+        ImGui::CloseCurrentPopup();
+    };
+    const float bw = px(190.0f);
+    if (ui::Button(msg::data_error_retry, ImVec2(bw, 0))) answer(true);
+    ui::help_on_hover(msg::data_error_retry_help);
+    ImGui::SameLine();
+    if (ui::Button(msg::stop_and_save, ImVec2(bw, 0))) answer(false);
+    ui::help_on_hover(msg::stop_and_save_help);
+    ImGui::EndPopup();
 }
 
 void GuiApp::draw_confirm_modal() {
