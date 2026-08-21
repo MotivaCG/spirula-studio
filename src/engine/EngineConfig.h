@@ -214,6 +214,11 @@ struct DensifyConfig {
     float las_split_opacity_k_init      = 0.5f;
     float las_split_opacity_k_final     = 0.6f;
     int   las_split_opacity_k_warmup    = 4500;
+    // Subtracted from linear opacity (and, for scale, a shrink factor) once
+    // per refine, scaled by 1 - progress. 0 disables. Unlike the opacity_reg
+    // loss term, this reaches splats no camera supervises.
+    float opacity_decay                 = 0.0f;
+    float scale_decay                   = 0.0f;
 };
 
 

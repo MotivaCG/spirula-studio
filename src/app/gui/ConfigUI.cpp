@@ -219,14 +219,20 @@ bool draw_value(const char*, std::optional<bool>& v, const char*) {
 // than as another column on every row of the field table.
 bool unset_is_none(const char* key) {
     return !std::strcmp(key, "darkness_boost") ||
-           !std::strcmp(key, "opacity_boost");
+           !std::strcmp(key, "opacity_boost") ||
+           !std::strcmp(key, "opacity_decay") ||
+           !std::strcmp(key, "scale_decay");
 }
 
+// What ticking the box starts from. A rate whose useful range is thousandths
+// is unusable if the box hands you a zero and no hint of the magnitude.
 template <typename T>
 T optional_seed(const char* key) {
     if constexpr (std::is_arithmetic_v<T>) {
         if (!std::strcmp(key, "darkness_boost")) return (T)2;
         if (!std::strcmp(key, "opacity_boost")) return (T)1.5;
+        if (!std::strcmp(key, "opacity_decay")) return (T)0.002;
+        if (!std::strcmp(key, "scale_decay")) return (T)0.002;
     }
     return T{};
 }
@@ -243,6 +249,7 @@ bool clamp_to_min(const char* key, std::optional<T>& v) {
     }
     return false;
 }
+
 
 template <typename T>
 bool draw_value(const char* key, std::optional<T>& v, const char* choices) {

@@ -41,6 +41,15 @@ struct DensifyClipScaleParams {
 static_assert(sizeof(DensifyClipScaleParams) == 3 * 8 + 8 * 4,
               "params layout must match the slang struct");
 
+// Mirrors DensifyDecayParams.
+struct DensifyDecayParams {
+    uint64_t logit_opacs, log_scales;
+    float opacity_decay, scale_decay;
+    uint32_t num_splats, wgs_per_row;
+};
+static_assert(sizeof(DensifyDecayParams) == 2 * 8 + 4 * 4,
+              "params layout must match the slang struct");
+
 // Mirrors DensifyNoiseParams.
 struct DensifyNoiseParams {
     uint64_t means, log_scales, quats, logit_opacs, radii;
@@ -477,6 +486,25 @@ void densify_clip_scale_tensor(
     p.num_splats = (uint32_t)num_splats;
     vkk::dispatch_flat("densify.densify_clip_scale", {}, num_splats, 256, &p,
                        sizeof(p), &p.wgs_per_row);
+}
+
+void splat_decay_tensor(
+    int64_t num_splats,
+    float opacity_decay,
+    float scale_decay,
+    DeviceVector<float> opacs,
+    DeviceVector<float3> log_scales
+) {
+    if (num_splats <= 0 || (opacity_decay <= 0.0f && scale_decay <= 0.0f))
+        return;
+    DensifyDecayParams p{};
+    p.logit_opacs = (uint64_t)opacs.data_ptr();
+    p.log_scales = (uint64_t)log_scales.data_ptr();
+    p.opacity_decay = opacity_decay;
+    p.scale_decay = scale_decay;
+    p.num_splats = (uint32_t)num_splats;
+    vkk::dispatch_flat("densify.densify_splat_decay", {}, num_splats, 256,
+                       &p, sizeof(p), &p.wgs_per_row);
 }
 
 void mcmc_add_noise_tensor(

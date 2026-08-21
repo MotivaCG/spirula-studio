@@ -5745,41 +5745,69 @@ SS_MSG(opacity_decay,
     IT("Decadimento dell'opacità"), NL("Afname van de dekking"),
     RU("Затухание непрозрачности"), TR("Saydamsızlık sönümü"));
 SS_MSG(opacity_decay_help,
-    EN("Fade every splat's opacity slightly each step, freeing weak ones for "
-       "reuse. An alternative to opacity_reg that acts on all splats equally."),
-    JA("すべてのスプラットの不透明度を毎ステップ少しずつ薄め、弱いものを再利用"
-       "に回します。opacity_reg の代わりに使え、すべてのスプラットに等しく効き"
-       "ます。"),
-    ZH_HANS("每一步都把所有泼溅的不透明度稍稍淡化，把弱的释放出来重新利用。可"
-            "作为 opacity_reg 的替代，对所有泼溅一视同仁。"),
-    ZH_HANT("每一步都把所有潑濺的不透明度稍稍淡化，把弱的釋放出來重新利用。可"
-            "作為 opacity_reg 的替代，對所有潑濺一視同仁。"),
-    KO("매 스텝마다 모든 스플랫의 불투명도를 조금씩 낮춰 약한 것을 재사용으로"
-       " 돌립니다. opacity_reg의 대안이며 모든 스플랫에 똑같이 작용합니다."),
-    DE("Die Deckkraft jedes Splats bei jedem Schritt ein wenig verblassen lassen "
-       "und schwache so zur Wiederverwendung freigeben. Eine Alternative zu opacity_reg, "
-       "die alle Splats gleich behandelt."),
-    FR("Estomper légèrement l'opacité de chaque splat à chaque étape, libérant "
-       "les plus faibles pour réemploi. Une solution de rechange à opacity_reg, "
-       "qui agit sur tous les splats de la même façon."),
-    ES("Atenuar un poco la opacidad de cada splat en cada paso, liberando los "
-       "débiles para reutilizarlos. Una alternativa a opacity_reg que actúa igual "
-       "sobre todos los splats."),
-    PT("Esmaecer um pouco a opacidade de cada splat a cada passo, liberando os "
-       "fracos para reutilização. Uma alternativa ao opacity_reg que age igualmente "
-       "sobre todos os splats."),
-    IT("Sbiadire un poco l'opacità di ogni splat a ogni passo, liberando i più "
-       "deboli per il riuso. Un'alternativa a opacity_reg che agisce allo stesso "
-       "modo su tutti gli splat."),
-    NL("De dekking van elke splat bij elke stap iets laten vervagen, waardoor "
-       "zwakke splats vrijkomen voor hergebruik. Een alternatief voor opacity_reg "
-       "dat alle splats gelijk behandelt."),
-    RU("Слегка гасить непрозрачность каждого сплата на каждом шаге, освобождая "
-       "слабые для повторного использования. Замена opacity_reg, действующая "
-       "одинаково на все сплаты."),
-    TR("Her adımda her splat'ın saydamsızlığını biraz soldurur ve zayıf olanları "
-       "yeniden kullanıma açar. opacity_reg'e alternatiftir ve tüm splat'lara "
-       "eşit davranır."));
+    EN("Fade every splat's opacity at each refine, freeing weak ones for "
+       "reuse. Written straight onto the splats instead of added to the "
+       "loss, so unlike opacity_reg it also reaches splats no camera "
+       "supervises. Falls linearly to zero as training ends."),
+    JA("リファインごとに各スプラットの不透明度を下げ、弱いものを"
+       "再利用に回します。損失に足すのではなくスプラットへ直接書"
+       "き込むので、opacity_reg と違ってどのカメラも"
+       "監督しないスプラットにも届きます。学習の進行とともに線形"
+       "にゼロへ弱まります。"),
+    ZH_HANS("每次细化时降低每个泼溅的不透明度，把弱的释放出来重用。它"
+            "直接写入泼溅而不是加进损失，所以与 "
+            "opacity_reg 不同，也能触及没有任何相机监督的"
+            "泼溅。随着训练推进线性减弱到零。"),
+    ZH_HANT("每次細化時降低每個潑濺的不透明度，把弱的釋放出來重用。它"
+            "直接寫入潑濺而不是加進損失，所以與 "
+            "opacity_reg 不同，也能觸及沒有任何相機監督的"
+            "潑濺。隨著訓練推進線性減弱到零。"),
+    KO("리파인마다 각 스플랫의 불투명도를 낮춰 약한 것을 "
+       "재사용으로 돌립니다. 손실에 더하는 대신 스플랫에 "
+       "직접 쓰므로 opacity_reg와 달리 어떤 카메"
+       "라도 감독하지 않는 스플랫에도 닿습니다. 학습이 진"
+       "행될수록 선형으로 0까지 약해집니다."),
+    DE("Senkt bei jedem Refine die Deckkraft jedes Splats und gibt "
+       "schwache zur Wiederverwendung frei. Wird direkt auf die Splats "
+       "geschrieben statt auf die Verlustfunktion addiert und erreicht "
+       "daher, anders als opacity_reg, auch Splats, die keine Kamera "
+       "überwacht. Fällt im Lauf des Trainings linear auf null."),
+    FR("Atténue l'opacité de chaque splat à chaque affinage, libérant les "
+       "faibles pour réemploi. Écrit directement sur les splats au lieu "
+       "d'être ajouté à la perte : contrairement à opacity_reg, il atteint "
+       "aussi les splats qu'aucune caméra ne supervise. Décroît "
+       "linéairement jusqu'à zéro en fin d'entraînement."),
+    ES("Atenúa la opacidad de cada splat en cada refinado, liberando los "
+       "débiles para reutilizarlos. Se escribe directamente sobre los "
+       "splats en vez de sumarse a la pérdida, así que, a diferencia de "
+       "opacity_reg, también alcanza a los que ninguna cámara supervisa. "
+       "Baja linealmente hasta cero al avanzar el entrenamiento."),
+    PT("Reduz a opacidade de cada splat a cada refinamento, liberando os "
+       "fracos para reuso. É escrito direto nos splats em vez de somado à "
+       "perda, então, ao contrário de opacity_reg, também alcança os "
+       "splats que nenhuma câmera supervisiona. Cai linearmente até zero "
+       "conforme o treinamento avança."),
+    IT("Attenua l'opacità di ogni splat a ogni raffinamento, liberando i "
+       "più deboli per il riuso. Viene scritto direttamente sugli splat "
+       "invece che aggiunto alla perdita, quindi a differenza di "
+       "opacity_reg raggiunge anche gli splat che nessuna camera "
+       "supervisiona. Cala linearmente a zero con l'avanzare "
+       "dell'addestramento."),
+    NL("Vermindert de dekking van elke splat bij elke verfijning en maakt "
+       "zwakke splats vrij voor hergebruik. Wordt rechtstreeks op de "
+       "splats geschreven in plaats van bij het verlies opgeteld, dus "
+       "anders dan opacity_reg bereikt het ook splats die geen camera "
+       "bewaakt. Zakt lineair naar nul naarmate de training vordert."),
+    RU("Снижает непрозрачность каждого сплата на каждом уточнении, "
+       "освобождая слабые для повторного использования. Пишется прямо в "
+       "сплаты, а не добавляется к функции потерь, поэтому, в отличие от "
+       "opacity_reg, достаёт и до сплатов, которые не видит ни одна "
+       "камера. По ходу обучения линейно спадает до нуля."),
+    TR("Her iyileştirmede her splat'ın saydamsızlığını azaltır ve zayıf "
+       "olanları yeniden kullanıma bırakır. Kayba eklenmek yerine doğrudan "
+       "splat'lara yazılır; bu yüzden opacity_reg'den farklı olarak hiçbir "
+       "kameranın denetlemediği splat'lara da ulaşır. Eğitim ilerledikçe "
+       "doğrusal olarak sıfıra iner."));
 
 SS_MSG(scale_decay,
     EN("Size decay"), JA("大きさの減衰"), ZH_HANS("尺寸衰减"),
@@ -5788,32 +5816,55 @@ SS_MSG(scale_decay,
     PT("Decaimento do tamanho"), IT("Decadimento della dimensione"),
     NL("Afname van de grootte"), RU("Затухание размера"), TR("Boyut sönümü"));
 SS_MSG(scale_decay_help,
-    EN("Shrink every splat slightly each step. An alternative to scale_reg that "
-       "acts on all splats equally."),
-    JA("すべてのスプラットを毎ステップ少しずつ縮めます。scale_reg の代わりに使"
-       "え、すべてのスプラットに等しく効きます。"),
-    ZH_HANS("每一步都把所有泼溅稍稍缩小。可作为 scale_reg 的替代，对所有泼溅一"
-            "视同仁。"),
-    ZH_HANT("每一步都把所有潑濺稍稍縮小。可作為 scale_reg 的替代，對所有潑濺一"
-            "視同仁。"),
-    KO("매 스텝마다 모든 스플랫을 조금씩 줄입니다. scale_reg의 대안이며 모든 "
-       "스플랫에 똑같이 작용합니다."),
-    DE("Jeden Splat bei jedem Schritt ein wenig verkleinern. Eine Alternative "
-       "zu scale_reg, die alle Splats gleich behandelt."),
-    FR("Rétrécir légèrement chaque splat à chaque étape. Une solution de rechange "
-       "à scale_reg, qui agit sur tous les splats de la même façon."),
-    ES("Encoger un poco cada splat en cada paso. Una alternativa a scale_reg "
-       "que actúa igual sobre todos los splats."),
-    PT("Encolher um pouco cada splat a cada passo. Uma alternativa ao scale_reg "
-       "que age igualmente sobre todos os splats."),
-    IT("Rimpicciolire un poco ogni splat a ogni passo. Un'alternativa a scale_reg "
-       "che agisce allo stesso modo su tutti gli splat."),
-    NL("Elke splat bij elke stap iets verkleinen. Een alternatief voor scale_reg "
-       "dat alle splats gelijk behandelt."),
-    RU("Слегка уменьшать каждый сплат на каждом шаге. Замена scale_reg, действующая "
-       "одинаково на все сплаты."),
-    TR("Her adımda her splat'ı biraz küçültür. scale_reg'e alternatiftir ve tüm "
-       "splat'lara eşit davranır."));
+    EN("Shrink every splat at each refine. Written straight onto the "
+       "splats instead of added to the loss, and falls to zero on the same "
+       "linear schedule as opacity_decay. Pairs with it against large, "
+       "diffuse floaters."),
+    JA("リファインごとに各スプラットを縮めます。損失に足すのでは"
+       "なくスプラットへ直接書き込み、opacity_decay"
+       " と同じ線形スケジュールでゼロまで弱まります。大きくぼや"
+       "けたフローターには両方を組み合わせてください。"),
+    ZH_HANS("每次细化时缩小每个泼溅。直接写入泼溅而不是加进损失，并按"
+            "与 opacity_decay 相同的线性时间表减弱到零"
+            "。两者搭配对付又大又散的漂浮物。"),
+    ZH_HANT("每次細化時縮小每個潑濺。直接寫入潑濺而不是加進損失，並按"
+            "與 opacity_decay 相同的線性時間表減弱到零"
+            "。兩者搭配對付又大又散的漂浮物。"),
+    KO("리파인마다 각 스플랫을 줄입니다. 손실에 더하는 대"
+       "신 스플랫에 직접 쓰며, opacity_decay와"
+       " 같은 선형 일정으로 0까지 약해집니다. 크고 흐릿"
+       "한 플로터에는 둘을 함께 쓰세요."),
+    DE("Verkleinert bei jedem Refine jeden Splat. Wird direkt auf die "
+       "Splats geschrieben statt auf die Verlustfunktion addiert und fällt "
+       "nach demselben linearen Zeitplan wie opacity_decay auf null. "
+       "Zusammen gegen große, diffuse Floater."),
+    FR("Rétrécit chaque splat à chaque affinage. Écrit directement sur les "
+       "splats au lieu d'être ajouté à la perte, et décroît jusqu'à zéro "
+       "selon le même calendrier linéaire que opacity_decay. Les deux "
+       "ensemble contre les floaters grands et diffus."),
+    ES("Encoge cada splat en cada refinado. Se escribe directamente sobre "
+       "los splats en vez de sumarse a la pérdida, y baja hasta cero con "
+       "el mismo calendario lineal que opacity_decay. Juntos, contra los "
+       "floaters grandes y difusos."),
+    PT("Encolhe cada splat a cada refinamento. É escrito direto nos splats "
+       "em vez de somado à perda e cai até zero no mesmo cronograma linear "
+       "que opacity_decay. Juntos, contra floaters grandes e difusos."),
+    IT("Rimpicciolisce ogni splat a ogni raffinamento. Viene scritto "
+       "direttamente sugli splat invece che aggiunto alla perdita e cala a "
+       "zero con la stessa pianificazione lineare di opacity_decay. "
+       "Insieme, contro i floater grandi e diffusi."),
+    NL("Verkleint elke splat bij elke verfijning. Wordt rechtstreeks op de "
+       "splats geschreven in plaats van bij het verlies opgeteld en zakt "
+       "naar nul volgens hetzelfde lineaire schema als opacity_decay. "
+       "Samen tegen grote, diffuse floaters."),
+    RU("Уменьшает каждый сплат на каждом уточнении. Пишется прямо в "
+       "сплаты, а не добавляется к функции потерь, и спадает до нуля по "
+       "тому же линейному графику, что и opacity_decay. Вместе — против "
+       "крупных размытых артефактов."),
+    TR("Her iyileştirmede her splat'ı küçültür. Kayba eklenmek yerine "
+       "doğrudan splat'lara yazılır ve opacity_decay ile aynı doğrusal "
+       "takvimde sıfıra iner. Büyük, dağınık floater'lara karşı birlikte "
+       "kullanılır."));
 
 SS_MSG(erank_reg,
     EN("Roundness (erank)"), JA("丸さ（erank）"), ZH_HANS("圆度（erank）"),
