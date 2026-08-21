@@ -123,6 +123,7 @@ enum class SaveClass : uint8_t {
   X(EngAccumBuffer                 , "eng.accum_buffer",                  Splat    , Resume) \
   X(EngBiasCorrectionSteps         , "eng.bias_correction_steps",         Splat    , Resume) \
   X(EngDensifyWorldGradScore       , "eng.densify.world_grad_score",      Splat    , Never) \
+  X(EngDensifySampleScore          , "eng.densify.sample_score",          Splat    , Never) \
   /* ---- sub-batch scratch ---- */ \
   X(EngSubbatchAccumWeightSum      , "eng.subbatch.accum_weight_sum",     Splat    , Never) \
   /* ---- gradients ---- */ \
@@ -306,7 +307,9 @@ enum class SaveClass : uint8_t {
   X(SsimMaskWeightTmp              , "ssim.mask_weight_tmp",              Image    , Never) \
   /* ---- densify scratch ---- */ \
   X(DensifyQuantileTemp            , "densify_quantile_temp",             Other    , Never) \
-  X(DensifyInvMedian               , "densify_inv_median",                Other    , Never) \
+  X(DensifyMapNorm                 , "densify_map_norm",                  Other    , Never) \
+  X(DensifyScoreGather             , "densify_score_gather",              Other    , Never) \
+  X(DensifyScoreClip               , "densify_score_clip",                Other    , Never) \
   X(DensifyClipScale               , "densify_clip_scale",                Other    , Never) \
   X(DensifyUpdateWeight            , "densify_update_weight",             Other    , Never) \
   X(DensifyWswrSortingValues       , "densify_wswr_sorting_values",       Other    , Never) \

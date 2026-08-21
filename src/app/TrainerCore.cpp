@@ -246,7 +246,18 @@ int densify_loss_map_mode_int(const std::string& mode) {
     if (mode == "ssim_structure")    return 4;
     if (mode == "edge_aware")        return 5;
     if (mode == "robust_edge_aware") return 6;
+    if (mode == "loss_full_nms")       return 7;
+    if (mode == "ssim_full_nms")       return 8;
+    if (mode == "ssim_cs_nms")         return 9;
+    if (mode == "ssim_structure_nms")  return 10;
     throw std::runtime_error("unknown densify_loss_map_mode: " + mode);
+}
+
+int densify_accum_mode_int(const std::string& mode) {
+    if (mode == "max") return (int)DensifyAccumMode::Max;
+    if (mode == "sum") return (int)DensifyAccumMode::Sum;
+    if (mode == "avg") return (int)DensifyAccumMode::Avg;
+    throw std::runtime_error("unknown densify_accum_mode: " + mode);
 }
 
 }  // namespace
@@ -313,6 +324,11 @@ EngineStepConfig build_step_config(const TrainConfig& c, const RunState& st, int
     cfg.loss.loss_map_mode = loss_map_mode;
     cfg.loss.compute_loss_map = (loss_map_mode != 0);
     cfg.loss.robust_edge_aware_quantile = c.densify_robust_edge_aware_quantile;
+    cfg.loss.nms_falloff = c.densify_nms_falloff;
+    cfg.loss.loss_map_normalize = c.densify_loss_map_normalize;
+    cfg.loss.loss_map_clip_quantile = c.densify_loss_map_clip_quantile;
+    cfg.loss.loss_map_power = c.densify_loss_map_power;
+    cfg.loss.loss_map_accum_mode = densify_accum_mode_int(c.densify_accum_mode);
     cfg.loss.overexposure_reg_weight = c.overexposure_reg;
     if (st.bilagrid_rgb_init || st.ppisp_init) {
         cfg.loss.color_shift_reg_weight = c.color_shift_reg_weight;
@@ -371,6 +387,9 @@ EngineStepConfig build_step_config(const TrainConfig& c, const RunState& st, int
         : c.densify_score_mode == "max" ? 1
         : c.densify_score_mode == "median" ? 2 : 3;
     cfg.densify.score_blend_world_grad = c.densify_score_blend_world_grad;
+    cfg.densify.score_power = c.densify_score_power;
+    cfg.densify.score_clip_quantile = c.densify_score_clip_quantile;
+    cfg.densify.final_score_power = c.densify_final_score_power;
     cfg.densify.las_split_opacity_k_init   = c.long_axis_split_opacity_k[0];
     cfg.densify.las_split_opacity_k_final  = c.long_axis_split_opacity_k[1];
     cfg.densify.las_split_opacity_k_warmup = (int)c.long_axis_split_opacity_k[2];
@@ -569,13 +588,9 @@ void TrainerSession::load_dataset() {
         ds, cfg.warp_to_pinhole, cfg.warp_spherical_to_pinhole);
 
     // Warp-path guards, plus: a modality no weight reads is not loaded at all.
-    // Alpha is in the depth list because its validity mask IS the reference
-    // depth (per_pixel_losses.slang, `alpha_mask`).
-    const bool alpha_reads_depth =
-        cfg.apply_loss_for_mask &&
-        (cfg.alpha_loss_weight > 0.0f || cfg.alpha_loss_weight_under > 0.0f);
+    has_mask   = !ds.mask_filenames.empty()   && cfg.load_masks;
     has_depth  = !ds.depth_filenames.empty()  && cfg.load_depths &&
-                 (cfg.depth_supervision_weight > 0.0f || alpha_reads_depth);
+                 cfg.depth_supervision_weight > 0.0f;
     has_normal = !ds.normal_filenames.empty() && cfg.load_normals &&
                  (cfg.normal_supervision_weight > 0.0f ||
                   cfg.median_normal_supervision_weight > 0.0f);
@@ -711,12 +726,10 @@ void TrainerSession::setup_engine() {
 
     DataManagerConfig dm;
     dm.cache_mode  = (cfg.cache_images == "disk") ? CacheMode::DISK : CacheMode::CPU;
-    // Enable masks also when the fisheye warp is active with no on-disk
-    // masks -- the DataManager synthesizes a 1x1 white placeholder per
-    // such image so the wide-warp kernel produces the post-split FOV
-    // mask (1 inside the lens circle, 0 outside). Without it the unseen
-    // face regions train as black.
-    dm.load_masks  = !ds.mask_filenames.empty() || post.any_fisheye_warp;
+    // A fisheye warp needs a mask even when none is on disk: the synthesized
+    // all-white one becomes the post-split FOV mask (0 outside the lens
+    // circle), without which the unseen face regions train as black.
+    dm.load_masks  = has_mask || post.any_fisheye_warp;
     dm.load_depths      = has_depth;
     dm.load_normals     = has_normal;
     dm.train_batch_size = train_bs;
@@ -725,7 +738,8 @@ void TrainerSession::setup_engine() {
     dm.warp_to_pinhole  = cfg.warp_to_pinhole;
     engine_setup_data_manager(
         dm, ds.camera_models, ds.camera_distortions,
-        ds.image_filenames, ds.mask_filenames,
+        ds.image_filenames,
+        has_mask ? ds.mask_filenames : std::vector<std::string>{},
         has_depth ? ds.depth_filenames : std::vector<std::string>{},
         has_normal ? ds.normal_filenames : std::vector<std::string>{},
         ds.widths, ds.heights,
@@ -1151,7 +1165,8 @@ void TrainerSession::eval() {
     // otherwise pack several resolutions into one step.
     DataManagerConfig dm;
     dm.cache_mode  = (cfg.cache_images == "disk") ? CacheMode::DISK : CacheMode::CPU;
-    dm.load_masks  = !eds.mask_filenames.empty() || epost.any_fisheye_warp;
+    const bool eval_masks = !eds.mask_filenames.empty() && cfg.load_masks;
+    dm.load_masks  = eval_masks || epost.any_fisheye_warp;
     dm.load_depths = false;
     dm.load_normals = false;
     dm.train_batch_size = 1;
@@ -1165,7 +1180,8 @@ void TrainerSession::eval() {
         std::lock_guard<std::mutex> lk(engine_mutex);
         engine_setup_data_manager(
             dm, eds.camera_models, eds.camera_distortions,
-            eds.image_filenames, eds.mask_filenames, {}, {},
+            eds.image_filenames,
+            eval_masks ? eds.mask_filenames : std::vector<std::string>{}, {}, {},
             eds.widths, eds.heights,
             epost.any_warp ? epost.K_per_camera : std::vector<int32_t>{},
             epost.any_warp ? epost.post_offsets : std::vector<int32_t>{},

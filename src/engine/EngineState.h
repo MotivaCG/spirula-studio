@@ -139,6 +139,9 @@ struct ForwardCache {
     RenderOutput::TensorTuple         distortions;  // [C,H,W,...] D=W*S-C^2, only the dist_type channels allocated
     DistortionType                    dist_type = DistortionType::None;  // which distortion channels the forward emitted
     DeviceVector<float>               accum_weight; // [max_num_splats] per-splat score from raster bwd
+    // What produced accum_weight, so densify folds and finalizes it the same
+    // way regardless of which train-step path filled it.
+    DensifyAccumMode                  accum_mode = DensifyAccumMode::None;
     // [max_num_splats] per-splat ||dL/dmean_world|| * max post-exp world
     // scale, written by the splat optim step (both FPBO and non-FPBO paths)
     // when OptimConfig::write_densify_world_grad_score is set. Consumed by
@@ -239,6 +242,9 @@ struct SplatOptim {
     DeviceVector<float>    radii;                  // [max_N]
     DeviceVector<float2>   accum_buffer;           // [max_N]
     DeviceVector<int32_t>  bias_correction_steps;  // [max_N], or empty
+    // accum_buffer with DensifyConfig::final_score_power applied to lane 0.
+    // Empty when that power is 1, which is when accum_buffer IS the score.
+    DeviceVector<float2>   densify_sample_score;   // [cur_N], or empty
 
     // Set per-step from cfg.optim.use_fused_proj_bwd_optim before forward/loss
     // so engine_compute_loss_backward knows to skip projection_*_backward and

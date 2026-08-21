@@ -30,6 +30,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -40,6 +41,7 @@
 #include "sfm/SfmConfig.h"
 #include "sfm/core/Progress.h"
 #include "sfm/core/CameraSetup.h"
+#include "sfm/core/FeatureCompaction.h"
 #include "sfm/core/Log.h"
 #include "sfm/core/Features.h"
 #include "sfm/core/Image.h"
@@ -466,6 +468,16 @@ static void adoptExrColorSpace(SfmConfig& cfg, const std::string& imagedir,
             L::warn(Tag::Run, M::run_exr_gamut_unknown, {});
         return;
     }
+}
+
+static void reportFeatureCompaction(const FeatureCompactionStats& stats) {
+    const double removed_pct =
+        stats.original_features ? 100.0 * stats.removedFeatures() / stats.original_features : 0.0;
+    L::out(Tag::Map, M::map_feature_compaction,
+           {(long long)stats.original_features, (long long)stats.compact_features,
+            (long long)stats.removedFeatures(), L::num(removed_pct, 2), (long long)stats.images,
+            (long long)stats.zero_feature_images, (long long)stats.pairs,
+            (long long)stats.correspondences});
 }
 
 // Point colours are sampled from images the loader converted to sRGB, which is
@@ -1540,6 +1552,8 @@ static int cmdMap(int argc, char** argv) {
     const std::string& featdir = cfg.feature_dir;
 
     MatchesDatabase db = readMatches(matchesPath);
+    std::optional<FeatureCompactionPlan> compaction;
+    if (cfg.compact_unused_features) compaction.emplace(buildFeatureCompactionPlan(db));
     std::vector<FeatureSet> feats(db.images.size());
     {
         // Descriptors are skipped: matching is over, and on a 5000-image
@@ -1556,7 +1570,14 @@ static int cmdMap(int argc, char** argv) {
             pool.emplace_back([&] {
                 for (size_t i = next++; i < db.images.size(); i = next++) {
                     try {
-                        feats[i] = readFeatures(featdir + "/" + db.images[i].name + ".bin", false);
+                        FeatureSet loaded =
+                            readFeatures(featdir + "/" + db.images[i].name + ".bin", false);
+                        if (compaction)
+                            feats[i] = compactFeatureSet(std::move(loaded),
+                                                         compaction->old_to_new[i],
+                                                         compaction->compact_counts[i]);
+                        else
+                            feats[i] = std::move(loaded);
                     } catch (const std::exception& e) {
                         std::lock_guard<std::mutex> lk(err_mtx);
                         if (first_error.empty()) first_error = e.what();
@@ -1568,6 +1589,13 @@ static int cmdMap(int argc, char** argv) {
             L::err_raw(Tag::Map, first_error);
             return 1;
         }
+    }
+    if (compaction) {
+        remapMatches(db, *compaction, feats);
+        const FeatureCompactionStats stats = compaction->stats;
+        // old_to_new is the only temporary proportional to the original row count.
+        compaction.reset();
+        if (opt.verbose) reportFeatureCompaction(stats);
     }
 
     // The camera setup, in order of authority: what the command line asked for,
@@ -1619,6 +1647,22 @@ static int cmdMap(int argc, char** argv) {
         // must come from this database (image ids are positions in it); adopt()
         // checks the names and says so if they do not.
         if (!readModels(cfg.resume, models, opt.verbose)) return 1;
+        // point2D_idx indexes this run's feature arrays. A model written with a
+        // different --compact-unused-features would index other keypoints, and
+        // the mapper can only drop those observations, not recover them.
+        for (const Reconstruction& m : models)
+            for (const auto& kv : m.images) {
+                if (!kv.second.registered || kv.first >= feats.size()) continue;
+                if (kv.second.points2D.size() == feats[kv.first].count()) continue;
+                L::err_raw(Tag::Map,
+                           "resumed model image '" + kv.second.name + "' holds " +
+                               std::to_string(kv.second.points2D.size()) +
+                               " keypoints but this run's features have " +
+                               std::to_string(feats[kv.first].count()) +
+                               "; --compact-unused-features must match the run that wrote " +
+                               cfg.resume);
+                return 1;
+            }
         L::out(Tag::Map, M::map_resumed,
                {(long long)models.size(),
                 (long long)distinctRegistered(models),
@@ -1991,6 +2035,16 @@ static int cmdAuto(int argc, char** argv) {
     // whole of mapping for nothing.
     for (FeatureSet& fs : feats) {
         std::vector<uint8_t>().swap(fs.descriptors);
+    }
+    // After writeMatches, never before: the file on disk indexes the feature
+    // files, which keep every row.
+    if (cfg.compact_unused_features) {
+        FeatureCompactionPlan plan = buildFeatureCompactionPlan(db);
+        for (size_t i = 0; i < feats.size(); i++)
+            feats[i] = compactFeatureSet(std::move(feats[i]), plan.old_to_new[i],
+                                         plan.compact_counts[i]);
+        remapMatches(db, plan, feats);
+        if (verbose) reportFeatureCompaction(plan.stats);
     }
 
     // ---- 3. incremental mapping ----

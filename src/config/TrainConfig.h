@@ -112,6 +112,7 @@ inline int train_tier_rank(const char* tier) {
     X(std::string, data_format, "", "dataset", "basic", "colmap|nerfstudio|metashape|none") \
     X(std::string, image_dir, "images", "dataset", "basic", "")              \
     X(std::string, mask_dir, "masks", "dataset", "basic", "")                \
+    X(bool, load_masks, true, "dataset", "basic", "")                        \
     X(bool, apply_loss_for_mask, false, "dataset", "basic", "")              \
     X(float, mask_boundary_offset, 0.0f, "dataset", "advanced", "")          \
     X(std::string, depth_dir, "depths", "dataset", "basic", "")              \
@@ -170,8 +171,16 @@ inline int train_tier_rank(const char* tier) {
     X(bool, use_revised_densification, true, "detail", "expert", "")         \
     X(std::string, densify_score_mode, "mean", "detail", "basic", "mean|max|median|geom") \
     X(float, densify_score_blend_world_grad, 0.0f, "detail", "advanced", "") \
-    X(std::string, densify_loss_map_mode, "ssim_structure", "detail", "basic", "none|loss_full|ssim_full|ssim_cs|ssim_structure|edge_aware|robust_edge_aware") \
+    X(std::string, densify_loss_map_mode, "ssim_cs", "detail", "basic", "none|loss_full|ssim_full|ssim_cs|ssim_structure|edge_aware|robust_edge_aware|loss_full_nms|ssim_full_nms|ssim_cs_nms|ssim_structure_nms") \
     X(float, densify_robust_edge_aware_quantile, 0.9f, "detail", "basic", "")\
+    X(float, densify_nms_falloff, 0.5f, "detail", "advanced", "")            \
+    X(bool, densify_loss_map_normalize, false, "detail", "advanced", "")     \
+    X(float, densify_loss_map_clip_quantile, 1.0f, "detail", "advanced", "") \
+    X(float, densify_loss_map_power, 4.0f, "detail", "advanced", "")         \
+    X(std::string, densify_accum_mode, "avg", "detail", "basic", "max|sum|avg") \
+    X(float, densify_score_power, 0.4f, "detail", "advanced", "")            \
+    X(float, densify_score_clip_quantile, 1.0f, "detail", "advanced", "")    \
+    X(float, densify_final_score_power, 1.0f, "detail", "advanced", "")      \
     X(bool, use_long_axis_split, true, "detail", "expert", "")               \
     X(TrainVec3f, long_axis_split_opacity_k, train_v3f(0.5f, 0.6f, 8000.0f), "detail", "basic", "") \
     X(float, max_screen_size, 0.3f, "detail", "basic", "")                   \
@@ -188,7 +197,7 @@ inline int train_tier_rank(const char* tier) {
     X(float, l2_weight_v, 0.0f, "loss", "advanced", "")                      \
     X(int, loss_scale_min_pixels, 1920, "loss", "advanced", "")              \
     X(int, num_loss_scales, 0, "loss", "advanced", "")                       \
-    X(float, alpha_loss_weight, 0.01f, "loss", "basic", "")                  \
+    X(float, alpha_loss_weight, 0.1f, "loss", "basic", "")                   \
     X(float, alpha_loss_weight_under, 0.0f, "loss", "basic", "")             \
                                                                              \
     /* ==== geometry -- how crisp the surfaces come out, and depth/normal guidance ==== */ \
@@ -328,8 +337,8 @@ struct TrainConfig {
     X(orientation_method) X(center_method) X(auto_scale_poses) \
     X(outlier_threshold) X(train_frame) X(eval_mode) X(train_split_fraction) \
     X(eval_interval) X(depth_unit_scale_factor) X(validation_fraction) \
-    X(warp_to_pinhole) X(warp_spherical_to_pinhole) X(load_depths) \
-    X(load_normals) X(relative_scale) \
+    X(warp_to_pinhole) X(warp_spherical_to_pinhole) X(load_masks) \
+    X(load_depths) X(load_normals) X(relative_scale) \
     /* end */
 
 
