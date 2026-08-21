@@ -353,6 +353,17 @@ int engine_densify_step(int step, int max_steps, const DensifyConfig& cfg) {
         backend::memset_sync(dv_accum_buf.data_ptr(), 0, dv_accum_buf.size() * sizeof(float2));
     }
 
+    // Decay, on the refine cadence its rates are calibrated for, tapered by
+    // 1 - progress so the final refinement is unconstrained and whatever the
+    // image still needs recovers the opacity this took away.
+    if (do_densify && (cfg.opacity_decay > 0.0f || cfg.scale_decay > 0.0f)) {
+        float taper = std::max(0.0f, 1.0f - progress);
+        splat_decay_tensor(
+            cur_num_splats + num_added,
+            cfg.opacity_decay * taper, cfg.scale_decay * taper,
+            dv_opacs, dv_scales);
+    }
+
     // Add MCMC noise
     if (cfg.noise_lr > 0.0f && cfg.noise_lr_final > 0.0f) {
         float noise_scalar = cfg.noise_lr * powf(cfg.noise_lr_final / cfg.noise_lr, progress);

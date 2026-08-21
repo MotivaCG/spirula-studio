@@ -220,8 +220,8 @@ inline int train_tier_rank(const char* tier) {
     /* ==== shape -- keeping individual splats compact and well behaved ==== */ \
     X(float, opacity_reg, 0.01f, "shape", "basic", "")                       \
     X(float, scale_reg, 0.01f, "shape", "basic", "")                         \
-    X(float, opacity_decay, 0.0f, "shape", "basic", "")                      \
-    X(float, scale_decay, 0.0f, "shape", "basic", "")                        \
+    X(std::optional<float>, opacity_decay, std::nullopt, "shape", "basic", "")\
+    X(std::optional<float>, scale_decay, std::nullopt, "shape", "basic", "") \
     X(float, erank_reg, 0.0f, "shape", "basic", "")                          \
     X(float, erank_reg_s3, 0.0f, "shape", "advanced", "")                    \
     X(float, scale_regularization_weight, 0.0f, "shape", "advanced", "")     \

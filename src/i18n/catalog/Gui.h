@@ -2660,6 +2660,27 @@ SS_MSG(cfg_auto,
     PT("(automático)"),  IT("(automatico)"), NL("(automatisch)"), RU("(авто)"),
     TR("(otomatik)"));
 
+SS_MSG(cfg_none,
+    EN("(off)"),          JA("（オフ）"),      ZH_HANS("（关闭）"),  ZH_HANT("（關閉）"),
+    KO("(끔)"),           DE("(aus)"),        FR("(désactivé)"), ES("(desactivado)"),
+    PT("(desativado)"),  IT("(disattivato)"), NL("(uit)"),      RU("(выкл.)"),
+    TR("(kapalı)"));
+
+SS_MSG(cfg_unchecked_is_none,
+    EN("unchecked = off"),
+    JA("チェックを外すとオフ"),
+    ZH_HANS("未勾选 = 关闭"),
+    ZH_HANT("未勾選 = 關閉"),
+    KO("체크 해제 = 끔"),
+    DE("nicht angehakt = aus"),
+    FR("décoché = désactivé"),
+    ES("sin marcar = desactivado"),
+    PT("desmarcado = desativado"),
+    IT("deselezionato = disattivato"),
+    NL("niet aangevinkt = uit"),
+    RU("без флажка — выключено"),
+    TR("işaretsiz = kapalı"));
+
 SS_MSG(cfg_unchecked_is_auto,
     EN("unchecked = auto"),
     JA("チェックを外すと自動"),

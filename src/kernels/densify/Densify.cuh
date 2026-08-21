@@ -223,6 +223,15 @@ void add_splats_mcmc_tensor(
 );
 
 
+void splat_decay_tensor(
+    int64_t num_splats,
+    float opacity_decay,
+    float scale_decay,
+    DeviceVector<float> opacs,
+    DeviceVector<float3> log_scales
+);
+
+
 void mcmc_add_noise_tensor(
     int64_t num_splats,
     float scaler,

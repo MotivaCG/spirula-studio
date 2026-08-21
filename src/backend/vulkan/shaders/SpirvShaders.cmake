@@ -41,6 +41,11 @@ function(ss_setup_spirv shared_dir vk_dir slangc spirv_dir embed_cpp debug)
 
     # Discover every blob (name / source / entry / defines / include-closure).
     file(GLOB slang_sources CONFIGURE_DEPENDS ${vk_dir}/*.slang)
+    # GLOB's CONFIGURE_DEPENDS watches the file LIST; the manifest depends on
+    # the entry points INSIDE them. Without this, an entry point added to an
+    # existing shader fails only at dispatch, with no blob of that name.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                 ${slang_sources})
     execute_process(
         COMMAND ${tool_exe} discover ${incdirs} ${slang_sources}
         OUTPUT_VARIABLE manifest

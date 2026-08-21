@@ -160,6 +160,37 @@ void densify_clip_scale(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
 }
 
 // ---------------------------------------------------------------------------
+// Splat decay (mirrors splat_decay_3dgs_kernel; see kernels/densify)
+// ---------------------------------------------------------------------------
+
+struct DensifyDecayParams {  // 32 bytes: pushed directly
+    float* logit_opacs;  // [N] updated in place
+    float* log_scales;   // [N, 3] updated in place
+    float opacity_decay;
+    float scale_decay;
+    uint num_splats;
+    uint wgs_per_row;
+};
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void densify_splat_decay(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
+                         uniform DensifyDecayParams p) {
+    uint idx = (wg.y * p.wgs_per_row + wg.x) * 256 + tid;
+    if (idx >= p.num_splats) return;
+    if (p.opacity_decay > 0.0f) {
+        float opac = 1.0f / (1.0f + exp(-p.logit_opacs[idx])) - p.opacity_decay;
+        opac = clamp(opac, 1e-12f, 1.0f - 1e-12f);
+        p.logit_opacs[idx] = log(opac / (1.0f - opac));
+    }
+    if (p.scale_decay > 0.0f) {
+        float shrink = log(max(1.0f - p.scale_decay, 1e-12f));
+        for (int d = 0; d < 3; d++)
+            p.log_scales[3 * idx + d] = p.log_scales[3 * idx + d] + shrink;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MCMC / revised noise (canonical device code from ../densify.slang)
 // ---------------------------------------------------------------------------
 

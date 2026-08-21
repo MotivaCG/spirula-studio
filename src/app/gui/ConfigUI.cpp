@@ -213,22 +213,43 @@ bool draw_value(const char*, std::optional<bool>& v, const char*) {
     return changed;
 }
 
+// Unset derives a value for most optional fields but switches others off --
+// a different promise, so it reads differently. Listed per field here rather
+// than as another column on every row of the field table.
+bool unset_is_none(const char* key) {
+    return !std::strcmp(key, "opacity_decay") ||
+           !std::strcmp(key, "scale_decay");
+}
+
+// What ticking the box starts from. A rate whose useful range is thousandths
+// is unusable if the box hands you a zero and no hint of the magnitude.
+template <typename T>
+T optional_seed(const char* key) {
+    if constexpr (std::is_arithmetic_v<T>) {
+        if (!std::strcmp(key, "opacity_decay")) return (T)0.002;
+        if (!std::strcmp(key, "scale_decay")) return (T)0.002;
+    }
+    return T{};
+}
+
 template <typename T>
 bool draw_value(const char* key, std::optional<T>& v, const char* choices) {
     bool has = v.has_value();
     bool changed = false;
     if (ui::CheckboxRaw("##has", &has)) {
-        v = has ? std::optional<T>(T{}) : std::nullopt;
+        v = has ? std::optional<T>(optional_seed<T>(key)) : std::nullopt;
         changed = true;
     }
+    const bool none = unset_is_none(key);
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
-        ui::SetTooltip(msg::cfg_unchecked_is_auto);
+        ui::SetTooltip(none ? msg::cfg_unchecked_is_none
+                            : msg::cfg_unchecked_is_auto);
     ImGui::SameLine();
     if (v.has_value()) {
         T tmp = *v;
         if (draw_value(key, tmp, choices)) { v = tmp; changed = true; }
     } else {
-        ui::TextDisabled(msg::cfg_auto);
+        ui::TextDisabled(none ? msg::cfg_none : msg::cfg_auto);
     }
     return changed;
 }
