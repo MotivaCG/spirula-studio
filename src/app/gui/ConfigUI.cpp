@@ -221,7 +221,8 @@ bool unset_is_none(const char* key) {
     return !std::strcmp(key, "darkness_boost") ||
            !std::strcmp(key, "opacity_boost") ||
            !std::strcmp(key, "opacity_decay") ||
-           !std::strcmp(key, "scale_decay");
+           !std::strcmp(key, "scale_decay") ||
+           !std::strcmp(key, "sh_decay");
 }
 
 // What ticking the box starts from. A rate whose useful range is thousandths
@@ -233,6 +234,7 @@ T optional_seed(const char* key) {
         if (!std::strcmp(key, "opacity_boost")) return (T)1.5;
         if (!std::strcmp(key, "opacity_decay")) return (T)0.002;
         if (!std::strcmp(key, "scale_decay")) return (T)0.002;
+        if (!std::strcmp(key, "sh_decay")) return (T)0.04;
     }
     return T{};
 }

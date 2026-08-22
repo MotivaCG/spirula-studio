@@ -369,6 +369,10 @@ struct EngineBackground {
 
     // SH mode config
     int  sh_degree       = 0;            // 0..4
+    // The band this step evaluates, which sh_decay walks down. Seeded to
+    // sh_degree so a viewer or eval render that never sets step params
+    // behaves as it always did.
+    int  cur_sh_degree   = 0;
 
     // SH parameters: index 0 is DC (the "background_color"), 1..(deg+1)^2-1 are
     // higher-order SH bands. Stored once on device, persistent across steps.

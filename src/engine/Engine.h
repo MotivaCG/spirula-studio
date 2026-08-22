@@ -259,7 +259,8 @@ void engine_init_background_sh(
 // Training calls this each step; the viewer/eval path can ignore it and reuse
 // the last-stashed values (the engine defaults of 0/0 produce a uniform
 // half-gray noise blend, avoiding per-frame flicker in noise-mode viewer renders).
-void engine_set_background_step_params(uint32_t seed, float randomize_weight);
+void engine_set_background_step_params(uint32_t seed, float randomize_weight,
+                                       int sh_degree);
 
 // Adam step over the SH coefficient table. No-op for Noise mode or when SH
 // training was not enabled at init.

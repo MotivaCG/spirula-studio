@@ -95,6 +95,7 @@ inline int train_tier_rank(const char* tier) {
     /* ==== smn -- SMN pipeline options ==== */                              \
     X(std::optional<float>, darkness_boost, std::nullopt, "smn", "basic", "")\
     X(std::optional<float>, opacity_boost, std::nullopt, "smn", "basic", "") \
+    X(std::optional<float>, sh_decay, std::nullopt, "smn", "basic", "")      \
                                                                              \
     /* ==== run -- run control: where output goes, how long, checkpoints, viewer ==== */ \
     X(std::string, data, {}, "run", "basic", "")                             \

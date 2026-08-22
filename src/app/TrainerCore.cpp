@@ -444,6 +444,16 @@ EngineStepConfig build_step_config(const TrainConfig& c, const RunState& st, int
     } else if (c.background_mode == "sh") {
         cfg.background.lr_dc = scheduled_lr(step, max_steps_lr, c.background_dc_lr);
         cfg.background.lr_sh = scheduled_lr(step, max_steps_lr, c.background_sh_lr);
+        // One band less per that fraction of the run, down to a flat DC sky
+        // and no further: taking the background away entirely hands the loss
+        // back to densification, which answers it with geometry.
+        cfg.background.sh_degree = c.background_sh_degree;
+        if (c.sh_decay && *c.sh_decay > 0.0f) {
+            float progress = (float)step / (float)std::max(c.num_iterations, 1);
+            int dropped = (int)(progress / *c.sh_decay);
+            cfg.background.sh_degree =
+                std::max(0, c.background_sh_degree - dropped);
+        }
     }
     cfg.background.seed = (uint32_t)(step & 0x7FFFFFFF);
 

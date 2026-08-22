@@ -51,6 +51,7 @@ void engine_init_background_sh(int sh_degree,
     bg.mode           = EngineBackground::Mode::Sh;
     bg.enabled        = true;
     bg.sh_degree      = sh_degree;
+    bg.cur_sh_degree  = sh_degree;
     bg.splat_color_is_linear = splat_color_is_linear;
 
     // Layout: slot 0 = DC color, slots 1..(sh_degree+1)^2-1 = higher SH bands.
@@ -122,10 +123,12 @@ static BgShViews _engine_bg_sh_views(int C_batch) {
 // step; the viewer/eval path can ignore it (defaults of 0 give a uniform-gray
 // noise blend, which avoids per-frame flicker in noise-mode viewer renders).
 // ============================================================================
-void engine_set_background_step_params(uint32_t seed, float randomize_weight) {
+void engine_set_background_step_params(uint32_t seed, float randomize_weight,
+                                       int sh_degree) {
     auto& bg = engine().background;
     bg.cur_seed             = seed;
     bg.cur_randomize_weight = randomize_weight;
+    if (sh_degree >= 0) bg.cur_sh_degree = sh_degree;
 }
 
 
@@ -175,7 +178,7 @@ void _engine_background_forward() {
     BgShViews vs = _engine_bg_sh_views(C_batch);
     render_background_sh_forward(
         W, H, engine().camera.model_str,
-        engine().camera.distortion_str, bg.sh_degree,
+        engine().camera.distortion_str, bg.cur_sh_degree,
         vs.viewmats, vs.intrins, vs.dist_coeffs,
         vs.sh_coeffs, bg_image_tv);
 
@@ -270,7 +273,7 @@ void _engine_background_backward_hook(
 
         render_background_sh_backward(
             W, H, engine().camera.model_str,
-        engine().camera.distortion_str, bg.sh_degree,
+        engine().camera.distortion_str, bg.cur_sh_degree,
             vs.viewmats, vs.intrins, vs.dist_coeffs,
             vs.sh_coeffs,
             bg_image_tv, v_bg_tv2,

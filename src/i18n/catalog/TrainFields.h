@@ -93,6 +93,113 @@ SS_MSG(darkness_boost_help,
        "ortalama yeniden normalleştirilir ve kaybın ölçeği korunur. "
        "Ayarlanmazsa veya 0 ise kapalıdır."));
 
+SS_MSG(sh_decay,
+    EN("Skybox fade"),
+    JA("スカイボックスの減衰"),
+    ZH_HANS("天空盒衰减"),
+    ZH_HANT("天空盒衰減"),
+    KO("스카이박스 감쇠"),
+    DE("Skybox-Abbau"),
+    FR("Extinction de la skybox"),
+    ES("Desvanecido del cielo"),
+    PT("Desvanecimento do céu"),
+    IT("Dissolvenza dello sfondo"),
+    NL("Skybox-afbouw"),
+    RU("Затухание неба"),
+    TR("Gökyüzü sönümü"));
+SS_MSG(sh_decay_help,
+    EN("Only with background_mode sh. Flatten the skybox by one band for "
+       "every this much of the run -- at 0.04 degree 4 lasts until a "
+       "twenty-fifth is done, then 3, and so on -- stopping at a single "
+       "flat colour. Detail the skybox holds is missing from the exported "
+       "splats, since they never carry it, and shows up as a fringe around "
+       "the subject; flattening it early leaves less to go missing. It "
+       "also gets cheaper with every band dropped."),
+    JA("background_mode が sh のときだけ効き"
+       "ます。学習がこの割合だけ進むごとにスカイボックスの次数を"
+       " 1 つ下げて平らにしていき（0.04 なら 25 分の"
+       " 1 まで 4 次、次に 3 次…）、単色になったところ"
+       "で止まります。スカイボックスが抱えた細部は書き出すスプラ"
+       "ットには入らないので、その分が欠けて被写体のふちに縁取り"
+       "として出ます。早めに平らにするほど欠ける分が減ります。次"
+       "数が下がるたびに計算も軽くなります。"),
+    ZH_HANS("只在 background_mode 为 sh 时有效。"
+            "训练每推进这么多，天空盒就压平一阶（0.04 表示前二十"
+            "五分之一用 4 阶，然后 3 阶，依此类推），直到只剩一"
+            "个纯色为止。天空盒里的细节不会进入导出的泼溅，因此那部分"
+            "是缺的，会在主体边缘显示成一圈镶边；越早压平，缺的越少。"
+            "而且每降一阶都更便宜。"),
+    ZH_HANT("只在 background_mode 為 sh 時有效。"
+            "訓練每推進這麼多，天空盒就壓平一階（0.04 表示前二十"
+            "五分之一用 4 階，然後 3 階，依此類推），直到只剩一"
+            "個純色為止。天空盒裡的細節不會進入匯出的潑濺，因此那部分"
+            "是缺的，會在主體邊緣顯示成一圈鑲邊；越早壓平，缺的越少。"
+            "而且每降一階都更便宜。"),
+    KO("background_mode가 sh일 때만 동작합니"
+       "다. 학습이 이만큼 진행될 때마다 스카이박스를 한 "
+       "차수씩 평평하게 만들고(0.04면 25분의 1까지 "
+       "4차, 다음 3차, 이런 식으로) 단색 하나가 되면"
+       " 멈춥니다. 스카이박스가 담은 디테일은 내보내는 스"
+       "플랫에 들어가지 않으므로 그만큼이 빠져 피사체 가장"
+       "자리에 테두리로 나타납니다. 일찍 평평하게 할수록 "
+       "빠지는 몫이 줄어듭니다. 차수를 내릴 때마다 계산도"
+       " 싸집니다."),
+    DE("Nur bei background_mode sh. Glättet die Skybox um ein Band je "
+       "diesen Anteil des Laufs -- bei 0.04 hält Grad 4 bis ein "
+       "Fünfundzwanzigstel vorbei ist, dann 3 und so weiter -- und hört "
+       "bei einer einzigen flachen Farbe auf. Was die Skybox an Detail "
+       "hält, fehlt in den exportierten Splats, die es nie tragen, und "
+       "zeigt sich als Saum um das Motiv; früh geglättet fehlt weniger. "
+       "Mit jedem Band wird sie zudem billiger."),
+    FR("Seulement avec background_mode sh. Aplatit la skybox d'un degré à "
+       "chaque fraction de l'entraînement -- à 0.04 le degré 4 tient "
+       "jusqu'au vingt-cinquième, puis 3, et ainsi de suite -- en "
+       "s'arrêtant sur une seule couleur unie. Le détail que porte la "
+       "skybox manque dans les splats exportés, qui ne l'emportent jamais, "
+       "et apparaît en liseré autour du sujet ; l'aplatir tôt laisse moins "
+       "de manque. Elle devient aussi moins chère à chaque degré."),
+    ES("Sólo con background_mode sh. Aplana el cielo un grado cada vez que "
+       "pasa esta fracción del entrenamiento -- con 0.04 el grado 4 dura "
+       "hasta la veinticincoava parte, luego 3, y así -- y se detiene en "
+       "un color plano. El detalle que guarda el cielo falta en los splats "
+       "exportados, que nunca lo llevan, y aparece como una orla alrededor "
+       "del sujeto; aplanarlo pronto deja menos por faltar. Además se "
+       "abarata con cada grado que baja."),
+    PT("Só com background_mode sh. Achata o céu um grau a cada fração do "
+       "treinamento -- com 0.04 o grau 4 dura até um vinte e cinco avos, "
+       "depois 3, e assim por diante -- parando numa cor lisa. O detalhe "
+       "que o céu guarda falta nos splats exportados, que nunca o levam, e "
+       "aparece como uma orla em volta do sujeito; achatá-lo cedo deixa "
+       "menos por faltar. E fica mais barato a cada grau que desce."),
+    IT("Solo con background_mode sh. Appiattisce lo sfondo di un grado "
+       "ogni volta che passa questa frazione dell'addestramento -- con "
+       "0.04 il grado 4 dura fino a un venticinquesimo, poi 3, e così via "
+       "-- fermandosi a un colore piatto. Il dettaglio che lo sfondo "
+       "trattiene manca negli splat esportati, che non lo portano mai, e "
+       "appare come un bordo attorno al soggetto; appiattirlo presto "
+       "lascia meno da mancare. E costa meno a ogni grado."),
+    NL("Alleen bij background_mode sh. Vlakt de skybox met één band af per "
+       "dit deel van de training -- bij 0.04 houdt graad 4 het tot een "
+       "vijfentwintigste, dan 3, enzovoort -- en stopt bij één egale "
+       "kleur. Het detail dat de skybox vasthoudt ontbreekt in de "
+       "geëxporteerde splats, die het nooit dragen, en verschijnt als een "
+       "randje om het onderwerp; vroeg afvlakken laat minder ontbreken. "
+       "Hij wordt ook goedkoper met elke band."),
+    RU("Только при background_mode sh. Уплощает небо на один порядок за "
+       "каждую такую долю обучения — при 0.04 порядок 4 держится до одной "
+       "двадцать пятой, потом 3, и так далее — и останавливается на одном "
+       "ровном цвете. Детали, которые держит небо, отсутствуют в "
+       "экспортируемых сплатах, они их не несут, и проступают каймой "
+       "вокруг объекта; чем раньше уплощено, тем меньше пропадает. С "
+       "каждым порядком оно ещё и дешевеет."),
+    TR("Yalnızca background_mode sh ile. Eğitimin bu kadarı geçtikçe "
+       "gökyüzünü bir derece düzleştirir -- 0.04'te derece 4 yirmi beşte "
+       "bire kadar sürer, sonra 3, böyle devam eder -- ve tek bir düz "
+       "renkte durur. Gökyüzünün tuttuğu ayrıntı dışa aktarılan "
+       "splat'larda yoktur, onlar bunu hiç taşımaz; öznenin çevresinde bir "
+       "kenar olarak görünür. Erken düzleştirmek eksik kalanı azaltır. Her "
+       "derecede biraz daha ucuzlar."));
+
 SS_MSG(opacity_boost,
     EN("Opacity boost"), JA("不透明度ブースト"),
     ZH_HANS("不透明度提升"), ZH_HANT("不透明度提升"), KO("불투명도 부스트"),

@@ -246,6 +246,9 @@ struct BackgroundStepConfig {
     float    lr_sh           = 0.0f;
     float    randomize_weight = 0.0f;
     uint32_t seed             = 0;
+    // Sh mode only: the band this step evaluates, which sh_decay walks down.
+    // Negative keeps whatever the run was initialised with.
+    int      sh_degree        = -1;
 };
 
 
