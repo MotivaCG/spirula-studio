@@ -109,7 +109,7 @@ int main(int argc, char** argv) {
                              bg_sh.data(), bg_sh.size() * sizeof(float),
                              MemcpyKind::HostToDevice);
     }
-    engine_set_background_step_params(4321u, 0.6f);
+    engine_set_background_step_params(4321u, 0.6f, /*sh_degree=*/-1);
 
     // --- color space: mildly non-identity splat matrix (sRGB working) ---
     engine_init_color_space(
