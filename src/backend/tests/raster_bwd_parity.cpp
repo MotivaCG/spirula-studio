@@ -62,7 +62,9 @@ int check_error() {
     return 0;
 }
 
-DeviceTensor2D<float4> vec_to_2d_float4(const DeviceVector<float4>& vec) {
+// static: the engine library these tools link defines the same helper
+// inline (engine/EngineCommon.h), and MSVC refuses the duplicate.
+static DeviceTensor2D<float4> vec_to_2d_float4(const DeviceVector<float4>& vec) {
     TorchTensorView tv{(uint64_t)vec.data_ptr(), (uint32_t)sizeof(float),
                        {vec.size(), 1LL, 4LL}};
     return DeviceTensor2D<float4>(tv);
@@ -246,7 +248,7 @@ int main(int argc, char** argv) {
             do_intersect_tile_generic(aabb_nd, depths_nd, proj_xy, proj_conic,
                                       proj_opac, C,
                                       ttv(d_intr, {(int64_t)C, 4}), W, H,
-                                      image_ids_ptr);
+                                      image_ids_ptr, /*tile_active=*/nullptr);
         backend::device_synchronize();
         if (check_error()) return 1;
 

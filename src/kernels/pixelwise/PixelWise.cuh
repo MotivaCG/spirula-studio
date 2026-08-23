@@ -130,9 +130,10 @@ void blend_background_forward(
 
 
 void blend_background_backward(
-    DeviceTensor3D<float3> rgb,              // [B, H, W, 3]
+    DeviceTensor3D<float3> rgb,              // [B, H, W, 3] PRE-blend
     DeviceTensor3D<float>  transmittance,    // [B, H, W, 1]
     DeviceTensor3D<float3> background,       // [B, H, W, 3]
+    float overexposure_weight,               // fused image-space reg, 0 = off
     DeviceTensor3D<float3> v_out_rgb,        // [B, H, W, 3]
     DeviceTensor3D<float3> v_rgb,            // [B, H, W, 3]
     DeviceTensor3D<float>  v_transmittance,  // [B, H, W, 1]
@@ -152,10 +153,11 @@ void blend_background_noise_forward(
 
 void blend_background_noise_backward(
     bool is_linear,
-    DeviceTensor3D<float3> rgb,              // [B, H, W, 3]
+    DeviceTensor3D<float3> rgb,              // [B, H, W, 3] PRE-blend
     DeviceTensor3D<float>  transmittance,    // [B, H, W, 1]
     float randomize_weight,
     uint32_t seed,
+    float overexposure_weight,               // fused image-space reg, 0 = off
     DeviceTensor3D<float3> v_out_rgb,        // [B, H, W, 3]
     DeviceTensor3D<float3> v_rgb,            // [B, H, W, 3]
     DeviceTensor3D<float>  v_transmittance   // [B, H, W, 1]
@@ -331,26 +333,6 @@ void undistort_image_tensor(
 );
 
 
-void warp_image_wide_to_pinhole_tensor(
-    std::string camera_model,
-    std::string distortion,
-    TorchTensorView intrins,            // [B, 4]
-    TorchTensorView dist_coeffs,        // [B, 8]
-    TorchTensorView wide_image,         // [B, H, W, C] (float)
-    TorchTensorView axes,               // [K, 3, 3]
-    int out_w, int out_h,
-    TorchTensorView pinhole_images      // [B, K, H, W, C] (float)
-);
-
-
-void warp_image_equirectangular_to_pinhole_tensor(
-    TorchTensorView equirectangular_image,  // [B, H, W, C] (float)
-    TorchTensorView axes,                   // [K, 3, 3]
-    int out_w, int out_h,
-    TorchTensorView pinhole_images          // [B, K, H, W, C] (float)
-);
-
-
 void launch_warp_byte_to_float_wide(
     std::string camera_model,
     std::string distortion,
@@ -361,13 +343,16 @@ void launch_warp_byte_to_float_wide(
     const void* d_byte, bool input_is_u16,
     int B, int Hin, int Win, int C,
     float* d_float_out, int K, int Hout, int Wout,
-    const float* d_axes);
+    const float* d_post_intrins,           // [B*K, 4]
+    const float* d_axes                    // [B*K, 3, 3]
+);
 
 
 void launch_warp_byte_to_float_equi(
     const void* d_byte, bool input_is_u16,
     int B, int Hin, int Win, int C,
     float* d_float_out, int K, int Hout, int Wout,
+    const float* d_post_intrins,
     const float* d_axes);
 
 
@@ -381,6 +366,7 @@ void launch_warp_mask_wide(
     const uint8_t* d_byte_mask,
     int B, int Hin, int Win,
     uint8_t* d_byte_out, int K, int Hout, int Wout,
+    const float* d_post_intrins,
     const float* d_axes);
 
 
@@ -388,6 +374,7 @@ void launch_warp_mask_equi(
     const uint8_t* d_byte_mask,
     int B, int Hin, int Win,
     uint8_t* d_byte_out, int K, int Hout, int Wout,
+    const float* d_post_intrins,
     const float* d_axes);
 
 
@@ -455,6 +442,7 @@ void launch_warp_depth_wide(
     int B, int Hin, int Win,
     int in_H, int in_W,
     float* d_float_out, int K, int Hout, int Wout,
+    const float* d_post_intrins,
     const float* d_axes, bool input_is_ray_depth);
 
 
@@ -462,6 +450,7 @@ void launch_warp_depth_equi(
     const void* d_depth, uint32_t elem_size,
     int B, int Hin, int Win,
     float* d_float_out, int K, int Hout, int Wout,
+    const float* d_post_intrins,
     const float* d_axes, bool input_is_ray_depth);
 
 
@@ -476,6 +465,7 @@ void launch_warp_normal_wide(
     int B, int Hin, int Win,
     int in_H, int in_W,
     float* d_float_out, int K, int Hout, int Wout,
+    const float* d_post_intrins,
     const float* d_axes);
 
 
@@ -483,67 +473,8 @@ void launch_warp_normal_equi(
     const void* d_normal, uint32_t elem_size,
     int B, int Hin, int Win,
     float* d_float_out, int K, int Hout, int Wout,
+    const float* d_post_intrins,
     const float* d_axes);
-
-
-void warp_image_pinhole_to_wide_tensor(
-    std::string camera_model,
-    std::string distortion,
-    TorchTensorView intrins,            // [B, 4]
-    TorchTensorView dist_coeffs,        // [B, 8]
-    TorchTensorView pinhole_images,     // [B, K, H, W, C]
-    TorchTensorView axes,               // [K, 3, 3]
-    int out_w, int out_h,
-    TorchTensorView wide_image          // [B, H, W, C]
-);
-
-
-void warp_linear_depth_pinhole_to_wide_tensor(
-    std::string camera_model,
-    std::string distortion,
-    TorchTensorView intrins,            // [B, 4]
-    TorchTensorView dist_coeffs,        // [B, 8]
-    TorchTensorView pinhole_images,     // [B, K, H, W, 1]
-    TorchTensorView axes,               // [K, 3, 3]
-    int out_w, int out_h,
-    TorchTensorView wide_image          // [B, H, W, 1]
-);
-
-
-void warp_ray_depth_pinhole_to_wide_tensor(
-    std::string camera_model,
-    std::string distortion,
-    TorchTensorView intrins,            // [B, 4]
-    TorchTensorView dist_coeffs,        // [B, 8]
-    TorchTensorView pinhole_images,     // [B, K, H, W, 1]
-    TorchTensorView axes,               // [K, 3, 3]
-    int out_w, int out_h,
-    TorchTensorView wide_image          // [B, H, W, 1]
-);
-
-
-void warp_points_pinhole_to_wide_tensor(
-    std::string camera_model,
-    std::string distortion,
-    TorchTensorView intrins,            // [B, 4]
-    TorchTensorView dist_coeffs,        // [B, 8]
-    TorchTensorView pinhole_images,     // [B, K, H, W, 3]
-    TorchTensorView axes,               // [K, 3, 3]
-    int out_w, int out_h,
-    TorchTensorView wide_image          // [B, H, W, 3]
-);
-
-
-void warp_depth_pinhole_to_wide_scale_matrix_tensor(
-    std::string camera_model,
-    std::string distortion,
-    TorchTensorView intrins,            // [B, 4]
-    TorchTensorView dist_coeffs,        // [B, 8]
-    TorchTensorView pinhole_images,     // [B, K, H, W, 1]
-    TorchTensorView axes,               // [K, 3, 3]
-    int out_w, int out_h,
-    TorchTensorView matrix              // [B, K, K] (must be pre-zeroed)
-);
 
 
 void ppisp_forward(

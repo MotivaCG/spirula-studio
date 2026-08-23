@@ -139,14 +139,13 @@ struct IndexGroup {
     int32_t              depth_h  = 0, depth_w  = 0;
     int32_t              normal_h = 0, normal_w = 0;
 
-    // Warp metadata (uniform per group since model is uniform). K = 1 / 5 / 6.
-    // `out_h` / `out_w` are the post-split sub-image resolution. `axes_dev`
-    // is a device pointer to the corresponding cubemap face table (nullptr
-    // when K == 1).
+    // Warp metadata, part of the group key: the split factor, the first
+    // pass's resolution (= the input's when K == 1) and the runs of equal
+    // face size the faces fall into.
     int32_t              K        = 1;
     int32_t              out_h    = 0;
     int32_t              out_w    = 0;
-    const float*         axes_dev = nullptr;
+    std::vector<WarpFacePass> passes;
 
     std::vector<int32_t> indices;       // dataset-global indices, shuffled
     size_t               cursor = 0;    // next index to emit
@@ -607,6 +606,9 @@ void DecodedBatch::build_views() {
         }
     }
 
+    if (!face_axes.empty())
+        face_axes_view = mk(face_axes.data(), 4, {B_post, 3LL, 3LL});
+
     // Image / modality views stay at INPUT shape. The engine warps on the
     // fly when K > 1; when K == 1, input == post by construction.
     int64_t H_in = input_height, W_in = input_width;
@@ -650,6 +652,9 @@ public:
         std::vector<float>       viewmats,        // post-split
         std::vector<float>       intrins,         // post-split
         std::vector<float>       dist_coeffs,     // post-split
+        std::vector<int32_t>     post_widths,     // post-split
+        std::vector<int32_t>     post_heights,
+        std::vector<float>       face_axes,
         std::vector<float>       input_intrins,   // per-input
         std::vector<float>       input_dist_coeffs,
         std::vector<int32_t>     redistort_models,
@@ -671,6 +676,13 @@ public:
     int64_t num_val()      const { return (int64_t)_val_indices.size(); }
     bool    has_val()      const { return !_val_indices.empty(); }
     CacheMode cache_mode() const { return _cfg.cache_mode; }
+
+    int max_face_passes() const {
+        int n = 1;
+        for (const auto& g : _train_groups) n = std::max(n, (int)g.passes.size());
+        for (const auto& g : _val_groups)   n = std::max(n, (int)g.passes.size());
+        return n;
+    }
 
     // Largest INPUT-image batch size (pre-split) for a single training step.
     // The engine's split_batch dispatcher carves a sub-batch per INPUT image
@@ -703,22 +715,16 @@ private:
     std::vector<int32_t>      _redistort_models;
     std::vector<float>        _redistort_params;
     // Per-input K and post-split offset. Length N. K[i] is the split factor
-    // for input camera i (1 / 5 / 6). post_offsets[i] is the starting index
-    // in _viewmats / _intrins / _dist_coeffs (which are now POST-split).
+    // for input camera i; post_offsets[i] is the starting index in the
+    // POST-split arrays (_viewmats / _intrins / _dist_coeffs / _face_axes).
     std::vector<int32_t>      _K_per_camera;
     std::vector<int32_t>      _post_offsets;
     int64_t                   _n_post = 0;     // total post-split cameras
-    // Device-resident cubemap axis tables. Populated lazily the first time
-    // a group needs them, then re-used for the manager's lifetime.
-    const float*              _axes_fisheye5_dev   = nullptr;  // [5, 3, 3]
-    const float*              _axes_equirect6_dev  = nullptr;  // [6, 3, 3]
     std::vector<std::string>  _image_filenames;
     std::vector<std::string>  _mask_filenames;
-    // Per-image synthetic-mask flag. Set for fisheye/equisolid inputs when
-    // warp_to_pinhole is on AND no real mask file is supplied. The
-    // probe/preload/disk-worker paths treat these slots as a 1x1 all-white
-    // mask, which the warp kernel projects into a proper post-split FOV
-    // mask (1 inside the lens, 0 outside).
+    // Per-image synthetic-mask flag: load_masks is on and no real mask file
+    // is supplied. The decode paths treat these slots as an all-white mask,
+    // which the warp kernel projects into a post-split FOV mask.
     std::vector<uint8_t>      _synth_white_mask;
     bool                      _has_synth_masks = false;
     std::vector<std::string>  _depth_filenames;
@@ -726,7 +732,10 @@ private:
     std::vector<int32_t>      _widths, _heights;
     std::vector<float>        _viewmats;     // [N_post,4,4] flat
     std::vector<float>        _intrins;      // [N_post,4]
-    std::vector<float>        _dist_coeffs;  // [N_post,10]
+    std::vector<float>        _dist_coeffs;  // [N_post,8]
+    std::vector<int32_t>      _post_widths;  // [N_post]; empty = input sizes
+    std::vector<int32_t>      _post_heights;
+    std::vector<float>        _face_axes;    // [N_post,3,3]; empty = identity
     // Per-INPUT intrins / dist_coeffs (length N each).  Empty when no
     // fisheye-warp camera is present.
     std::vector<float>        _input_intrins;
@@ -834,10 +843,6 @@ private:
 
     // ---- Setup helpers ---------------------------------------------------
     void probe_dtypes();
-    // Allocate + H2D the two cubemap axis tables (5-face for fisheye warp,
-    // 6-face for equirectangular split). Only the ones actually needed by
-    // the dataset's camera models get uploaded.
-    void upload_cubemap_axes();
     // Build (W,H)-keyed groups, enforcing per-modality uniformity WITHIN
     // each group (allowing 1x1 broadcast for mask). Throws on intra-group
     // shape mismatch. Inter-group differences are fine.
@@ -906,6 +911,9 @@ DataManagerImpl::DataManagerImpl(
     std::vector<float>         viewmats,
     std::vector<float>         intrins,
     std::vector<float>         dist_coeffs,
+    std::vector<int32_t>       post_widths,
+    std::vector<int32_t>       post_heights,
+    std::vector<float>         face_axes,
     std::vector<float>         input_intrins,
     std::vector<float>         input_dist_coeffs,
     std::vector<int32_t>       redistort_models,
@@ -927,6 +935,9 @@ DataManagerImpl::DataManagerImpl(
       _viewmats(std::move(viewmats)),
       _intrins(std::move(intrins)),
       _dist_coeffs(std::move(dist_coeffs)),
+      _post_widths(std::move(post_widths)),
+      _post_heights(std::move(post_heights)),
+      _face_axes(std::move(face_axes)),
       _input_intrins(std::move(input_intrins)),
       _input_dist_coeffs(std::move(input_dist_coeffs)),
       _train_indices(std::move(train_indices)),
@@ -969,8 +980,19 @@ DataManagerImpl::DataManagerImpl(
          (int64_t)_input_dist_coeffs.size() != N * kCameraDistortionParams)) {
         throw std::runtime_error(
             "DataManager: input_intrins / input_dist_coeffs length mismatch "
-            "(expected length 4*N / 10*N respectively, or both empty)");
+            "(expected length 4*N / 8*N respectively, or both empty)");
     }
+    if (!_post_widths.empty() &&
+        ((int64_t)_post_widths.size() != n_post ||
+         (int64_t)_post_heights.size() != n_post ||
+         (int64_t)_face_axes.size() != n_post * 9))
+        throw std::runtime_error(
+            "DataManager: post_widths / post_heights / face_axes length "
+            "mismatch (expected N_post, N_post and 9*N_post, or all empty)");
+    for (int64_t i = 0; i < N; ++i)
+        if (_K_per_camera[i] > 1 && _post_widths.empty())
+            throw std::runtime_error(
+                "DataManager: a split camera needs post_widths / post_heights / face_axes");
     if (!_mask_filenames.empty()   && (int64_t)_mask_filenames.size()   != N)
         throw std::runtime_error("DataManager: mask_filenames length mismatch");
 
@@ -1019,7 +1041,6 @@ DataManagerImpl::DataManagerImpl(
     _rng.seed(seed);
 
     probe_dtypes();
-    upload_cubemap_axes();
 
     _train_groups = build_index_groups_member(_train_indices);
     _val_groups   = build_index_groups_member(_val_indices);
@@ -1109,46 +1130,6 @@ void DataManagerImpl::probe_dtypes() {
 }
 
 
-// Cubemap axis tables: 5 faces for fisheye, 6 for equirectangular. Each face
-// is a 3x3 row-major rotation laid out as 9 contiguous floats. MUST match
-// DatasetCommon.cpp's kAxes5 / kAxes6, which drive the camera poses.
-static const float kAxesFisheye5[5 * 9] = {
-    1, 0, 0,  0, 1, 0,  0, 0, 1,
-    0, 1, 0,  0, 0, 1,  1, 0, 0,
-   -1, 0, 0,  0, 0, 1,  0, 1, 0,
-    0,-1, 0,  0, 0, 1, -1, 0, 0,
-    1, 0, 0,  0, 0, 1,  0,-1, 0,
-};
-static const float kAxesEquirect6[6 * 9] = {
-    1, 0, 0,  0, 1, 0,  0, 0, 1,
-    0, 0,-1,  0, 1, 0,  1, 0, 0,
-   -1, 0, 0,  0, 0, 1,  0, 1, 0,
-    0,-1, 0,  0, 0, 1, -1, 0, 0,
-    1, 0, 0,  0, 0, 1,  0,-1, 0,
-    1, 0, 0,  0,-1, 0,  0, 0,-1,
-};
-
-void DataManagerImpl::upload_cubemap_axes() {
-    bool need_fisheye5 = false, need_equirect6 = false;
-    for (int32_t cm : _camera_models) {
-        CameraModelType m = (CameraModelType)cm;
-        if (m == CameraModelType::EQUIRECTANGULAR) need_equirect6 = true;
-        if (_cfg.warp_to_pinhole &&
-            (m == CameraModelType::FISHEYE || m == CameraModelType::EQUISOLID))
-            need_fisheye5 = true;
-    }
-    if (need_fisheye5) {
-        float* p = DevicePool::global().acquire<float>(PoolSlot::DmAxesFisheye5, 5 * 9);
-        backend::memcpy_sync(p, kAxesFisheye5, sizeof(kAxesFisheye5), backend::MemcpyKind::HostToDevice);
-        _axes_fisheye5_dev = p;
-    }
-    if (need_equirect6) {
-        float* p = DevicePool::global().acquire<float>(PoolSlot::DmAxesEquirect6, 6 * 9);
-        backend::memcpy_sync(p, kAxesEquirect6, sizeof(kAxesEquirect6), backend::MemcpyKind::HostToDevice);
-        _axes_equirect6_dev = p;
-    }
-}
-
 
 // Build per-image-shape groups (homogeneous (RGB W, H)) and pick each
 // group's modality shape as the LARGEST (by area) on-disk shape across
@@ -1158,10 +1139,11 @@ void DataManagerImpl::upload_cubemap_axes() {
 std::vector<IndexGroup> DataManagerImpl::build_index_groups_member(
     const std::vector<int32_t>& flat_indices) const
 {
-    // Group key: (W, H, camera_model). std::map handles tuple keys natively,
-    // and group build happens once at construction, so we don't need an
-    // unordered_map's hash machinery here.
-    std::map<std::tuple<int32_t, int32_t, int32_t, int32_t, int32_t>,
+    // Group key: (W, H, model, tier, redistort, K, out_W, out_H, size run).
+    // std::map handles tuple keys natively, and group build happens once at
+    // construction, so we don't need an unordered_map's hash machinery here.
+    std::map<std::tuple<int32_t, int32_t, int32_t, int32_t, int32_t,
+                        int32_t, int32_t, int32_t, int32_t>,
              IndexGroup> by_shape;
 
     // Track first per-modality mismatch for a one-shot warning. Mutable so
@@ -1171,9 +1153,20 @@ std::vector<IndexGroup> DataManagerImpl::build_index_groups_member(
     for (int32_t i : flat_indices) {
         const bool redistort_i =
             !_redistort_models.empty() && _redistort_models[i] >= 0;
+        const int32_t K_i = _K_per_camera[i];
+        const int32_t out_w = K_i > 1 ? _post_widths[_post_offsets[i]]  : _widths[i];
+        const int32_t out_h = K_i > 1 ? _post_heights[_post_offsets[i]] : _heights[i];
+        // The whole size sequence keys the group, not just the first face:
+        // per-image intrinsics give two cameras of one shape different crops,
+        // and a batch renders its faces run by run.
+        int32_t sig = 0;
+        for (int k = 0; K_i > 1 && k < K_i; ++k) {
+            const int64_t o = _post_offsets[i] + k;
+            sig = sig * 31 + _post_widths[o] * 7919 + _post_heights[o];
+        }
         auto key = std::make_tuple(_widths[i], _heights[i], _camera_models[i],
                                    _camera_distortions[i],
-                                   (int32_t)redistort_i);
+                                   (int32_t)redistort_i, K_i, out_w, out_h, sig);
         auto& g = by_shape[key];
         if (g.indices.empty()) {
             g.width  = _widths[i];
@@ -1181,23 +1174,19 @@ std::vector<IndexGroup> DataManagerImpl::build_index_groups_member(
             g.model  = (CameraModelType)_camera_models[i];
             g.distortion = (CameraDistortionType)_camera_distortions[i];
             g.redistort  = redistort_i;
-            g.K      = _K_per_camera[i];
-            // Pick the cubemap axes corresponding to this group's split factor.
-            if (g.K == 5) g.axes_dev = _axes_fisheye5_dev;
-            else if (g.K == 6) g.axes_dev = _axes_equirect6_dev;
-            else g.axes_dev = nullptr;
-            // Post-split sub-image size: out_shape = ceil(sqrt(H * W / K)).
-            if (g.K > 1) {
-                int s = (int)std::ceil(std::sqrt((double)g.height * g.width / (double)g.K));
-                g.out_h = g.out_w = s;
-            } else {
-                g.out_h = g.height; g.out_w = g.width;
+            g.K      = K_i;
+            g.out_w  = out_w;
+            g.out_h  = out_h;
+            for (int32_t k = 0; k < K_i; ++k) {
+                const int64_t o = _post_offsets[i] + k;
+                const int32_t w = K_i > 1 ? _post_widths[o]  : out_w;
+                const int32_t h = K_i > 1 ? _post_heights[o] : out_h;
+                if (!g.passes.empty() && g.passes.back().width == w &&
+                    g.passes.back().height == h)
+                    g.passes.back().k1 = k + 1;
+                else
+                    g.passes.push_back(WarpFacePass{k, k + 1, w, h});
             }
-        }
-        if (_K_per_camera[i] != g.K) {
-            // (W, H, model) key already implies same K, but assert anyway in
-            // case the caller's K_per_camera was inconsistent.
-            throw std::runtime_error("DataManager: inconsistent K within an index group");
         }
 
         // Take the max-area shape across the group. We compare by area so
@@ -1414,9 +1403,11 @@ void DataManagerImpl::allocate_batch(
     b.K            = K;
     b.input_model  = g.model;
     b.input_distortion = g.distortion;
-    b.axes_dev     = g.axes_dev;
+    b.face_passes  = g.passes;
 
     b.viewmats.assign((size_t)B_post * 16, 0.0f);
+    if (K > 1) b.face_axes.assign((size_t)B_post * 9, 0.0f);
+    else       b.face_axes.clear();
     b.intrins.assign((size_t)B_post * 4, 0.0f);
     b.dist_coeffs.assign((size_t)B_post * kCameraDistortionParams, 0.0f);
 
@@ -1501,6 +1492,10 @@ void DataManagerImpl::fill_camera_params(DecodedBatch& b) {
         std::memcpy(&b.dist_coeffs[(size_t)j * K * kCameraDistortionParams],
                     &_dist_coeffs[(size_t)off * kCameraDistortionParams],
                     (size_t)K * kCameraDistortionParams * sizeof(float));
+        if (!b.face_axes.empty())
+            std::memcpy(&b.face_axes[(size_t)j * K * 9],
+                        &_face_axes[(size_t)off * 9],
+                        (size_t)K * 9 * sizeof(float));
         if (have_in) {
             std::memcpy(&b.input_intrins[(size_t)j * 4],
                         &_input_intrins[(size_t)i_in * 4],
@@ -2207,6 +2202,9 @@ DataManager::DataManager(
     std::vector<float>         viewmats,
     std::vector<float>         intrins,
     std::vector<float>         dist_coeffs,
+    std::vector<int32_t>       post_widths,
+    std::vector<int32_t>       post_heights,
+    std::vector<float>         face_axes,
     std::vector<float>         input_intrins,
     std::vector<float>         input_dist_coeffs,
     std::vector<int32_t>       redistort_models,
@@ -2222,6 +2220,7 @@ DataManager::DataManager(
         std::move(widths), std::move(heights),
         std::move(K_per_camera), std::move(post_offsets),
         std::move(viewmats), std::move(intrins), std::move(dist_coeffs),
+        std::move(post_widths), std::move(post_heights), std::move(face_axes),
         std::move(input_intrins), std::move(input_dist_coeffs),
         std::move(redistort_models), std::move(redistort_params),
         std::move(train_indices), std::move(val_indices));
@@ -2243,3 +2242,4 @@ bool      DataManager::has_masks()      const              { return _impl->has_m
 bool      DataManager::has_depths()     const              { return _impl->has_depths(); }
 bool      DataManager::has_normals()    const              { return _impl->has_normals(); }
 int64_t   DataManager::max_input_batch_size() const         { return _impl->max_input_batch_size(); }
+int       DataManager::max_face_passes() const              { return _impl->max_face_passes(); }

@@ -10,6 +10,7 @@
 #include "i18n/catalog/Log.h"
 #include "data/CameraMath.h"
 #include "data/Knn.h"
+#include "sfm/core/Exif.h"
 
 #ifndef _WIN32
 #include <ftw.h>
@@ -95,6 +96,12 @@ ColorResolution resolve_color(const TrainConfig& c) {
     }
     r.convert_seed = convert.value_or(false);
     return r;
+}
+
+static WarpFaceFit resolve_face_fit(const TrainConfig& c) {
+    if (c.warp_face_fit == "uniform")  return WarpFaceFit::Uniform;
+    if (c.warp_face_fit == "per-face") return WarpFaceFit::PerFace;
+    throw std::runtime_error("unknown warp_face_fit: " + c.warp_face_fit);
 }
 
 // What `depths/` measures when the flag does not say. `spirula geometry`
@@ -600,7 +607,8 @@ void TrainerSession::load_dataset() {
 
     // POST-split camera bake (identity when no warp flag applies).
     post = bake_post_split(
-        ds, cfg.warp_to_pinhole, cfg.warp_spherical_to_pinhole);
+        ds, cfg.warp_to_pinhole, cfg.warp_spherical_to_pinhole,
+        resolve_face_fit(cfg));
 
     // Warp-path guards, plus: a modality no weight reads is not loaded at all.
     has_mask   = !ds.mask_filenames.empty()   && cfg.load_masks;
@@ -669,6 +677,44 @@ static void check_cuda_runtime() {
         throw std::runtime_error("No CUDA-capable GPU detected.");
 }
 #endif  // SS_BACKEND_VULKAN
+
+// PPISP exposure seeds: mean-relative EXIF EV x 0.5 per POST-split slot; empty
+// when no image has the tags. The 0.5: PPISP multiplies the sRGB-encoded
+// render, where a bracketed +1 EV measures x2^0.49 (0.34-0.76 by tone curve).
+static std::vector<float> exif_exposure_evs(const ParsedDataset& ds,
+                                            const PostSplitCameras& post,
+                                            int& n_found) {
+    int64_t n = ds.num_cameras;
+    std::vector<double> ev(n, 0.0);
+    std::vector<char> has(n, 0);
+    double sum = 0.0;
+    n_found = 0;
+    for (int64_t i = 0; i < n; i++) {
+        double v;
+        if (sfm::exifExposureEv(sfm::readExif(ds.image_filenames[i]), v)) {
+            ev[i] = v;
+            has[i] = 1;
+            sum += v;
+            // sum += std::exp2(v);
+            n_found++;
+        }
+    }
+    if (n_found == 0) return {};
+    double mean = sum / n_found;
+    // double mean = std::log2(sum / n_found);
+    std::vector<float> out((size_t)post.n_post, 0.0f);
+    for (int64_t i = 0; i < n; i++) {
+        if (!has[i]) continue;
+        float v = 0.5f * (float)(ev[i] - mean);
+        if (post.K_per_camera.empty()) {
+            out[i] = v;
+        } else {
+            for (int k = 0; k < post.K_per_camera[i]; k++)
+                out[post.post_offsets[i] + k] = v;
+        }
+    }
+    return out;
+}
 
 void TrainerSession::setup_engine() {
 #ifndef SS_BACKEND_VULKAN
@@ -741,16 +787,15 @@ void TrainerSession::setup_engine() {
 
     DataManagerConfig dm;
     dm.cache_mode  = (cfg.cache_images == "disk") ? CacheMode::DISK : CacheMode::CPU;
-    // A fisheye warp needs a mask even when none is on disk: the synthesized
-    // all-white one becomes the post-split FOV mask (0 outside the lens
-    // circle), without which the unseen face regions train as black.
-    dm.load_masks  = has_mask || post.any_fisheye_warp;
+    // A split needs a mask even when none is on disk: the synthesized
+    // all-white one becomes the post-split FOV mask (0 past the lens),
+    // without which the unseen face regions train as black.
+    dm.load_masks  = has_mask || post.any_fov_mask;
     dm.load_depths      = has_depth;
     dm.load_normals     = has_normal;
     dm.train_batch_size = train_bs;
     dm.val_batch_size   = val_bs;
     dm.mask_boundary_offset = cfg.mask_boundary_offset;
-    dm.warp_to_pinhole  = cfg.warp_to_pinhole;
     engine_setup_data_manager(
         dm, ds.camera_models, ds.camera_distortions,
         ds.image_filenames,
@@ -761,6 +806,9 @@ void TrainerSession::setup_engine() {
         post.any_warp ? post.K_per_camera : std::vector<int32_t>{},
         post.any_warp ? post.post_offsets : std::vector<int32_t>{},
         post.viewmats, post.intrins, post.dist_coeffs,
+        post.any_warp ? post.post_widths : std::vector<int32_t>{},
+        post.any_warp ? post.post_heights : std::vector<int32_t>{},
+        post.any_warp ? post.face_axes : std::vector<float>{},
         post.input_intrins, post.input_dist_coeffs,
         post.redistort_models, post.redistort_params,
         ds.train_indices, ds.val_indices);
@@ -821,7 +869,16 @@ void TrainerSession::setup_engine() {
     }
     if (cfg.use_ppisp &&
         (cfg.use_adagrad_ppisp_optim ? cfg.ppisp_adagrad_lr : cfg.ppisp_lr) > 0.0f) {
-        engine_init_ppisp(n_grids, cfg.ppisp_param_type, cfg.use_adagrad_ppisp_optim);
+        std::vector<float> exif_ev;
+        if (cfg.ppisp_exposure_from_exif) {
+            int n_exif = 0;
+            exif_ev = exif_exposure_evs(ds, post, n_exif);
+            if (n_exif > 0)
+                log(lfmt(lmsg::ppisp_exif_exposure,
+                         {(long long)n_exif, (long long)ds.num_cameras}));
+        }
+        engine_init_ppisp(n_grids, cfg.ppisp_param_type,
+                          cfg.use_adagrad_ppisp_optim, exif_ev);
         st.ppisp_init = true;
     }
 
@@ -1173,21 +1230,23 @@ void TrainerSession::eval() {
         for (int64_t i = 0; i < eds.num_cameras; i++)
             for (int r = 0; r < 3; r++) eds.c2w[i*12 + r*4 + 3] *= rs;
     }
+    // Uniform whatever the run trains with: eval renders one pass per image,
+    // and its metrics stay comparable between the two fits.
     PostSplitCameras epost = bake_post_split(
-        eds, cfg.warp_to_pinhole, cfg.warp_spherical_to_pinhole);
+        eds, cfg.warp_to_pinhole, cfg.warp_spherical_to_pinhole,
+        WarpFaceFit::Uniform);
 
     // One image per step: metrics are per-image, and the batch scheduler would
     // otherwise pack several resolutions into one step.
     DataManagerConfig dm;
     dm.cache_mode  = (cfg.cache_images == "disk") ? CacheMode::DISK : CacheMode::CPU;
     const bool eval_masks = !eds.mask_filenames.empty() && cfg.load_masks;
-    dm.load_masks  = eval_masks || epost.any_fisheye_warp;
+    dm.load_masks  = eval_masks || epost.any_fov_mask;
     dm.load_depths = false;
     dm.load_normals = false;
     dm.train_batch_size = 1;
     dm.val_batch_size   = 1;
     dm.mask_boundary_offset = cfg.mask_boundary_offset;
-    dm.warp_to_pinhole  = cfg.warp_to_pinhole;
     std::vector<int32_t> all_idx((size_t)eds.num_cameras);
     std::iota(all_idx.begin(), all_idx.end(), 0);
 
@@ -1201,6 +1260,9 @@ void TrainerSession::eval() {
             epost.any_warp ? epost.K_per_camera : std::vector<int32_t>{},
             epost.any_warp ? epost.post_offsets : std::vector<int32_t>{},
             epost.viewmats, epost.intrins, epost.dist_coeffs,
+            epost.any_warp ? epost.post_widths : std::vector<int32_t>{},
+            epost.any_warp ? epost.post_heights : std::vector<int32_t>{},
+            epost.any_warp ? epost.face_axes : std::vector<float>{},
             epost.input_intrins, epost.input_dist_coeffs,
             epost.redistort_models, epost.redistort_params,
             all_idx, {});

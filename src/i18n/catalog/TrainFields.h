@@ -1916,6 +1916,95 @@ SS_MSG(warp_spherical_to_pinhole_help,
        "Kapatılırsa doğrudan panorama üzerinde eğitilir ve özgün pikseller "
        "korunur."));
 
+SS_MSG(warp_face_fit,
+    EN("Face size when splitting"), JA("分割時の面サイズ"),
+    ZH_HANS("拆分后各面的尺寸"), ZH_HANT("拆分後各面的尺寸"),
+    KO("분할 시 면 크기"), DE("Flächengröße beim Aufteilen"),
+    FR("Taille des faces au découpage"), ES("Tamaño de las caras al dividir"),
+    PT("Tamanho das faces ao dividir"),
+    IT("Dimensione delle facce nella suddivisione"),
+    NL("Vlakgrootte bij het opsplitsen"),
+    RU("Размер граней при разбиении"),
+    TR("Bölmede yüz boyutu"));
+SS_MSG(warp_face_fit_help,
+    EN("Whether the pinhole faces a wide lens is split into all share one "
+       "size. `uniform` renders them in a single pass, which the fused "
+       "optimizer needs, and is the faster choice. `per-face` crops each face "
+       "to the part its lens fills (never under half a frame), drawing 15-40% "
+       "fewer pixels for less VRAM, but costs one pass per size and turns the "
+       "fused optimizer off."),
+    JA("広角レンズを分割したピンホール面をすべて同じサイズにするかどうか。"
+       "`uniform` は 1 回のパスで描画でき、融合オプティマイザはこれを必要とし、"
+       "速度も最も速くなります。`per-face` は各面をレンズが写る範囲（最小でも"
+       "面の半分）に切り詰め、画素数が 15〜40% 減って VRAM を節約しますが、"
+       "サイズごとに 1 パスかかり融合オプティマイザは無効になります。"),
+    ZH_HANS("拆分广角镜头得到的针孔面是否统一为同一尺寸。`uniform` 只需一遍渲"
+            "染，融合优化器需要这样，速度也最快。`per-face` 把每个面裁到镜头实"
+            "际覆盖的部分（不小于半个面），像素少 15-40%，更省显存，但每种尺寸"
+            "要多一遍渲染，且会关闭融合优化器。"),
+    ZH_HANT("拆分廣角鏡頭得到的針孔面是否統一為同一尺寸。`uniform` 只需一遍算"
+            "圖，融合最佳化器需要如此，速度也最快。`per-face` 把每個面裁到鏡頭實"
+            "際涵蓋的部分（不小於半個面），像素少 15-40%，更省顯示記憶體，但每種"
+            "尺寸要多一遍算圖，且會關閉融合最佳化器。"),
+    KO("광각 렌즈를 분할한 핀홀 면을 모두 같은 크기로 둘지 여부입니다. "
+       "`uniform` 은 한 번의 패스로 그리며 통합 옵티마이저가 이를 필요로 하고 "
+       "속도도 가장 빠릅니다. `per-face` 는 각 면을 렌즈가 담기는 부분(최소 면의 "
+       "절반)까지 잘라 픽셀이 15-40% 줄고 VRAM 을 아끼지만, 크기마다 패스가 "
+       "하나씩 늘고 통합 옵티마이저가 꺼집니다."),
+    DE("Ob die Lochkamera-Flächen, in die ein Weitwinkel zerlegt wird, alle "
+       "dieselbe Größe haben. `uniform` rendert sie in einem Durchgang, was "
+       "der fusionierte Optimierer braucht, und ist die schnellere Wahl. "
+       "`per-face` beschneidet jede Fläche auf den vom Objektiv gefüllten Teil "
+       "(nie unter eine halbe Fläche) und zeichnet 15-40% weniger Pixel bei "
+       "weniger VRAM, kostet aber einen Durchgang je Größe und schaltet den "
+       "fusionierten Optimierer ab."),
+    FR("Si les faces sténopé issues du découpage d'un objectif large ont "
+       "toutes la même taille. `uniform` les rend en une seule passe, ce dont "
+       "l'optimiseur fusionné a besoin, et c'est le choix le plus rapide. "
+       "`per-face` recadre chaque face sur la partie que remplit l'objectif "
+       "(jamais moins d'une demi-face), soit 15 à 40% de pixels en moins et "
+       "moins de VRAM, mais coûte une passe par taille et désactive "
+       "l'optimiseur fusionné."),
+    ES("Si las caras estenopeicas en que se divide un objetivo ancho comparten "
+       "un mismo tamaño. `uniform` las renderiza en una sola pasada, que es lo "
+       "que necesita el optimizador fusionado, y es la opción más rápida. "
+       "`per-face` recorta cada cara a la parte que llena su objetivo (nunca "
+       "menos de media cara) y dibuja entre un 15% y un 40% menos de píxeles "
+       "con menos VRAM, pero cuesta una pasada por tamaño y desactiva el "
+       "optimizador fusionado."),
+    PT("Se as faces estenopeicas em que uma lente larga é dividida têm todas o "
+       "mesmo tamanho. `uniform` desenha-as numa única passagem, que é o que o "
+       "otimizador fundido precisa, e é a opção mais rápida. `per-face` recorta "
+       "cada face à parte que a lente preenche (nunca menos de meia face) e "
+       "desenha 15 a 40% menos pixels com menos VRAM, mas custa uma passagem "
+       "por tamanho e desliga o otimizador fundido."),
+    IT("Se le facce stenopeiche in cui viene divisa un'ottica ampia hanno tutte "
+       "la stessa dimensione. `uniform` le disegna in un solo passaggio, ciò "
+       "che serve all'ottimizzatore fuso, ed è la scelta più veloce. `per-face` "
+       "ritaglia ogni faccia alla parte coperta dall'obiettivo (mai meno di "
+       "mezza faccia) e disegna il 15-40% di pixel in meno con meno VRAM, ma "
+       "costa un passaggio per dimensione e disattiva l'ottimizzatore fuso."),
+    NL("Of de pinhole-vlakken waarin een groothoeklens wordt opgesplitst "
+       "allemaal dezelfde grootte hebben. `uniform` rendert ze in één doorgang, "
+       "wat de gefuseerde optimizer nodig heeft, en is de snelste keuze. "
+       "`per-face` snijdt elk vlak bij tot het deel dat de lens vult (nooit "
+       "minder dan een half vlak) en tekent 15-40% minder pixels met minder "
+       "VRAM, maar kost een doorgang per grootte en schakelt de gefuseerde "
+       "optimizer uit."),
+    RU("Должны ли все пинхол-грани, на которые разбивается широкоугольный "
+       "объектив, иметь один размер. `uniform` отрисовывает их за один проход, "
+       "что нужно объединённому оптимизатору, и работает быстрее всего. "
+       "`per-face` обрезает каждую грань до части, которую заполняет объектив "
+       "(не меньше половины грани), рисуя на 15-40% меньше пикселей и экономя "
+       "видеопамять, но требует прохода на каждый размер и отключает "
+       "объединённый оптимизатор."),
+    TR("Geniş bir merceğin bölündüğü iğne deliği yüzlerinin hepsinin aynı "
+       "boyutta olup olmayacağı. `uniform` hepsini tek geçişte çizer; birleşik "
+       "eniyileyici bunu gerektirir ve en hızlı seçenektir. `per-face` her yüzü "
+       "merceğin doldurduğu kısma (en az yarım yüz) kırpar, %15-40 daha az "
+       "piksel çizip VRAM'den tasarruf eder, ancak boyut başına bir geçişe mal "
+       "olur ve birleşik eniyileyiciyi kapatır."));
+
 SS_MSG(deblur_training_images,
     EN("Deblur training images"), JA("学習画像のぶれを補正"),
     ZH_HANS("对训练图像去模糊"), ZH_HANT("對訓練影像去模糊"),
@@ -6886,6 +6975,65 @@ SS_MSG(ppisp_param_type_help,
        "rengi kapsar, ardından sonucu düpedüz kırpar. `original` bunun üstüne "
        "bir ton eğrisi ekler. `rqs` ise karanlık bölgelerde daha iyi davranan "
        "bir ton eğrisi kullanır."));
+
+SS_MSG(ppisp_exposure_from_exif,
+    EN("Exposure init from EXIF"), JA("EXIF による露出の初期化"),
+    ZH_HANS("用 EXIF 初始化曝光"), ZH_HANT("用 EXIF 初始化曝光"),
+    KO("EXIF로 노출 초기화"), DE("Belichtungsstart aus EXIF"),
+    FR("Exposition initiale depuis l'EXIF"), ES("Exposición inicial desde EXIF"),
+    PT("Exposição inicial do EXIF"), IT("Esposizione iniziale da EXIF"),
+    NL("Belichting starten vanuit EXIF"), RU("Начальная экспозиция из EXIF"),
+    TR("EXIF'ten pozlama başlangıcı"));
+SS_MSG(ppisp_exposure_from_exif_help,
+    EN("Seed each photo's exposure correction from the shutter, aperture and "
+       "ISO its EXIF records, relative to the set's average, instead of from "
+       "zero. Photos without those tags start at the average. Helps when "
+       "exposure varies across the capture."),
+    JA("各写真の露出補正を、ゼロからではなく EXIF に記録されたシャッター速度・"
+       "絞り・ISO から、セットの平均を基準に初期化します。タグのない写真は平均"
+       "から始まります。撮影中に露出が変わる場合に有効です。"),
+    ZH_HANS("用 EXIF 记录的快门、光圈和 ISO（相对于整组的平均值）来初始化每张"
+            "照片的曝光校正，而不是从零开始。没有这些标签的照片从平均值开始。"
+            "在拍摄过程中曝光有变化时有帮助。"),
+    ZH_HANT("用 EXIF 記錄的快門、光圈和 ISO（相對於整組的平均值）來初始化每張"
+            "照片的曝光校正，而不是從零開始。沒有這些標籤的照片從平均值開始。"
+            "在拍攝過程中曝光有變化時有幫助。"),
+    KO("각 사진의 노출 보정을 0이 아니라 EXIF에 기록된 셔터·조리개·ISO에서, 전"
+       "체 평균을 기준으로 초기화합니다. 태그가 없는 사진은 평균에서 시작합니"
+       "다. 촬영 중 노출이 달라질 때 도움이 됩니다."),
+    DE("Die Belichtungskorrektur jedes Fotos aus Verschlusszeit, Blende und ISO "
+       "seiner EXIF-Daten starten, relativ zum Durchschnitt des Satzes, statt "
+       "bei null. Fotos ohne diese Tags starten beim Durchschnitt. Hilft, wenn "
+       "die Belichtung über die Aufnahme variiert."),
+    FR("Amorcer la correction d'exposition de chaque photo à partir de la vitesse, "
+       "de l'ouverture et de l'ISO enregistrés dans son EXIF, par rapport à la "
+       "moyenne de l'ensemble, plutôt qu'à zéro. Les photos sans ces balises "
+       "partent de la moyenne. Utile quand l'exposition varie au fil de la prise "
+       "de vue."),
+    ES("Inicializar la corrección de exposición de cada foto a partir del obturador, "
+       "la apertura y el ISO que registra su EXIF, relativos a la media del conjunto, "
+       "en lugar de desde cero. Las fotos sin esas etiquetas parten de la media. "
+       "Ayuda cuando la exposición varía a lo largo de la captura."),
+    PT("Inicializar a correção de exposição de cada foto a partir do obturador, "
+       "da abertura e do ISO registrados no EXIF, relativos à média do conjunto, "
+       "em vez de partir do zero. Fotos sem essas tags partem da média. Ajuda "
+       "quando a exposição varia ao longo da captura."),
+    IT("Inizializzare la correzione di esposizione di ogni foto da otturatore, "
+       "apertura e ISO registrati nel suo EXIF, relativi alla media del set, invece "
+       "che da zero. Le foto senza quei tag partono dalla media. Aiuta quando "
+       "l'esposizione varia durante la ripresa."),
+    NL("De belichtingscorrectie van elke foto starten vanuit de sluitertijd, het "
+       "diafragma en de ISO uit de EXIF, relatief aan het gemiddelde van de set, "
+       "in plaats van vanaf nul. Foto's zonder die tags starten op het gemiddelde. "
+       "Helpt wanneer de belichting tijdens de opname varieert."),
+    RU("Инициализировать коррекцию экспозиции каждого фото по выдержке, диафрагме "
+       "и ISO из его EXIF относительно среднего по набору, а не с нуля. Фото без "
+       "этих тегов начинают со среднего. Помогает, когда экспозиция меняется по "
+       "ходу съёмки."),
+    TR("Her fotoğrafın pozlama düzeltmesini sıfırdan değil, EXIF'inde kayıtlı "
+       "enstantane, diyafram ve ISO'dan, kümenin ortalamasına göre başlatır. Bu "
+       "etiketleri olmayan fotoğraflar ortalamadan başlar. Pozlama çekim boyunca "
+       "değişiyorsa yardımcı olur."));
 
 SS_MSG(apply_ppisp_before_bilagrid,
     EN("Camera correction first"), JA("カメラ補正を先に適用"),

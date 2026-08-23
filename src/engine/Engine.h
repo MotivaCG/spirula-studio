@@ -84,13 +84,9 @@ void set_training_data(
 );
 
 
-// Warp-fused GT upload used by engine_train_step_managed when the current
-// batch needs fisheye / equirectangular -> pinhole splitting. The GT RGB
-// (and optionally mask / depth / normal) byte buffer is warped on GPU
-// directly into a post-split float buffer; no full-res float intermediate is
-// allocated. Throws when PPISP is enabled. Depth is warped to per-face ray
-// depth; normal is rotated into each face's camera frame. Pass null
-// gt_depth / gt_normal to disable those.
+// Warp-fused GT upload for a fisheye / equirectangular -> pinhole split: the
+// byte GT is warped on GPU straight into post-split float buffers, through
+// the camera table set_camera_params installed (call it FIRST).
 void set_training_data_warped(
     std::string  input_model_name,    // "FISHEYE" / "EQUISOLID" / "EQUIRECTANGULAR"
     std::string  input_distortion,
@@ -108,7 +104,7 @@ void set_training_data_warped(
     TorchTensorView input_dist_coeffs,// [B_in, 8] float
     TorchTensorView input_source_models,  // [B_in] int32 (nullable)
     TorchTensorView input_source_params,  // [B_in, 16] float
-    uint64_t axes_dev                 // device float ptr [K, 3, 3]
+    TorchTensorView face_axes         // [B_in*K, 3, 3] float (host or device)
 );
 
 // --- Forward ---
@@ -222,14 +218,10 @@ void engine_bilagrid_forward(TorchTensorView cam_indices);
 void engine_bilagrid_optim_step(int step, const BilagridStepConfig& cfg);
 
 // --- PPISP (RGB only, applied AFTER bilagrid). ---
-// Allocates a per-camera PPISP parameter table and seeds it with the type's
-// default values ("original" -> 12 zeros, 12 zeros, 3x(a,a,b,0); "rqs" -> all 0).
-//
-// use_adagrad: if true, PPISP uses unscheduled AdaGrad (lr_decay=0,
-// weight_decay=0, initial_accumulator_value=0, eps=1e-15) instead of Adam.
-// No quantization path is provided for PPISP either way -- the parameter
-// table is small (N_cam x ~36 floats), so the fp32 store/state suffices.
-void engine_init_ppisp(int n_grids, std::string param_type, bool use_adagrad);
+// Table seeded with the param_type's defaults; exposure_init optionally seeds
+// params[:, 0] with [n_grids] log2 gains. use_adagrad: AdaGrad over Adam.
+void engine_init_ppisp(int n_grids, std::string param_type, bool use_adagrad,
+                       const std::vector<float>& exposure_init = {});
 
 // Apply PPISP forward in place on the current rendered RGB; saves a pre-PPISP
 // copy used by backward. cam_indices: [C_batch] int32, or null/empty for
@@ -343,16 +335,19 @@ std::map<std::string, float> engine_train_step_warped(
     int depth_in_H, int depth_in_W,
     TorchTensorView gt_normal_byte,
     int normal_in_H, int normal_in_W,
-    uint64_t axes_dev,
+    TorchTensorView face_axes,
+    // Runs of equal-size faces (DecodedBatch::face_passes). Empty or a single
+    // entry renders every face in one pass at out_W x out_H; more than one
+    // needs the accumulating path, so the fused optimizer must be off.
+    const std::vector<WarpFacePass>& face_passes,
     TorchTensorView bilagrid_cam_indices,
     const EngineStepConfig& cfg
 );
 
 
-// One homogeneous, non-warp sub-batch of a heterogeneous training step. All
-// cameras in a sub-batch share (width, height, camera_model); different
-// sub-batches of the same step may differ. Views point at host buffers that
-// must stay alive for the whole engine_train_step_hetero call.
+// One homogeneous, non-warp sub-batch of a heterogeneous training step: all its
+// cameras share (width, height, camera_model, distortion). The views point at
+// host buffers that must outlive the whole engine_train_step_hetero call.
 struct HeteroSubBatch {
     int width  = 0;
     int height = 0;
@@ -420,6 +415,11 @@ void engine_setup_data_manager(
     std::vector<float>        viewmats,
     std::vector<float>        intrins,
     std::vector<float>        dist_coeffs,
+    // POST-split face size and frame (PostSplitCameras::post_widths /
+    // post_heights / face_axes); empty when the warp path is off.
+    std::vector<int32_t>      post_widths,
+    std::vector<int32_t>      post_heights,
+    std::vector<float>        face_axes,
     // Per-INPUT intrins / dist_coeffs (length N). Required for the wide
     // warp kernel (fisheye / equisolid); pass empty when no fisheye-warp
     // camera is in the dataset.
@@ -455,19 +455,13 @@ void engine_resolve_data_error(bool retry);
 // the training DataManager, so this belongs after the training loop.
 int engine_eval_forward(std::string primitive, int sh_degree, bool packed);
 
-// Same, for ONE image chosen by dataset index instead of the next one in the
-// stream: the GUI's ground-truth-vs-render view. `apply_color_correction`
-// additionally runs the per-image bilagrid / PPISP forward the training step
-// runs, so the pair read back is the pair the loss is computed on rather than
-// the raw render.
-//
-// This overwrites the GT and camera-parameter state a training step owns. The
-// next engine_train_step_managed sets both again, so it is safe BETWEEN steps
-// -- take the same mutex the trainer does. Returns the POST-split view count
-// (K) for that image.
+// Same, for ONE image by dataset index (the GUI's compare view), rendering one
+// pass of its faces: returns that pass's views, `out_passes` the image's count.
+// Overwrites the GT and camera state a step owns -- BETWEEN steps, under its mutex.
 int engine_preview_forward(int index, std::string primitive, int sh_degree,
                            bool packed, bool apply_color_correction,
-                           const LossConfig& loss);
+                           const LossConfig& loss, int pass = 0,
+                           int* out_passes = nullptr);
 
 // --- Debug rendering ---
 
