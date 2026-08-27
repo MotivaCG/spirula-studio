@@ -1,16 +1,25 @@
 // All per-Gaussian losses in one kernel
 
+// t*log(t) is 0 at t=0 in the limit, but the raw product is 0*-inf = NaN.
+// exp(2*s) leaves the fp32 normal range at s = -43.7 and --use_fast_math
+// flushes it to zero, so a collapsed axis reaches exactly that.
+[ForceInline]
+[Differentiable]
+float xlogx(float t) {
+    return t > 0.0 ? t * log(t) : 0.0;
+}
+
 [ForceInline]
 [Differentiable]
 float erank_reg_3dgs(float3 scales, float erank_reg, float erank_reg_s3) {
     scales = exp(2.0*scales);
     float x = scales.x, y = scales.y, z = scales.z;
-    float s = x + y + z;
+    float s = max(x + y + z, 1e-30);
     float s1 = max(max(x, y), z) / s;
     float s3 = min(min(x, y), z) / s;
-    float s2 = 1.0 - s1 - s3;
-    float r = exp(-s1*log(s1) - s2*log(s2) - s3*log(s3));
-    float reg = max(-log(r-0.99999), 0.0);
+    float s2 = max(1.0 - s1 - s3, 0.0);
+    float r = exp(-xlogx(s1) - xlogx(s2) - xlogx(s3));
+    float reg = max(-log(max(r-0.99999, 1e-9)), 0.0);
     return erank_reg * reg + erank_reg_s3 * s3;
 }
 
@@ -19,11 +28,11 @@ float erank_reg_3dgs(float3 scales, float erank_reg, float erank_reg_s3) {
 float erank_reg_2dgs(float2 scales, float erank_reg) {
     scales = exp(2.0*scales);
     float x = scales.x, y = scales.y;
-    float s = x + y;
+    float s = max(x + y, 1e-30);
     float s1 = max(x, y) / s;
     float s2 = min(x, y) / s;
-    float r = exp(-s1*log(s1) - s2*log(s2));
-    float reg = max(-log(r-0.99999), 0.0);
+    float r = exp(-xlogx(s1) - xlogx(s2));
+    float reg = max(-log(max(r-0.99999, 1e-9)), 0.0);
     return erank_reg * reg;
 }
 
@@ -33,7 +42,8 @@ float erank_reg_2dgs(float2 scales, float erank_reg) {
 float scale_reg_3dgs(float3 scales, float max_gauss_ratio, float scale_regularization_weight) {
     scales = exp(scales);
     float x = scales.x, y = scales.y, z = scales.z;
-    float scale_reg = max(max(max(x, y), z) / min(min(x, y), z), max_gauss_ratio) - max_gauss_ratio;
+    float scale_reg = max(max(max(x, y), z) / max(min(min(x, y), z), 1e-30),
+                          max_gauss_ratio) - max_gauss_ratio;
     return scale_regularization_weight * scale_reg;
 }
 
@@ -42,7 +52,8 @@ float scale_reg_3dgs(float3 scales, float max_gauss_ratio, float scale_regulariz
 float scale_reg_2dgs(float2 scales, float max_gauss_ratio, float scale_regularization_weight) {
     scales = exp(scales);
     float x = scales.x, y = scales.y;
-    float scale_reg = max(max(x, y) / min(x, y), max_gauss_ratio) - max_gauss_ratio;
+    float scale_reg = max(max(x, y) / max(min(x, y), 1e-30),
+                          max_gauss_ratio) - max_gauss_ratio;
     return scale_regularization_weight * scale_reg;
 }
 
