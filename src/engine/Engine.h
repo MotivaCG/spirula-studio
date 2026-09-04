@@ -109,6 +109,21 @@ void set_training_data_warped(
 
 // --- Forward ---
 
+// Binning tile edge in pixels for subsequent forwards: a power of two in
+// [8, 128], or 0 to choose from the splat footprint each forward measures.
+// Sticky; throws on a size that is not a supported power of two.
+void engine_set_bin_tile_size(int pixels);
+
+// One training step's fwd+bwd wall time, which the automatic binning search
+// compares between granularities. Training only -- a viewport render must not
+// feed it. No-op when a size is forced.
+void engine_bin_tile_observe(double step_seconds);
+
+// Binning granularity the next forward at the current camera size will use.
+// Anything sized against the tile grid before the forward -- the live-tile
+// map -- has to ask, or it builds a grid the intersect then indexes wrongly.
+int engine_bin_macro_log2();
+
 void forward_3dgs(
     std::string primitive,
     int sh_degree,
@@ -217,16 +232,15 @@ void engine_bilagrid_forward(TorchTensorView cam_indices);
 // Adam step + optional TV-loss regularization for each enabled bilagrid type.
 void engine_bilagrid_optim_step(int step, const BilagridStepConfig& cfg);
 
-// --- PPISP (RGB only, applied AFTER bilagrid). ---
-// Table seeded with the param_type's defaults; exposure_init optionally seeds
-// params[:, 0] with [n_grids] log2 gains. use_adagrad: AdaGrad over Adam.
+// --- PPISP (RGB only; PpispStepConfig picks where in the chain it runs) ---
+// ppisp_param_spec (kernels/pixelwise/PixelWise.cuh) owns the param_type list.
+// exposure_init optionally seeds params[:, 0] with [n_grids] log2 gains.
 void engine_init_ppisp(int n_grids, std::string param_type, bool use_adagrad,
                        const std::vector<float>& exposure_init = {});
 
 // Apply PPISP forward in place on the current rendered RGB; saves a pre-PPISP
-// copy used by backward. cam_indices: [C_batch] int32, or null/empty for
-// identity. Must be called after forward_3dgs (and after engine_bilagrid_forward
-// when bilagrid is also enabled).
+// copy used by backward. cam_indices: [C_batch] int32, null/empty for identity.
+// After forward_3dgs -- the before-color-space order runs inside it instead.
 void engine_ppisp_forward(TorchTensorView cam_indices);
 
 // Optimizer step over the PPISP parameter table (Adam or AdaGrad depending on
@@ -243,9 +257,9 @@ void engine_ppisp_optim_step(int step, const PpispStepConfig& cfg);
 //          plus higher-order bands; both updated by Adam when train_color=true.
 //
 // dc_color is the linear-space DC color used at SH init time (set slot 0).
-void engine_init_background_noise(bool splat_color_is_linear);
+void engine_init_background_noise(int splat_transfer, bool splat_is_linear);
 void engine_init_background_sh(
-    int sh_degree, bool splat_color_is_linear);
+    int sh_degree, int splat_transfer, bool splat_is_linear);
 
 // Per-iter (seed, randomize_weight) for the next forward_3dgs background blend.
 // Training calls this each step; the viewer/eval path can ignore it and reuse
@@ -275,9 +289,11 @@ int engine_copy_background_to_host(TorchTensorView out_image);
 // matrices when the corresponding side is not enabled.
 void engine_init_color_space(
     bool splat_enabled,
-    bool splat_is_linear,
+    int splat_transfer,                       // colorspace::Transfer
+    bool splat_is_linear,                     // splats store linear light
     std::vector<float> splat_color_matrix,    // [9], row-major
     bool image_enabled,
+    int image_transfer,
     bool image_is_linear,
     std::vector<float> image_color_matrix     // [9], row-major
 );
@@ -633,7 +649,8 @@ void engine_scene_set_data_3dgs(
 // The model's own colour space, applied by engine_scene_activate. Two models
 // trained in different spaces are converted each its own way, which is the
 // whole point of carrying it here rather than in the engine's one slot.
-void engine_scene_set_color_space(int slot, bool enabled, bool is_linear,
+void engine_scene_set_color_space(int slot, bool enabled, int transfer,
+                                  bool is_linear,
                                   std::vector<float> color_matrix);
 
 // Bind `slot` to the world buffers. Throws when the slot holds nothing.
@@ -649,6 +666,14 @@ std::vector<std::tuple<std::string, size_t, size_t>> engine_get_pool_breakdown()
 std::vector<std::tuple<std::string, std::string, size_t, size_t>>
 engine_get_pool_breakdown_categorized();
 size_t engine_get_scratch_bytes();
+
+// Formatted per-category pool report (SS_PROFILE). Reads the pool's
+// high-water capacities, so it is a peak, not an instantaneous figure.
+std::string engine_vram_report();
+// Hand that report to the profiler, which prints it at process exit -- by
+// which time the pool this reads is already destroyed. No-op unless
+// SS_PROFILE is set.
+void engine_profile_capture_vram();
 
 // --- Checkpoint save ---
 //

@@ -72,6 +72,25 @@ case " $* " in
         ;;
 esac
 
+# Homebrew's libomp is keg-only: nothing points at it, so CMake finds no
+# OpenMP and meshing, UV unwrap and metrics run serial (cmake/SsMacBundle.cmake
+# then has no dylib to make static either).
+if [ "$(uname)" = "Darwin" ]; then
+    case " $* " in
+        *" -DOpenMP_ROOT="*) ;;
+        *)
+            for omp_root in "$(brew --prefix libomp 2>/dev/null)" \
+                            /opt/homebrew/opt/libomp /usr/local/opt/libomp; do
+                [ -n "$omp_root" ] || continue
+                [ -f "$omp_root/lib/libomp.a" ] ||
+                    [ -f "$omp_root/lib/libomp.dylib" ] || continue
+                set -- "$@" "-DOpenMP_ROOT=$omp_root"
+                echo "OpenMP: passing -DOpenMP_ROOT=$omp_root (keg-only formula)"
+                break
+            done ;;
+    esac
+fi
+
 cmake -G Ninja -B "${SS_BUILD_DIR}" "${ss_fatbin_args[@]}" "$@" || exit $?
 
 # Repair the ninja dependency log.
