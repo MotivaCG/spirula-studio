@@ -182,58 +182,6 @@ std::string GuiApp::settings_path() {
     return (fs::path(app::config_dir()) / "gui.conf").string();
 }
 
-const char* GuiApp::pick_key(PickAction what) {
-    switch (what) {
-        case PickAction::OpenDataset:     return "open_dataset";
-        case PickAction::SourceImages:    return "source_images";
-        case PickAction::SourceVideo:     return "source_video";
-        case PickAction::SourceReplace:   return "source_replace";
-        case PickAction::Workspace:       return "workspace";
-        case PickAction::OutputPrefix:    return "output_prefix";
-        case PickAction::VocabTree:       return "vocab_tree";
-        case PickAction::MaskModelFile:   return "mask_model";
-        case PickAction::SplatFile:       return "splat_file";
-        case PickAction::AddSplatFile:    return "add_splat_file";
-        case PickAction::PresetFile:      return "preset_file";
-        case PickAction::PresetSaveFolder:return "preset_save_folder";
-        case PickAction::BatchDataset:    return "batch_dataset";
-        case PickAction::BatchOutput:     return "batch_output";
-        case PickAction::BatchPresetFile: return "batch_preset_file";
-        case PickAction::MeshSource:      return "mesh_source";
-        case PickAction::MeshPhotos:      return "mesh_photos";
-        case PickAction::MeshOutput:      return "mesh_output";
-        case PickAction::None:            return "";
-    }
-    return "";
-}
-
-std::string GuiApp::last_dir(PickAction what) const {
-    const char* key = pick_key(what);
-    auto it = _last_dirs.find(key);
-    if (it == _last_dirs.end()) return "";
-    // A stored folder outlives the drive it was on and the run that made it,
-    // and a picker opened on one that is gone is worse than one opened where
-    // it always used to open.
-    std::error_code ec;
-    return fs::is_directory(it->second, ec) ? it->second : std::string();
-}
-
-void GuiApp::remember_dir(PickAction what, const std::string& path) {
-    const char* key = pick_key(what);
-    if (!*key || path.empty()) return;
-    std::error_code ec;
-    fs::path dir = fs::path(path).parent_path();
-    if (dir.empty() || !fs::is_directory(dir, ec)) return;
-    _last_dirs[key] = dir.string();
-}
-
-void GuiApp::open_dialog(const std::string& title, FileDialog::Mode mode,
-                         const std::vector<std::string>& extensions,
-                         const std::string& start_dir, bool multi_select) {
-    _dialog.open(title, mode, extensions,
-                 start_dir.empty() ? last_dir(_pick) : start_dir, multi_select);
-}
-
 void GuiApp::load_settings() {
     // Presets have a folder of their own; every other kind of pick starts at
     // the home directory until one of that kind has been made.
@@ -259,8 +207,6 @@ void GuiApp::load_settings() {
                  std::find(_model_recents.begin(), _model_recents.end(), v) ==
                      _model_recents.end())
             _model_recents.push_back(v);
-        else if (k.rfind("last_dir_", 0) == 0 && !v.empty())
-            _last_dirs[k.substr(9)] = v;
         else if (k == "colmap_exe" && !v.empty()) _colmap_exe = v;
         else if (k == "ffmpeg_exe" && !v.empty()) _ffmpeg_exe = v;
         else if (k == "python_exe" && !v.empty()) _python_exe = v;
@@ -306,8 +252,6 @@ void GuiApp::save_settings() {
         std::fprintf(f, "recent=%s\n", r.c_str());
     for (const auto& r : _model_recents)
         std::fprintf(f, "recent_model=%s\n", r.c_str());
-    for (const auto& [key, dir] : _last_dirs)
-        std::fprintf(f, "last_dir_%s=%s\n", key.c_str(), dir.c_str());
     std::fprintf(f, "colmap_exe=%s\n", _colmap_exe.c_str());
     std::fprintf(f, "ffmpeg_exe=%s\n", _ffmpeg_exe.c_str());
     std::fprintf(f, "python_exe=%s\n", _python_exe.c_str());

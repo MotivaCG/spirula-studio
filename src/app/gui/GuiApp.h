@@ -318,13 +318,6 @@ private:
     void draw_data_error_modal();
     void handle_dialog_result(const std::vector<std::string>& paths);
 
-    // Arms the picker for the `_pick` just set, in that pick's own last
-    // directory unless the caller names one. Every picker here goes through
-    // it, so none of them can be armed without a `_pick` to answer for it.
-    void open_dialog(const std::string& title, FileDialog::Mode mode,
-                     const std::vector<std::string>& extensions = {},
-                     const std::string& start_dir = "",
-                     bool multi_select = false);
     // Take paths onto the input list, `replace` clearing what was there (a
     // fresh pick from Home) rather than adding to it (the panel's Add buttons).
     // Sets the per-input defaults and, unless the user has edited it, the
@@ -546,7 +539,6 @@ private:
     int _pick_row = -1;
 
     // Settings (persisted).
-    std::map<std::string, std::string> _last_dirs;  // pick_key() -> folder
     std::vector<std::string> _recents;
     // Where a pick of each kind last landed, so a session opens where the last
     // one left off rather than at the home directory.
