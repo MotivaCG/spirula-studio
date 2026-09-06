@@ -1,6 +1,7 @@
 #pragma once
 
 #include <core/Tensor.h>
+#include "core/ColorTrustState.h"
 #include "core/NonShQuantState.h"
 #include "kernels/projection/ProjectionBwdQuantGrad.cuh"   // GradQuantBuffers
 
@@ -138,6 +139,7 @@ void fused_optim_3dgs_geometry(
     const float dc_reg_weight, const float sh_reg_weight,
     const float max_screen_size, const float max_screen_size_penalty,
     bool use_scale_agnostic_mean,
+    ColorTrustState color_trust,
     NonShQuantState non_sh,
     GradQuantBuffers gq,
     int32_t step, DeviceVector<int32_t> per_splat_steps,
@@ -178,6 +180,7 @@ void fused_adam_step_quantized(
     float l2_reg,
     float l2_reg_offset,
     int bits,                           // 4 or 8 -- selects QuantizedAdamState<BITS, 256>
+    ColorTrustState color_trust,
     float grad_scale, bool zero_grad
 );
 
@@ -200,6 +203,7 @@ void fused_adam_step_quantized_value(
     float l2_reg_offset,
     int optim_bits,                     // 4 or 8
     int value_bits,                     // 8 or 16
+    ColorTrustState color_trust,
     float grad_scale, bool zero_grad
 );
 
@@ -315,6 +319,8 @@ void fused_adamtr_linear_rgb_optim(
     float beta2,
     float eps,
     float eps_tr,
+    float dc_reg_weight,
+    float sh_reg_weight,
     int step,
     float grad_scale, bool zero_grad
 );
@@ -331,6 +337,8 @@ void fused_adamtr_rgb_optim(
     float beta2,
     float eps,
     float eps_tr,
+    float dc_reg_weight,
+    float sh_reg_weight,
     int step,
     float grad_scale, bool zero_grad
 );
@@ -348,6 +356,7 @@ void fused_adamtr_linear_rgb_sh_optim(
     float beta2,
     float eps,
     float eps_tr,
+    float sh_reg_weight,
     int step,
     float grad_scale, bool zero_grad
 );
@@ -365,6 +374,7 @@ void fused_adamtr_rgb_sh_optim(
     float beta2,
     float eps,
     float eps_tr,
+    float sh_reg_weight,
     int step,
     float grad_scale, bool zero_grad
 );

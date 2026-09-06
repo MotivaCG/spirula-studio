@@ -82,15 +82,17 @@ int main(int argc, char** argv) {
     std::vector<int32_t> codes;
 
     // ---- fused_optim_3dgs_geometry ----
-    // (sam, zero_grad, non_sh_quant, grad_quant, per_splat_steps, densify)
+    // (sam, zero_grad, non_sh_quant, grad_quant, per_splat_steps, densify,
+    //  linear colour trust region -- only the nq config updates DC)
     struct GeoCfg {
-        bool sam, zero_grad, nq, gq, steps, densify;
+        bool sam, zero_grad, nq, gq, steps, densify, ct;
     };
-    const GeoCfg geo_cfgs[4] = {
-        {false, true, false, false, false, true},
-        {true, false, false, false, true, false},
-        {false, true, true, false, false, true},
-        {true, true, false, true, true, true},
+    const GeoCfg geo_cfgs[5] = {
+        {false, true, false, false, false, true, false},
+        {true, false, false, false, true, false, false},
+        {false, true, true, false, false, true, false},
+        {true, true, false, true, true, true, false},
+        {false, false, true, false, false, false, true},
     };
 
     for (const GeoCfg& c : geo_cfgs) {
@@ -187,6 +189,14 @@ int main(int argc, char** argv) {
             steps = dv<int32_t>(upload(st), N);
         }
 
+        ColorTrustState ct{};
+        if (c.ct) {
+            ct.enabled = true;
+            ct.eps_tr = 1e-4f;
+            ct.features_dc = d_dc;
+            ct.opacities = d_opacs;
+        }
+
         // Two steps so the quantized configs decode self-written state.
         for (int step_i = 0; step_i < (c.nq ? 2 : 1); step_i++) {
             fused_optim_3dgs_geometry(
@@ -207,7 +217,7 @@ int main(int argc, char** argv) {
                 /*erank=*/0.1f, /*erank_s3=*/0.05f, /*quat_norm=*/0.1f,
                 /*dc_reg=*/0.01f, /*sh_reg=*/0.01f,
                 /*max_screen_size=*/0.3f, /*max_screen_size_penalty=*/1.5f,
-                c.sam, nq, gq,
+                c.sam, ct, nq, gq,
                 /*step=*/7 + step_i, steps, /*grad_scale=*/0.5f,
                 c.zero_grad);
             backend::device_synchronize();
@@ -256,7 +266,8 @@ int main(int argc, char** argv) {
                                 : fused_adamtr_rgb_optim;
             fn(ttv(d_p, {N, 3}), ttv(d_g, {N, 3}), ttv(d_g1, {N, 3}),
                ttv(d_g2, {N, 3}), ttv(d_o, {N, 1}), 2.5e-3f, 0.9f, 0.999f,
-               1e-15f, /*eps_tr=*/1e-4f, /*step=*/7, /*grad_scale=*/0.5f,
+               1e-15f, /*eps_tr=*/1e-4f, /*dc_reg=*/0.01f, /*sh_reg=*/0.01f,
+               /*step=*/7, /*grad_scale=*/0.5f,
                /*zero_grad=*/is_linear == 1);
             backend::device_synchronize();
             readback_f(acc, d_p, 3 * N);
@@ -279,7 +290,7 @@ int main(int argc, char** argv) {
             sfn(ttv(d_sp, {N, K, 3}), ttv(d_sg, {N, K, 3}),
                 ttv(d_sg1, {N, K, 3}), ttv(d_sg2, {N, K, 3}),
                 ttv(d_p, {N, 3}), ttv(d_o, {N, 1}), 1.25e-4f, 0.9f, 0.999f,
-                1e-15f, 1e-4f, 7, 0.5f, is_linear == 1);
+                1e-15f, 1e-4f, /*sh_reg=*/0.01f, 7, 0.5f, is_linear == 1);
             backend::device_synchronize();
             readback_f(acc, d_sp, 3 * K * N);
             readback_f(acc, d_sg, 3 * K * N);

@@ -704,7 +704,8 @@ __global__ void fused_projection_bwd_optimizer_3dgs_kernel
             const int ch = i % 3;
             [[maybe_unused]] const float c_ch = (ch == 0) ? c_dc.x : (ch == 1) ? c_dc.y : c_dc.z;
             if constexpr (color_trust_linear) {
-                v_sh_coeff /= SlangPixelWise::linear_rgb_to_srgb_grad(c_ch);
+                // v_sh_coeff /= SlangPixelWise::linear_rgb_to_srgb_grad(c_ch);
+                v_sh_coeff *= __expf(c_ch);
             }
             float g1_feature_sh = beta1 * g1_sh_ptr[i] + (1.f - beta1) * v_sh_coeff;
             float g2_feature_sh = beta2 * g2_sh_ptr[i] + (1.f - beta2) * v_sh_coeff*v_sh_coeff;

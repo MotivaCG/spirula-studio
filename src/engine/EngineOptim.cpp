@@ -516,6 +516,14 @@ void engine_optim_step(int step, const OptimConfig& cfg) {
     const float grad_scale = engine().optim.grad_scale;
     const bool  zero_grad  = engine().optim.zero_grad_in_optim;
 
+    // Same collapse of the two flags FPBO makes, so the DC/SH kernels below
+    // move colour exactly the way the fused path does.
+    ColorTrustState color_trust;
+    color_trust.enabled     = cfg.use_color_trust_region || cfg.color_is_linear;
+    color_trust.eps_tr      = cfg.eps_tr;
+    color_trust.features_dc = (const float*)engine().world.features_dc.data_ptr();
+    color_trust.opacities   = engine().world.opacities.data_ptr();
+
     // Non-SH Adam-state quant bundle. Same struct as FPBO consumes; when
     // enabled, the geometry kernel reads/writes the 5 non-SH attrs (means,
     // quats, scales, opacities, features_dc) through the codec instead of
@@ -582,6 +590,7 @@ void engine_optim_step(int step, const OptimConfig& cfg) {
         cfg.dc_reg_weight, cfg.sh_reg_weight,
         cfg.max_screen_size, cfg.max_screen_size_penalty,
         cfg.use_scale_agnostic_mean,
+        color_trust,
         non_sh_optim,
         grad_q,
         step + 1, per_splat_steps,
@@ -603,7 +612,8 @@ void engine_optim_step(int step, const OptimConfig& cfg) {
                 _dv_tv(engine().optim.g2_features_dc),
                 _dv_tv(engine().world.opacities),
                 cfg.lr_features_dc,
-                beta1, beta2, eps, cfg.eps_tr, s1,
+                beta1, beta2, eps, cfg.eps_tr,
+                cfg.dc_reg_weight, cfg.sh_reg_weight, s1,
                 grad_scale, zero_grad
             );
         } else {
@@ -613,7 +623,9 @@ void engine_optim_step(int step, const OptimConfig& cfg) {
                 DeviceTensorFloatND(engine().optim.g1_features_dc),
                 DeviceTensorFloatND(engine().optim.g2_features_dc),
                 cfg.lr_features_dc, step + 1, per_splat_steps,
-                cfg.dc_reg_weight, 0.5f / 0.28209479177387814f,
+                // fused_adam_step divides l2_reg by the parameter count;
+                // FPBO applies 2*dc_reg/3 per splat, so pre-multiply by N.
+                cfg.dc_reg_weight * (float)N, 0.5f / 0.28209479177387814f,
                 grad_scale, zero_grad);
         }
     }
@@ -654,7 +666,7 @@ void engine_optim_step(int step, const OptimConfig& cfg) {
             engine().world.features_sh_quant8.bounds_ptr(),
             cfg.lr_features_sh, step + 1, per_splat_steps,
             cfg.sh_reg_weight, 0.0f,
-            cfg.sh_optim_bits, /*value_bits=*/8,
+            cfg.sh_optim_bits, /*value_bits=*/8, color_trust,
             grad_scale, zero_grad);
     } else if (cfg.sh_value_bits != 32
                && engine().world.features_sh_quant16.initialized()) {
@@ -670,7 +682,7 @@ void engine_optim_step(int step, const OptimConfig& cfg) {
             engine().world.features_sh_quant16.bounds_ptr(),
             cfg.lr_features_sh, step + 1, per_splat_steps,
             cfg.sh_reg_weight, 0.0f,
-            cfg.sh_optim_bits, /*value_bits=*/16,
+            cfg.sh_optim_bits, /*value_bits=*/16, color_trust,
             grad_scale, zero_grad);
     } else if (cfg.sh_optim_bits != 32 && engine().optim.sh_quant_state.initialized()) {
         // SH-quant (optim) only -- fp32 SH values. Plain quantized Adam kernel.
@@ -683,7 +695,7 @@ void engine_optim_step(int step, const OptimConfig& cfg) {
             engine().optim.sh_quant_state.bounds_ptr(),
             cfg.lr_features_sh, step + 1, per_splat_steps,
             cfg.sh_reg_weight, 0.0f,
-            cfg.sh_optim_bits,
+            cfg.sh_optim_bits, color_trust,
             grad_scale, zero_grad);
     } else if (cfg.use_color_trust_region) {
         const int s1 = step + 1;
@@ -696,7 +708,7 @@ void engine_optim_step(int step, const OptimConfig& cfg) {
             _dv_tv(engine().world.features_dc),
             _dv_tv(engine().world.opacities),
             cfg.lr_features_sh,
-            beta1, beta2, eps, cfg.eps_tr, s1,
+            beta1, beta2, eps, cfg.eps_tr, cfg.sh_reg_weight, s1,
             grad_scale, zero_grad
         );
     } else {

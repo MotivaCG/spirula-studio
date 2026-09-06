@@ -39,24 +39,25 @@ static_assert(sizeof(AdagradParams) == 3 * 8 + 3 * 4 + 4 /*pad*/,
 // Mirrors QAdamParams.
 struct QAdamParams {
     uint64_t param, grad, packed, quant_bounds, steps;
-    float lr, decay, decay_offset, grad_scale;
+    uint64_t ct_features_dc, ct_opacities;
+    float lr, decay, decay_offset, grad_scale, ct_eps_tr;
     int32_t scalar_step;
     uint32_t has_steps, numel, stride, zero_grad, num_blocks, wgs_per_row;
-    uint32_t _pad0;
 };
-static_assert(sizeof(QAdamParams) == 5 * 8 + 12 * 4,
+static_assert(sizeof(QAdamParams) == 7 * 8 + 12 * 4,
               "params layout must match the slang struct");
 
 // Mirrors QQAdamParams.
 struct QQAdamParams {
     uint64_t grad, grad_q_packed, grad_q_bounds, optim_packed, optim_bounds,
         value_packed, value_bounds, steps;
-    float lr, decay, decay_offset, grad_scale;
+    uint64_t ct_features_dc, ct_opacities;
+    float lr, decay, decay_offset, grad_scale, ct_eps_tr;
     int32_t scalar_step;
     uint32_t has_steps, grad_quant, numel, stride, zero_grad, num_blocks,
-        wgs_per_row;
+        wgs_per_row, _pad0;
 };
-static_assert(sizeof(QQAdamParams) == 8 * 8 + 12 * 4,
+static_assert(sizeof(QQAdamParams) == 10 * 8 + 14 * 4,
               "params layout must match the slang struct");
 
 // Mirrors FloatAddParams.
@@ -175,6 +176,7 @@ void fused_adam_step_quantized(
     float l2_reg,
     float l2_reg_offset,
     int bits,
+    ColorTrustState color_trust,
     float grad_scale, bool zero_grad
 ) {
     int64_t param_numel = param.numel();
@@ -201,24 +203,36 @@ void fused_adam_step_quantized(
     p.scalar_step = step;
     p.stride = (uint32_t)stride;
     p.zero_grad = zero_grad ? 1u : 0u;
+    p.ct_features_dc = vkk::or_fallback(color_trust.features_dc);
+    p.ct_opacities = vkk::or_fallback(color_trust.opacities);
+    p.ct_eps_tr = color_trust.eps_tr;
+    const uint32_t ct = color_trust.enabled ? 1u : 0u;
     const int64_t slice = optim_slice_cells(stride);
     const uint64_t cell_bytes = bits == 8 ? 2u : 1u;
     const uint64_t b_param = p.param, b_grad = p.grad;
     const uint64_t b_packed = p.packed, b_bounds = p.quant_bounds;
     const uint64_t b_steps = p.steps;
+    const uint64_t b_ctdc = p.ct_features_dc, b_ctop = p.ct_opacities;
     for (int64_t base = 0; base < numel; base += slice) {
         const int64_t n = std::min(slice, numel - base);
+        const uint64_t splat = (uint64_t)(base / stride);
         p.param = b_param + 4u * (uint64_t)base;
         p.grad = b_grad + 4u * (uint64_t)base;
         p.packed = b_packed + cell_bytes * (uint64_t)base;
         p.quant_bounds = b_bounds + 16u * (uint64_t)(base / 256);
         if (p.has_steps) p.steps = b_steps + 4u * (uint64_t)(base / stride);
+        if (ct) {
+            p.ct_features_dc = b_ctdc + 12u * splat;
+            p.ct_opacities = b_ctop + 4u * splat;
+        }
         p.numel = checked_u32_numel(n, "fused_adam_step_quantized");
         p.num_blocks = (uint32_t)((n + 255) / 256);
-        // Spec IDs: 0 = kOptimBits (kValueBits unused by this entry).
-        vkk::dispatch_flat("optimizer.fused_adam_q",
-                           backend::vk::SpecList{(uint32_t)bits}, n, 256, &p,
-                           sizeof(p), &p.wgs_per_row);
+        // Spec IDs: 0 = kOptimBits, 1 = kValueBits (unused here, pinned so
+        // the pipeline key is stable), 2 = kColorTrust.
+        vkk::dispatch_flat(
+            "optimizer.fused_adam_q",
+            backend::vk::SpecList{(uint32_t)bits, 8u, ct}, n, 256, &p,
+            sizeof(p), &p.wgs_per_row);
     }
 }
 
@@ -238,6 +252,7 @@ void fused_adam_step_quantized_value(
     float l2_reg_offset,
     int optim_bits,
     int value_bits,
+    ColorTrustState color_trust,
     float grad_scale, bool zero_grad
 ) {
     if (param_numel == 0 || num_splats == 0)
@@ -270,6 +285,10 @@ void fused_adam_step_quantized_value(
     p.scalar_step = step;
     p.stride = (uint32_t)stride;
     p.zero_grad = zero_grad ? 1u : 0u;
+    p.ct_features_dc = vkk::or_fallback(color_trust.features_dc);
+    p.ct_opacities = vkk::or_fallback(color_trust.opacities);
+    p.ct_eps_tr = color_trust.eps_tr;
+    const uint32_t ct = color_trust.enabled ? 1u : 0u;
     const int64_t slice = optim_slice_cells(stride);
     const uint64_t optim_bytes = optim_bits == 8 ? 2u : 1u;
     const uint64_t value_bytes = value_bits == 16 ? 2u : 1u;
@@ -278,6 +297,7 @@ void fused_adam_step_quantized_value(
     const uint64_t b_op = p.optim_packed, b_ob = p.optim_bounds;
     const uint64_t b_vp = p.value_packed, b_vb = p.value_bounds;
     const uint64_t b_steps = p.steps;
+    const uint64_t b_ctdc = p.ct_features_dc, b_ctop = p.ct_opacities;
     for (int64_t base = 0; base < numel; base += slice) {
         const int64_t n = std::min(slice, numel - base);
         const uint64_t splat = (uint64_t)(base / stride);
@@ -291,13 +311,20 @@ void fused_adam_step_quantized_value(
         p.value_packed = b_vp + value_bytes * (uint64_t)base;
         p.value_bounds = b_vb + 8u * (uint64_t)(base / 256);
         if (p.has_steps) p.steps = b_steps + 4u * splat;
+        if (ct) {
+            p.ct_features_dc = b_ctdc + 12u * splat;
+            p.ct_opacities = b_ctop + 4u * splat;
+        }
         p.numel = checked_u32_numel(n, "fused_adam_step_quantized_value");
         p.num_blocks = (uint32_t)((n + 255) / 256);
-        // Spec IDs: 0 = kOptimBits, 1 = kValueBits.
-        vkk::dispatch_flat(
+        // Spec IDs: 0 = kOptimBits, 1 = kValueBits, 2 = kColorTrust.
+        vkk::Fold f = vkk::fold_1d(n, 256);
+        p.wgs_per_row = f.per_row;
+        vkk::dispatch_ring(
             "optimizer.fused_adam_qq",
-            backend::vk::SpecList{(uint32_t)optim_bits, (uint32_t)value_bits},
-            n, 256, &p, sizeof(p), &p.wgs_per_row);
+            backend::vk::SpecList{(uint32_t)optim_bits, (uint32_t)value_bits,
+                                  ct},
+            f.per_row, f.rows, 1, &p, sizeof(p));
     }
 }
 
@@ -339,18 +366,19 @@ namespace {
 // Mirrors AdamTrRgbParams in shaders/optim_color.slang.
 struct AdamTrRgbParams {
     uint64_t rgbs, grad, exp_avg, exp_avg_sq, opacities;
-    float lr, bias_correction1, bias_correction2, eps, eps_tr, grad_scale;
-    uint32_t is_linear, zero_grad, num_gs, wgs_per_row;
+    float lr, bias_correction1, bias_correction2, eps, eps_tr,
+        dc_reg_weight, sh_reg_weight, grad_scale;
+    uint32_t zero_grad, num_gs, wgs_per_row, _pad0;
 };
-static_assert(sizeof(AdamTrRgbParams) == 5 * 8 + 10 * 4,
+static_assert(sizeof(AdamTrRgbParams) == 5 * 8 + 12 * 4,
               "params layout must match the slang struct");
 
 // Mirrors AdamTrRgbShParams.
 struct AdamTrRgbShParams {
     uint64_t param, grad, exp_avg, exp_avg_sq, rgbs, opacities;
-    float lr, bias_correction1, bias_correction2, eps, eps_tr, grad_scale;
-    uint32_t is_linear, zero_grad, num_params, num_sh, wgs_per_row;
-    uint32_t _pad0;
+    float lr, bias_correction1, bias_correction2, eps, eps_tr,
+        sh_reg_weight, grad_scale;
+    uint32_t zero_grad, num_params, num_sh, wgs_per_row, _pad0;
 };
 static_assert(sizeof(AdamTrRgbShParams) == 6 * 8 + 12 * 4,
               "params layout must match the slang struct");
@@ -375,7 +403,7 @@ struct OptimGeoParams {
         mcmc_opacity_reg_weight, mcmc_scale_reg_weight, erank_reg_weight,
         erank_reg_weight_s3, quat_norm_reg_weight,
         dc_reg_weight, sh_reg_weight, grad_scale, max_screen_size,
-        max_screen_size_penalty, _pad;
+        max_screen_size_penalty, eps_tr;
     int32_t scalar_step;
     uint32_t has_steps, has_densify_score, numel, wgs_per_row;
     uint32_t _pad0;
@@ -393,7 +421,8 @@ void launch_adamtr_rgb(bool is_linear, TorchTensorView param,
                        TorchTensorView grad, TorchTensorView exp_avg,
                        TorchTensorView exp_avg_sq, TorchTensorView opacities,
                        float lr, float beta1, float beta2, float eps,
-                       float eps_tr, int step, float grad_scale,
+                       float eps_tr, float dc_reg_weight,
+                       float sh_reg_weight, int step, float grad_scale,
                        bool zero_grad) {
     int64_t num_gs = tv_numel(param) / 3;
     if (num_gs == 0) return;
@@ -408,20 +437,23 @@ void launch_adamtr_rgb(bool is_linear, TorchTensorView param,
     p.bias_correction2 = 1.0f - std::pow(beta2, (float)step);
     p.eps = eps;
     p.eps_tr = eps_tr;
+    p.dc_reg_weight = 2.0f * dc_reg_weight / 3.0f;
+    p.sh_reg_weight = 2.0f * sh_reg_weight / (float)(3 * num_gs);
     p.grad_scale = grad_scale;
-    p.is_linear = is_linear ? 1u : 0u;
     p.zero_grad = zero_grad ? 1u : 0u;
     p.num_gs = checked_u32_numel(num_gs, "fused_adamtr_rgb_optim");
+    // Spec ID 0 = kIsLinear.
     vkk::dispatch_flat("optim_color.fused_adamtr_rgb",
-                       backend::vk::SpecList{}, num_gs, 256, &p, sizeof(p),
-                       &p.wgs_per_row);
+                       backend::vk::SpecList{is_linear ? 1u : 0u}, num_gs, 256,
+                       &p, sizeof(p), &p.wgs_per_row);
 }
 
 void launch_adamtr_rgb_sh(bool is_linear, TorchTensorView param,
                           TorchTensorView grad, TorchTensorView exp_avg,
                           TorchTensorView exp_avg_sq, TorchTensorView colors,
                           TorchTensorView opacities, float lr, float beta1,
-                          float beta2, float eps, float eps_tr, int step,
+                          float beta2, float eps, float eps_tr,
+                          float sh_reg_weight, int step,
                           float grad_scale, bool zero_grad) {
     int64_t colors_numel = tv_numel(colors);
     int64_t num_gs = colors_numel / 3;
@@ -441,8 +473,8 @@ void launch_adamtr_rgb_sh(bool is_linear, TorchTensorView param,
     p.bias_correction2 = 1.0f - std::pow(beta2, (float)step);
     p.eps = eps;
     p.eps_tr = eps_tr;
+    p.sh_reg_weight = 2.0f * sh_reg_weight / (float)num_params;
     p.grad_scale = grad_scale;
-    p.is_linear = is_linear ? 1u : 0u;
     p.zero_grad = zero_grad ? 1u : 0u;
     p.num_sh = (uint32_t)num_sh;
     const int64_t stride = num_sh * 3;
@@ -460,9 +492,10 @@ void launch_adamtr_rgb_sh(bool is_linear, TorchTensorView param,
         p.rgbs = b_rgbs + 12u * splat;
         p.opacities = b_opac + 4u * splat;
         p.num_params = checked_u32_numel(n, "fused_adamtr_rgb_sh_optim");
+        // Spec ID 0 = kIsLinear.
         vkk::dispatch_flat("optim_color.fused_adamtr_rgb_sh",
-                           backend::vk::SpecList{}, n, 256, &p, sizeof(p),
-                           &p.wgs_per_row);
+                           backend::vk::SpecList{is_linear ? 1u : 0u}, n, 256,
+                           &p, sizeof(p), &p.wgs_per_row);
     }
 }
 
@@ -471,43 +504,47 @@ void launch_adamtr_rgb_sh(bool is_linear, TorchTensorView param,
 void fused_adamtr_linear_rgb_optim(
     TorchTensorView param, TorchTensorView grad, TorchTensorView exp_avg,
     TorchTensorView exp_avg_sq, TorchTensorView opacities, float lr,
-    float beta1, float beta2, float eps, float eps_tr, int step,
-    float grad_scale, bool zero_grad
+    float beta1, float beta2, float eps, float eps_tr, float dc_reg_weight,
+    float sh_reg_weight, int step, float grad_scale, bool zero_grad
 ) {
     launch_adamtr_rgb(true, param, grad, exp_avg, exp_avg_sq, opacities, lr,
-                      beta1, beta2, eps, eps_tr, step, grad_scale, zero_grad);
+                      beta1, beta2, eps, eps_tr, dc_reg_weight, sh_reg_weight,
+                      step, grad_scale, zero_grad);
 }
 
 void fused_adamtr_rgb_optim(
     TorchTensorView param, TorchTensorView grad, TorchTensorView exp_avg,
     TorchTensorView exp_avg_sq, TorchTensorView opacities, float lr,
-    float beta1, float beta2, float eps, float eps_tr, int step,
-    float grad_scale, bool zero_grad
+    float beta1, float beta2, float eps, float eps_tr, float dc_reg_weight,
+    float sh_reg_weight, int step, float grad_scale, bool zero_grad
 ) {
     launch_adamtr_rgb(false, param, grad, exp_avg, exp_avg_sq, opacities, lr,
-                      beta1, beta2, eps, eps_tr, step, grad_scale, zero_grad);
+                      beta1, beta2, eps, eps_tr, dc_reg_weight, sh_reg_weight,
+                      step, grad_scale, zero_grad);
 }
 
 void fused_adamtr_linear_rgb_sh_optim(
     TorchTensorView param, TorchTensorView grad, TorchTensorView exp_avg,
     TorchTensorView exp_avg_sq, TorchTensorView colors,
     TorchTensorView opacities, float lr, float beta1, float beta2, float eps,
-    float eps_tr, int step, float grad_scale, bool zero_grad
+    float eps_tr, float sh_reg_weight, int step, float grad_scale,
+    bool zero_grad
 ) {
     launch_adamtr_rgb_sh(true, param, grad, exp_avg, exp_avg_sq, colors,
-                         opacities, lr, beta1, beta2, eps, eps_tr, step,
-                         grad_scale, zero_grad);
+                         opacities, lr, beta1, beta2, eps, eps_tr,
+                         sh_reg_weight, step, grad_scale, zero_grad);
 }
 
 void fused_adamtr_rgb_sh_optim(
     TorchTensorView param, TorchTensorView grad, TorchTensorView exp_avg,
     TorchTensorView exp_avg_sq, TorchTensorView colors,
     TorchTensorView opacities, float lr, float beta1, float beta2, float eps,
-    float eps_tr, int step, float grad_scale, bool zero_grad
+    float eps_tr, float sh_reg_weight, int step, float grad_scale,
+    bool zero_grad
 ) {
     launch_adamtr_rgb_sh(false, param, grad, exp_avg, exp_avg_sq, colors,
-                         opacities, lr, beta1, beta2, eps, eps_tr, step,
-                         grad_scale, zero_grad);
+                         opacities, lr, beta1, beta2, eps, eps_tr,
+                         sh_reg_weight, step, grad_scale, zero_grad);
 }
 
 void fused_optim_3dgs_geometry(
@@ -527,6 +564,7 @@ void fused_optim_3dgs_geometry(
     const float dc_reg_weight, const float sh_reg_weight,
     const float max_screen_size, const float max_screen_size_penalty,
     bool use_scale_agnostic_mean,
+    ColorTrustState color_trust,
     NonShQuantState non_sh,
     GradQuantBuffers gq,
     int32_t step, DeviceVector<int32_t> per_splat_steps,
@@ -598,8 +636,8 @@ void fused_optim_3dgs_geometry(
     p.erank_reg_weight = erank_reg_weight / (float)num_splats;
     p.erank_reg_weight_s3 = erank_reg_weight_s3 / (float)num_splats;
     p.quat_norm_reg_weight = quat_norm_reg_weight / (float)num_splats;
-    p.dc_reg_weight = dc_reg_weight;
-    p.sh_reg_weight = sh_reg_weight;
+    p.dc_reg_weight = 2.0f * dc_reg_weight / 3.0f;
+    p.sh_reg_weight = 2.0f * sh_reg_weight / (float)(3 * num_splats);
     p.grad_scale = grad_scale;
     p.max_screen_size = max_screen_size;
     p.max_screen_size_penalty =
@@ -607,6 +645,7 @@ void fused_optim_3dgs_geometry(
     p.scalar_step = step;
     p.has_steps = per_splat_steps.data_ptr() ? 1u : 0u;
     p.has_densify_score = densify_score.data_ptr() ? 1u : 0u;
+    p.eps_tr = color_trust.eps_tr;
     p.numel = checked_u32_numel(num_splats, "fused_optim_3dgs_geometry");
 
     backend::vk::SpecList spec{
@@ -614,6 +653,9 @@ void fused_optim_3dgs_geometry(
         zero_grad ? 1u : 0u,
         non_sh.enabled ? 1u : 0u,
         gq_mask,
+        // Colour trust only reaches the features_dc update, which only runs
+        // under non-SH quant.
+        (non_sh.enabled && color_trust.enabled) ? 1u : 0u,
     };
     vkk::Fold f = vkk::fold_1d(num_splats, 256);
     p.wgs_per_row = f.per_row;

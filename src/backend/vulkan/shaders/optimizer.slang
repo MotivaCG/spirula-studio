@@ -11,15 +11,48 @@
 // their memory accesses with `inside`/`blk_ok` instead of returning early —
 // every thread reaches every barrier.
 
+#define CudaDeviceExport ForceInline
+#include "shaders/pixel_wise.slang"
+#undef CudaDeviceExport
 #include "optim_quant.slang"
 
 [SpecializationConstant]
 const int kOptimBits = 8;   // QuantizedAdamState bits: 4 or 8
 [SpecializationConstant]
 const int kValueBits = 8;   // QuantizedTensor value bits: 8 or 16
+[SpecializationConstant]
+const int kColorTrust = 0;  // linear splat colour space (SH cells)
 
 static const float kBeta1 = 0.9f;
 static const float kBeta2 = 0.999f;
+static const float kOptSh0 = 0.28209479177387814f;  // 1 / (2*sqrt(pi))
+
+// SH stays in coefficient space under a linear working colour space (the DC
+// reparameterization needs |sh| << c_dc, which 3DGS does not satisfy); only
+// the gradient carry and the trust-region clip apply. Matches fpbo.slang.
+struct ShColorTrust {
+    float scale;  // 1 / (dx/d(dc)) at this cell's DC colour
+    float clip;   // step rail; 0 disables clipping
+};
+
+[ForceInline]
+ShColorTrust _sh_color_trust(float* features_dc, float* opacities,
+                             float eps_tr, uint idx, uint stride) {
+    ShColorTrust r;
+    uint splat = idx / stride;
+    float c_dc = kOptSh0 * features_dc[3 * splat + (idx % 3)] + 0.5f;
+    r.scale = 1.0f / linear_rgb_to_srgb_grad(c_dc);
+    float c_cl = max(c_dc, (1.0f / 255.0f) * (1.0f / 255.0f));
+    float opac = max(1.0f / (1.0f + exp(-opacities[splat])), 1e-12f);
+    r.clip = kOptSh0 * sqrt(max(4.0f * eps_tr * c_cl / opac, 0.0f));
+    return r;
+}
+
+[ForceInline]
+float _sh_trust_clamp(ShColorTrust t, float delta) {
+    delta = clamp(delta, -t.clip, t.clip);
+    return isfinite(delta) ? delta : 0.0f;
+}
 
 [ForceInline]
 bool _finitef(float v) {
@@ -122,16 +155,19 @@ void fused_adagrad_fwd(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
 // fused_adam_step_quantized (QuantizedAdamState<kOptimBits, 256>)
 // ---------------------------------------------------------------------------
 
-struct QAdamParams {  // 88 bytes: pushed directly
+struct QAdamParams {  // 104 bytes: pushed directly
     float* param;
     float* grad;
     uint* packed;          // AoS (u, log_s) cells
     float4* quant_bounds;  // per-block (u_min, u_max, log_s_min, log_s_max)
     int* steps;            // has_steps gates; fallback-backed
+    float* ct_features_dc;  // [N, 3]; kColorTrust gates, fallback-backed
+    float* ct_opacities;    // [N] pre-sigmoid
     float lr;
     float decay;
     float decay_offset;
     float grad_scale;
+    float ct_eps_tr;
     int scalar_step;
     uint has_steps;
     uint numel;
@@ -139,7 +175,6 @@ struct QAdamParams {  // 88 bytes: pushed directly
     uint zero_grad;
     uint num_blocks;       // ceil(numel / 256); grid may be folded larger
     uint wgs_per_row;
-    uint _pad0;
 };
 
 [ForceInline]
@@ -162,6 +197,13 @@ void _adam_q_impl<let BITS : int>(uint3 wg, uint tid, QAdamParams p) {
     v += p.decay *
          (max(x - p.decay_offset, 0.0f) + min(x + p.decay_offset, 0.0f));
 
+    ShColorTrust trust = { 1.0f, 0.0f };
+    if (kColorTrust != 0 && inside) {
+        trust = _sh_color_trust(p.ct_features_dc, p.ct_opacities,
+                                p.ct_eps_tr, idx, p.stride);
+        v *= trust.scale;
+    }
+
     float4 mm = blk_ok ? p.quant_bounds[blk] : float4(0.0f);
     float g1 = 0.0f, g2 = 0.0f;
     if (inside) {
@@ -173,7 +215,9 @@ void _adam_q_impl<let BITS : int>(uint3 wg, uint tid, QAdamParams p) {
     g1 = kBeta1 * g1 + (1.0f - kBeta1) * v;
     g2 = kBeta2 * g2 + (1.0f - kBeta2) * v * v;
 
-    x -= p.lr * ibc1 * g1 / (sqrt(g2 * ibc2) + kAdamEps);
+    float delta = -p.lr * ibc1 * g1 / (sqrt(g2 * ibc2) + kAdamEps);
+    if (kColorTrust != 0) delta = _sh_trust_clamp(trust, delta);
+    x += delta;
     if (inside) p.param[idx] = x;
 
     float2 us = qadam_g1g2_to_us(g1, g2);
@@ -202,7 +246,7 @@ void fused_adam_q(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
 // value; optionally reads the block-quantized SH gradient (gradq codec).
 // ---------------------------------------------------------------------------
 
-struct QQAdamParams {  // 112 bytes: pushed directly
+struct QQAdamParams {  // 136 bytes: above the push floor, passed by ring
     float* grad;            // fp32 dense; null under grad-quant
     uint* grad_q_packed;    // int8 codes; null keeps the fp32 read
     float2* grad_q_bounds;  // per-splat-block bounds, index (idx/stride)/256
@@ -211,10 +255,13 @@ struct QQAdamParams {  // 112 bytes: pushed directly
     uint* value_packed;
     float2* value_bounds;
     int* steps;             // has_steps gates; fallback-backed
+    float* ct_features_dc;  // [N, 3]; kColorTrust gates, fallback-backed
+    float* ct_opacities;    // [N] pre-sigmoid
     float lr;
     float decay;
     float decay_offset;
     float grad_scale;
+    float ct_eps_tr;
     int scalar_step;
     uint has_steps;
     uint grad_quant;        // 1: decode grad_q_* ; 0: read fp32 grad
@@ -223,6 +270,7 @@ struct QQAdamParams {  // 112 bytes: pushed directly
     uint zero_grad;
     uint num_blocks;
     uint wgs_per_row;
+    uint _pad0;
 };
 
 [ForceInline]
@@ -257,6 +305,13 @@ void _adam_qq_impl<let OPTIM_BITS : int, let VALUE_BITS : int>(
     v += p.decay *
          (max(x - p.decay_offset, 0.0f) + min(x + p.decay_offset, 0.0f));
 
+    ShColorTrust trust = { 1.0f, 0.0f };
+    if (kColorTrust != 0 && inside) {
+        trust = _sh_color_trust(p.ct_features_dc, p.ct_opacities,
+                                p.ct_eps_tr, idx, p.stride);
+        v *= trust.scale;
+    }
+
     float4 optim_mm = blk_ok ? p.optim_bounds[blk] : float4(0.0f);
     float g1 = 0.0f, g2 = 0.0f;
     if (inside) {
@@ -269,7 +324,9 @@ void _adam_qq_impl<let OPTIM_BITS : int, let VALUE_BITS : int>(
     g1 = kBeta1 * g1 + (1.0f - kBeta1) * v;
     g2 = kBeta2 * g2 + (1.0f - kBeta2) * v * v;
 
-    x -= p.lr * ibc1 * g1 / (sqrt(g2 * ibc2) + kAdamEps);
+    float delta = -p.lr * ibc1 * g1 / (sqrt(g2 * ibc2) + kAdamEps);
+    if (kColorTrust != 0) delta = _sh_trust_clamp(trust, delta);
+    x += delta;
 
     float2 value_mm =
         oq_block_reduce_mm2(inside ? float2(x, x) : float2(1e30f, -1e30f),
@@ -298,7 +355,8 @@ void _adam_qq_impl<let OPTIM_BITS : int, let VALUE_BITS : int>(
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void fused_adam_qq(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
-                   uniform QQAdamParams p) {
+                   uniform QQAdamParams* pp) {
+    QQAdamParams p = *pp;
     if (kOptimBits == 4) {
         if (kValueBits == 8) _adam_qq_impl<4, 8>(wg, tid, p);
         else _adam_qq_impl<4, 16>(wg, tid, p);
