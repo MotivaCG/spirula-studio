@@ -12,7 +12,7 @@
 
 import {
   dsMount, dsEnumerate, dsParse, dsReadCameras, dsReadPoints,
-  dsSummary, dsFitSphere, dsLastError,
+  dsSummary, dsFitSphere, dsFrustumSize, dsLastError,
 } from './wasm.js';
 
 // Engine CameraModelType ints (ParsedDataset.camera_models / Common.cuh:130).
@@ -320,7 +320,8 @@ export function parseDatasetComponent(token) {
   const cameras = dsReadCameras();      // copied
   const summary = dsSummary();          // copied
   const fit = dsFitSphere();            // copied
+  const frustumSize = dsFrustumSize();
   const frustum = buildFrustums(cameras);
   const points = dsReadPoints();        // live heap views — upload before dsFree
-  return { cameras, summary, fit, frustum, points, error };
+  return { cameras, summary, fit, frustumSize, frustum, points, error };
 }

@@ -382,7 +382,7 @@ async function loadDataset(entries, token) {
   sortGen++; sortPending = null;       // invalidate any in-flight splat sort
 
   const fit = res.fit;
-  const frustumBase = 0.02 * (fit[3] || 1);
+  const frustumBase = res.frustumSize;
   const frustumMult = dataset ? dataset.frustumMult : 1.0;
   opts.frustumScale = frustumBase * frustumMult;
   dataset = {

@@ -836,8 +836,6 @@ bool PreviewRenderer::build(const ParsedDataset& ds, const PostSplitCameras& pos
     _num_cam_verts = (int64_t)cams.size();
     fill_line_deltas(cams, /*delta_from_aux=*/true);
 
-    // Base frustum size: the engine's kNN heuristic (train frame) mapped to
-    // normalized units.
     _base_cam_size = viewer_camera_size_heuristic(post) * (float)sA;
 
     auto make_vao = [&](unsigned& vao, unsigned& vbo, const void* data,

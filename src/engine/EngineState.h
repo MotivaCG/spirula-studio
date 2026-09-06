@@ -483,7 +483,7 @@ struct EngineViewerState {
     DeviceVector<float>   d_dist_coeffs;      // [N_post, 8]
     DeviceVector<int32_t> d_distortions;      // [N_post] CameraDistortionType
     DeviceVector<float>   d_camera_to_worlds; // [N_post, 3, 4] (y/z-flipped form)
-    float  camera_size = 0.0f;                // frustum render scale, from knn-dist
+    float  camera_size = 0.0f;                // frustum render scale, world units
 
     // Thumbnail cache: [N_post, S, S, 4] uint8, S = VIEWER_THUMBNAIL_SIZE.
     // done_mask[i] = 1 once cam i's thumbnail has been written. Host fast-path

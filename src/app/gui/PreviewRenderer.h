@@ -77,7 +77,7 @@ public:
                     const float view_target[3], bool show_cams,
                     float frustum_scale, bool show_grid);
 
-    // Base frustum size (kNN heuristic, normalized frame).
+    // Base frustum size (camhost::frustum_display_size, normalized frame).
     float base_camera_size() const { return _base_cam_size; }
     int64_t num_points() const { return _num_points; }
 
