@@ -96,6 +96,7 @@ struct MsCfg {
     int loss_map_mode;    // DensifyLossMapMode
     float quantile;
     float nms_falloff;    // *_nms modes only; 0 = the hard canny suppression
+    float sat;            // blown-highlight cutoff; <= 0 disables it
 };
 
 void run_ms_cfg(Rng& r, const MsCfg& c) {
@@ -105,8 +106,22 @@ void run_ms_cfg(Rng& r, const MsCfg& c) {
     const int64_t Ha = c.Ha ? c.Ha : c.H, Wa = c.Wa ? c.Wa : c.W;
     const int64_t npd = c.B * Hd * Wd, npn = c.B * Hn * Wn, npa = c.B * Ha * Wa;
 
-    float* render_rgb = upload(r.vec(3 * np, 0.0f, 1.0f));
-    float* ref_rgb = upload(r.vec(3 * np, 0.0f, 1.0f));
+    auto rgb1 = r.vec(3 * np, 0.0f, 1.0f);
+    auto rgb2 = r.vec(3 * np, 0.0f, 1.0f);
+    if (c.sat > 0.0f) {
+        // One contiguous blown-out block rather than scattered pixels, so the
+        // window coverage divide is exercised across its edge too.
+        for (int64_t b = 0; b < c.B; b++)
+            for (int64_t y = c.H / 4; y < c.H / 2; y++)
+                for (int64_t x = c.W / 4; x < c.W / 2; x++)
+                    for (int k = 0; k < 3; k++) {
+                        size_t i = (size_t)((b * c.H + y) * c.W + x) * 3 + k;
+                        rgb1[i] = 0.985f + 0.015f * r.uf(0.0f, 1.0f);
+                        rgb2[i] = 0.985f + 0.015f * r.uf(0.0f, 1.0f);
+                    }
+    }
+    float* render_rgb = upload(rgb1);
+    float* ref_rgb = upload(rgb2);
     float* render_Ts = upload(r.vec(np, 0.0f, 1.0f));
 
     float* render_depth = nullptr;
@@ -213,7 +228,7 @@ void run_ms_cfg(Rng& r, const MsCfg& c) {
                 ? std::make_tuple((uint64_t)ref_alpha, (uint32_t)1,
                                   std::vector<int64_t>{c.B, Ha, Wa, 1})
                 : ttv_null(),
-            /*has_mask=*/c.with_alpha, weights, w_ssim,
+            /*has_mask=*/c.with_alpha, weights, w_ssim, c.sat,
             ttv(v_losses, {(int)LossIndex::length}), needs, num_train,
             cams ? ttv(cams, {c.B}) : ttv_null(),
             ttv(loss_map_out, {c.B, c.H, c.W, 1}), c.loss_map_mode,
@@ -346,35 +361,42 @@ int main(int argc, char** argv) {
     const MsCfg cfgs[] = {
         // Full modality set, equal-shape GT, mask, 3 scales, LossFull map.
         {"full", 2, 64, 80, 3, 0, 0, 0, 0, 0, 0, true, false, false,
-         (int)DensifyLossMapMode::LossFull, 0.9f, 0.5f},
+         (int)DensifyLossMapMode::LossFull, 0.9f, 0.5f, -1.0f},
         // Scaled GT modalities (bilinear paths), camera indices, no mask,
         // 2 scales, full-SSIM map; checks the SSIM scalar.
         {"scaled_gt", 2, 40, 48, 2, 80, 96, 30, 36, 0, 0, false, true, false,
-         (int)DensifyLossMapMode::SsimFull, 0.9f, 0.5f},
+         (int)DensifyLossMapMode::SsimFull, 0.9f, 0.5f, -1.0f},
         // Minimal modalities, robust edge-aware map (residual + quantile +
         // tukey + canny), equal-res mask (canny indexes the mask at render
         // resolution), single scale.
         {"robust_edge", 1, 48, 64, 1, 0, 0, 0, 0, 0, 0, true, false, true,
-         (int)DensifyLossMapMode::RobustEdgeAware, 0.85f, 0.5f},
+         (int)DensifyLossMapMode::RobustEdgeAware, 0.85f, 0.5f, -1.0f},
         // Plain edge-aware map (canny of GT rgb), 2 scales.
         {"edge_aware", 1, 32, 32, 2, 0, 0, 0, 0, 0, 0, true, false, true,
-         (int)DensifyLossMapMode::EdgeAware, 0.9f, 0.5f},
+         (int)DensifyLossMapMode::EdgeAware, 0.9f, 0.5f, -1.0f},
         // SSIM contrast*structure and structure-only map variants; the
         // latter with a smaller-resolution mask (SSIM's clamped mask path).
         {"ssim_cs", 1, 32, 32, 1, 0, 0, 0, 0, 0, 0, false, false, true,
-         (int)DensifyLossMapMode::SsimContrastStruct, 0.9f, 0.5f},
+         (int)DensifyLossMapMode::SsimContrastStruct, 0.9f, 0.5f, -1.0f},
         {"ssim_str", 1, 32, 32, 1, 0, 0, 0, 0, 16, 16, true, false, true,
-         (int)DensifyLossMapMode::SsimStructure, 0.9f, 0.5f},
+         (int)DensifyLossMapMode::SsimStructure, 0.9f, 0.5f, -1.0f},
         // The NMS variants: same maps, thinned to their ridges. Multi-scale
         // on the loss_full one, since NMS runs per scale.
         {"loss_nms", 1, 40, 48, 2, 0, 0, 0, 0, 0, 0, true, false, false,
-         (int)DensifyLossMapMode::LossFullNms, 0.9f, 0.5f},
+         (int)DensifyLossMapMode::LossFullNms, 0.9f, 0.5f, -1.0f},
         {"ssim_f_nms", 1, 32, 32, 1, 0, 0, 0, 0, 0, 0, false, false, true,
-         (int)DensifyLossMapMode::SsimFullNms, 0.9f, 0.0f},
+         (int)DensifyLossMapMode::SsimFullNms, 0.9f, 0.0f, -1.0f},
         {"ssim_cs_nms", 1, 32, 32, 1, 0, 0, 0, 0, 0, 0, false, false, true,
-         (int)DensifyLossMapMode::SsimContrastStructNms, 0.9f, 0.25f},
+         (int)DensifyLossMapMode::SsimContrastStructNms, 0.9f, 0.25f, -1.0f},
         {"ssim_str_nms", 1, 32, 32, 1, 0, 0, 0, 0, 16, 16, true, false, true,
-         (int)DensifyLossMapMode::SsimStructureNms, 0.9f, 1.0f},
+         (int)DensifyLossMapMode::SsimStructureNms, 0.9f, 1.0f, -1.0f},
+        // Blown-highlight cutoff: the drop-and-renormalize path the mask takes,
+        // once with a mask over it and once alone (the no-mask coverage divide).
+        // Dims are multiples of both SSIM tile edges at every scale.
+        {"sat_mask", 2, 96, 96, 2, 0, 0, 0, 0, 0, 0, true, false, false,
+         (int)DensifyLossMapMode::LossFull, 0.9f, 0.5f, 0.98f},
+        {"sat_only", 1, 48, 48, 1, 0, 0, 0, 0, 0, 0, false, false, false,
+         (int)DensifyLossMapMode::SsimFull, 0.9f, 0.5f, 0.98f},
     };
     for (const MsCfg& c : cfgs) run_ms_cfg(r, c);
     run_quantile(r);

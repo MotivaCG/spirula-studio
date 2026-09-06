@@ -201,6 +201,8 @@ inline int train_tier_rank(const char* tier) {
     X(int, num_loss_scales, 0, "loss", "advanced", "")                       \
     X(float, alpha_loss_weight, 0.1f, "loss", "basic", "")                   \
     X(float, alpha_loss_weight_under, 0.0f, "loss", "basic", "")             \
+    X(float, loss_saturation_threshold, -1.0f, "loss", "advanced", "")       \
+    X(bool, normalize_loss_by_luminance, false, "loss", "advanced", "")      \
                                                                              \
     /* ==== geometry -- how crisp the surfaces come out, and depth/normal guidance ==== */ \
     X(std::string, floater_suppression, "off", "geometry", "basic", "off|mild|strong") \
@@ -423,16 +425,18 @@ inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
         c.image_color_gamut = "Rec.709";
         c.image_color_is_linear = false;
         // c.image_color_transfer = "srgb-clamped";
-        c.ppisp_param_type = "no_crf_no_vig_clamp";
         // c.apply_ppisp_before_color_space = true;
         // c.ppisp_adagrad_lr = 0.25f;
         c.ppisp_exposure_from_exif = true;
         c.background_mode = "noise";
         c.depth_distortion_reg = 0.01f;
+        c.loss_saturation_threshold = 0.98f;
+        c.normalize_loss_by_luminance = true;
         c.dc_reg = 0.0f;
         c.max_screen_size = 0.15f;
-        c.features_dc_lr = 0.0015f;
-        c.features_sh_lr = 0.000075f;
+        // c.features_dc_lr = 0.0015f;
+        c.features_sh_lr = 0.0001f;
+        c.ssim_lambda = 0.1f;
         return true;
     }
     if (name == "synthetic") {

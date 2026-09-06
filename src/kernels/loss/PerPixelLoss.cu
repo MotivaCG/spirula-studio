@@ -121,6 +121,7 @@ __global__ void per_pixel_losses_forward_kernel(
     const float3* __restrict__ median_normal,
     const bool* __restrict__ ref_alpha,
     bool has_mask,                          // gt_alpha buffer present (per-pixel mask)
+    float saturation_threshold,
     FixedArray<float, (uint)LossWeightIndex::length> loss_weights,
     float* __restrict__ out_loss_map,  // non differentiable
     float* __restrict__ out_losses
@@ -179,6 +180,7 @@ __global__ void per_pixel_losses_forward_kernel(
             median_normal ? median_normal[idx] : make_float3(0),
             ref_alpha_v,
             has_mask,
+            saturation_threshold,
             loss_weights,
             &losses
         );
@@ -256,6 +258,7 @@ __global__ void per_pixel_losses_backward_kernel(
     const float3* __restrict__ median_normal,
     const bool* __restrict__ ref_alpha,
     bool has_mask,                          // gt_alpha buffer present
+    float saturation_threshold,
     FixedArray<float, (uint)LossWeightIndex::length> loss_weights,
     const float* __restrict__ v_out_losses,
     float3* __restrict__ v_render_rgb,
@@ -348,6 +351,7 @@ __global__ void per_pixel_losses_backward_kernel(
         median_normal ? median_normal[idx] : make_float3(0),
         ref_alpha_v,
         has_mask,
+        saturation_threshold,
         loss_weights,
         v_losses,
         &temp_v_render_rgb,
@@ -487,6 +491,7 @@ static void _compute_per_pixel_losses_forward(
     TorchTensorView median_normal,
     TorchTensorView ref_alpha,
     bool has_mask,
+    float saturation_threshold,
     FixedArray<float, (uint)LossWeightIndex::length> loss_weights,
     long num_train_images,
     TorchTensorView camera_indices,
@@ -517,6 +522,7 @@ static void _compute_per_pixel_losses_forward(
         _f3ptr(median_normal),
         _bptr(ref_alpha),
         has_mask,
+        saturation_threshold,
         loss_weights,
         loss_map_ptr,
         raw_losses_ptr
@@ -552,6 +558,7 @@ static void _compute_per_pixel_losses_backward(
     TorchTensorView median_normal,
     TorchTensorView ref_alpha,
     bool has_mask,
+    float saturation_threshold,
     float* raw_losses_ptr,
     FixedArray<float, (uint)LossWeightIndex::length> loss_weights,
     float* v_losses_ptr,
@@ -594,6 +601,7 @@ static void _compute_per_pixel_losses_backward(
         _f3ptr(median_normal),
         _bptr(ref_alpha),
         has_mask,
+        saturation_threshold,
         loss_weights,
         v_raw_losses,
         _f3ptr(grads.v_render_rgb),
@@ -964,6 +972,10 @@ LossValues compute_multi_scale_per_pixel_losses(
     bool has_mask,
     const std::array<float, (int)LossWeightIndex::length> loss_weights_0,
     const float w_ssim,
+    // Positive: a pixel whose render and reference are both above it in every
+    // channel leaves the loss entirely -- value, map and gradient. Both are
+    // clipped there, so no colour error at that pixel is recoverable.
+    const float saturation_threshold,
     TorchTensorView v_losses,
     std::vector<bool> needs_input_grad,
     long num_train_images,
@@ -1135,7 +1147,7 @@ LossValues compute_multi_scale_per_pixel_losses(
             render_normal_s[scale], depth_normal_s[scale], ref_normal_s[scale], render_Ts_s[scale],
             rgb_dist_s[scale], depth_dist_s[scale], normal_dist_s[scale],
             median_depth_s[scale], median_normal_s[scale],
-            ref_alpha_s[scale], has_mask,
+            ref_alpha_s[scale], has_mask, saturation_threshold,
             loss_weights, num_train_images, camera_indices,
             per_pixel_loss_map_ptr, raw_losses_ptr, losses_ptr
         );
@@ -1203,7 +1215,7 @@ LossValues compute_multi_scale_per_pixel_losses(
             render_normal_s[scale], depth_normal_s[scale], ref_normal_s[scale], render_Ts_s[scale],
             rgb_dist_s[scale], depth_dist_s[scale], normal_dist_s[scale],
             median_depth_s[scale], median_normal_s[scale],
-            ref_alpha_s[scale], has_mask,
+            ref_alpha_s[scale], has_mask, saturation_threshold,
             raw_losses_ptr, loss_weights, _fptr(v_losses),
             num_train_images, camera_indices, scale_grads
         );
@@ -1221,6 +1233,7 @@ LossValues compute_multi_scale_per_pixel_losses(
                 loss_map_scale,
                 w_ssim,
                 _ssim_mode,
+                saturation_threshold,
                 ssim_readout
             );
         } else {
@@ -1231,7 +1244,8 @@ LossValues compute_multi_scale_per_pixel_losses(
                 /*return_ssim_val=*/false,
                 loss_map_scale,
                 w_ssim,
-                _ssim_mode
+                _ssim_mode,
+                saturation_threshold
             );
         }
 

@@ -451,6 +451,7 @@ static std::map<std::string, float> _engine_loss(
     float loss_map_clip_quantile,
     float loss_map_power,
     int loss_map_accum_mode,
+    float saturation_threshold,
     float overexposure_reg_weight,
     float color_shift_reg_weight,
     float color_shift_reg_beta,
@@ -661,6 +662,7 @@ static std::map<std::string, float> _engine_loss(
         engine().gt.has_mask,
         loss_weights,
         w_ssim,
+        saturation_threshold,
         v_losses_buf,
         needs_input_grad,
         -1,  // num_train_images: -1 means use batch size
@@ -909,6 +911,7 @@ std::map<std::string, float> engine_compute_loss_backward(
     float loss_map_clip_quantile,
     float loss_map_power,
     int loss_map_accum_mode,
+    float saturation_threshold,
     float overexposure_reg_weight,
     float color_shift_reg_weight,
     float color_shift_reg_beta
@@ -918,7 +921,7 @@ std::map<std::string, float> engine_compute_loss_backward(
                         robust_edge_aware_quantile, nms_falloff,
                         loss_map_normalize,
                         loss_map_clip_quantile, loss_map_power,
-                        loss_map_accum_mode,
+                        loss_map_accum_mode, saturation_threshold,
                         overexposure_reg_weight,
                         color_shift_reg_weight, color_shift_reg_beta,
                         _tv_null());
@@ -937,7 +940,7 @@ bool engine_preview_loss_map(const LossConfig& loss, TorchTensorView out) {
                  loss.robust_edge_aware_quantile, loss.nms_falloff,
                  loss.loss_map_normalize,
                  loss.loss_map_clip_quantile, loss.loss_map_power,
-                 loss.loss_map_accum_mode,
+                 loss.loss_map_accum_mode, loss.saturation_threshold,
                  0.0f, 0.0f, 0.0f, out);
     return true;
 }

@@ -99,6 +99,7 @@ struct PplParams {
     int W_ref_normal, H_ref_normal;
     int W_ref_alpha, H_ref_alpha;
     int has_mask;
+    float saturation_threshold;
     uint in_flags;
     uint out_flags;
     uint wgs_per_row;     // pixel axis folds across (wg.x, wg.z); wg.y = batch
@@ -376,7 +377,7 @@ void ppl_fwd(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
             render_rgb, ref_rgb, render_depth, ref_depth_v, render_normal,
             depth_normal, ref_normal_v, render_Ts, rgb_dist, depth_dist,
             normal_dist, median_depth, median_normal, ref_alpha_v,
-            p.has_mask != 0, p.weights);
+            p.has_mask != 0, p.saturation_threshold, p.weights);
 
         if ((p.in_flags & kInLossMap) != 0) {
             p.loss_map[idx] = abs(
@@ -462,7 +463,8 @@ void ppl_bwd(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
         render_rgb, ref_rgb, render_depth, ref_depth_v, render_normal,
         depth_normal, ref_normal_v, render_Ts, rgb_dist, depth_dist,
         normal_dist, median_depth, median_normal, ref_alpha_v,
-        p.has_mask != 0, p.weights, v_losses, v_render_rgb, v_ref_rgb,
+        p.has_mask != 0, p.saturation_threshold, p.weights, v_losses,
+        v_render_rgb, v_ref_rgb,
         v_render_depth, v_ref_depth, v_render_normal, v_depth_normal,
         v_ref_normal, v_render_Ts, v_rgb_dist, v_depth_dist, v_normal_dist,
         v_median_depth, v_median_normal);

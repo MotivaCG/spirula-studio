@@ -5099,6 +5099,137 @@ SS_MSG(alpha_loss_weight_under_help,
        "alanların ne kadar kararlıca doldurulacağı. Öznede delikler beliriyorsa "
        "yükseltin."));
 
+SS_MSG(loss_saturation_threshold,
+    EN("Blown-highlight cutoff"), JA("白飛びとみなす明るさ"),
+    ZH_HANS("过曝高光阈值"), ZH_HANT("過曝高光閾值"),
+    KO("날아간 하이라이트 기준값"),
+    DE("Schwelle für ausgebrannte Lichter"),
+    FR("Seuil des hautes lumières brûlées"),
+    ES("Umbral de altas luces quemadas"),
+    PT("Limiar de altas luzes queimadas"),
+    IT("Soglia delle alte luci bruciate"),
+    NL("Drempel voor uitgebeten hoge lichten"),
+    RU("Порог выбитых светов"),
+    TR("Yanmış parlaklık eşiği"));
+SS_MSG(loss_saturation_threshold_help,
+    EN("Brightness above which a pixel counts as blown out. Where both the photo "
+       "and the render are that bright in all three channels, the pixel is left "
+       "out of the loss entirely: both are clipped, so no error there is real. "
+       "Negative (the default) keeps every pixel."),
+    JA("これを超えた明るさの画素は白飛びとみなします。写真と描画の両方が三チャ"
+       "ンネルとも, この明るさを超えている画素は損失から完全に外します。どちら"
+       "も飽和していて, そこの誤差は本物ではないからです。負の値（既定）ではす"
+       "べての画素を残します。"),
+    ZH_HANS("超过这个亮度的像素算作过曝。照片和渲染结果在三个通道上都达到该亮度"
+            "的像素，会被完全排除在损失之外：两边都已削波，那里的误差不是真的。"
+            "负值（默认）保留全部像素。"),
+    ZH_HANT("超過這個亮度的像素算作過曝。照片和算圖結果在三個通道上都達到該亮度"
+            "的像素，會完全排除在損失之外：兩邊都已削波，那裡的誤差不是真的。負"
+            "值（預設）保留全部像素。"),
+    KO("이 밝기를 넘는 픽셀은 날아간 것으로 봅니다. 사진과 렌더가 세 채널 모두"
+       " 이만큼 밝은 픽셀은 손실에서 완전히 빠집니다. 양쪽 다 잘려 있어 그곳의"
+       " 오차는 진짜가 아니기 때문입니다. 음수(기본값)는 모든 픽셀을 남깁니다."),
+    DE("Helligkeit, ab der ein Pixel als ausgebrannt gilt. Wo Foto und Rendering "
+       "in allen drei Kanälen so hell sind, fällt das Pixel ganz aus dem Verlust "
+       "heraus: beide sind beschnitten, ein Fehler dort ist also keiner. Negativ "
+       "(die Vorgabe) behält jedes Pixel."),
+    FR("Luminosité au-delà de laquelle un pixel compte comme brûlé. Là où la "
+       "photo et le rendu sont aussi clairs dans les trois canaux, le pixel sort "
+       "entièrement de la perte : les deux sont écrêtés, l'erreur n'y est donc "
+       "pas réelle. Négatif (par défaut) garde tous les pixels."),
+    ES("Brillo a partir del cual un píxel cuenta como quemado. Donde la foto y "
+       "el render llegan a ese brillo en los tres canales, el píxel queda fuera "
+       "de la pérdida por completo: ambos están recortados, así que el error de "
+       "ahí no es real. Negativo (lo predeterminado) conserva todos los píxeles."),
+    PT("Brilho a partir do qual um pixel conta como queimado. Onde a foto e a "
+       "renderização chegam a esse brilho nos três canais, o pixel fica de fora "
+       "da perda por completo: ambos estão cortados, por isso o erro ali não é "
+       "real. Negativo (o padrão) mantém todos os pixels."),
+    IT("Luminosità oltre la quale un pixel conta come bruciato. Dove foto e "
+       "render sono così chiari in tutti e tre i canali, il pixel esce del tutto "
+       "dalla perdita: entrambi sono tagliati, quindi l'errore lì non è reale. "
+       "Negativo (il valore predefinito) tiene ogni pixel."),
+    NL("Helderheid waarboven een pixel als uitgebeten telt. Waar zowel de foto "
+       "als de rendering in alle drie de kanalen zo licht zijn, valt de pixel "
+       "helemaal buiten het verlies: beide zijn afgekapt, dus een fout daar is "
+       "geen fout. Negatief (de standaard) houdt elke pixel."),
+    RU("Яркость, выше которой пиксель считается выбитым. Там, где и фотография, "
+       "и рендер настолько ярки во всех трёх каналах, пиксель полностью выходит "
+       "из потерь: оба обрезаны, так что ошибка там не настоящая. Отрицательное "
+       "значение (по умолчанию) оставляет все пиксели."),
+    TR("Bir pikselin yanmış sayıldığı parlaklık. Fotoğrafın da çizimin de üç "
+       "kanalda birden bu kadar parlak olduğu piksel kayıptan tamamen çıkar: "
+       "ikisi de kırpılmıştır, oradaki hata gerçek değildir. Negatif (varsayılan) "
+       "her pikseli tutar."));
+
+SS_MSG(normalize_loss_by_luminance,
+    EN("Scale color error by brightness"), JA("明るさで色の誤差を調整"),
+    ZH_HANS("按亮度缩放颜色误差"), ZH_HANT("依亮度縮放顏色誤差"),
+    KO("밝기로 색 오차 조정"),
+    DE("Farbfehler nach Helligkeit skalieren"),
+    FR("Mettre l'erreur de couleur à l'échelle de la luminosité"),
+    ES("Escalar el error de color según el brillo"),
+    PT("Escalar o erro de cor pelo brilho"),
+    IT("Scalare l'errore di colore con la luminosità"),
+    NL("Kleurfout schalen met de helderheid"),
+    RU("Масштабировать ошибку цвета по яркости"),
+    TR("Renk hatasını parlaklığa göre ölçekle"));
+SS_MSG(normalize_loss_by_luminance_help,
+    EN("Scales the color-error weights (L1, L2 and SSIM) by twice the mean "
+       "brightness of the photo, measured in sRGB, so a dark capture counts for "
+       "as much as a bright one. It is meant for training in linear light, where "
+       "the display curve already makes a dark pixel push harder."),
+    JA("色の誤差の重み（L1, L2, SSIM）を, sRGB で測った写真の平均的な明るさの二"
+       "倍で調整します。暗い写真も明るい写真と同じだけ効くようになります。線形"
+       "の光での学習を想定しています。そこでは表示曲線のせいで暗い画素のほうが"
+       "強く効いてしまいます。"),
+    ZH_HANS("把颜色误差的权重（L1、L2 和 SSIM）乘以照片在 sRGB 下平均亮度的两"
+            "倍，让偏暗的照片和明亮的照片起同样的作用。它是为线性光下的训练准备"
+            "的：在那里显示曲线本来就让暗像素推得更用力。"),
+    ZH_HANT("把顏色誤差的權重（L1、L2 和 SSIM）乘以照片在 sRGB 下平均亮度的兩"
+            "倍，讓偏暗的照片和明亮的照片起同樣的作用。它是為線性光下的訓練準備"
+            "的：在那裡顯示曲線本來就讓暗像素推得更用力。"),
+    KO("색 오차 가중치(L1, L2, SSIM)에 sRGB로 잰 사진의 평균 밝기의 두 배를 곱"
+       "합니다. 어두운 사진도 밝은 사진만큼 힘을 냅니다. 선형 광에서 학습할 때"
+       "를 위한 것으로, 거기서는 표시 곡선 때문에 어두운 픽셀이 더 세게 밀어붙"
+       "입니다."),
+    DE("Skaliert die Gewichte des Farbfehlers (L1, L2 und SSIM) mit der "
+       "doppelten mittleren Helligkeit des Fotos, gemessen in sRGB, sodass eine "
+       "dunkle Aufnahme so viel zählt wie eine helle. Gedacht für das Training "
+       "in linearem Licht, wo die Anzeigekurve ein dunkles Pixel ohnehin stärker "
+       "drücken lässt."),
+    FR("Met les poids de l'erreur de couleur (L1, L2 et SSIM) à l'échelle du "
+       "double de la luminosité moyenne de la photo, mesurée en sRGB, pour qu'une "
+       "prise sombre compte autant qu'une prise claire. Prévu pour "
+       "l'entraînement en lumière linéaire, où la courbe d'affichage fait déjà "
+       "pousser un pixel sombre plus fort."),
+    ES("Escala los pesos del error de color (L1, L2 y SSIM) por el doble del "
+       "brillo medio de la foto, medido en sRGB, para que una toma oscura cuente "
+       "tanto como una clara. Está pensado para el entrenamiento en luz lineal, "
+       "donde la curva de pantalla ya hace que un píxel oscuro empuje más fuerte."),
+    PT("Escala os pesos do erro de cor (L1, L2 e SSIM) pelo dobro do brilho "
+       "médio da foto, medido em sRGB, para que uma captura escura conte tanto "
+       "quanto uma clara. Destina-se ao treino em luz linear, onde a curva de "
+       "exibição já faz um pixel escuro empurrar com mais força."),
+    IT("Scala i pesi dell'errore di colore (L1, L2 e SSIM) per il doppio della "
+       "luminosità media della foto, misurata in sRGB, così uno scatto scuro "
+       "conta quanto uno chiaro. È pensato per l'addestramento in luce lineare, "
+       "dove la curva di visualizzazione fa già spingere di più un pixel scuro."),
+    NL("Schaalt de gewichten van de kleurfout (L1, L2 en SSIM) met tweemaal de "
+       "gemiddelde helderheid van de foto, gemeten in sRGB, zodat een donkere "
+       "opname net zo zwaar telt als een lichte. Bedoeld voor training in "
+       "lineair licht, waar de weergavecurve een donkere pixel toch al harder "
+       "laat duwen."),
+    RU("Масштабирует веса ошибки цвета (L1, L2 и SSIM) на удвоенную среднюю "
+       "яркость снимка, измеренную в sRGB, чтобы тёмный кадр значил столько же, "
+       "сколько светлый. Предназначено для обучения в линейном свете, где кривая "
+       "отображения и так заставляет тёмный пиксель давить сильнее."),
+    TR("Renk hatası ağırlıklarını, fotoğrafın sRGB'de ölçülen ortalama "
+       "parlaklığının iki katıyla ölçekler (L1, L2 ve SSIM); böylece karanlık bir "
+       "çekim aydınlık olan kadar sayılır. Doğrusal ışıkta eğitim için "
+       "düşünülmüştür; orada görüntüleme eğrisi karanlık pikseli zaten daha sert "
+       "ittirir."));
+
 
 // ===========================================================================
 // Geometry & Surfaces

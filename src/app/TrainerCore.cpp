@@ -367,6 +367,8 @@ EngineStepConfig build_step_config(const TrainConfig& c, const RunState& st, int
     cfg.loss.loss_map_clip_quantile = c.densify_loss_map_clip_quantile;
     cfg.loss.loss_map_power = c.densify_loss_map_power;
     cfg.loss.loss_map_accum_mode = densify_accum_mode_int(c.densify_accum_mode);
+    cfg.loss.saturation_threshold = c.loss_saturation_threshold;
+    cfg.loss.normalize_by_luminance = c.normalize_loss_by_luminance;
     cfg.loss.overexposure_reg_weight = c.overexposure_reg;
     if (st.bilagrid_rgb_init || st.ppisp_init) {
         cfg.loss.color_shift_reg_weight = c.color_shift_reg_weight;

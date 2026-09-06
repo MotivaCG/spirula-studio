@@ -8,8 +8,8 @@
 // zero-padded input, so tile size only shifts the atomic ssim scalar's
 // grouping (loose parity channel).
 //
-// Masked pixels are dropped from the window sums and divided back out through
-// mask_w (see FusedSSIM.cu), making the moments conditional on the mask.
+// Masked pixels -- and, with `sat` positive, ones both images clip above --
+// drop out of the window sums, divided back out through mask_w (FusedSSIM.cu).
 
 #include "int8_compat.slang"
 #include "atomic_float.slang"
@@ -43,6 +43,7 @@ static const uint kSsimHasMask = 1u << 0;
 static const uint kSsimHasVal = 1u << 1;
 static const uint kSsimWriteGrad = 1u << 2;
 static const uint kSsimHasLossMap = 1u << 3;
+static const uint kSsimHasCov = 1u << 4;
 
 struct SsimParams {
     float* img1;      // [B,H,W,3]
@@ -56,6 +57,7 @@ struct SsimParams {
     int Bm, Hm, Wm;
     float dL_dmap;
     float map_weight;
+    float sat;        // clip threshold, or <= 0 to disable
     int mode;         // SsimLossMapMode: 0 skip, 1 LCS, 2 CS, 3 structure
     uint flags;
 };
@@ -85,10 +87,25 @@ bool _fs_mask_at(uint* masks, int Bm, int Hm, int Wm, int H, int W,
     return u8_load(masks, idx) != 0u;
 }
 
+// A pixel both images clip above carries no recoverable error, so it drops out
+// of the window sums the way a masked one does. Out-of-image taps read
+// unclipped, matching _fs_mask_at.
+[ForceInline]
+bool _fs_unclipped(float* img1, float* img2, float sat, int H, int W,
+                   int b, int y, int x) {
+    if (sat <= 0.0f) return true;
+    if (uint(x) >= uint(W) || uint(y) >= uint(H)) return true;
+    int i = (((b * H) + y) * W + x) * 3;
+    return min(min(img1[i], img1[i + 1]), img1[i + 2]) <= sat ||
+           min(min(img2[i], img2[i + 1]), img2[i + 2]) <= sat;
+}
+
 [ForceInline]
 bool _fs_mask(SsimParams p, int b, int y, int x) {
-    if ((p.flags & kSsimHasMask) == 0) return true;
-    return _fs_mask_at(p.masks, p.Bm, p.Hm, p.Wm, p.H, p.W, b, y, x);
+    if ((p.flags & kSsimHasMask) != 0 &&
+            !_fs_mask_at(p.masks, p.Bm, p.Hm, p.Wm, p.H, p.W, b, y, x))
+        return false;
+    return _fs_unclipped(p.img1, p.img2, p.sat, p.H, p.W, b, y, x);
 }
 
 
@@ -99,16 +116,22 @@ static const float kGaussSum = 0.9999999f;
 
 struct SsimCovParams {
     uint* masks;
+    float* img1;
+    float* img2;
     float* tmp;
     float* out;
     int B, H, W;
     int Bm, Hm, Wm;
+    float sat;
+    int _pad0;
 };
 
+// Bm is 0 when there is no mask buffer, which _fs_mask_at reads as unmasked.
 [ForceInline]
 float _fs_cov_mask(SsimCovParams p, int b, int y, int x) {
-    return _fs_mask_at(p.masks, p.Bm, p.Hm, p.Wm, p.H, p.W, b, y, x) ? 1.0f
-                                                                     : 0.0f;
+    bool keep = _fs_mask_at(p.masks, p.Bm, p.Hm, p.Wm, p.H, p.W, b, y, x) &&
+                _fs_unclipped(p.img1, p.img2, p.sat, p.H, p.W, b, y, x);
+    return keep ? 1.0f : 0.0f;
 }
 
 [shader("compute")]
@@ -261,7 +284,7 @@ void ssim_bwd_inplace(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
             int cy = startY + ly - 2 * HALO;
             int cx = startX + lx - HALO;
             float inv_cov = 1.0f;
-            if ((p.flags & kSsimHasMask) != 0 && uint(cx) < uint(p.W) &&
+            if ((p.flags & kSsimHasCov) != 0 && uint(cx) < uint(p.W) &&
                     uint(cy) < uint(p.H))
                 inv_cov = 1.0f /
                     max(p.mask_w[(bIdx * p.H + cy) * p.W + cx], 1e-6f);

@@ -125,6 +125,28 @@ __device__ __forceinline__ bool get_pix_value(
     return img[b * H_mask * W_mask + ys * W_mask + xs];
 }
 
+// The mask every stage below reads: the image mask, plus (when `sat` is
+// positive) a pixel both images clip above, which carries no recoverable
+// error. Out-of-image taps read unmasked, as the mask fetch does.
+__device__ __forceinline__ bool get_pix_mask(
+    const float3* img1, const float3* img2, float sat,
+    const bool* masks,
+    int b, int y, int x,
+    int B_mask, int H_mask, int W_mask,
+    int H, int W
+) {
+    if (!get_pix_value(masks, b, y, x, B_mask, H_mask, W_mask, H, W))
+        return false;
+    if (sat <= 0.0f)
+        return true;
+    if ((unsigned)x >= (unsigned)W || (unsigned)y >= (unsigned)H)
+        return true;
+    float3 a = img1[(b * H + y) * W + x];
+    float3 c = img2[(b * H + y) * W + x];
+    return fminf(fminf(a.x, a.y), a.z) <= sat ||
+           fminf(fminf(c.x, c.y), c.z) <= sat;
+}
+
 // ------------------------------------------
 // Window coverage of the mask
 // ------------------------------------------
@@ -137,6 +159,9 @@ __constant__ float cGaussSum = 0.9999999f;
 
 __global__ void _ssim_mask_coverage_x_kernel(
     int B, int H, int W,
+    const float3* __restrict__ img1,
+    const float3* __restrict__ img2,
+    float sat,
     const bool* __restrict__ masks,
     int B_mask, int H_mask, int W_mask,
     float* __restrict__ tmp  // [B, H, W]
@@ -149,8 +174,8 @@ __global__ void _ssim_mask_coverage_x_kernel(
     #pragma unroll
     for (int d = -HALO; d <= HALO; ++d)
         acc += cGauss[HALO - abs(d)] *
-            (float)get_pix_value(masks, b, y, x + d, B_mask, H_mask, W_mask,
-                                 H, W);
+            (float)get_pix_mask(img1, img2, sat, masks, b, y, x + d,
+                                B_mask, H_mask, W_mask, H, W);
     tmp[((size_t)b * H + y) * W + x] = acc;
 }
 
@@ -176,18 +201,19 @@ __global__ void _ssim_mask_coverage_y_kernel(
     out[((size_t)b * H + y) * W + x] = acc;
 }
 
-// Returns null when there is no mask -- the caller then skips the divide and
-// reproduces the unmasked result bit for bit.
+// Returns null when nothing is masked out -- the caller then skips the divide
+// and reproduces the unmasked result bit for bit.
 static float* _ssim_mask_coverage(
     int B, int H, int W,
+    const float3* img1, const float3* img2, float sat,
     const bool* masks, int B_mask, int H_mask, int W_mask
 ) {
-    if (masks == nullptr) return nullptr;
+    if (masks == nullptr && sat <= 0.0f) return nullptr;
     const size_t n = (size_t)B * H * W;
     float* out = DevicePool::global().acquire<float>(PoolSlot::SsimMaskWeight, n);
     float* tmp = DevicePool::global().acquire<float>(PoolSlot::SsimMaskWeightTmp, n);
     _ssim_mask_coverage_x_kernel<<<_LAUNCH_ARGS_3D(W, H, B, 32, 8, 1)>>>(
-        B, H, W, masks, B_mask, H_mask, W_mask, tmp);
+        B, H, W, img1, img2, sat, masks, B_mask, H_mask, W_mask, tmp);
     _ssim_mask_coverage_y_kernel<<<_LAUNCH_ARGS_3D(W, H, B, 32, 8, 1)>>>(
         B, H, W, tmp, out);
     CHECK_DEVICE_ERROR(cudaGetLastError());
@@ -643,6 +669,7 @@ __global__ void memory_efficient_ssim_backward_kernel(
     const float3* __restrict__ img2,   // [B, H, W, 3]
     const bool* __restrict__ masks,  // [B_mask, H_mask, W_mask, 1]
     int B_mask, int H_mask, int W_mask,
+    float sat,                       // clip threshold, or <= 0 to disable
     const float* __restrict__ mask_w,  // [B, H, W] gaussian-blurred mask, or null
     const float dL_dmap, // [1]
     float3* __restrict__ dL_dimg1,      // [B, H, W, 3]
@@ -714,8 +741,8 @@ __global__ void memory_efficient_ssim_backward_kernel(
 
                 float X = get_pix_value(img1, bIdx, gy, gx, ci, H, W);
                 float Y = get_pix_value(img2, bIdx, gy, gx, ci, H, W);
-                bool mask = get_pix_value(masks, bIdx, gy, gx, B_mask, H_mask,
-                                          W_mask, H, W);
+                bool mask = get_pix_mask(img1, img2, sat, masks, bIdx, gy, gx,
+                                         B_mask, H_mask, W_mask, H, W);
                 // Drop the sample instead of substituting for it: every window
                 // sum below is over w*mask, and `mask_w` divides the coverage
                 // back out, so the statistics are conditional on the mask.
@@ -856,7 +883,8 @@ __global__ void memory_efficient_ssim_backward_kernel(
                 && cx < W && cy < H
         ) {
             const bool cmask =
-                get_pix_value(masks, bIdx, cy, cx, B_mask, H_mask, W_mask, H, W);
+                get_pix_mask(img1, img2, sat, masks, bIdx, cy, cx,
+                             B_mask, H_mask, W_mask, H, W);
             float ssim_v = (C_ * D_) / (A * B);
             if (lm_out) {
                 // ssim_loss_map_mode selects which SSIM variant gets folded
@@ -904,8 +932,8 @@ __global__ void memory_efficient_ssim_backward_kernel(
         // neighbours it overlaps -- its moments are a divide by ~nothing.
         float masked_grad = grad * float(
             pix_x >= HALO && pix_y >= HALO && pix_x < W+HALO && pix_y < H+HALO
-            && get_pix_value(masks, bIdx, pix_y - HALO, pix_x - HALO,
-                             B_mask, H_mask, W_mask, H, W)
+            && get_pix_mask(img1, img2, sat, masks, bIdx, pix_y - HALO,
+                            pix_x - HALO, B_mask, H_mask, W_mask, H, W)
         );
 
         // Each moment was divided by the coverage, so its vjp carries the same
@@ -985,8 +1013,8 @@ __global__ void memory_efficient_ssim_backward_kernel(
         // final accumulation
         float p1 = get_pix_value(img1, bIdx, pix_y, pix_x, ci, H, W);
         float p2 = get_pix_value(img2, bIdx, pix_y, pix_x, ci, H, W);
-        bool mask = get_pix_value(masks, bIdx, pix_y, pix_x, B_mask, H_mask,
-                                  W_mask, H, W);
+        bool mask = get_pix_mask(img1, img2, sat, masks, bIdx, pix_y, pix_x,
+                                 B_mask, H_mask, W_mask, H, W);
         float dL_dpix = sum0 + (2.f * p1) * sum1 + (p2) * sum2;
         // Masked pixels get no gradient; the ssim scalar already counted them
         // as a perfect match, up in the aligned window loop.
@@ -1118,6 +1146,7 @@ void fused_ssim_backward(
             (float3*)std::get<0>(img2),
             nullptr,
             /*B_mask=*/0, /*H_mask=*/0, /*W_mask=*/0,
+            /*sat=*/-1.0f,
             /*mask_w=*/nullptr,
             dL_dmap,
             (float3*)std::get<0>(dL_dimg1),
@@ -1138,7 +1167,8 @@ static inline void _launch_fused_ssim_inplace(
     float* ssim_buf,                // non-null to receive SSIM scalar
     TorchTensorView ssim_loss_map,
     float ssim_loss_map_weight,
-    int ssim_loss_map_mode
+    int ssim_loss_map_mode,
+    float saturation_threshold
 ) {
     const auto& s = std::get<2>(img1);
     int B = s[0], H = s[1], W = s[2];
@@ -1157,8 +1187,11 @@ static inline void _launch_fused_ssim_inplace(
         }
     }
 
+    const float3* p_img1 = (const float3*)std::get<0>(img1);
+    const float3* p_img2 = (const float3*)std::get<0>(img2);
     const float* mask_w =
-        _ssim_mask_coverage(B, H, W, mask_ptr, B_mask, H_mask, W_mask);
+        _ssim_mask_coverage(B, H, W, p_img1, p_img2, saturation_threshold,
+                            mask_ptr, B_mask, H_mask, W_mask);
 
     memory_efficient_ssim_backward_kernel<true><<<_LAUNCH_ARGS_3D(W, H, B, BLOCK_X_ME, BLOCK_Y_ME, 1)>>>(
         B, H, W,
@@ -1166,6 +1199,7 @@ static inline void _launch_fused_ssim_inplace(
         (float3*)std::get<0>(img2),
         mask_ptr,
         B_mask, H_mask, W_mask,
+        saturation_threshold,
         mask_w,
         dL_dmap,
         (float3*)std::get<0>(dL_dimg1),
@@ -1186,7 +1220,10 @@ float fused_ssim_inplace(
     bool return_ssim_val,
     TorchTensorView ssim_loss_map,  // [B, H, W, 1] output, or null
     float ssim_loss_map_weight,
-    int ssim_loss_map_mode
+    int ssim_loss_map_mode,
+    // Positive: a pixel above it in every channel of BOTH images drops out,
+    // exactly as a masked one does.
+    float saturation_threshold
 ) {
     float* ssim_buf = nullptr;
     if (return_ssim_val) {
@@ -1197,7 +1234,7 @@ float fused_ssim_inplace(
     _launch_fused_ssim_inplace(
         img1, img2, mask, dL_dmap, dL_dimg1,
         ssim_buf, ssim_loss_map, ssim_loss_map_weight,
-        ssim_loss_map_mode);
+        ssim_loss_map_mode, saturation_threshold);
 
     if (return_ssim_val) {
         float val;
@@ -1217,6 +1254,7 @@ float fused_ssim_inplace_async(
     TorchTensorView ssim_loss_map,
     float ssim_loss_map_weight,
     int ssim_loss_map_mode,
+    float saturation_threshold,
     AsyncReadout<float>& readout
 ) {
     float* ssim_buf = DevicePool::global().acquire<float>(PoolSlot::SsimScalar, 1);
@@ -1225,7 +1263,7 @@ float fused_ssim_inplace_async(
     _launch_fused_ssim_inplace(
         img1, img2, mask, dL_dmap, dL_dimg1,
         ssim_buf, ssim_loss_map, ssim_loss_map_weight,
-        ssim_loss_map_mode);
+        ssim_loss_map_mode, saturation_threshold);
 
     const float* prev = readout.read_previous();
     float val = prev ? prev[0] : 0.0f;

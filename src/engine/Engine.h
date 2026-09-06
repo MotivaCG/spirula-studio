@@ -165,6 +165,8 @@ std::map<std::string, float> engine_compute_loss_backward(
     float loss_map_power,
     // DensifyAccumMode as an int (see LossConfig::loss_map_accum_mode).
     int loss_map_accum_mode,
+    // Clipped-highlight cutoff (see LossConfig::saturation_threshold).
+    float saturation_threshold,
     // Image-space overexposure regularization weight (see LossConfig).
     // Zero (default) disables the kernel launch entirely.
     float overexposure_reg_weight = 0.0f,
