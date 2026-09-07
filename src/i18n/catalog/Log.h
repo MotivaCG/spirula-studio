@@ -802,6 +802,32 @@ SS_MSG(colmap_split_frame_sizes,
        "bu yüzden her boyut için ayrı kamera ile çıkarım yapılıyor. "
        "Kamera grubu sayısı: {0}"));
 
+SS_MSG(sfm_not_metric,
+    EN("Note: the GPS scale could not be fitted. The model is written in its "
+       "own units, not metres."),
+    JA("メモ: GPS による寸法を当てはめられませんでした。モデルはメートルではなく"
+       "独自の単位で書き出されます。"),
+    ZH_HANS("提示：没能拟合出 GPS 尺度。模型按自身单位写出，而不是米。"),
+    ZH_HANT("提示：沒能擬合出 GPS 尺度。模型按自身單位寫出，而不是公尺。"),
+    KO("참고: GPS 로 크기를 맞추지 못했습니다. 모델은 미터가 아니라 자체 단위로 "
+       "기록됩니다."),
+    DE("Hinweis: Der GPS-Maßstab ließ sich nicht anpassen. Das Modell wird in "
+       "eigenen Einheiten geschrieben, nicht in Metern."),
+    FR("Note : l'échelle GPS n'a pas pu être ajustée. Le modèle est écrit dans "
+       "ses propres unités, pas en mètres."),
+    ES("Nota: no se pudo ajustar la escala por GPS. El modelo se escribe en sus "
+       "propias unidades, no en metros."),
+    PT("Nota: não foi possível ajustar a escala por GPS. O modelo é escrito nas "
+       "suas próprias unidades, não em metros."),
+    IT("Nota: la scala da GPS non si è potuta stimare. Il modello viene scritto "
+       "nelle sue unità, non in metri."),
+    NL("Let op: de GPS-schaal kon niet worden gefit. Het model wordt in eigen "
+       "eenheden geschreven, niet in meters."),
+    RU("Примечание: масштаб по GPS подобрать не удалось. Модель записывается в "
+       "своих единицах, а не в метрах."),
+    TR("Not: GPS ölçeği oturtulamadı. Model metre yerine kendi biriminde "
+       "yazılıyor."));
+
 SS_MSG(sfm_partial,
     EN("Note: only part of the capture reconstructed. It will still train, but "
        "expect gaps."),

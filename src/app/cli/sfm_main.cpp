@@ -106,7 +106,7 @@ struct CommandInfo {
     // examples are what the reader types, so they are not.
     const spirula::i18n::Msg* summary;              // one line, for `--help`
     const char* usage;                              // argument syntax
-    const spirula::i18n::Msg* description[3];       // one per paragraph, then null
+    const spirula::i18n::Msg* description[4];       // one per paragraph, then null
     void (*own_options)(FILE*);
     const char* examples;                           // pre-wrapped, indented
     bool exit_status;                               // print `auto`'s footer
@@ -196,11 +196,12 @@ static const CommandInfo kCommands[] = {
 
     {"merge", CMD_MERGE, &H::sum_merge,
      "<SPARSE_DIR|MODEL_DIR> [more...] -o DIR [options]",
-     {&H::desc_merge_1, &H::desc_merge_2, nullptr},
+     {&H::desc_merge_1, &H::desc_merge_2, &H::desc_merge_3, nullptr},
      ownOptionsMerge,
      "  spirula-sfm merge sparse/ -o merged/\n"
      "  spirula-sfm merge sparse/ --in-place\n"
-     "  spirula-sfm merge runA/sparse/0 runB/sparse/0 -o merged/ --min-common 5",
+     "  spirula-sfm merge runA/sparse/0 runB/sparse/0 -o merged/ --min-common 5\n"
+     "  spirula-sfm merge ws/sparse --in-place --metric-gps horizontal --images ws/images",
      false},
 };
 
@@ -216,7 +217,7 @@ static void printCommandHelp(const CommandInfo& c) {
     std::fprintf(out, "%s\n  %s %s %s\n\n", H::label_usage.get(), kProgram, c.name,
                  c.usage);
     std::fprintf(out, "%s\n", H::label_description.get());
-    for (int i = 0; i < 3 && c.description[i]; i++) {
+    for (int i = 0; i < 4 && c.description[i]; i++) {
         if (i) std::fprintf(out, "\n");
         printParagraph(out, *c.description[i]);
     }
@@ -491,7 +492,8 @@ static std::string metricReason(const MetricFit& f) {
 // otherwise. False when a metric frame was asked for and not delivered.
 static bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
                      const std::string& imagedir, bool verbose) {
-    const bool gps = cfg.metric_gps;
+    const bool gps = cfg.metric_gps != "none";
+    const bool flat = cfg.metric_gps == "horizontal";
     const bool file = !cfg.metric_positions.empty();
     if (!gps && !file) {
         orientModels(models, cfg.orient, verbose);
@@ -520,17 +522,26 @@ static bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
                    {(long long)gc.matched, (long long)(gc.matched + gc.no_gps),
                     (long long)gc.no_alt});
         }
-        const MetricFit fit = fitMetricGauge(ref, cfg.metric_max_error);
+        // Horizontal mode takes the tilt from the cameras' own up axis, so its
+        // fit -- scale, heading and place -- runs in the upright frame.
+        const Sim3 pre = flat ? uprightTransform(models[i]) : Sim3{};
+        for (Vec3& c : ref.centres) c = transformPoint(pre, c);
+        const MetricFit fit =
+            fitMetricGauge(ref, cfg.metric_max_error,
+                           flat ? MetricAxes::Horizontal : MetricAxes::Full);
         if (!fit.ok) {
             all = false;
             if (cfg.orient) orientModel(models[i]);
             L::fail(Tag::Orient, M::metric_failed, {(long long)i, metricReason(fit)});
             continue;
         }
-        applySim3(models[i], fit.T);
+        applySim3(models[i], composeSim3(fit.T, pre));
         L::out(Tag::Orient, M::metric_done,
                {(long long)i,
-                spirula::i18n::format(gps ? M::metric_source_gps : M::metric_source_positions, {}),
+                spirula::i18n::format(!gps    ? M::metric_source_positions
+                                      : flat  ? M::metric_source_gps_flat
+                                              : M::metric_source_gps,
+                                      {}),
                 L::num(fit.T.scale, 6), L::num(fit.max_error, 3), (long long)fit.inliers,
                 (long long)fit.n, L::num(fit.rms, 4), L::num(fit.scale_unc, 3),
                 L::num(fit.rot_unc_deg, 3)});
@@ -1996,33 +2007,39 @@ static int cmdMerge(int argc, char** argv) {
                {d.string(), models.back().numRegistered(),
                 (long long)models.back().points3D.size()});
     }
-    if (models.size() < 2) {
+    // A metric reference re-gauges a model instead of joining it to another,
+    // which is the one thing this command does that one model can want (D74).
+    const bool metric = cfg.metric_gps != "none" || !cfg.metric_positions.empty();
+    if (models.size() < 2 && !metric) {
         L::fail(Tag::Merge, M::merge_need_two, {(long long)models.size()});
         return 1;
     }
-    const size_t covered_before = distinctRegistered(models);
+    if (models.size() < 2) L::out(Tag::Merge, M::merge_metric_only, {});
+    else {
+        const size_t covered_before = distinctRegistered(models);
 
-    MergeSummary sum;
-    models = mergeModels(std::move(models), mo, cfg.merge_ba, cfg.device, sum);
+        MergeSummary sum;
+        models = mergeModels(std::move(models), mo, cfg.merge_ba, cfg.device, sum);
 
-    L::out(Tag::Merge, M::merge_summary,
-           {(long long)sum.before, (long long)sum.after, L::num(sum.seconds, 2),
-            (long long)sum.merges, (long long)sum.refused});
-    if (sum.ba_seconds > 0)
-        L::out(Tag::Merge, M::merge_ba_seconds, {L::num(sum.ba_seconds, 2)});
-    for (size_t i = 0; i < models.size(); i++) {
-        double mean = 0, median = 0;
-        size_t nobs = 0;
-        modelReprojStats(models[i], mean, median, nobs);
-        L::out(Tag::Merge, M::merge_model_line,
-               {(long long)i, models[i].numRegistered(),
-                (long long)models[i].points3D.size(), L::num(mean, 3),
-                L::num(median, 3), (long long)nobs});
+        L::out(Tag::Merge, M::merge_summary,
+               {(long long)sum.before, (long long)sum.after, L::num(sum.seconds, 2),
+                (long long)sum.merges, (long long)sum.refused});
+        if (sum.ba_seconds > 0)
+            L::out(Tag::Merge, M::merge_ba_seconds, {L::num(sum.ba_seconds, 2)});
+        for (size_t i = 0; i < models.size(); i++) {
+            double mean = 0, median = 0;
+            size_t nobs = 0;
+            modelReprojStats(models[i], mean, median, nobs);
+            L::out(Tag::Merge, M::merge_model_line,
+                   {(long long)i, models[i].numRegistered(),
+                    (long long)models[i].points3D.size(), L::num(mean, 3),
+                    L::num(median, 3), (long long)nobs});
+        }
+        const size_t covered_after = distinctRegistered(models);
+        if (covered_after != covered_before)
+            L::out(Tag::Merge, M::merge_survived,
+                   {(long long)covered_after, (long long)covered_before});
     }
-    const size_t covered_after = distinctRegistered(models);
-    if (covered_after != covered_before)
-        L::out(Tag::Merge, M::merge_survived,
-               {(long long)covered_after, (long long)covered_before});
 
     const bool merge_metric = fixGauge(models, cfg, cfg.image_dir, mo.verbose);
     recolorPoints(models, cfg);
@@ -2300,16 +2317,14 @@ static int cmdAuto(int argc, char** argv) {
         L::out(Tag::Run, M::result_failed);
         return 2;
     }
-    if (frac < 0.5 || mean > 2.0) {
-        L::out(Tag::Run, M::result_partial, {L::num(100 * frac, 0), L::num(mean, 2)});
-        return 3;
-    }
+    const bool partial = frac < 0.5 || mean > 2.0;
+    if (partial) L::out(Tag::Run, M::result_partial, {L::num(100 * frac, 0), L::num(mean, 2)});
     // A sound model in the wrong gauge is still a sound model, so the metric
-    // verdict comes after the ones about the reconstruction itself.
-    if (!auto_metric) {
-        L::out(Tag::Run, M::result_not_metric);
-        return 4;
-    }
+    // verdict takes the exit status only when nothing about the reconstruction
+    // itself claims it -- but it is always printed, and the GUI reads the line.
+    if (!auto_metric) L::out(Tag::Run, M::result_not_metric);
+    if (partial) return 3;
+    if (!auto_metric) return 4;
     L::out(Tag::Run, M::result_ok, {L::num(100 * frac, 0), L::num(mean, 2)});
     return 0;
 }

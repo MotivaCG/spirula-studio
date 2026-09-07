@@ -42,6 +42,11 @@ struct MetricRef {
 
 enum class MetricFail { None, Pairs, Spread, Inliers, Collinear };
 
+// Which components of the reference carry the gauge. Horizontal reads the
+// level pair and takes the tilt from the caller's own up axis: a GPS altitude
+// biased by metres tips a full fit by degrees over a 100 m capture (D75).
+enum class MetricAxes { Full, Horizontal };
+
 struct MetricFit {
     bool ok = false;
     MetricFail reason = MetricFail::Pairs;
@@ -53,7 +58,7 @@ struct MetricFit {
     double scale_unc = 0;       // per cent, std(ds/s) -- advisory
     double rot_unc_deg = 0;     // worst principal axis -- advisory
     double spread = 0;          // metres, RMS radius of the reference positions
-    double perp_frac = 0;       // RMS spread across the long axis, over the whole
+    double perp_frac = 0;       // spread across the least-resisted axis, over the whole
     std::vector<char> inlier_mask;
 };
 
@@ -72,12 +77,42 @@ inline Vec3 meanOf(const std::vector<Vec3>& v) {
 
 }  // namespace detail
 
+// The similarity restricted to scale, heading and place: one rotation about
+// +Z, fitted to the level components alone. Flattening the targets and calling
+// estimateSim3 instead would fit a full rotation and tip the model into them.
+inline bool estimateSim3Yaw(const std::vector<Vec3>& src, const std::vector<Vec3>& dst,
+                            Sim3& out) {
+    const size_t n = src.size();
+    if (n < 2 || dst.size() != n) return false;
+    Vec3 ms{0, 0, 0}, md{0, 0, 0};
+    for (size_t i = 0; i < n; i++) { ms = ms + src[i]; md = md + dst[i]; }
+    ms = ms * (1.0 / (double)n);
+    md = md * (1.0 / (double)n);
+    double var_s = 0, dot = 0, cross = 0;
+    for (size_t i = 0; i < n; i++) {
+        const Vec3 a = src[i] - ms, b = dst[i] - md;
+        var_s += a.x * a.x + a.y * a.y;
+        dot += a.x * b.x + a.y * b.y;
+        cross += a.x * b.y - a.y * b.x;
+    }
+    const double h = std::sqrt(dot * dot + cross * cross);
+    if (!(var_s > 1e-12) || !(h > 1e-12)) return false;
+    const double c = dot / h, s = cross / h;
+    out.scale = h / var_s;
+    if (!(out.scale > 1e-12) || !std::isfinite(out.scale)) return false;
+    out.R = Mat3{c, -s, 0, s, c, 0, 0, 0, 1};
+    out.t = md - mul(out.R, ms) * out.scale;
+    return std::isfinite(out.t.x) && std::isfinite(out.t.y) && std::isfinite(out.t.z);
+}
+
 // The similarity taking `ref.centres` onto `ref.targets`, refused with a named
 // reason when the data cannot support one. `max_error` is the RANSAC inlier
-// radius in metres.
-inline MetricFit fitMetricGauge(const MetricRef& ref, double max_error) {
+// radius in metres, measured in the components `axes` reads.
+inline MetricFit fitMetricGauge(const MetricRef& ref, double max_error,
+                                MetricAxes axes = MetricAxes::Full) {
     MetricFit out;
     out.max_error = max_error;
+    const bool flat = axes == MetricAxes::Horizontal;
     const int n = (int)ref.centres.size();
     out.n = n;
     if (n < 3 || (int)ref.targets.size() != n) {
@@ -89,7 +124,10 @@ inline MetricFit fitMetricGauge(const MetricRef& ref, double max_error) {
     // every fit to them is an arbitrary one that would pass an RMS gate.
     const Vec3 pbar = detail::meanOf(ref.targets);
     double var_t = 0;
-    for (const Vec3& p : ref.targets) var_t += (p - pbar).dot(p - pbar);
+    for (const Vec3& p : ref.targets) {
+        const Vec3 d = p - pbar;
+        var_t += flat ? d.x * d.x + d.y * d.y : d.dot(d);
+    }
     out.spread = std::sqrt(var_t / (double)n);
     if (!(out.spread > max_error)) {
         out.reason = MetricFail::Spread;
@@ -106,19 +144,19 @@ inline MetricFit fitMetricGauge(const MetricRef& ref, double max_error) {
             d.push_back(ref.targets[i]);
         }
         Sim3 T;
-        if (estimateSim3(s, d, T)) models.push_back(T);
+        if (flat ? estimateSim3Yaw(s, d, T) : estimateSim3(s, d, T)) models.push_back(T);
         return models;
     };
     auto res_fn = [&](const Sim3& T, int i) {
         const Vec3 r = ref.targets[i] - transformPoint(T, ref.centres[i]);
-        return r.dot(r);
+        return flat ? r.x * r.x + r.y * r.y : r.dot(r);
     };
 
     RansacOptions opt;
     opt.max_error = max_error;
     opt.max_num_trials = 1000;
     opt.seed = 0;
-    RansacReport<Sim3> rep = loransac<Sim3>(n, 3, fit_fn, fit_fn, res_fn, opt);
+    RansacReport<Sim3> rep = loransac<Sim3>(n, flat ? 2 : 3, fit_fn, fit_fn, res_fn, opt);
     out.inlier_mask = rep.inlier_mask;
     out.inliers = std::max(rep.num_inliers, 0);
     const int need = std::max(3, (n + 1) / 2);
@@ -147,14 +185,14 @@ inline MetricFit fitMetricGauge(const MetricRef& ref, double max_error) {
     }
     cbar = cbar * (1.0 / (double)m);
     out.rms = std::sqrt(ss / (double)m);
-    // Seven parameters come out of 3m residual components, so the noise
-    // estimate divides by what is left.
-    const double sigma = std::sqrt(ss / (double)(3 * m - 7));
+    // Seven parameters come out of 3m residual components -- four out of the
+    // 2m level ones -- so the noise estimate divides by what is left.
+    const double sigma = std::sqrt(ss / (double)(flat ? 2 * m - 4 : 3 * m - 7));
 
     std::vector<double> C(9, 0.0);
     for (int i : keep) {
         const Vec3 a = ref.centres[i] - cbar;
-        const double v[3] = {a.x, a.y, a.z};
+        const double v[3] = {a.x, a.y, flat ? 0.0 : a.z};
         for (int r = 0; r < 3; r++)
             for (int c = 0; c < 3; c++) C[3 * r + c] += v[r] * v[c];
     }
@@ -165,12 +203,12 @@ inline MetricFit fitMetricGauge(const MetricRef& ref, double max_error) {
     const double tr = lam[0] + lam[1] + lam[2];
 
     out.scale_unc = 100.0 * sigma / (std::sqrt((double)m) * std::sqrt(tr));
-    // Rotation about principal axis k is resisted only by the spread
-    // perpendicular to it; where there is none the angle is unidentifiable
-    // whatever the residual says.
+    // Rotation about principal axis k is resisted only by the spread across
+    // it, and none at all makes the angle unidentifiable; the horizontal fit
+    // turns about the vertical alone, which the whole in-plane radius resists.
     double worst = 0, perp_min = 0;
     for (int k = 0; k < 3; k++) {
-        const double perp = tr - lam[k];
+        const double perp = flat ? tr : tr - lam[k];
         worst = std::max(worst, perp > 0.0 ? sigma / std::sqrt((double)m * perp)
                                            : std::numeric_limits<double>::infinity());
         if (k == 0 || perp < perp_min) perp_min = perp;
@@ -178,7 +216,8 @@ inline MetricFit fitMetricGauge(const MetricRef& ref, double max_error) {
     out.rot_unc_deg = worst * 180.0 / M_PI;
     out.perp_frac = tr > 0.0 ? std::sqrt(std::max(perp_min, 0.0) / tr) : 0.0;
 
-    if (!(out.perp_frac >= kMetricMinPerpFraction)) {
+    // The horizontal fit makes no rotation this can refuse.
+    if (!flat && !(out.perp_frac >= kMetricMinPerpFraction)) {
         out.reason = MetricFail::Collinear;
         return out;
     }

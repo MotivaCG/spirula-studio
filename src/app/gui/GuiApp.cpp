@@ -3544,6 +3544,12 @@ void GuiApp::draw_sfm_advanced() {
     ui::InputInt(dmsg::max_image_size_auto, &_sfm_job.max_image_size);
     ui::help_on_hover(dmsg::max_image_size_auto_help);
 
+    ImGui::SetNextItemWidth(px(260.0f));
+    ui::Combo(dmsg::sfm_metric_gps, &_sfm_job.metric_gps,
+              {&dmsg::sfm_metric_gps_off, &dmsg::sfm_metric_gps_horizontal,
+               &dmsg::sfm_metric_gps_full});
+    ui::help_on_hover(dmsg::sfm_metric_gps_help);
+
     ui::Checkbox(dmsg::keep_intermediate, &_sfm_job.keep_intermediate);
     ui::help_on_hover(dmsg::keep_intermediate_help);
 
@@ -3867,6 +3873,8 @@ void GuiApp::draw_dataset_form(float height, bool running) {
     if (st.done) {
         if (effective_engine() == Engine::BuiltIn && _sfm.partial())
             ui::TextColoredWrapped(kWarn, dmsg::partial_reconstruction);
+        if (effective_engine() == Engine::BuiltIn && _sfm.not_metric())
+            ui::TextColoredWrapped(kWarn, dmsg::not_metric_reconstruction);
         ui::TextColoredWrapped(kOk, dmsg::done_at, {st.dir});
         if (ui::Button(dmsg::open_in_trainer)) {
             if (training_busy()) {

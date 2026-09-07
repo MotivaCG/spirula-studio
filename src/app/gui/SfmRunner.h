@@ -127,6 +127,10 @@ struct SfmJob {
     // an order of magnitude slower per pair -- the panel greys it out for SIFT
     // and the CLI refuses the combination outright.
     int matcher = 0;
+    // Scale and heading from the images' EXIF GPS: 0 off, 1 latitude and
+    // longitude only, 2 with altitude. 1 leaves the tilt to the cameras' own
+    // up axis, which a city capture's altitude is too biased to give.
+    int metric_gps = 0;
     bool keep_intermediate = false;   // keep features/ and matches.bin
     // Bundle adjustment on the host from the start. The escape hatch for a
     // driver that resets under a long solve: a run falls back by itself when
@@ -212,6 +216,9 @@ public:
     // Done, but under half the images registered (or a high reprojection
     // error). The dataset is usable; the user should know it has gaps.
     bool partial() const { return _partial.load(); }
+    // Done, but the metric frame asked for could not be fitted: the model is
+    // in its own units, not metres.
+    bool not_metric() const { return _not_metric.load(); }
 
 private:
     void run(SfmJob job);
@@ -238,6 +245,7 @@ private:
     std::atomic<State> _state{State::Idle};
     std::atomic<bool> _cancel{false};
     std::atomic<bool> _partial{false};
+    std::atomic<bool> _not_metric{false};
     RunProgress _prog;
     RunFilms _films;
     std::mutex _mu;

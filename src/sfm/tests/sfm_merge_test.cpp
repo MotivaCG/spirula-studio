@@ -139,6 +139,17 @@ int cmdMergeSelftest(int, char**) {
         printf("merge-selftest: Sim3 invariance %.2e px, inverse round-trip %.2e\n", maxPx, maxRt);
         check(maxPx < 1e-6, "transformPose/transformPoint disagree on projection");
         check(maxRt < 1e-9, "invertSim3 round-trip");
+
+        Sim3 T2;
+        T2.scale = 0.4;
+        T2.R = angleAxisToRotation({-0.2, 0.5, 0.9});
+        T2.t = {-2, 7, 1};
+        double maxC = 0;
+        for (int p = 0; p < N; p += 17) {
+            const Vec3 a = transformPoint(T2, transformPoint(S, pts[p]));
+            maxC = std::max(maxC, (a - transformPoint(composeSim3(T2, S), pts[p])).norm());
+        }
+        check(maxC < 1e-9, "composeSim3 is the two applied in order");
     }
 
     // ---- 2. Umeyama on exact correspondences ----

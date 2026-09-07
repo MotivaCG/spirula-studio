@@ -772,6 +772,75 @@ int cmdMetricSelftest(int, char**) {
         check(above.ok, "T11: 0.055 is accepted, so the floor is not above it");
     }
 
+    // ---- T12: the horizontal fit, against an altitude that ramps ----------
+    // A level 30 m ring whose reference altitude drifts 0.1 m per metre east:
+    // the full fit turns that ramp into a tilt of the whole scene.
+    {
+        Sim3 T;
+        T.scale = 4.0;
+        T.R = rotFromAxisAngle({0, 0, 1}, 0.7);
+        T.t = {12.0, -3.0, 5.0};
+        std::vector<Vec3> c(40);
+        for (int i = 0; i < 40; i++) {
+            const double a = 2.0 * M_PI * i / 40;
+            c[i] = {7.5 * std::cos(a), 7.5 * std::sin(a), 0.08 * std::sin(3.0 * a)};
+        }
+        MetricRef ref = makeRef(c, T);
+        for (Vec3& p : ref.targets) p.z += 0.1 * p.x;
+        MetricFit flat = fitMetricGauge(ref, 3.0, MetricAxes::Horizontal);
+        MetricFit full = fitMetricGauge(ref, 3.0);
+        const double flat_tilt = std::acos(std::min(1.0, flat.T.R[8])) * 180.0 / M_PI;
+        const double full_tilt = std::acos(std::min(1.0, full.T.R[8])) * 180.0 / M_PI;
+        printf("  T12: tilt %.4f deg (horizontal) / %.4f deg (full); scale error "
+               "%.2e / %.2e\n", flat_tilt, full_tilt,
+               std::fabs(flat.T.scale / T.scale - 1.0),
+               std::fabs(full.T.scale / T.scale - 1.0));
+        check(flat.ok && full.ok, "T12: both fits are accepted");
+        check(std::fabs(flat.T.scale / T.scale - 1.0) <= 1e-12,
+              "T12: the horizontal fit recovers the scale exactly");
+        check(chordal(flat.T.R, T.R) <= 1e-12,
+              "T12: and the heading, with no tilt of its own");
+        check(flat.T.R[2] == 0.0 && flat.T.R[5] == 0.0 && flat.T.R[6] == 0.0 &&
+                  flat.T.R[7] == 0.0 && flat.T.R[8] == 1.0,
+              "T12: the horizontal rotation is a turn about +Z, bit for bit");
+        check(full_tilt > 2.0, "T12: the full fit tips the scene by degrees");
+        check(flat.rms <= 1e-12, "T12: the level residuals are the fit's own");
+        // The vertical the horizontal fit did not read is still reported, so
+        // the reference's own altitude error stays visible.
+        double u = 0;
+        for (size_t k = 0; k < ref.centres.size(); k++) {
+            const Vec3 r = ref.targets[k] - transformPoint(flat.T, ref.centres[k]);
+            u += r.z * r.z;
+        }
+        check(std::sqrt(u / ref.centres.size()) > 1.0,
+              "T12: and the altitude it refused is still there to be printed");
+    }
+
+    // ---- T13: a street the full fit refuses, and the horizontal one does not
+    // The T11 line at 0.045 transverse spread, level: nothing fixes the roll
+    // about it, but a turn about the vertical is fully resisted.
+    {
+        Sim3 T;
+        T.scale = 2.5;
+        T.R = rotFromAxisAngle({0, 0, 1}, 0.4);
+        T.t = {3.0, -1.0, 8.0};
+        std::vector<Vec3> c(60);
+        for (int i = 0; i < 60; i++) {
+            const int j = i % 4;
+            c[i] = {(double)i, (j == 0 || j == 3) ? 0.780105 : -0.780105, 0.0};
+        }
+        MetricRef ref = makeRef(c, T);
+        MetricFit full = fitMetricGauge(ref, 0.5);
+        MetricFit flat = fitMetricGauge(ref, 0.5, MetricAxes::Horizontal);
+        printf("  T13: perp frac %.4f; scale %.6f (horizontal), refused: %d (full)\n",
+               full.perp_frac, flat.T.scale, (int)full.reason);
+        check(!full.ok && full.reason == MetricFail::Collinear,
+              "T13: the full fit refuses the line");
+        check(flat.ok && std::fabs(flat.T.scale / T.scale - 1.0) <= 1e-12,
+              "T13: the horizontal fit takes it and recovers the scale");
+        check(flat.inliers == 60, "T13: with every camera an inlier");
+    }
+
     printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }

@@ -2190,6 +2190,21 @@ SS_MSG(merge_need_two,
     RU("для слияния нужно не меньше двух моделей, а их {0}"),
     TR("birleştirme en az iki model ister, burada {0} tane var"));
 
+SS_MSG(merge_metric_only,
+    EN("one model: nothing to merge, fixing its metric gauge alone"),
+    JA("モデルは 1 つ: 統合するものはなく、メートル座標系だけを合わせます"),
+    ZH_HANS("只有一个模型: 没有可合并的内容，只确定米制坐标系"),
+    ZH_HANT("只有一個模型: 沒有可合併的內容，只確定公尺座標系"),
+    KO("모델이 1개: 병합할 것이 없어 미터 좌표계만 맞춥니다"),
+    DE("ein Modell: nichts zu vereinen, nur der metrische Rahmen wird gesetzt"),
+    FR("un seul modèle : rien à fusionner, seul le repère métrique est fixé"),
+    ES("un solo modelo: nada que fusionar, solo se fija el marco métrico"),
+    PT("um só modelo: nada a fundir, só se fixa o referencial métrico"),
+    IT("un solo modello: niente da fondere, si fissa solo il sistema metrico"),
+    NL("één model: niets samen te voegen, alleen het metrische stelsel wordt gezet"),
+    RU("одна модель: сливать нечего, задаётся только метрическая система"),
+    TR("tek model: birleştirilecek bir şey yok, yalnızca metrik çerçeve belirlenir"));
+
 SS_MSG(merge_summary,
     EN("merged {0} models into {1} in {2} s (merges: {3}, refused: {4})"),
     JA("{0} 個のモデルを {1} 個に統合しました（{2} 秒、統合: {3}、拒否: {4}）"),
@@ -2393,6 +2408,21 @@ SS_MSG(metric_source_gps,
     KO("EXIF GPS"),        DE("EXIF-GPS"),     FR("le GPS EXIF"),   ES("el GPS EXIF"),
     PT("o GPS EXIF"),      IT("il GPS EXIF"),  NL("de EXIF-GPS"),   RU("GPS из EXIF"),
     TR("EXIF GPS"));
+
+SS_MSG(metric_source_gps_flat,
+    EN("EXIF GPS (latitude and longitude only)"),
+    JA("EXIF の GPS (緯度と経度のみ)"),
+    ZH_HANS("EXIF GPS (只用经纬度)"),
+    ZH_HANT("EXIF GPS (只用經緯度)"),
+    KO("EXIF GPS (위도와 경도만)"),
+    DE("EXIF-GPS (nur Breite und Länge)"),
+    FR("le GPS EXIF (latitude et longitude seules)"),
+    ES("el GPS EXIF (solo latitud y longitud)"),
+    PT("o GPS EXIF (só latitude e longitude)"),
+    IT("il GPS EXIF (solo latitudine e longitudine)"),
+    NL("de EXIF-GPS (alleen breedte en lengte)"),
+    RU("GPS из EXIF (только широта и долгота)"),
+    TR("EXIF GPS (yalnızca enlem ve boylam)"));
 
 SS_MSG(metric_source_positions,
     EN("the positions file"), JA("位置ファイル"), ZH_HANS("位置文件"), ZH_HANT("位置檔"),

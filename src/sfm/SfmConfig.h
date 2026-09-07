@@ -136,7 +136,9 @@ struct SfmConfig {
     // Instead: fix the gauge from an outside measurement in metres, so the
     // model is written metric (map/MetricGauge.h, D74).
     std::string metric_positions;       // one `image_name X Y Z` per line
-    bool metric_gps = false;            // each image's own EXIF GPS
+    // Each image's own EXIF GPS: "none", "horizontal" (latitude and longitude,
+    // tilt left to the cameras) or "full" (altitude as well).
+    std::string metric_gps = "none";
     double metric_max_error = 0;        // metres; 0 resolves per source
     bool merge_ba = true;               // merge: bundle-adjust across the seams
     bool in_place = false;              // merge: write back over the input
@@ -350,7 +352,7 @@ struct SfmConfig {
     F(metric_positions, "metric-positions", CMD_AUTO | CMD_MAP | CMD_MERGE, Tier::Advanced,        \
       "mapper", 0, 0, "", metric_positions)                                                        \
     F(metric_gps, "metric-gps", CMD_AUTO | CMD_MAP | CMD_MERGE, Tier::Advanced, "mapper", 0, 0,    \
-      "", metric_gps)                                                                              \
+      "none|horizontal|full", metric_gps)                                                          \
     F(metric_max_error, "metric-max-error", CMD_AUTO | CMD_MAP | CMD_MERGE, Tier::Advanced,        \
       "mapper", 0, 1000000, "", metric_max_error)                                                  \
     F(mapper.min_tri_angle_deg, "min-tri-angle", CMD_AUTO | CMD_MAP, Tier::Advanced, "mapper", 0,  \

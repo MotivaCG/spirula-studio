@@ -3237,38 +3237,51 @@ SS_MSG(metric_positions_help,
        "`image_name X Y Z`, metre); başarısız uyum bildirilir ve model ölçeklenmeden yazılır"));
 
 SS_MSG(metric_gps_help,
-    EN("Write the model in a local east-north-up metre frame fitted to the images' EXIF "
-       "GPS; accuracy is a few metres, so the capture must be tens of metres across"),
-    JA("画像の EXIF GPS に合わせたローカルな東北上メートル座標系でモデルを書き出します。"
+    EN("Fit a local east-north-up metre frame to the images' EXIF GPS: `horizontal` reads "
+       "latitude and longitude and leaves the tilt to the cameras' own up axis, `full` reads "
+       "altitude too; accuracy is a few metres, so the capture must be tens of metres across"),
+    JA("画像の EXIF GPS にローカルな東北上メートル座標系を当てはめます。`horizontal` は"
+       "緯度と経度だけを読み、傾きはカメラ自身の上方向に任せます。`full` は高度も読みます。"
        "精度は数メートルなので、撮影範囲は数十メートル必要です"),
-    ZH_HANS("按图像 EXIF GPS 拟合的本地东北天米制坐标系写出模型; 精度只有几米，所以采集范围要有"
-            "几十米"),
-    ZH_HANT("按影像 EXIF GPS 擬合的本地東北天公尺座標系寫出模型; 精度只有幾公尺，所以拍攝範圍要"
-            "有數十公尺"),
-    KO("이미지의 EXIF GPS 에 맞춘 지역 동북상 미터 좌표계로 모델을 씁니다. 정확도가 수 미터라 "
-       "촬영 범위가 수십 미터는 되어야 합니다"),
-    DE("Das Modell in einem lokalen Ost-Nord-Oben-Meterrahmen schreiben, der an das EXIF-GPS "
-       "der Bilder angepasst wird; die Genauigkeit liegt bei einigen Metern, die Aufnahme "
-       "muss also zehner Meter groß sein"),
-    FR("Écrire le modèle dans un repère local est-nord-haut en mètres ajusté au GPS EXIF des "
-       "images ; la précision est de quelques mètres, la prise doit donc faire des dizaines "
-       "de mètres"),
-    ES("Escribir el modelo en un marco local este-norte-arriba en metros ajustado al GPS "
-       "EXIF de las imágenes; la precisión es de unos metros, así que la toma debe medir "
-       "decenas de metros"),
-    PT("Escrever o modelo num referencial local este-norte-cima em metros ajustado ao GPS "
-       "EXIF das imagens; a precisão é de alguns metros, por isso a captura tem de ter "
-       "dezenas de metros"),
-    IT("Scrivere il modello in un sistema locale est-nord-alto in metri stimato dal GPS EXIF "
-       "delle immagini; la precisione è di alcuni metri, quindi la ripresa deve misurare "
-       "decine di metri"),
-    NL("Het model schrijven in een lokaal oost-noord-omhoog meterstelsel dat op de EXIF-GPS "
-       "van de beelden is gefit; de nauwkeurigheid is enkele meters, dus de opname moet "
-       "tientallen meters groot zijn"),
-    RU("Записать модель в локальной метровой системе восток-север-верх, подогнанной к GPS из "
-       "EXIF снимков; точность в несколько метров, поэтому съёмка должна быть десятки метров"),
-    TR("Modeli, görüntülerin EXIF GPS'ine oturtulmuş yerel bir doğu-kuzey-yukarı metre "
-       "çerçevesinde yaz; doğruluk birkaç metre olduğundan çekim onlarca metre olmalı"));
+    ZH_HANS("按图像 EXIF GPS 拟合本地东北天米制坐标系: `horizontal` 只读经纬度，倾斜交给相机"
+            "自身的上方向; `full` 连高度一起读。精度只有几米，所以采集范围要有几十米"),
+    ZH_HANT("按影像 EXIF GPS 擬合本地東北天公尺座標系: `horizontal` 只讀經緯度，傾斜交給相機"
+            "自身的上方向; `full` 連高度一起讀。精度只有幾公尺，所以拍攝範圍要有數十公尺"),
+    KO("이미지의 EXIF GPS 에 지역 동북상 미터 좌표계를 맞춥니다. `horizontal` 은 위도와 경도만 "
+       "읽고 기울기는 카메라 자신의 위 방향에 맡기며, `full` 은 고도까지 읽습니다. 정확도가 "
+       "수 미터라 촬영 범위가 수십 미터는 되어야 합니다"),
+    DE("Einen lokalen Ost-Nord-Oben-Meterrahmen an das EXIF-GPS der Bilder anpassen: "
+       "`horizontal` liest Breite und Länge und überlässt die Neigung der eigenen Hochachse "
+       "der Kameras, `full` liest auch die Höhe; die Genauigkeit liegt bei einigen Metern, "
+       "die Aufnahme muss also zehner Meter groß sein"),
+    FR("Ajuster un repère local est-nord-haut en mètres au GPS EXIF des images : `horizontal` "
+       "lit la latitude et la longitude et laisse l'inclinaison à l'axe vertical des caméras, "
+       "`full` lit aussi l'altitude ; la précision est de quelques mètres, la prise doit donc "
+       "faire des dizaines de mètres"),
+    ES("Ajustar un marco local este-norte-arriba en metros al GPS EXIF de las imágenes: "
+       "`horizontal` lee latitud y longitud y deja la inclinación al eje vertical de las "
+       "cámaras, `full` lee también la altitud; la precisión es de unos metros, así que la "
+       "toma debe medir decenas de metros"),
+    PT("Ajustar um referencial local este-norte-cima em metros ao GPS EXIF das imagens: "
+       "`horizontal` lê latitude e longitude e deixa a inclinação ao eixo vertical das "
+       "câmeras, `full` lê também a altitude; a precisão é de alguns metros, por isso a "
+       "captura tem de ter dezenas de metros"),
+    IT("Stimare un sistema locale est-nord-alto in metri dal GPS EXIF delle immagini: "
+       "`horizontal` legge latitudine e longitudine e lascia l'inclinazione all'asse "
+       "verticale delle camere, `full` legge anche la quota; la precisione è di alcuni metri, "
+       "quindi la ripresa deve misurare decine di metri"),
+    NL("Een lokaal oost-noord-omhoog meterstelsel op de EXIF-GPS van de beelden fitten: "
+       "`horizontal` leest breedte en lengte en laat de kanteling aan de eigen verticale as "
+       "van de camera's, `full` leest ook de hoogte; de nauwkeurigheid is enkele meters, dus "
+       "de opname moet tientallen meters groot zijn"),
+    RU("Подогнать локальную метровую систему восток-север-верх к GPS из EXIF снимков: "
+       "`horizontal` читает широту и долготу, а наклон оставляет собственной вертикали камер, "
+       "`full` читает и высоту; точность в несколько метров, поэтому съёмка должна быть "
+       "десятки метров"),
+    TR("Görüntülerin EXIF GPS'ine yerel bir doğu-kuzey-yukarı metre çerçevesi oturt: "
+       "`horizontal` enlem ve boylamı okur, eğimi kameraların kendi yukarı eksenine bırakır; "
+       "`full` yüksekliği de okur; doğruluk birkaç metre olduğundan çekim onlarca metre "
+       "olmalı"));
 
 SS_MSG(metric_max_error_help,
     EN("Cameras farther than this many metres from the fitted position are outliers; 0 "

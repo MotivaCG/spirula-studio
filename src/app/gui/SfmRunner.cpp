@@ -56,6 +56,7 @@ const char* kPairs[] = {"auto", "exhaustive", "sequential", "prefilter"};
 const char* kMapper[] = {"flat", "bottom-up"};
 const char* kFeatures[] = {"sift", "aliked-n16rot", "aliked-n32", "loma-b128",
                            "loma-b"};
+const char* kMetricGps[] = {"none", "horizontal", "full"};
 
 template <int N>
 const char* pick(const char* const (&table)[N], int i, int fallback = 0) {
@@ -182,6 +183,7 @@ void SfmRunner::start(const SfmJob& job, RunFilms films) {
     if (_worker.joinable()) _worker.join();
     _cancel = false;
     _partial = false;
+    _not_metric = false;
     _films = films;
     _prog.reset();
     if (_films.frames) _films.frames->clear();
@@ -228,6 +230,7 @@ void SfmRunner::take_reconstruction(SfmJob& job) {
     job.mapper = _live.mapper;
     job.features = _live.features;
     job.matcher = _live.matcher;
+    job.metric_gps = _live.metric_gps;
     job.keep_intermediate = _live.keep_intermediate;
     job.ba_cpu = _live.ba_cpu;
     job.extra_args = _live.extra_args;
@@ -526,6 +529,10 @@ std::vector<std::string> SfmRunner::recon_args(const SfmJob& job,
         argv.push_back("--max-image-size");
         argv.push_back(std::to_string(job.max_image_size));
     }
+    if (job.metric_gps > 0) {
+        argv.push_back("--metric-gps");
+        argv.push_back(pick(kMetricGps, job.metric_gps));
+    }
     if (!job.image_gamut.empty()) {
         argv.push_back("--image-gamut");
         argv.push_back(job.image_gamut);
@@ -662,27 +669,32 @@ void SfmRunner::run(SfmJob job) {
             // What to advise on failure depends on which stage lost the
             // device: a CPU bundle adjustment is no answer to one lost while
             // matching.
-            bool mapping = false, gpu_failure = false;
+            bool mapping = false, gpu_failure = false, no_metric = false;
             const int rc = run_process(argv, "", [&](const std::string& l) {
                 log(l, !child_line_is_notable(l));
                 note_progress(l);
 #ifdef SS_TOOL_SFM
                 const std::string map = sfm::slog::prefix(sfm::slog::Tag::Map);
                 if (l.compare(0, map.size(), map) == 0) mapping = true;
+                // A run that is both partial and un-scaled exits 3, so the
+                // status alone would miss this one.
+                if (l.find(spirula::i18n::msg::sfm::result_not_metric.get()) !=
+                    std::string::npos)
+                    no_metric = true;
 #endif
                 if (mapping && child_line_is_gpu_failure(l)) gpu_failure = true;
             }, _cancel);
             if (rc == kCancelled) return fail(lmsg::err_cancelled.get());
             if (rc == kSpawnFailed)
                 return fail(fmt(lmsg::err_spawn_recon, {argv[0]}));
-            // `auto` spends exit code 2 on "nothing reconstructed" and 3 on
-            // "reconstructed, but under half the images registered or the
-            // reprojection error is high" (src/sfm/README.md). 3 is a warning
-            // here, not a failure: a partial model still trains, and throwing
-            // it away over a threshold would be worse than saying so.
-            if (rc == 3) {
-                _partial = true;
-                log(lmsg::sfm_partial.get());
+            // Neither 3 (under half the images registered, or a high
+            // reprojection error) nor 4 (no metric frame) is a failure here:
+            // the model still trains, and it cost an hour (src/sfm/README.md).
+            if (rc == 3 || rc == 4) {
+                _partial = rc == 3;
+                _not_metric = no_metric || rc == 4;
+                if (_partial) log(lmsg::sfm_partial.get());
+                if (_not_metric) log(lmsg::sfm_not_metric.get());
             } else if (rc != 0) {
                 return fail(gpu_failure
                                 ? fmt(lmsg::err_recon_gpu,

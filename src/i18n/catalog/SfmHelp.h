@@ -872,6 +872,35 @@ SS_MSG(desc_merge_1,
        "hepsine açılır. Farklı özniteliklerden kurulmuş modeller "
        "birleştirilemez."));
 
+SS_MSG(desc_merge_3,
+    EN("A single model is accepted only with --metric-positions or --metric-gps: "
+       "there is nothing to merge, and the run only re-gauges it in metres."),
+    JA("モデルが 1 つだけの場合は --metric-positions か --metric-gps を"
+       "指定したときにのみ受け付けます。統合するものはなく、メートル座標系に"
+       "直すだけの実行になります。"),
+    ZH_HANS("只有一个模型时，仅在给出 --metric-positions 或 --metric-gps 的情况下才接受："
+            "没有可合并的内容，这次运行只是把它改写为米制坐标系。"),
+    ZH_HANT("只有一個模型時，僅在給出 --metric-positions 或 --metric-gps 的情況下才接受："
+            "沒有可合併的內容，這次執行只是把它改寫為公尺座標系。"),
+    KO("모델이 하나뿐일 때는 --metric-positions 또는 --metric-gps 를 준 경우에만 "
+       "받습니다. 병합할 것이 없고, 미터 좌표계로 다시 맞추기만 합니다."),
+    DE("Ein einzelnes Modell wird nur mit --metric-positions oder --metric-gps "
+       "angenommen: es gibt nichts zu vereinen, der Lauf setzt es nur in Meter."),
+    FR("Un modèle seul n'est accepté qu'avec --metric-positions ou --metric-gps : "
+       "il n'y a rien à fusionner, la passe ne fait que le remettre en mètres."),
+    ES("Un solo modelo se acepta únicamente con --metric-positions o "
+       "--metric-gps: no hay nada que fusionar y la pasada solo lo pone en metros."),
+    PT("Um único modelo só é aceite com --metric-positions ou --metric-gps: não "
+       "há nada a fundir e a passagem apenas o volta a pôr em metros."),
+    IT("Un solo modello è accettato unicamente con --metric-positions o "
+       "--metric-gps: non c'è nulla da fondere, la passata lo rimette in metri."),
+    NL("Eén model wordt alleen met --metric-positions of --metric-gps aanvaard: "
+       "er valt niets samen te voegen, de run zet het enkel in meters."),
+    RU("Одна модель принимается только с --metric-positions или --metric-gps: "
+       "сливать нечего, прогон лишь переводит её в метры."),
+    TR("Tek bir model yalnızca --metric-positions ya da --metric-gps ile kabul "
+       "edilir: birleştirilecek bir şey yoktur, çalıştırma onu yalnızca metreye çevirir."));
+
 SS_MSG(desc_merge_2,
     EN("A merged model is two independently optimized halves glued along a seam "
        "no bundle adjustment has ever seen, so one runs across it afterwards "

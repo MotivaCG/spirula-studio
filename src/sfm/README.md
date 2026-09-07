@@ -393,18 +393,38 @@ outside measurement instead, so the model is written **in metres**. The first
 reads per-image camera positions in COLMAP's `model_aligner --ref_images_path`
 format (`image_name X Y Z` per line, any right-handed metric frame — a LiDAR
 trajectory, ARKit, RTK); the second reads each registered image's own EXIF GPS
-and converts it to a local east-north-up frame. Either way a full similarity is
+and converts it to a local east-north-up frame. Either way a similarity is
 fitted from the camera centres with LO-RANSAC over the same `estimateSim3` that
 model merging uses, and `--metric-max-error` is its inlier radius in metres (0
 picks 5 for GPS, 0.5 for a positions file).
 
+`--metric-gps` takes `none` (the default), `horizontal` or `full`, and the
+difference is the altitude. `full` fits all seven parameters, so the reference's
+vertical sets the model's tilt; `horizontal` fits only scale, heading and place,
+against latitude and longitude, and leaves which way is up to the cameras' own
+mean up axis — the same claim `--orient` makes. A phone's altitude is the worst
+component it reports, and over a capture wider than it is tall the fit converts
+that error into tilt: on an 850-image walk around a city square (150 m across,
+level ground) `full` came out **5.05 degrees off vertical**, spreading the
+cameras over 12.9 m of fake height, where `horizontal` leaves them within 2.5 m
+and recovers a scale 0.2 % away. The east and north residuals were the same to
+2 % either way, so the vertical is what was paid for. `horizontal` also has no
+collinearity gate: a turn about the vertical is resisted by the whole in-plane
+radius, so a street walked end to end — which `full` refuses — fits.
+
 The fit is refused rather than approximated, and **what refuses it is geometry,
 not a noise model**. Fewer than three positioned cameras, reference positions
 that do not spread wider than the inlier radius, under half the cameras inlying,
-or cameras lying so close to a line that the reference amplifies orientation
-error more than 20x — each reports its own reason with the numbers behind it;
-the model is then still written, in the ordinary orient gauge, and the exit
-status is 4.
+or (full only) cameras lying so close to a line that the reference amplifies
+orientation error more than 20x — each reports its own reason with the numbers
+behind it; the model is then still written, in the ordinary orient gauge, and
+the exit status is 4. A run that is *also* partial exits 3, since the
+reconstruction's own verdict outranks the gauge's, but prints both RESULT lines.
+
+`merge` accepts a single model when a metric reference is given: there is
+nothing to merge, and it re-gauges the model in place. That is the way to put
+metres on a finished reconstruction without rebuilding it —
+`spirula sfm merge ws/sparse --in-place --metric-gps horizontal --images ws/images`.
 
 The scale and orientation uncertainties are **reported and never gated on**.
 They come from the inlier residuals assuming uncorrelated noise, and measured

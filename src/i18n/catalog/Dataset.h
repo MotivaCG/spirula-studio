@@ -1169,6 +1169,44 @@ SS_MSG(partial_reconstruction,
        "boşluklar olacak. Çekimler arasında daha çok örtüşme ya da daha "
        "yüksek bir kalite ayarı genelde sorunu çözer."));
 
+SS_MSG(not_metric_reconstruction,
+    EN("The model reconstructed, but its GPS scale could not be fitted -- it is "
+       "in its own units, not metres. The log line above says which check "
+       "refused it."),
+    JA("モデルは再構成できましたが、GPS による寸法を当てはめられませんでした。"
+       "メートルではなく独自の単位のままです。どの検査で退けられたかは上のログ"
+       "行にあります。"),
+    ZH_HANS("模型重建成功，但没能拟合出 GPS 尺度——它仍是自身单位，而不是米。"
+            "上面的日志行说明是哪一项检查拒绝了它。"),
+    ZH_HANT("模型重建成功，但沒能擬合出 GPS 尺度——它仍是自身單位，而不是公尺。"
+            "上面的日誌行說明是哪一項檢查拒絕了它。"),
+    KO("모델은 재구성되었지만 GPS 로 크기를 맞추지 못했습니다. 미터가 아니라 "
+       "자체 단위 그대로입니다. 어떤 검사에서 막혔는지는 위 기록 줄에 있습니다."),
+    DE("Das Modell wurde rekonstruiert, aber sein GPS-Maßstab ließ sich nicht "
+       "anpassen -- es steht in eigenen Einheiten, nicht in Metern. Die "
+       "Protokollzeile darüber nennt die Prüfung, die das abgelehnt hat."),
+    FR("Le modèle a été reconstruit, mais son échelle GPS n'a pas pu être "
+       "ajustée : il est dans ses propres unités, pas en mètres. La ligne de "
+       "journal ci-dessus indique le contrôle qui l'a refusé."),
+    ES("El modelo se reconstruyó, pero no se pudo ajustar su escala por GPS: "
+       "está en sus propias unidades, no en metros. La línea de registro de "
+       "arriba dice qué comprobación lo rechazó."),
+    PT("O modelo foi reconstruído, mas a sua escala por GPS não pôde ser "
+       "ajustada: está nas suas próprias unidades, não em metros. A linha de "
+       "registo acima diz qual verificação o recusou."),
+    IT("Il modello è stato ricostruito, ma la sua scala da GPS non si è potuta "
+       "stimare: è nelle sue unità, non in metri. La riga di log qui sopra dice "
+       "quale controllo l'ha rifiutata."),
+    NL("Het model is gereconstrueerd, maar de GPS-schaal kon niet worden gefit "
+       "-- het staat in eigen eenheden, niet in meters. De logregel hierboven "
+       "noemt de controle die het weigerde."),
+    RU("Модель восстановлена, но масштаб по GPS подобрать не удалось — она в "
+       "своих единицах, а не в метрах. В строке журнала выше сказано, какая "
+       "проверка его отклонила."),
+    TR("Model yeniden oluşturuldu ama GPS ölçeği oturtulamadı -- metre değil, "
+       "kendi biriminde. Yukarıdaki günlük satırı hangi denetimin reddettiğini "
+       "söyler."));
+
 // ===========================================================================
 // Inputs and output folder
 // ===========================================================================
@@ -6188,6 +6226,156 @@ SS_MSG(sfm_distortion_refinement_help,
        "demet dengelemesiyle bulur; bozulması az bir objektifte bu daha "
        "kararlıdır. \"Asla\" ise hâlihazırda güvendiğiniz bir kalibrasyonu "
        "korur."));
+
+SS_MSG(sfm_metric_gps,
+    EN("Scale from GPS"),
+    JA("GPS による寸法"),
+    ZH_HANS("按 GPS 定尺度"),
+    ZH_HANT("按 GPS 定尺度"),
+    KO("GPS 로 크기 맞추기"),
+    DE("Maßstab aus GPS"),
+    FR("Échelle d'après le GPS"),
+    ES("Escala a partir del GPS"),
+    PT("Escala a partir do GPS"),
+    IT("Scala dal GPS"),
+    NL("Schaal uit GPS"),
+    RU("Масштаб по GPS"),
+    TR("GPS'ten ölçek"));
+
+SS_MSG(sfm_metric_gps_off,
+    EN("Off"),
+    JA("使わない"),
+    ZH_HANS("不使用"),
+    ZH_HANT("不使用"),
+    KO("사용 안 함"),
+    DE("Aus"),
+    FR("Désactivé"),
+    ES("Desactivado"),
+    PT("Desligado"),
+    IT("Disattivato"),
+    NL("Uit"),
+    RU("Выключено"),
+    TR("Kapalı"));
+
+SS_MSG(sfm_metric_gps_horizontal,
+    EN("Latitude and longitude"),
+    JA("緯度と経度"),
+    ZH_HANS("经纬度"),
+    ZH_HANT("經緯度"),
+    KO("위도와 경도"),
+    DE("Breite und Länge"),
+    FR("Latitude et longitude"),
+    ES("Latitud y longitud"),
+    PT("Latitude e longitude"),
+    IT("Latitudine e longitudine"),
+    NL("Breedte en lengte"),
+    RU("Широта и долгота"),
+    TR("Enlem ve boylam"));
+
+SS_MSG(sfm_metric_gps_full,
+    EN("With altitude"),
+    JA("高度も使う"),
+    ZH_HANS("连高度一起用"),
+    ZH_HANT("連高度一起用"),
+    KO("고도까지 사용"),
+    DE("Mit Höhe"),
+    FR("Avec l'altitude"),
+    ES("Con la altitud"),
+    PT("Com a altitude"),
+    IT("Con la quota"),
+    NL("Met hoogte"),
+    RU("С высотой"),
+    TR("Yükseklikle"));
+
+SS_MSG(sfm_metric_gps_help,
+    EN("Write the model in metres, sized and turned to the GPS in the photos' "
+       "EXIF. Latitude and longitude alone is the safe choice: it takes the "
+       "scale and the compass heading from the fixes and leaves which way is "
+       "up to the cameras themselves. Adding altitude also levels the scene by "
+       "GPS, which a phone measures badly -- in a city it can tilt the whole "
+       "model by degrees. Either way the capture must be tens of metres across, "
+       "and a model that cannot be fitted is written unscaled and says so."),
+    JA("写真の EXIF にある GPS に合わせて、寸法と向きを決めたメートル単位の"
+       "モデルを書き出します。緯度と経度だけを使うのが安全です。位置から寸法と"
+       "方位だけを取り、どちらが上かはカメラ自身に任せます。高度も使うと傾きまで"
+       "GPS で決めますが、スマートフォンの高度は誤差が大きく、市街地ではモデル"
+       "全体が数度傾くことがあります。いずれの場合も撮影範囲は数十メートル必要で、"
+       "当てはめられないモデルは寸法なしで書き出し、その旨を伝えます。"),
+    ZH_HANS("按照片 EXIF 中的 GPS 确定尺度和朝向，以米为单位写出模型。只用经纬度"
+            "更稳妥：只从定位取尺度和方位角，哪边朝上仍交给相机自身判断。连高度"
+            "一起用则连倾斜也由 GPS 决定，而手机测得的高度误差很大——在城市里可能"
+            "让整个模型倾斜几度。两种方式都要求采集范围有几十米；拟合不成功时会按"
+            "未定尺度写出，并给出说明。"),
+    ZH_HANT("按照片 EXIF 中的 GPS 確定尺度和朝向，以公尺為單位寫出模型。只用經緯度"
+            "更穩妥：只從定位取尺度和方位角，哪邊朝上仍交給相機自身判斷。連高度"
+            "一起用則連傾斜也由 GPS 決定，而手機測得的高度誤差很大——在城市裡可能"
+            "讓整個模型傾斜幾度。兩種方式都要求拍攝範圍有數十公尺；擬合不成功時會按"
+            "未定尺度寫出，並給出說明。"),
+    KO("사진 EXIF 의 GPS 에 맞춰 크기와 방향을 정한 미터 단위 모델을 씁니다. "
+       "위도와 경도만 쓰는 쪽이 안전합니다. 위치에서 크기와 방위만 가져오고, "
+       "어느 쪽이 위인지는 카메라 자신에게 맡깁니다. 고도까지 쓰면 기울기도 GPS 로 "
+       "정하는데, 휴대전화의 고도는 오차가 커서 도심에서는 모델 전체가 몇 도 기울 "
+       "수 있습니다. 어느 쪽이든 촬영 범위가 수십 미터는 되어야 하며, 맞추지 못한 "
+       "모델은 크기 없이 쓰고 그 사실을 알립니다."),
+    DE("Das Modell in Metern schreiben, in Größe und Richtung an das GPS in den "
+       "EXIF-Daten der Fotos angepasst. Breite und Länge allein ist die sichere "
+       "Wahl: sie nehmen Maßstab und Himmelsrichtung aus den Positionen und "
+       "überlassen das Oben den Kameras selbst. Mit der Höhe richtet auch das "
+       "GPS die Szene aus, das ein Telefon schlecht misst -- in der Stadt kann "
+       "das das ganze Modell um Grade kippen. In beiden Fällen muss die Aufnahme "
+       "zehner Meter groß sein; ein Modell, das nicht passt, wird unskaliert "
+       "geschrieben und sagt das."),
+    FR("Écrire le modèle en mètres, dimensionné et orienté d'après le GPS des "
+       "EXIF des photos. La latitude et la longitude seules sont le choix sûr : "
+       "elles prennent l'échelle et le cap dans les positions et laissent le "
+       "haut aux caméras elles-mêmes. Avec l'altitude, le GPS redresse aussi la "
+       "scène, or un téléphone la mesure mal -- en ville cela peut incliner tout "
+       "le modèle de plusieurs degrés. Dans les deux cas la prise doit faire des "
+       "dizaines de mètres ; un modèle qui ne s'ajuste pas est écrit sans "
+       "échelle et le signale."),
+    ES("Escribir el modelo en metros, con el tamaño y el giro que da el GPS de "
+       "los EXIF de las fotos. Solo latitud y longitud es la opción segura: toma "
+       "la escala y el rumbo de las posiciones y deja el arriba a las propias "
+       "cámaras. Con la altitud el GPS también nivela la escena, y un teléfono "
+       "la mide mal: en ciudad puede inclinar el modelo entero varios grados. En "
+       "ambos casos la toma debe medir decenas de metros; un modelo que no se "
+       "puede ajustar se escribe sin escalar y lo dice."),
+    PT("Escrever o modelo em metros, dimensionado e virado conforme o GPS dos "
+       "EXIF das fotos. Só latitude e longitude é a escolha segura: tira a "
+       "escala e o rumo das posições e deixa o para cima às próprias câmeras. "
+       "Com a altitude o GPS também nivela a cena, e um telemóvel mede-a mal -- "
+       "na cidade pode inclinar o modelo inteiro em graus. Em qualquer dos casos "
+       "a captura tem de ter dezenas de metros; um modelo que não se ajusta é "
+       "escrito sem escala e avisa disso."),
+    IT("Scrivere il modello in metri, dimensionato e ruotato in base al GPS "
+       "negli EXIF delle foto. Solo latitudine e longitudine è la scelta sicura: "
+       "prende scala e direzione dalle posizioni e lascia l'alto alle camere "
+       "stesse. Con la quota anche l'inclinazione viene dal GPS, che un telefono "
+       "misura male: in città può inclinare l'intero modello di gradi. In "
+       "entrambi i casi la ripresa deve misurare decine di metri; un modello che "
+       "non si stima viene scritto senza scala e lo segnala."),
+    NL("Het model in meters schrijven, op maat en gedraaid volgens de GPS in de "
+       "EXIF van de foto's. Alleen breedte en lengte is de veilige keuze: die "
+       "halen de schaal en de kompasrichting uit de posities en laten het boven "
+       "aan de camera's zelf. Met de hoogte zet het GPS de scène ook waterpas, "
+       "en die meet een telefoon slecht -- in een stad kan dat het hele model "
+       "graden doen kantelen. In beide gevallen moet de opname tientallen meters "
+       "groot zijn; een model dat niet past wordt ongeschaald geschreven en "
+       "meldt dat."),
+    RU("Записать модель в метрах, с размером и поворотом по GPS из EXIF снимков. "
+       "Только широта и долгота — безопасный выбор: масштаб и направление берутся "
+       "из координат, а где верх, решают сами камеры. С высотой по GPS задаётся и "
+       "наклон, а телефон измеряет её плохо — в городе это может наклонить всю "
+       "модель на градусы. В обоих случаях съёмка должна быть десятки метров; "
+       "модель, которую подобрать не удалось, пишется без масштаба и сообщает об "
+       "этом."),
+    TR("Modeli, fotoğrafların EXIF'indeki GPS'e göre ölçeklenmiş ve döndürülmüş "
+       "olarak metre biriminde yaz. Yalnızca enlem ve boylam güvenli seçimdir: "
+       "ölçeği ve pusula yönünü konumlardan alır, yukarının neresi olduğunu "
+       "kameralara bırakır. Yükseklik de eklenirse sahneyi GPS düzler; telefonun "
+       "yükseklik ölçümü kötüdür ve şehirde tüm modeli derecelerce yatırabilir. "
+       "Her iki durumda da çekim onlarca metre olmalı; oturtulamayan model "
+       "ölçeksiz yazılır ve bunu bildirir."));
 
 SS_MSG(sfm_per_image_intrinsics,
     EN("Per-image intrinsics at the end"),
