@@ -827,7 +827,7 @@ the engine level.
 - **Real-dataset training via CLI/GUI (phase 5 wrap-up)**: the
   `SS_BACKEND=vulkan` CMake branch now builds `spirula train` (always —
   it is this build's primary artifact, as in the CUDA no-torch build) and
-  the GUI (with `SS_BUILD_GUI=ON`), linking `csrc_portable` +
+  the GUI (unless `SS_BUILD_GUI=OFF`), linking `csrc_portable` +
   `ss_backend_vulkan` through the shared app-target section
   (`SS_APP_LIBS` selects the per-backend libraries). `spirula mesh` builds
   here too since the phase-6 meshing port. The app layer

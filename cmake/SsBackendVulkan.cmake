@@ -9,9 +9,6 @@ message(STATUS "SS_BACKEND=vulkan: portable engine layer + "
     "backend/vulkan runtime; kernel coverage is tracked in "
     "src/backend/vulkan/README.md.")
 
-# The command-line tools are this build's primary artifact; the GUI is opt-in.
-set(SS_BUILD_CLI ON)
-
 include(SsVulkan)
 include(SsMacBundle)
 ss_vulkan_lib()

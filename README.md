@@ -88,7 +88,7 @@ Make sure you have Vulkan SDK installed. On macOS, MoltenVK is automatically fet
 
 ```bat
 cd spirula-studio\
-build_develop.bat -DSS_BUILD_CLI=ON -DSS_BUILD_GUI=ON -DSS_BACKEND=vulkan -DSS_ENABLE_PATENTED=ON
+.\build_develop.bat -DSS_BACKEND=vulkan -DSS_ENABLE_PATENTED=ON
 ```
 
 If it builds successfully, you get `build\spirula.exe`.
@@ -97,7 +97,7 @@ If it builds successfully, you get `build\spirula.exe`.
 
 ```bat
 cd spirula-studio\
-cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DSS_BUILD_CLI=ON -DSS_BUILD_GUI=ON -DSS_BACKEND=vulkan -DSS_ENABLE_PATENTED=ON -DCMAKE_MAKE_PROGRAM=Ninja
+cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DSS_BACKEND=vulkan -DSS_ENABLE_PATENTED=ON -DCMAKE_MAKE_PROGRAM=Ninja
 cmake --build build -j
 ```
 
@@ -109,7 +109,7 @@ If it builds successfully, you get `build\spirula.exe`.
 
 ```bash
 cd spirula-studio/
-bash build_develop.bash -DSS_BUILD_CLI=ON -DSS_BUILD_GUI=ON -DSS_BACKEND=vulkan -DSS_ENABLE_PATENTED=ON
+bash build_develop.bash -DSS_BACKEND=vulkan -DSS_ENABLE_PATENTED=ON
 ```
 
 If it builds successfully, you get `build/spirula` binary.
@@ -118,7 +118,7 @@ If it builds successfully, you get `build/spirula` binary.
 
 ```bash
 cd spirula-studio/
-bash build_develop.bash -DSS_BUILD_CLI=ON -DSS_BUILD_GUI=ON -DSS_BACKEND=vulkan -DSS_ENABLE_PATENTED=ON
+bash build_develop.bash -DSS_BACKEND=vulkan -DSS_ENABLE_PATENTED=ON
 cmake --build build --target macos_app
 cmake --build build --target macos_dmg
 ```
@@ -145,7 +145,7 @@ Make sure you have a recent version of CUDA installed. On Windows, you also need
 
 ```bat
 cd spirula-studio\
-build_develop.bat -DSS_BUILD_CLI=ON -DSS_BUILD_GUI=ON -DSS_BACKEND=cuda
+.\build_develop.bat -DSS_BACKEND=cuda
 ```
 
 If it builds successfully, you get `build\spirula.exe`.
@@ -154,7 +154,7 @@ If it builds successfully, you get `build\spirula.exe`.
 
 ```bash
 cd spirula-studio/
-bash build_develop.bash -DSS_BUILD_CLI=ON -DSS_BUILD_GUI=ON -DSS_BACKEND=cuda
+bash build_develop.bash -DSS_BACKEND=cuda
 ```
 
 If it builds successfully, you get `build/spirula` binary.

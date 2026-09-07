@@ -81,7 +81,7 @@ Resulting targets:
 
 ```
 SS_BUILD_SFM=ON                 ss_sfm            (static lib)
-  + SS_BUILD_CLI=ON             spirula sfm            (CLI, alongside
+  (always)                      spirula sfm            (CLI, alongside
                                                            spirula train and,
                                                            on CUDA, spirula mesh)
   + SS_BUILD_GUI=ON             the GUI gains the built-in SfM path
@@ -193,7 +193,7 @@ in the import commit message and in `src/sfm/README.md`.
    `sfm_mask_test`, `sfm_merge_test`, `sfm_cholesky_test` — built the way
    `src/backend/tests/*.cpp` are (glob → one exe per file, same name).
 
-*Done when:* `bash build_develop.bash -DSS_BACKEND=vulkan -DSS_BUILD_CLI=ON`
+*Done when:* `bash build_develop.bash -DSS_BACKEND=vulkan`
 builds `spirula train` and `spirula sfm`, every `sfm_*_test` passes, and
 `spirula sfm auto` reproduces a known-good reconstruction on a public dataset
 (Mip-NeRF 360 `garden`, 25-frame subset) with the same registered count and

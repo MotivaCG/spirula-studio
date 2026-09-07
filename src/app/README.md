@@ -10,7 +10,7 @@ Vulkan/cross-vendor port.
 ## Build & run
 
 ```bash
-cmake -G Ninja -B build -DSS_BUILD_CLI=ON && cmake --build build --target spirula
+cmake -G Ninja -B build && cmake --build build --target spirula
 ./build/spirula train [<preset>] --data <colmap_dataset_dir> [--flag value ...]
 ```
 
@@ -33,8 +33,8 @@ cmake -G Ninja -B build_notorch -DSS_NO_TORCH=ON && cmake --build build_notorch
 
 In this mode `csrc` is a STATIC lib (the engine API has no dllexport
 annotations, and this yields a self-contained exe — deps are just libcudart +
-system libs), `SS_BUILD_CLI` is forced ON, CUDA archs come from
-`nvidia-smi --query-gpu=compute_cap` (override with `-DTORCH_CUDA_ARCH_LIST`),
+system libs), CUDA archs come from `nvidia-smi --query-gpu=compute_cap`
+(override with `-DTORCH_CUDA_ARCH_LIST`),
 and the libpython link + static-libstdc++/nftw interposition workarounds are
 skipped (they exist only because of libtorch). Generated headers
 (`src/generated/`, `src/instantiations/`) are committed, so a fresh
@@ -54,10 +54,11 @@ equivalent from a vcvars64 shell:
 ## Native GUI (`spirula` with no arguments, Phase 2)
 
 Dear ImGui + GLFW + OpenGL 3.2-core desktop app ("Spirula Studio").
-Off by default; enable with:
+On by default; `-DSS_BUILD_GUI=OFF` leaves a command-line-only binary that
+needs neither a display nor GL, and fetches nothing.
 
 ```bash
-cmake -G Ninja -B build -DSS_BUILD_GUI=ON   # composes with -DSS_NO_TORCH=ON
+cmake -G Ninja -B build   # composes with -DSS_NO_TORCH=ON
 cmake --build build --target spirula
 ```
 
@@ -142,9 +143,9 @@ the Python dataparser/trainer algebra (see verification notes below).
 
 ## Mesh extraction (`spirula-mesh`)
 
-Drives `Meshing.h` / `MeshingHost.cpp` / `MeshUV.cpp` / `MeshExport.cpp`. Built by
-the same `SS_BUILD_CLI` block; `mesh_main.cpp` + the dataset parsers, no
-HTTP/viewer.
+Drives `Meshing.h` / `MeshingHost.cpp` / `MeshUV.cpp` / `MeshExport.cpp`. Built
+with the rest of the command-line tools; `mesh_main.cpp` + the dataset parsers,
+no HTTP/viewer.
 
 ```bash
 ./build/spirula-mesh <ckpt> [--data <dir>] [--format ply,obj,gltf,glb] \

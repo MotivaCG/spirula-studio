@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Development build for Linux. Extra arguments are passed to CMake, e.g.
-#   ./build_develop.bash -DSS_BUILD_CLI=ON -DSS_BUILD_GUI=ON
+#   ./build_develop.bash -DSS_BACKEND=vulkan -DSS_BUILD_GUI=OFF
 
 # Regenerate headers. Skipped when python3 is unavailable -- the generated
 # files are committed, so the build still works without it.

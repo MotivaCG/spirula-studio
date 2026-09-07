@@ -222,7 +222,7 @@ apart.
 ## Building
 
 ```bash
-bash build_develop.bash -DSS_BACKEND=vulkan -DSS_BUILD_CLI=ON
+bash build_develop.bash -DSS_BACKEND=vulkan
 ```
 
 `SS_BUILD_SFM` defaults ON for the Vulkan backend and OFF for CUDA (where

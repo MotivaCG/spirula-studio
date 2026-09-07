@@ -1,7 +1,7 @@
 @echo off
 setlocal
 rem Development build for Windows. Extra arguments are passed to CMake, e.g.
-rem   build_develop.bat -DSS_BUILD_CLI=ON -DSS_BUILD_GUI=ON
+rem   build_develop.bat -DSS_BACKEND=vulkan -DSS_BUILD_GUI=OFF
 rem Builds the standalone spirula.exe.
 rem Works from a plain cmd prompt: locates VS via vswhere and calls vcvars64,
 rem uses the VS-bundled CMake/Ninja when none are on PATH, and picks the
