@@ -373,7 +373,7 @@ inline constexpr TrainPresetInfo kTrainPresets[] = {
     {"360-camera"},
     {"in-the-wild"},
     {"centered-object"},
-    {"linear-color"},
+    {"hdr"},
     {"synthetic"},
     {"meshing"},
     // {"academic-baseline"},  // hidden by default, uncomment to enable
@@ -419,7 +419,7 @@ inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
         c.erank_reg = 0.05f;
         return true;
     }
-    if (name == "linear-color") {
+    if (name == "hdr") {
         c.splat_color_gamut = "ACEScg";
         c.splat_color_is_linear = true;
         c.image_color_gamut = "Rec.709";
@@ -428,8 +428,8 @@ inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
         // c.apply_ppisp_before_color_space = true;
         // c.ppisp_adagrad_lr = 0.25f;
         c.ppisp_exposure_from_exif = true;
-        c.background_mode = "noise";
-        c.depth_distortion_reg = 0.01f;
+        // c.background_mode = "noise";
+        // c.depth_distortion_reg = 0.01f;
         c.loss_saturation_threshold = 0.98f;
         c.normalize_loss_by_luminance = true;
         c.dc_reg = 0.0f;

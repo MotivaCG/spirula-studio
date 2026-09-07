@@ -84,9 +84,8 @@ what a display-referred fit can represent. Two consequences:
   escape. It is 0 by default; leave it there (the `meshing` preset sets it to
   10 and should stay on `srgb`).
 
-The `linear-color` preset deliberately stays on `srgb`: its point is to train
-in linear light and reproduce the input images, which a tone curve would
-break.
+The `hdr` preset deliberately stays on `srgb`: its point is to train in linear
+light and reproduce the input images, which a tone curve would break.
 
 ## The clip is straight-through
 

@@ -15,8 +15,7 @@ cmake -G Ninja -B build -DSS_BUILD_CLI=ON && cmake --build build --target spirul
 ```
 
 - Presets = tyro subcommands: `3dgs` (default), `360-camera`, `in-the-wild`,
-  `centered-object`, `linear-color`, `synthetic`, `meshing`,
-  `academic-baseline`.
+  `centered-object`, `hdr`, `synthetic`, `meshing`, `academic-baseline`.
 - Flag conventions: flattened names (`--sh-degree`, not `--model.sh-degree`);
   `-`/`_` interchangeable; bools take a value (`--warp-to-pinhole 1`);
   `--key=value` works (arity-1 only); `none` clears optionals; tuples take N
@@ -225,9 +224,9 @@ agree. Only the C++ exists now, so the table said nothing the code does not.
 ## Verified working
 
 - All presets train and converge (banana COLMAP set — 3dgs: PSNR 26.7 @ 500
-  steps); linear-color exercises color-space init + trust region; meshing
-  exercises 3dgut + median losses; academic-baseline exercises interval eval
-  split + non-FPBO + fp32.
+  steps); hdr exercises color-space init + trust region; meshing exercises
+  3dgut + median losses; academic-baseline exercises interval eval split +
+  non-FPBO + fp32.
 - **360-camera preset works end-to-end** (SharkWipf_SampleDataset, 400×3840²
   nerfstudio fisheye + masks): 5-face warp (400→2000 post cameras), warped
   GT upload, synthetic FOV masks, bilagrid/PPISP at n_post slots. Behavior
