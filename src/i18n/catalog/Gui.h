@@ -1067,6 +1067,31 @@ SS_MSG(opt_primitive_help,
        "izdüşümü, bozulmalı kameralar (balıkgözü / eşdikdörtgen) için tam "
        "doğrudur."));
 
+SS_MSG(opt_primitive_3dgut_warn,
+    EN("3dgut generally trains slower than 3dgs, and few existing viewers can "
+       "open what it produces."),
+    JA("3dgut は 3dgs より学習が遅く、その結果を開けるビューアも限られます。"),
+    ZH_HANS("3dgut 的训练通常比 3dgs 慢，能打开它的结果的现有查看器也很少。"),
+    ZH_HANT("3dgut 的訓練通常比 3dgs 慢，能開啟它的結果的現有檢視器也很少。"),
+    KO("3dgut은 3dgs보다 학습이 대체로 느리고, 그 결과를 열 수 있는 기존 "
+       "뷰어도 적습니다."),
+    DE("3dgut trainiert meist langsamer als 3dgs, und nur wenige vorhandene "
+       "Betrachter können das Ergebnis öffnen."),
+    FR("3dgut s'entraîne généralement plus lentement que 3dgs, et peu de "
+       "visionneuses existantes savent ouvrir ce qu'il produit."),
+    ES("3dgut suele entrenar más lento que 3dgs y pocos visores existentes "
+       "abren lo que produce."),
+    PT("3dgut costuma treinar mais devagar que 3dgs e poucos visualizadores "
+       "existentes abrem o que ele produz."),
+    IT("3dgut di solito si addestra più lentamente di 3dgs e pochi "
+       "visualizzatori esistenti aprono ciò che produce."),
+    NL("3dgut traint doorgaans langzamer dan 3dgs en weinig bestaande viewers "
+       "kunnen openen wat het oplevert."),
+    RU("3dgut обычно обучается медленнее, чем 3dgs, и мало какие существующие "
+       "просмотрщики открывают его результат."),
+    TR("3dgut genellikle 3dgs'den daha yavaş eğitilir ve ürettiğini açabilen "
+       "görüntüleyici azdır."));
+
 SS_MSG(opt_resolution,
     EN("Image resolution"), JA("画像の解像度"), ZH_HANS("图像分辨率"),
     ZH_HANT("影像解析度"),  KO("이미지 해상도"), DE("Bildauflösung"),

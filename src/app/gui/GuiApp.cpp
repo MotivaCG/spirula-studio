@@ -5223,6 +5223,8 @@ void GuiApp::draw_basic_options() {
             _cfg_ui.touched.insert("primitive");
         }
         ui::help_on_hover(msg::opt_primitive_help);
+        if (_cfg.primitive == "3dgut")
+            ui::TextColoredWrapped(kWarn, msg::opt_primitive_3dgut_warn);
     }
 
     int ds_idx = _cfg.train_resolution_divisor == 2.0f ? 1

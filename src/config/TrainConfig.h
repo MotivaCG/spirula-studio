@@ -448,7 +448,7 @@ inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
         return true;
     }
     if (name == "meshing") {
-        c.primitive = "3dgut";
+        c.primitive = "mip";
         c.sh_degree = 0;
         c.dc_reg = 10.0f;
         c.sh_reg = 10.0f;
