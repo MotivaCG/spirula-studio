@@ -1764,9 +1764,17 @@ void GuiApp::draw_home_banner(float avail, float indent) {
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
     const ImVec2 p1(p0.x + avail, p0.y + h);
 
+    // Full bleed: the artwork is painted out over the host window's padding on
+    // the three sides it touches, so the band meets the menu bar and both
+    // edges. Only the drawing grows -- p1 stays where the layout below it is.
+    const ImVec2 pad = ImGui::GetStyle().WindowPadding;
+    const ImVec2 q0(p0.x - pad.x, p0.y - pad.y);
+    const ImVec2 q1(p1.x + pad.x, p1.y);
+    const float band_w = q1.x - q0.x, band_h = q1.y - q0.y;
+
     // Cover, not fit: crop to the band's aspect so the artwork fills the width
     // whatever the window is doing.
-    const float want = avail / h, have = (float)bw / (float)bh;
+    const float want = band_w / band_h, have = (float)bw / (float)bh;
     ImVec2 uv0(0.0f, 0.0f), uv1(1.0f, 1.0f);
     const float f = have > want ? want / have : have / want;
     if (have > want) {
@@ -1778,10 +1786,10 @@ void GuiApp::draw_home_banner(float avail, float indent) {
     }
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddImage((ImTextureID)(intptr_t)tex, p0, p1, uv0, uv1);
+    dl->AddImage((ImTextureID)(intptr_t)tex, q0, q1, uv0, uv1);
     // The artwork is bright everywhere, so the text needs its own ground.
     const ImU32 clear = IM_COL32(14, 15, 18, 0), dark = IM_COL32(14, 15, 18, 232);
-    dl->AddRectFilledMultiColor(ImVec2(p0.x, p0.y + h * 0.30f), p1,
+    dl->AddRectFilledMultiColor(ImVec2(q0.x, q0.y + band_h * 0.30f), q1,
                                 clear, clear, dark, dark);
 
     ImGui::SetCursorScreenPos(ImVec2(p0.x + indent, p1.y - px(76.0f)));
@@ -3919,8 +3927,6 @@ void GuiApp::draw_new_dataset() {
     // panel that is read across everything, and it is what a run used to be
     // watched entirely through.
     const float log_h = log_height(ImGui::GetContentRegionAvail().y);
-    const float body_h = ImGui::GetContentRegionAvail().y - log_h -
-                         (log_h > 0 ? splitter_extent() : 0);
 
     // Side by side only when there is a preview AND room for both. On a narrow
     // window the preview goes under the form instead, which is worth less but
@@ -3928,7 +3934,7 @@ void GuiApp::draw_new_dataset() {
     const bool wide = ImGui::GetContentRegionAvail().x >= px(1000.0f);
     const bool two_col = preview_has_content() && wide;
 
-    ImGui::BeginChild("##dsbody", ImVec2(0, body_h));
+    ImGui::BeginChild("##dsbody", ImVec2(0, body_height(log_h)));
     if (two_col) {
         const float w = std::clamp(_ds_panel_w * ui_scale(), px(320.0f),
                                    std::max(px(320.0f),
@@ -5534,7 +5540,11 @@ float GuiApp::log_height(float avail) const {
 }
 
 float GuiApp::body_height(float log_h) {
-    return log_h > 0.0f ? -(log_h + splitter_extent()) : 0.0f;
+    // ItemSpacing twice: once above the splitter's grab and once below it.
+    // Counting it once left the body a spacing too tall, which the host window
+    // answered by becoming scrollable by exactly that much.
+    if (log_h <= 0.0f) return 0.0f;
+    return -(log_h + splitter_extent() + ImGui::GetStyle().ItemSpacing.y);
 }
 
 void GuiApp::draw_log_panel(float height) {
