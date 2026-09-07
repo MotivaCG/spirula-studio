@@ -388,6 +388,32 @@ model is written, so the trainer's own normalization comes out as the identity
 tilted with no way left to recover the transform. `map/Orient.h` has the
 algebra and the caveats; `--no-orient` keeps the mapper's raw gauge.
 
+`--metric-positions FILE` and `--metric-gps` fix that same gauge from an
+outside measurement instead, so the model is written **in metres**. The first
+reads per-image camera positions in COLMAP's `model_aligner --ref_images_path`
+format (`image_name X Y Z` per line, any right-handed metric frame — a LiDAR
+trajectory, ARKit, RTK); the second reads each registered image's own EXIF GPS
+and converts it to a local east-north-up frame. Either way a full similarity is
+fitted from the camera centres with LO-RANSAC over the same `estimateSim3` that
+model merging uses, and `--metric-max-error` is its inlier radius in metres (0
+picks 5 for GPS, 0.5 for a positions file).
+
+The fit is refused rather than approximated, and **what refuses it is geometry,
+not a noise model**. Fewer than three positioned cameras, reference positions
+that do not spread wider than the inlier radius, under half the cameras inlying,
+or cameras lying so close to a line that the reference amplifies orientation
+error more than 20x — each reports its own reason with the numbers behind it;
+the model is then still written, in the ordinary orient gauge, and the exit
+status is 4.
+
+The scale and orientation uncertainties are **reported and never gated on**.
+They come from the inlier residuals assuming uncorrelated noise, and measured
+against a reference whose error is correlated — GPS drift — they under-state
+the real error by 3.9-4.5x: on one flight a 2 % gate on them passed a 3.6 %
+scale error. A gate that passes what it exists to catch is worse than no gate,
+so they are printed as the lower bounds they are. `map/MetricGauge.h` has the
+algebra (D74).
+
 ### The finishing passes
 
 Reconstruction ends with up to two more global bundle adjustments, on models

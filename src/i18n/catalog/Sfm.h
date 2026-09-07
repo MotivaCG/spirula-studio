@@ -2388,6 +2388,248 @@ SS_MSG(merge_rebundled,
     TR("model {0} yeniden dengelendi (maliyet {1}); elenen gözlem: {2}, "
        "nokta: {3}; kalan nokta: {4}"));
 
+SS_MSG(metric_source_gps,
+    EN("EXIF GPS"),        JA("EXIF の GPS"),  ZH_HANS("EXIF GPS"), ZH_HANT("EXIF GPS"),
+    KO("EXIF GPS"),        DE("EXIF-GPS"),     FR("le GPS EXIF"),   ES("el GPS EXIF"),
+    PT("o GPS EXIF"),      IT("il GPS EXIF"),  NL("de EXIF-GPS"),   RU("GPS из EXIF"),
+    TR("EXIF GPS"));
+
+SS_MSG(metric_source_positions,
+    EN("the positions file"), JA("位置ファイル"), ZH_HANS("位置文件"), ZH_HANT("位置檔"),
+    KO("위치 파일"),          DE("die Positionsdatei"), FR("le fichier de positions"),
+    ES("el archivo de posiciones"), PT("o ficheiro de posições"),
+    IT("il file di posizioni"), NL("het positiebestand"), RU("файл позиций"),
+    TR("konum dosyası"));
+
+SS_MSG(metric_done,
+    EN("Model {0}: metric frame from {1} -- scale {2}, cameras within {3} m: {4}/{5}, "
+       "RMS {6} m; assuming uncorrelated reference error, which is a lower bound, "
+       "scale uncertainty {7}% and orientation uncertainty {8} deg"),
+    JA("モデル {0}: {1} によるメートル座標系 -- 縮尺 {2}、{3} m 以内のカメラ: {4}/{5}、"
+       "RMS {6} m。基準の誤差が無相関という下限の仮定で、縮尺の不確かさ {7}%、向きの不確かさ {8} 度"),
+    ZH_HANS("模型 {0}: 由{1}确定的米制坐标系 -- 缩放 {2}，{3} m 以内的相机: {4}/{5}，"
+            "RMS {6} m; 按参考误差互不相关这一下限假设，缩放不确定度 {7}%、朝向不确定度 {8} 度"),
+    ZH_HANT("模型 {0}: 由{1}確定的公尺座標系 -- 縮放 {2}，{3} m 以內的相機: {4}/{5}，"
+            "RMS {6} m; 按參考誤差互不相關這一下限假設，縮放不確定度 {7}%、朝向不確定度 {8} 度"),
+    KO("모델 {0}: {1} 기준 미터 좌표계 -- 배율 {2}, {3} m 이내 카메라: {4}/{5}, "
+       "RMS {6} m; 기준 오차가 무상관이라는 하한 가정에서 배율 불확실도 {7}%, 방향 불확실도 {8} 도"),
+    DE("Modell {0}: metrischer Rahmen aus {1} -- Maßstab {2}, Kameras innerhalb {3} m: "
+       "{4}/{5}, RMS {6} m; unter der Untergrenzannahme unkorrelierter Referenzfehler "
+       "Maßstabsunsicherheit {7}% und Orientierungsunsicherheit {8} Grad"),
+    FR("Modèle {0} : repère métrique d'après {1} -- échelle {2}, caméras à moins de {3} m : "
+       "{4}/{5}, RMS {6} m ; en supposant une erreur de référence non corrélée, ce qui est "
+       "une borne inférieure, incertitude d'échelle {7}% et d'orientation {8} degrés"),
+    ES("Modelo {0}: marco métrico a partir de {1} -- escala {2}, cámaras dentro de {3} m: "
+       "{4}/{5}, RMS {6} m; suponiendo error de referencia no correlacionado, que es una cota "
+       "inferior, incertidumbre de escala {7}% y de orientación {8} grados"),
+    PT("Modelo {0}: referencial métrico a partir de {1} -- escala {2}, câmeras dentro de {3} m: "
+       "{4}/{5}, RMS {6} m; supondo erro de referência não correlacionado, que é um limite "
+       "inferior, incerteza de escala {7}% e de orientação {8} graus"),
+    IT("Modello {0}: sistema metrico da {1} -- scala {2}, camere entro {3} m: {4}/{5}, "
+       "RMS {6} m; assumendo errore di riferimento non correlato, che è un limite inferiore, "
+       "incertezza di scala {7}% e di orientamento {8} gradi"),
+    NL("Model {0}: metrisch stelsel uit {1} -- schaal {2}, camera's binnen {3} m: {4}/{5}, "
+       "RMS {6} m; uitgaande van ongecorreleerde referentiefout, wat een ondergrens is, "
+       "schaalonzekerheid {7}% en oriëntatieonzekerheid {8} graden"),
+    RU("Модель {0}: метрическая система по источнику {1} -- масштаб {2}, камер в пределах "
+       "{3} м: {4}/{5}, СКО {6} м; в предположении некоррелированной ошибки эталона, что даёт "
+       "нижнюю границу, неопределённость масштаба {7}% и ориентации {8} градусов"),
+    TR("Model {0}: {1} kaynaklı metrik çerçeve -- ölçek {2}, {3} m içindeki kameralar: "
+       "{4}/{5}, RMS {6} m; ilişkisiz referans hatası varsayımıyla, ki bu bir alt sınırdır, "
+       "ölçek belirsizliği {7}% ve yönelim belirsizliği {8} derece"));
+
+SS_MSG(metric_failed,
+    EN("Model {0}: metric frame NOT applied, written in the normalized frame instead -- {1}"),
+    JA("モデル {0}: メートル座標系は適用せず、正規化座標系で書き出しました -- {1}"),
+    ZH_HANS("模型 {0}: 未应用米制坐标系，改为按归一化坐标系写出 -- {1}"),
+    ZH_HANT("模型 {0}: 未套用公尺座標系，改為按正規化座標系寫出 -- {1}"),
+    KO("모델 {0}: 미터 좌표계를 적용하지 않고 정규화 좌표계로 썼습니다 -- {1}"),
+    DE("Modell {0}: metrischer Rahmen NICHT angewandt, stattdessen im normalisierten "
+       "Rahmen geschrieben -- {1}"),
+    FR("Modèle {0} : repère métrique NON appliqué, écrit dans le repère normalisé -- {1}"),
+    ES("Modelo {0}: marco métrico NO aplicado, escrito en el marco normalizado -- {1}"),
+    PT("Modelo {0}: referencial métrico NÃO aplicado, escrito no referencial normalizado -- {1}"),
+    IT("Modello {0}: sistema metrico NON applicato, scritto nel sistema normalizzato -- {1}"),
+    NL("Model {0}: metrisch stelsel NIET toegepast, in het genormaliseerde stelsel "
+       "geschreven -- {1}"),
+    RU("Модель {0}: метрическая система НЕ применена, записано в нормализованной "
+       "системе -- {1}"),
+    TR("Model {0}: metrik çerçeve UYGULANMADI, normalize çerçevede yazıldı -- {1}"));
+
+SS_MSG(metric_fail_pairs,
+    EN("cameras with a metric position: {0}, need 3"),
+    JA("メートル位置を持つカメラ: {0}、3 台必要です"),
+    ZH_HANS("有米制位置的相机: {0}，需要 3 台"),
+    ZH_HANT("有公尺位置的相機: {0}，需要 3 台"),
+    KO("미터 위치가 있는 카메라: {0}, 3대가 필요합니다"),
+    DE("Kameras mit metrischer Position: {0}, benötigt werden 3"),
+    FR("caméras avec une position métrique : {0}, il en faut 3"),
+    ES("cámaras con posición métrica: {0}, hacen falta 3"),
+    PT("câmeras com posição métrica: {0}, são precisas 3"),
+    IT("camere con una posizione metrica: {0}, ne servono 3"),
+    NL("camera's met een metrische positie: {0}, er zijn er 3 nodig"),
+    RU("камер с метрической позицией: {0}, нужно 3"),
+    TR("metrik konumu olan kamera: {0}, 3 gerekli"));
+
+SS_MSG(metric_fail_spread,
+    EN("the metric positions do not spread out (radius {0} m); nothing to fit a scale to"),
+    JA("メートル位置に広がりがありません (半径 {0} m)。縮尺を合わせる手がかりがありません"),
+    ZH_HANS("米制位置没有展开 (半径 {0} m)，无从拟合缩放"),
+    ZH_HANT("公尺位置沒有展開 (半徑 {0} m)，無從擬合縮放"),
+    KO("미터 위치가 퍼져 있지 않습니다 (반지름 {0} m). 배율을 맞출 근거가 없습니다"),
+    DE("die metrischen Positionen streuen nicht (Radius {0} m); nichts, woran ein "
+       "Maßstab passt"),
+    FR("les positions métriques ne s'étalent pas (rayon {0} m) ; rien pour ajuster une échelle"),
+    ES("las posiciones métricas no se dispersan (radio {0} m); nada a lo que ajustar una escala"),
+    PT("as posições métricas não se espalham (raio {0} m); nada a que ajustar uma escala"),
+    IT("le posizioni metriche non si distribuiscono (raggio {0} m); niente su cui "
+       "stimare una scala"),
+    NL("de metrische posities spreiden niet (straal {0} m); niets om een schaal op te passen"),
+    RU("метрические позиции не разнесены (радиус {0} м); не к чему подгонять масштаб"),
+    TR("metrik konumlar yayılmıyor (yarıçap {0} m); ölçeği oturtacak bir şey yok"));
+
+SS_MSG(metric_fail_inliers,
+    EN("cameras within {0} m of the fit: {1}/{2}, need half"),
+    JA("当てはめから {0} m 以内のカメラ: {1}/{2}、半数必要です"),
+    ZH_HANS("与拟合相差 {0} m 以内的相机: {1}/{2}，需要半数"),
+    ZH_HANT("與擬合相差 {0} m 以內的相機: {1}/{2}，需要半數"),
+    KO("맞춤에서 {0} m 이내인 카메라: {1}/{2}, 절반이 필요합니다"),
+    DE("Kameras innerhalb {0} m der Anpassung: {1}/{2}, nötig ist die Hälfte"),
+    FR("caméras à moins de {0} m de l'ajustement : {1}/{2}, il en faut la moitié"),
+    ES("cámaras dentro de {0} m del ajuste: {1}/{2}, hace falta la mitad"),
+    PT("câmeras dentro de {0} m do ajuste: {1}/{2}, é precisa metade"),
+    IT("camere entro {0} m dalla stima: {1}/{2}, ne serve la metà"),
+    NL("camera's binnen {0} m van de fit: {1}/{2}, de helft is nodig"),
+    RU("камер в пределах {0} м от подгонки: {1}/{2}, нужна половина"),
+    TR("uyuma {0} m içinde olan kamera: {1}/{2}, yarısı gerekli"));
+
+SS_MSG(metric_fail_collinear,
+    EN("the cameras lie too close to a line: the spread across it is {0}% of the whole "
+       "and {1}% is the minimum, so this reference amplifies orientation error {2}x"),
+    JA("カメラがほぼ一直線に並んでいます。直線を横切る広がりは全体の {0}% で、最小は {1}% です。"
+       "この基準では向きの誤差が {2} 倍に拡大します"),
+    ZH_HANS("相机太接近一条直线: 横向展开只占整体的 {0}%，最小需要 {1}%，这样的参考会把朝向误差"
+            "放大 {2} 倍"),
+    ZH_HANT("相機太接近一條直線: 橫向展開只占整體的 {0}%，最小需要 {1}%，這樣的參考會把朝向誤差"
+            "放大 {2} 倍"),
+    KO("카메라가 거의 일직선에 놓여 있습니다. 직선을 가로지르는 퍼짐이 전체의 {0}% 이고 최소는 "
+       "{1}% 입니다. 이런 기준은 방향 오차를 {2} 배로 키웁니다"),
+    DE("die Kameras liegen zu nah an einer Linie: die Streuung quer dazu ist {0}% des Ganzen, "
+       "das Minimum ist {1}%, also verstärkt diese Referenz den Orientierungsfehler um das "
+       "{2}-fache"),
+    FR("les caméras sont trop proches d'une ligne : l'étalement en travers vaut {0}% du total "
+       "et le minimum est {1}%, donc cette référence amplifie l'erreur d'orientation {2} fois"),
+    ES("las cámaras están demasiado cerca de una línea: la dispersión transversal es el {0}% "
+       "del total y el mínimo es {1}%, así que esta referencia amplifica el error de "
+       "orientación {2} veces"),
+    PT("as câmeras estão demasiado perto de uma linha: a dispersão transversal é {0}% do total "
+       "e o mínimo é {1}%, portanto esta referência amplifica o erro de orientação {2} vezes"),
+    IT("le camere sono troppo vicine a una linea: la dispersione trasversale è il {0}% del "
+       "totale e il minimo è {1}%, quindi questo riferimento amplifica l'errore di "
+       "orientamento {2} volte"),
+    NL("de camera's liggen te dicht bij een lijn: de spreiding dwars erop is {0}% van het "
+       "geheel en {1}% is het minimum, dus deze referentie versterkt de oriëntatiefout {2} keer"),
+    RU("камеры лежат слишком близко к прямой: разброс поперёк неё составляет {0}% от общего "
+       "при минимуме {1}%, поэтому такой эталон усиливает ошибку ориентации в {2} раз"),
+    TR("kameralar bir doğruya fazla yakın: enine yayılım bütünün {0}% kadarı ve en az {1}% "
+       "olmalı, yani bu referans yönelim hatasını {2} kat büyütür"));
+
+SS_MSG(metric_matched,
+    EN("Positions file: matched {0}/{1} cameras (names not in the model: {2})"),
+    JA("位置ファイル: {0}/{1} 台のカメラと対応しました (モデルにない名前: {2})"),
+    ZH_HANS("位置文件: 匹配了 {0}/{1} 台相机 (模型中没有的名字: {2})"),
+    ZH_HANT("位置檔: 對應了 {0}/{1} 台相機 (模型中沒有的名稱: {2})"),
+    KO("위치 파일: 카메라 {0}/{1} 대와 대응했습니다 (모델에 없는 이름: {2})"),
+    DE("Positionsdatei: {0}/{1} Kameras zugeordnet (Namen, die das Modell nicht hat: {2})"),
+    FR("Fichier de positions : {0}/{1} caméras appariées (noms absents du modèle : {2})"),
+    ES("Archivo de posiciones: {0}/{1} cámaras emparejadas (nombres que no están en el "
+       "modelo: {2})"),
+    PT("Ficheiro de posições: {0}/{1} câmeras emparelhadas (nomes que o modelo não tem: {2})"),
+    IT("File di posizioni: {0}/{1} camere abbinate (nomi assenti dal modello: {2})"),
+    NL("Positiebestand: {0}/{1} camera's gekoppeld (namen die het model niet heeft: {2})"),
+    RU("Файл позиций: сопоставлено камер {0}/{1} (имён нет в модели: {2})"),
+    TR("Konum dosyası: {0}/{1} kamera eşleşti (modelde olmayan adlar: {2})"));
+
+SS_MSG(metric_gps_read,
+    EN("EXIF GPS: {0}/{1} cameras carry a fix ({2} of them without an altitude)"),
+    JA("EXIF の GPS: {0}/{1} 台のカメラに測位があります (うち高度なし: {2})"),
+    ZH_HANS("EXIF GPS: {0}/{1} 台相机带有定位 (其中没有高度的: {2})"),
+    ZH_HANT("EXIF GPS: {0}/{1} 台相機帶有定位 (其中沒有高度的: {2})"),
+    KO("EXIF GPS: 카메라 {0}/{1} 대에 측위가 있습니다 (그중 고도 없음: {2})"),
+    DE("EXIF-GPS: {0}/{1} Kameras haben eine Position ({2} davon ohne Höhe)"),
+    FR("GPS EXIF : {0}/{1} caméras ont un point ({2} d'entre elles sans altitude)"),
+    ES("GPS EXIF: {0}/{1} cámaras traen una posición ({2} de ellas sin altitud)"),
+    PT("GPS EXIF: {0}/{1} câmeras trazem uma posição ({2} delas sem altitude)"),
+    IT("GPS EXIF: {0}/{1} camere hanno un punto ({2} di esse senza quota)"),
+    NL("EXIF-GPS: {0}/{1} camera's hebben een fix ({2} daarvan zonder hoogte)"),
+    RU("GPS из EXIF: у {0}/{1} камер есть отсчёт ({2} из них без высоты)"),
+    TR("EXIF GPS: {0}/{1} kamerada konum var ({2} tanesi yükseklik olmadan)"));
+
+SS_MSG(metric_axes,
+    EN("Residual RMS per reference axis: {0}/{1}/{2} m; fitted up axis vs the "
+       "cameras' mean up: {3} deg"),
+    JA("基準軸ごとの残差 RMS: {0}/{1}/{2} m。当てはめた上方向とカメラの平均上方向の差: {3} 度"),
+    ZH_HANS("按参考轴的残差 RMS: {0}/{1}/{2} m; 拟合的上方向与相机平均上方向相差 {3} 度"),
+    ZH_HANT("按參考軸的殘差 RMS: {0}/{1}/{2} m; 擬合的上方向與相機平均上方向相差 {3} 度"),
+    KO("기준 축별 잔차 RMS: {0}/{1}/{2} m; 맞춘 상 방향과 카메라 평균 상 방향 차이: {3} 도"),
+    DE("Residuen-RMS je Referenzachse: {0}/{1}/{2} m; angepasste Hochachse gegen die "
+       "mittlere Hochachse der Kameras: {3} Grad"),
+    FR("RMS des résidus par axe de référence : {0}/{1}/{2} m ; axe vertical ajusté "
+       "contre le haut moyen des caméras : {3} degrés"),
+    ES("RMS de residuos por eje de referencia: {0}/{1}/{2} m; eje vertical ajustado "
+       "frente al arriba medio de las cámaras: {3} grados"),
+    PT("RMS dos resíduos por eixo de referência: {0}/{1}/{2} m; eixo vertical ajustado "
+       "contra o cima médio das câmeras: {3} graus"),
+    IT("RMS dei residui per asse di riferimento: {0}/{1}/{2} m; asse verticale stimato "
+       "rispetto all'alto medio delle camere: {3} gradi"),
+    NL("Residu-RMS per referentie-as: {0}/{1}/{2} m; gefitte omhoog-as tegen de "
+       "gemiddelde omhoog van de camera's: {3} graden"),
+    RU("СКО остатков по каждой оси эталона: {0}/{1}/{2} м; подогнанная вертикаль против "
+       "средней вертикали камер: {3} градусов"),
+    TR("Referans ekseni başına artık RMS: {0}/{1}/{2} m; oturtulan yukarı ekseni "
+       "kameraların ortalama yukarısına karşı: {3} derece"));
+
+SS_MSG(metric_positions_bad,
+    EN("Positions file {0} cannot be read: {1}"),
+    JA("位置ファイル {0} を読み取れません: {1}"),
+    ZH_HANS("无法读取位置文件 {0}: {1}"),
+    ZH_HANT("無法讀取位置檔 {0}: {1}"),
+    KO("위치 파일 {0} 을 읽을 수 없습니다: {1}"),
+    DE("Positionsdatei {0} lässt sich nicht lesen: {1}"),
+    FR("Le fichier de positions {0} est illisible : {1}"),
+    ES("No se puede leer el archivo de posiciones {0}: {1}"),
+    PT("Não é possível ler o ficheiro de posições {0}: {1}"),
+    IT("Impossibile leggere il file di posizioni {0}: {1}"),
+    NL("Positiebestand {0} kan niet gelezen worden: {1}"),
+    RU("Не удаётся прочитать файл позиций {0}: {1}"),
+    TR("Konum dosyası {0} okunamıyor: {1}"));
+
+SS_MSG(result_not_metric,
+    EN("RESULT: NOT METRIC -- the model is sound but the metric frame could not be fitted; "
+       "see the line above"),
+    JA("結果: メートル座標系なし -- モデル自体は健全ですが、メートル座標系を当てはめられません"
+       "でした。上の行を参照してください"),
+    ZH_HANS("结果: 非米制 -- 模型本身没问题，但无法拟合米制坐标系; 见上一行"),
+    ZH_HANT("結果: 非公尺 -- 模型本身沒問題，但無法擬合公尺座標系; 見上一行"),
+    KO("결과: 미터 좌표계 아님 -- 모델 자체는 온전하지만 미터 좌표계를 맞추지 못했습니다. "
+       "위 줄을 보십시오"),
+    DE("ERGEBNIS: NICHT METRISCH -- das Modell ist in Ordnung, aber der metrische Rahmen "
+       "ließ sich nicht anpassen; siehe die Zeile darüber"),
+    FR("RÉSULTAT : NON MÉTRIQUE -- le modèle est sain mais le repère métrique n'a pas pu "
+       "être ajusté ; voir la ligne ci-dessus"),
+    ES("RESULTADO: NO MÉTRICO -- el modelo está bien pero no se pudo ajustar el marco "
+       "métrico; vea la línea anterior"),
+    PT("RESULTADO: NÃO MÉTRICO -- o modelo está bem mas o referencial métrico não pôde ser "
+       "ajustado; veja a linha acima"),
+    IT("RISULTATO: NON METRICO -- il modello è valido ma il sistema metrico non si è potuto "
+       "stimare; vedere la riga sopra"),
+    NL("RESULTAAT: NIET METRISCH -- het model deugt, maar het metrische stelsel kon niet "
+       "gefit worden; zie de regel hierboven"),
+    RU("РЕЗУЛЬТАТ: НЕ МЕТРИЧЕСКИЙ -- модель исправна, но метрическую систему подогнать не "
+       "удалось; см. строку выше"),
+    TR("SONUÇ: METRİK DEĞİL -- model sağlam ama metrik çerçeve oturtulamadı; üstteki "
+       "satıra bakın"));
+
 }  // namespace sfm
 }  // namespace msg
 }  // namespace i18n
