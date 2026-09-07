@@ -110,7 +110,13 @@ namespace {
     namespace PCK {
 
         // typedef long double real;
+
         typedef double real;
+
+#ifdef LDBL_EPSILON
+    #undef LDBL_EPSILON
+    #define LDBL_EPSILON DBL_EPSILON
+#endif
 
         inline Sign sgn(real x) {
             return (x > 0) ? POSITIVE : ((x < 0) ? NEGATIVE : ZERO);
