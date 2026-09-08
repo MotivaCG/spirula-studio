@@ -126,7 +126,6 @@ enum class CameraDistortionType {
     None = 0,
     OpenCV = 1,
     ThinPrism = 2,
-    Rational = 3,
 };
 
 // Storage width of one camera's coefficient row. Each tier reads a prefix.
@@ -203,7 +202,6 @@ inline CameraDistortionType cdt(const std::string &s) {
     return (s == "NONE") ? CameraDistortionType::None :
         (s == "OPENCV") ? CameraDistortionType::OpenCV :
         (s == "THIN_PRISM") ? CameraDistortionType::ThinPrism :
-        (s == "RATIONAL") ? CameraDistortionType::Rational :
         (CameraDistortionType)-1;
 }
 

@@ -39,7 +39,6 @@ template<> struct CovProjNav<CameraModelType::MODEL, CameraDistortionType::TIER>
 _SS_COV_PERSP(None,      _none)
 _SS_COV_PERSP(OpenCV,    _opencv)
 _SS_COV_PERSP(ThinPrism, _prism)
-_SS_COV_PERSP(Rational,  _rational)
 _SS_COV_RADIAL_TIERS(FISHEYE,   fisheye)
 _SS_COV_RADIAL_TIERS(EQUISOLID, equisolid)
 _SS_COV_PROJ(EQUIRECTANGULAR, None,

@@ -166,7 +166,7 @@ int main(int argc, char** argv) {
         {"3dgs", "PINHOLE", 0, false, true, 0},
         {"3dgs", "PINHOLE", 1, false, true, 0},
         {"mip", "FISHEYE", 2, false, false, 2},
-        {"3dgut", "PINHOLE", 3, false, false, 0},
+        {"3dgut", "PINHOLE", 2, false, false, 0},
         {"3dgs", "EQUIRECTANGULAR", 0, true, false, 0},
     };
     for (const Cfg& c : cfgs) {
@@ -246,7 +246,7 @@ int main(int argc, char** argv) {
         // bends its edges by less than the byte-comparison tolerance.
         const std::vector<float> rows = dist_fixture::distortion_rows(1);
         for (int i : {1, 2, 4, 5}) {
-            int tier = i == 2 ? 2 : (i == 5 ? 3 : 1);  // fisheye: no RATIONAL
+            int tier = (i == 2 || i == 5) ? 2 : 1;
             v_tier[i] = tier;
             for (int k = 0; k < kCameraDistortionParams; k++)
                 v_dist[(size_t)i * kCameraDistortionParams + k] =

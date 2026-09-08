@@ -6,8 +6,8 @@
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     MipSplatting<3>,
-    CameraModelType::PINHOLE,
-    CameraDistortionType::OpenCV,
+    CameraModelType::EQUISOLID,
+    CameraDistortionType::ThinPrism,
     false,
     false,
     0
@@ -66,8 +66,8 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     MipSplatting<3>,
-    CameraModelType::PINHOLE,
-    CameraDistortionType::OpenCV,
+    CameraModelType::EQUISOLID,
+    CameraDistortionType::ThinPrism,
     false,
     false,
     1
@@ -126,8 +126,8 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     MipSplatting<3>,
-    CameraModelType::PINHOLE,
-    CameraDistortionType::ThinPrism,
+    CameraModelType::EQUIRECTANGULAR,
+    CameraDistortionType::None,
     true,
     true,
     0
@@ -186,8 +186,8 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     MipSplatting<3>,
-    CameraModelType::PINHOLE,
-    CameraDistortionType::ThinPrism,
+    CameraModelType::EQUIRECTANGULAR,
+    CameraDistortionType::None,
     true,
     true,
     1
@@ -246,8 +246,8 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     MipSplatting<3>,
-    CameraModelType::PINHOLE,
-    CameraDistortionType::ThinPrism,
+    CameraModelType::EQUIRECTANGULAR,
+    CameraDistortionType::None,
     true,
     false,
     0
@@ -306,8 +306,8 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     MipSplatting<3>,
-    CameraModelType::PINHOLE,
-    CameraDistortionType::ThinPrism,
+    CameraModelType::EQUIRECTANGULAR,
+    CameraDistortionType::None,
     true,
     false,
     1
@@ -366,8 +366,8 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     MipSplatting<3>,
-    CameraModelType::PINHOLE,
-    CameraDistortionType::ThinPrism,
+    CameraModelType::EQUIRECTANGULAR,
+    CameraDistortionType::None,
     false,
     true,
     0
@@ -426,8 +426,8 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     MipSplatting<3>,
-    CameraModelType::PINHOLE,
-    CameraDistortionType::ThinPrism,
+    CameraModelType::EQUIRECTANGULAR,
+    CameraDistortionType::None,
     false,
     true,
     1
@@ -486,8 +486,8 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     MipSplatting<3>,
-    CameraModelType::PINHOLE,
-    CameraDistortionType::ThinPrism,
+    CameraModelType::EQUIRECTANGULAR,
+    CameraDistortionType::None,
     false,
     false,
     0

@@ -264,7 +264,7 @@ ColmapPoints3D read_ply_points(const std::string& path) {
 namespace {
 
 // transforms.json distortion keys. k4..k6 mean different things either side of
-// the fisheye divide: on a perspective camera they are OpenCV's RATIONAL
+// the fisheye divide: on a perspective camera they are OpenCV's rational
 // denominator, on a fisheye they are further theta-space radial terms.
 struct RawDistortion {
     double k1, k2, k3, k4, k5, k6, p1, p2, sx1, sy1, b1, b2;
@@ -281,27 +281,30 @@ double frame_or_meta(const JsonValue& frame, const JsonValue& meta,
     return def;
 }
 
-// A sensor skew (Metashape b2) is an off-diagonal pixel term, and every tier's
-// pixel map is diagonal. So the camera is fitted without it and the images are
-// resampled from the true skewed projection -- unless the skew turns out to be
-// smaller than resampling can express, in which case it is simply dropped.
-struct SkewFit {
+// The two things no tier carries: a Metashape sensor skew (b2, off-diagonal
+// where every tier's pixel map is diagonal) and OpenCV's rational radial. Both
+// are fitted onto a tier and the images resampled -- unless the fit is exact.
+struct LensFit {
     CameraModelType      model;
     CameraDistortionType tier;
     double fx, fy, cx, cy;
     float  coeffs[kCameraDistortionParams];
-    RedistortSource source;   // source_model < 0 when the skew was negligible
+    RedistortSource source;   // source_model < 0 when the fit was exact
+    // The one report line this fit earns, printed after the frame loop.
+    std::string label;
+    double skew_px = 0.0, max_px = 0.0;
+    int    count = 0;
 };
 
 // Keyed on everything the fit depends on: a transforms.json repeats the same
 // intrinsics on every frame and each fit is a least-squares solve.
-using SkewCache = std::map<std::string, SkewFit>;
+using LensFitCache = std::map<std::string, LensFit>;
 
-const SkewFit& fit_skewed_sensor(SkewCache& cache, CameraModelType model,
-                                 CameraDistortionType tier,
-                                 double fx, double fy, double cx, double cy,
-                                 double skew_px, const float* coeffs,
-                                 double W, double H, const std::string& label) {
+LensFit& fit_unsupported_lens(LensFitCache& cache, CameraModelType model,
+                           bool rational,
+                           double fx, double fy, double cx, double cy,
+                           double skew_px, const float* coeffs,
+                           double W, double H, const std::string& label) {
     RedistortSource src;
     src.source_model = srccam::kSkewed;
     src.params[0] = (float)fx; src.params[1] = (float)fy;
@@ -312,40 +315,69 @@ const SkewFit& fit_skewed_sensor(SkewCache& cache, CameraModelType model,
     src.params[13] = model == CameraModelType::FISHEYE   ? srccam::kSkewBaseFisheye
                    : model == CameraModelType::EQUISOLID ? srccam::kSkewBaseEquisolid
                                                          : srccam::kSkewBasePerspective;
-    src.params[14] = tier == CameraDistortionType::Rational
-                   ? srccam::kSkewRadialRational : srccam::kSkewRadialPolynomial;
+    src.params[14] = rational ? srccam::kSkewRadialRational
+                             : srccam::kSkewRadialPolynomial;
 
     std::string key((const char*)src.params, sizeof(src.params));
     key += std::string((const char*)&W, sizeof(W));
     key += std::string((const char*)&H, sizeof(H));
     auto it = cache.find(key);
-    if (it != cache.end())
+    if (it != cache.end()) {
+        it->second.count++;
         return it->second;
+    }
 
     dsfit::SourceProject project =
         [&src](double x, double y, double z, double* u, double* v) {
             return srccam::project(src.source_model, src.params, x, y, z, u, v);
         };
-    // The same camera model reproduces everything but the skew, so try it
-    // before letting the fitter pick one it likes better.
-    dsfit::FitResult fit = dsfit::fit_camera(project, (int)W, (int)H, model);
+    // A skew leaves the field of view alone, so the declared camera model is
+    // still the right target. A rational denominator does not, so there the
+    // model comes from what the fitter measures, as it does in ColmapParser.
+    dsfit::FitResult fit = rational
+        ? dsfit::fit_camera_auto(project, (int)W, (int)H)
+        : dsfit::fit_camera(project, (int)W, (int)H, model);
     if (!fit.invertible || fit.samples == 0)
         fit = dsfit::fit_camera_auto(project, (int)W, (int)H);
 
-    SkewFit f{};
+    LensFit f{};
     f.model = fit.target.model;
     f.tier  = fit.target.distortion;
     f.fx = fit.target.fx; f.fy = fit.target.fy;
     f.cx = fit.target.cx; f.cy = fit.target.cy;
     for (int k = 0; k < kCameraDistortionParams; k++) f.coeffs[k] = fit.target.coeffs[k];
+    f.label = label;
+    f.skew_px = skew_px;
+    f.max_px = fit.max_px;
+    f.count = 1;
     if (fit.max_px >= dsfit::kExactFitPx) {
         f.source = src;
         f.source.fit_max_px = (float)fit.max_px;
-        std::printf("%s\n", spirula::i18n::format(dmsg::camera_sensor_skew,
-            {label, skew_px, camera_model_to_string(f.model),
-             camera_distortion_to_string(f.tier), fit.max_px}).c_str());
     }
     return cache.emplace(std::move(key), f).first->second;
+}
+
+// One line per distinct fit rather than per frame; the counted form matches
+// what ColmapParser reports for the same situation.
+void print_lens_fits(const LensFitCache& cache) {
+    for (const auto& [key, f] : cache) {
+        (void)key;
+        const char* mdl = camera_model_to_string(f.model);
+        const char* dst = camera_distortion_to_string(f.tier);
+        const bool redistorted = f.source.source_model >= 0;
+        if (f.skew_px != 0.0) {
+            if (redistorted)
+                std::printf("%s\n", spirula::i18n::format(dmsg::camera_sensor_skew,
+                    {f.label, f.skew_px, mdl, dst, f.max_px}).c_str());
+        } else if (redistorted) {
+            std::printf("%s\n", spirula::i18n::format(dmsg::camera_model_fitted,
+                {std::string("FULL_OPENCV"), f.count, mdl, dst, f.max_px}).c_str());
+        } else {
+            std::printf("%s\n", spirula::i18n::format(dmsg::camera_model_fitted_exact,
+                {std::string("FULL_OPENCV"), f.count, mdl, dst,
+                 dsfit::kExactFitPx}).c_str());
+        }
+    }
 }
 
 // 3x3 inverse (adjugate); used for applied_transform^-1.
@@ -486,7 +518,7 @@ ParsedDataset parse_nerfstudio_meta(const JsonValue& meta,
     bool any_mask = false, any_depth = false, any_normal = false;
     const int EQUIRECT_V = (int)camera_model_from_name("EQUIRECTANGULAR");
     const int PINHOLE_V  = (int)camera_model_from_name("PINHOLE");
-    SkewCache skew_cache;
+    LensFitCache lens_fits;
 
     for (int64_t j = 0; j < N; j++) {
         const Frame& F = frames[subset[j]];
@@ -532,11 +564,14 @@ ParsedDataset parse_nerfstudio_meta(const JsonValue& meta,
         // denominator) and a fisheye follows Kannala-Brandt (k4 is radial).
         // MetashapeParser always writes the key, because its 4th radial term
         // would otherwise be read as a denominator.
-        CameraDistortionType hint = (CameraDistortionType)-1;
+        std::string hint;
         if (const JsonValue* v = fr.find("camera_distortion"))
-            hint = camera_distortion_from_name(v->as_string());
+            hint = v->as_string();
         else if (const JsonValue* v2 = meta.find("camera_distortion"))
-            hint = camera_distortion_from_name(v2->as_string());
+            hint = v2->as_string();
+        const bool hint_rational = hint == "RATIONAL";
+        const bool hint_known =
+            hint_rational || (int)camera_distortion_from_name(hint) >= 0;
 
         // b1/b2 are Metashape's affinity and skew and sx1/sy1 are thin-prism
         // terms; a rational camera has none of them, so their mere PRESENCE
@@ -549,33 +584,37 @@ ParsedDataset parse_nerfstudio_meta(const JsonValue& meta,
         bool thin_prism_shaped =
             has("b1") || has("b2") || has("sx1") || has("sy1");
 
-        float* dst = &ds.dist_coeffs[j*kCameraDistortionParams];
-        CameraDistortionType tier;
         bool fisheye = ((int)model != PINHOLE_V);
-        bool rational = (hint == CameraDistortionType::Rational) ||
-                        ((int)hint < 0 && !fisheye &&
-                         (rd.k5 != 0.0 || rd.k6 != 0.0 ||
-                          (rd.k4 != 0.0 && !thin_prism_shaped)));
+        // 1/(1 + 0) == 1, so an all-zero denominator is the k1..k3 polynomial
+        // and needs no fit.
+        bool rational = (hint_rational ||
+                         (!hint_known && !fisheye &&
+                          (rd.k5 != 0.0 || rd.k6 != 0.0 ||
+                           (rd.k4 != 0.0 && !thin_prism_shaped)))) &&
+                        (rd.k4 != 0.0 || rd.k5 != 0.0 || rd.k6 != 0.0);
+
+        float raw[kCameraDistortionParams];
         if (rational) {
-            tier = CameraDistortionType::Rational;
-            dst[0] = (float)rd.k1; dst[1] = (float)rd.k2; dst[2] = (float)rd.k3;
-            dst[3] = (float)rd.k4; dst[4] = (float)rd.k5; dst[5] = (float)rd.k6;
-            dst[6] = (float)rd.p1; dst[7] = (float)rd.p2;
+            raw[0] = (float)rd.k1; raw[1] = (float)rd.k2; raw[2] = (float)rd.k3;
+            raw[3] = (float)rd.k4; raw[4] = (float)rd.k5; raw[5] = (float)rd.k6;
+            raw[6] = (float)rd.p1; raw[7] = (float)rd.p2;
         } else {
-            tier = CameraDistortionType::ThinPrism;
-            dst[0] = (float)rd.k1;  dst[1] = (float)rd.k2;
-            dst[2] = (float)rd.k3;  dst[3] = (float)rd.k4;
-            dst[4] = (float)rd.p1;  dst[5] = (float)rd.p2;
-            dst[6] = (float)rd.sx1; dst[7] = (float)rd.sy1;
+            raw[0] = (float)rd.k1;  raw[1] = (float)rd.k2;
+            raw[2] = (float)rd.k3;  raw[3] = (float)rd.k4;
+            raw[4] = (float)rd.p1;  raw[5] = (float)rd.p2;
+            raw[6] = (float)rd.sx1; raw[7] = (float)rd.sy1;
         }
+
+        float* dst = &ds.dist_coeffs[j*kCameraDistortionParams];
+        CameraDistortionType tier = CameraDistortionType::ThinPrism;
         if ((int)model == EQUIRECT_V) {
             // A panorama has no lens, so it has no skew either; b2 on one is
             // meaningless and ignored along with the rest of the coefficients.
             tier = CameraDistortionType::None;
             for (int k = 0; k < kCameraDistortionParams; k++) dst[k] = 0.0f;
-        } else if (skew_px != 0.0) {
-            const SkewFit& f = fit_skewed_sensor(skew_cache, model, tier, fx, fy,
-                                                 cx, cy, skew_px, dst, W, H, F.abs);
+        } else if (skew_px != 0.0 || rational) {
+            const LensFit& f = fit_unsupported_lens(lens_fits, model, rational, fx, fy,
+                                                 cx, cy, skew_px, raw, W, H, F.abs);
             model = f.model;
             tier  = f.tier;
             fx = f.fx; fy = f.fy; cx = f.cx; cy = f.cy;
@@ -584,6 +623,8 @@ ParsedDataset parse_nerfstudio_meta(const JsonValue& meta,
                 if (ds.redistort.empty()) ds.redistort.resize(N);
                 ds.redistort[j] = f.source;
             }
+        } else {
+            std::copy(raw, raw + kCameraDistortionParams, dst);
         }
         ds.camera_distortions.push_back(
             (int32_t)camera_distortion_demote(tier, dst, dst));
@@ -636,6 +677,7 @@ ParsedDataset parse_nerfstudio_meta(const JsonValue& meta,
     if (any_mask)   ds.mask_filenames   = std::move(mask_files);
     if (any_depth)  ds.depth_filenames  = std::move(depth_files);
     if (any_normal) ds.normal_filenames = std::move(normal_files);
+    print_lens_fits(lens_fits);
 
     // ---- Seed points ------------------------------------------------------
     std::string ply_rel;

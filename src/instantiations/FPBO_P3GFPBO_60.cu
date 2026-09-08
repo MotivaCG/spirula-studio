@@ -6,7 +6,7 @@
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<3>,
-    CameraModelType::PINHOLE,
+    CameraModelType::EQUISOLID,
     CameraDistortionType::OpenCV,
     false,
     true,
@@ -66,7 +66,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<3>,
-    CameraModelType::PINHOLE,
+    CameraModelType::EQUISOLID,
     CameraDistortionType::OpenCV,
     false,
     true,
@@ -126,7 +126,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<3>,
-    CameraModelType::PINHOLE,
+    CameraModelType::EQUISOLID,
     CameraDistortionType::OpenCV,
     false,
     false,
@@ -186,7 +186,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<3>,
-    CameraModelType::PINHOLE,
+    CameraModelType::EQUISOLID,
     CameraDistortionType::OpenCV,
     false,
     false,
@@ -246,7 +246,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<3>,
-    CameraModelType::PINHOLE,
+    CameraModelType::EQUISOLID,
     CameraDistortionType::ThinPrism,
     true,
     true,
@@ -306,7 +306,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<3>,
-    CameraModelType::PINHOLE,
+    CameraModelType::EQUISOLID,
     CameraDistortionType::ThinPrism,
     true,
     true,
@@ -366,7 +366,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<3>,
-    CameraModelType::PINHOLE,
+    CameraModelType::EQUISOLID,
     CameraDistortionType::ThinPrism,
     true,
     false,
@@ -426,7 +426,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<3>,
-    CameraModelType::PINHOLE,
+    CameraModelType::EQUISOLID,
     CameraDistortionType::ThinPrism,
     true,
     false,
@@ -486,7 +486,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<3>,
-    CameraModelType::PINHOLE,
+    CameraModelType::EQUISOLID,
     CameraDistortionType::ThinPrism,
     false,
     true,

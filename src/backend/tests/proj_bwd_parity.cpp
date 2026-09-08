@@ -177,7 +177,7 @@ int main(int argc, char** argv) {
         {0, false, 0, 1, 3, 0, false, true},
         {1, false, 1, 2, 2, 0, false, false},
         {0, true, 2, 1, 3, 0, false, false},
-        {2, false, 0, 3, 3, 0, false, true},
+        {2, false, 0, 2, 3, 0, false, true},
         {2, true, 1, 0, 1, 0, false, false},
         {0, false, 0, 2, 3, 8, false, false},
         {2, false, 3, 0, 3, 16, true, false},

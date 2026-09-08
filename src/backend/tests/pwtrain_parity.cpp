@@ -162,7 +162,7 @@ int main(int argc, char** argv) {
     float* d_depths = upload(depths);
 
     // ---- depth_to_normal_backward (pinhole; every tier x ray/linear) ----
-    for (int tier = 0; tier < 4; tier++)
+    for (int tier = 0; tier < 3; tier++)
         for (int rd = 0; rd < 2; rd++) {
             std::vector<float> vn(PIX * 3);
             fill(vn, -1.f, 1.f);

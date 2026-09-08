@@ -280,14 +280,8 @@ ColmapPoints3D read_points3D_text(const std::string& recon_dir) {
 // ===========================================================================
 // COLMAP camera model -> (CameraModelType, CameraDistortionType, coefficients)
 //
-// Every one of COLMAP's 18 models is accepted. Fourteen map exactly onto a
-// tier; the remaining four (FOV, SIMPLE_DIVISION, DIVISION, EUCM) and
-// RAD_TAN_THIN_PRISM_FISHEYE have no exact representation and are fitted, with
-// the source model recorded so the images can be re-distorted to match.
-//
-// COLMAP's parameter ORDER is not ours: it interleaves p1,p2 between k2 and k3
-// (models.h FullOpenCVCameraModel / ThinPrismFisheyeCameraModel), and its
-// FULL_OPENCV k4..k6 are DENOMINATOR terms, not further radial terms.
+// The six with no exact tier are fitted onto one, and COLMAP's parameter ORDER
+// is not ours -- it interleaves p1,p2 between k2 and k3 (models.h).
 // ===========================================================================
 
 namespace {
@@ -344,15 +338,16 @@ BakedIntrins bake_colmap_intrins(const ColmapCamera& cam) {
         o.dist[0] = P(4); o.dist[1] = P(5);     // k1 k2
         o.dist[2] = P(6); o.dist[3] = P(7);     // p1 p2
 
-    // ---- the rational model ----------------------------------------------
-    } else if (cam.model == "FULL_OPENCV") {
-        need(12);
+    // ---- rational with no denominator: a plain polynomial ----------------
+    // FULL_OPENCV's k4..k6 DIVIDE, which no tier carries, so a lens that uses
+    // them is fitted below instead.
+    } else if (cam.model == "FULL_OPENCV" && p.size() >= 12 &&
+               p[9] == 0.0 && p[10] == 0.0 && p[11] == 0.0) {
         o.fx = P(0); o.fy = P(1); o.cx = P(2); o.cy = P(3);
-        o.distortion = CameraDistortionType::Rational;
-        o.dist[0] = P(4);  o.dist[1] = P(5);    // k1 k2   numerator
-        o.dist[2] = P(8);                       // k3      numerator
-        o.dist[3] = P(9);  o.dist[4] = P(10); o.dist[5] = P(11);  // k4 k5 k6 denominator
-        o.dist[6] = P(6);  o.dist[7] = P(7);    // p1 p2
+        o.distortion = CameraDistortionType::ThinPrism;
+        o.dist[0] = P(4); o.dist[1] = P(5);     // k1 k2
+        o.dist[2] = P(8);                       // k3
+        o.dist[4] = P(6); o.dist[5] = P(7);     // p1 p2
 
     // ---- fisheye radial in theta-space -----------------------------------
     } else if (cam.model == "OPENCV_FISHEYE") {
@@ -401,38 +396,6 @@ BakedIntrins bake_colmap_intrins(const ColmapCamera& cam) {
 }
 
 }  // namespace
-
-bool colmap_preview_intrins(int model_id, int width, int height,
-                            const std::vector<double>& params,
-                            PreviewIntrins& out) {
-    const auto& table = colmap_model_table();
-    const auto it = table.find(model_id);
-    if (it == table.end() || (int)params.size() != it->second.num_params)
-        return false;
-    ColmapCamera cam;
-    cam.model = it->second.name;
-    cam.width = (uint64_t)width;
-    cam.height = (uint64_t)height;
-    cam.params = params;
-    BakedIntrins bi;
-    try {
-        bi = bake_colmap_intrins(cam);
-    } catch (const std::exception&) {
-        return false;
-    }
-    // A model with no exact tier comes back asking to be fitted, which needs
-    // the images. The caller draws a plain frustum instead.
-    if (bi.source.source_model >= 0) return false;
-    out.fx = bi.fx;
-    out.fy = bi.fy;
-    out.cx = bi.cx;
-    out.cy = bi.cy;
-    out.model = (int32_t)bi.model;
-    out.distortion = (int32_t)bi.distortion;
-    static_assert(kCameraDistortionParams == 8, "PreviewIntrins::dist width");
-    std::copy(bi.dist.begin(), bi.dist.end(), out.dist.begin());
-    return true;
-}
 
 namespace {
 
@@ -556,6 +519,42 @@ void colmap_to_c2w(const ColmapImage& im, float* out12) {
 }
 
 }  // namespace
+
+bool colmap_preview_intrins(int model_id, int width, int height,
+                            const std::vector<double>& params,
+                            PreviewIntrins& out) {
+    const auto& table = colmap_model_table();
+    const auto it = table.find(model_id);
+    if (it == table.end() || (int)params.size() != it->second.num_params)
+        return false;
+    ColmapCamera cam;
+    cam.model = it->second.name;
+    cam.width = (uint64_t)width;
+    cam.height = (uint64_t)height;
+    cam.params = params;
+    BakedIntrins bi;
+    try {
+        bi = bake_colmap_intrins(cam);
+        // A model with no exact tier is fitted the way the loader fits it, so
+        // the frustum is the camera training will use. ~25 ms, so a caller
+        // that draws many images caches on the camera record.
+        if (bi.source.source_model >= 0) {
+            std::map<std::string, FitReport> reports;
+            fit_colmap_source(cam, bi, reports);
+        }
+    } catch (const std::exception&) {
+        return false;
+    }
+    out.fx = bi.fx;
+    out.fy = bi.fy;
+    out.cx = bi.cx;
+    out.cy = bi.cy;
+    out.model = (int32_t)bi.model;
+    out.distortion = (int32_t)bi.distortion;
+    static_assert(kCameraDistortionParams == 8, "PreviewIntrins::dist width");
+    std::copy(bi.dist.begin(), bi.dist.end(), out.dist.begin());
+    return true;
+}
 
 
 // ===========================================================================

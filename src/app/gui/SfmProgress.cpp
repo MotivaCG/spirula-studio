@@ -15,6 +15,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <optional>
 
 namespace fs = std::filesystem;
 
@@ -105,6 +107,10 @@ bool read_live_model(const std::string& dir, int64_t& mtime, LiveModel& out) {
                                  (int32_t)CameraDistortionType::None);
     ds.dist_coeffs.assign((size_t)m.n_registered * kCameraDistortionParams, 0.0f);
     std::vector<double> params;
+    // One camera record per image in the snapshot, and a capture usually
+    // repeats one: colmap_preview_intrins solves a least-squares fit for a
+    // lens no tier represents, which is ~25 ms each.
+    std::map<std::string, std::optional<PreviewIntrins>> cams;
     for (uint32_t i = 0; i < m.n_registered; i++) {
         for (int k = 0; k < 12; k++) ds.c2w[(size_t)i * 12 + k] = r.f32();
         const int w = (int)r.u32(), h = (int)r.u32();
@@ -117,8 +123,17 @@ bool read_live_model(const std::string& dir, int64_t& mtime, LiveModel& out) {
         for (uint32_t k = 0; k < np; k++) r.take(&params[k], 8);
         // The parser's own mapping, so a fisheye draws as a fisheye rather
         // than as the pinhole a bare focal length would suggest.
-        PreviewIntrins pi;
-        if (colmap_preview_intrins(model_id, w, h, params, pi)) {
+        std::string key((const char*)&model_id, sizeof model_id);
+        key.append((const char*)&w, sizeof w).append((const char*)&h, sizeof h);
+        key.append((const char*)params.data(), params.size() * sizeof(double));
+        auto [ent, fresh] = cams.try_emplace(key);
+        if (fresh) {
+            PreviewIntrins pi;
+            if (colmap_preview_intrins(model_id, w, h, params, pi))
+                ent->second = pi;
+        }
+        if (ent->second) {
+            const PreviewIntrins& pi = *ent->second;
             ds.camera_models[i] = pi.model;
             ds.camera_distortions[i] = pi.distortion;
             ds.intrins[(size_t)i * 4 + 0] = pi.fx;
@@ -128,7 +143,7 @@ bool read_live_model(const std::string& dir, int64_t& mtime, LiveModel& out) {
             for (int k = 0; k < kCameraDistortionParams; k++)
                 ds.dist_coeffs[(size_t)i * kCameraDistortionParams + k] = pi.dist[k];
         } else if (params.size() >= 4) {
-            // A model the parser will not map without a fit; a plain frustum
+            // A record this reader cannot interpret at all; a plain frustum
             // from whatever the first four parameters are is still the right
             // place in space.
             for (int k = 0; k < 4; k++)

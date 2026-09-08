@@ -33,8 +33,7 @@ struct ColmapCamera {
 
 // What a COLMAP camera record means to the renderer: which model, which
 // distortion tier, and its coefficients. Exposed for a caller that only wants
-// to DRAW the camera -- the live SfM preview, whose model is not on disk yet --
-// so it needs neither the images nor the re-distort fit the parser runs.
+// to DRAW the camera -- the live SfM preview, whose model is not on disk yet.
 struct PreviewIntrins {
     float fx = 0, fy = 0, cx = 0, cy = 0;
     int32_t model = 0;         // CameraModelType
@@ -45,10 +44,9 @@ struct PreviewIntrins {
     std::array<float, 8> dist{};
 };
 
-// False for a model id this reader does not know, a parameter count that does
-// not match it, or a source model no tier represents exactly -- the last of
-// which the parser answers by fitting and resampling, which is more than a
-// frustum needs.
+// False for a model id this reader does not know or a parameter count that
+// does not match it. A lens no tier represents is FITTED here, exactly as the
+// loader fits it, which costs ~25 ms -- cache on the camera record.
 bool colmap_preview_intrins(int model_id, int width, int height,
                             const std::vector<double>& params,
                             PreviewIntrins& out);

@@ -19,7 +19,6 @@ kCameraVariants = [
     ("CameraModelType::PINHOLE",         "CameraDistortionType::None"),
     ("CameraModelType::PINHOLE",         "CameraDistortionType::OpenCV"),
     ("CameraModelType::PINHOLE",         "CameraDistortionType::ThinPrism"),
-    ("CameraModelType::PINHOLE",         "CameraDistortionType::Rational"),
     ("CameraModelType::FISHEYE",         "CameraDistortionType::None"),
     ("CameraModelType::FISHEYE",         "CameraDistortionType::OpenCV"),
     ("CameraModelType::FISHEYE",         "CameraDistortionType::ThinPrism"),
@@ -60,6 +59,12 @@ def extract_kernel_definition(header_src: Path, kernel_name: str):
     assert len(matches) == 1, matches
 
     return matches[0][0]
+
+
+# Every file emitted this run, so the stale ones can be pruned at the end. A
+# leftover from a larger kCameraVariants still compiles (cmake/sources.txt
+# globs the directory) and fails on the enumerator it names.
+_emitted: set = set()
 
 
 def write_if_changed(path, new_text):
@@ -187,6 +192,7 @@ def generate_kernel_instantiation(
         filename += ".cu"
 
         os.makedirs(DST_DIR, exist_ok=True)
+        _emitted.add(filename)
         if write_if_changed(DST_DIR / filename, content):
             print("Generated", filename)
 
@@ -369,3 +375,8 @@ generate_RasterizationFwd()
 generate_RasterizationBwd()
 generate_RasterizationEval3DFwd()
 generate_RasterizationEval3DBwd()
+
+for stale in sorted(DST_DIR.glob("*.cu")):
+    if stale.name not in _emitted:
+        stale.unlink()
+        print("Removed", stale.name)

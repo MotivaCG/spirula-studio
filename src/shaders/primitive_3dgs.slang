@@ -242,7 +242,6 @@ bool equirect_proj_3dgs<D : ICameraDistortion, let assume_valid : bool>(
 _DEF_proj_3dgs_nav(_none, DistNone, 1)
 _DEF_proj_3dgs_nav(_opencv, DistOpenCV, 4)
 _DEF_proj_3dgs_nav(_prism, DistThinPrism, 8)
-_DEF_proj_3dgs_nav(_rational, DistRational, 8)
 
 #undef _DEF_proj_3dgs_nav
 
@@ -580,10 +579,8 @@ void projection_3dgs<
 /* Forward Projection */
 
 // One export per (camera model, distortion tier) the CUDA instantiation table
-// compiles -- slangc cannot export a generic. The set is curated: no COLMAP
-// fisheye model uses the rational tier, so FISHEYE / EQUISOLID stop at thin
-// prism, and EQUIRECTANGULAR carries no distortion at all. Keep this list and
-// kCameraVariants in tools/codegen/generate_kernel_instantiation.py in step.
+// compiles -- slangc cannot export a generic. Keep this list and kCameraVariants
+// in tools/codegen/generate_kernel_instantiation.py in step.
 #define _DEF_projection_3dgs(funname, MODEL, D, NC, AV, E3D) \
     [CudaDeviceExport] \
     [ForceInline] \
@@ -598,20 +595,17 @@ void projection_3dgs<
         ); \
     }
 
-// Every tier a perspective camera can carry; the wide models drop the last one.
 #define _DEF_projection_3dgs_tiers(base, MODEL, E3D) \
     _DEF_projection_3dgs(base##_none, MODEL, DistNone, 1, false, E3D) \
     _DEF_projection_3dgs(base##_opencv, MODEL, DistOpenCV, 4, false, E3D) \
     _DEF_projection_3dgs(base##_prism, MODEL, DistThinPrism, 8, false, E3D)
 
 _DEF_projection_3dgs_tiers(projection_3dgs_persp, CameraModelType::PINHOLE, false)
-_DEF_projection_3dgs(projection_3dgs_persp_rational, CameraModelType::PINHOLE, DistRational, 8, false, false)
 _DEF_projection_3dgs_tiers(projection_3dgs_fisheye, CameraModelType::FISHEYE, false)
 _DEF_projection_3dgs_tiers(projection_3dgs_equisolid, CameraModelType::EQUISOLID, false)
 _DEF_projection_3dgs(projection_3dgs_equirect_none, CameraModelType::EQUIRECTANGULAR, DistNone, 1, false, false)
 
 _DEF_projection_3dgs_tiers(projection_3dgut_persp, CameraModelType::PINHOLE, true)
-_DEF_projection_3dgs(projection_3dgut_persp_rational, CameraModelType::PINHOLE, DistRational, 8, false, true)
 _DEF_projection_3dgs_tiers(projection_3dgut_fisheye, CameraModelType::FISHEYE, true)
 _DEF_projection_3dgs_tiers(projection_3dgut_equisolid, CameraModelType::EQUISOLID, true)
 _DEF_projection_3dgs(projection_3dgut_equirect_none, CameraModelType::EQUIRECTANGULAR, DistNone, 1, false, true)
@@ -647,13 +641,11 @@ interface _DiffProjection3DGS<let NC : int>
     _DEF_projection_3dgs_interface(base##_prism, MODEL, DistThinPrism, 8, true, E3D)
 
 _DEF_projection_3dgs_interface_tiers(_DiffProjection3DGS_3dgs_persp, CameraModelType::PINHOLE, false)
-_DEF_projection_3dgs_interface(_DiffProjection3DGS_3dgs_persp_rational, CameraModelType::PINHOLE, DistRational, 8, true, false)
 _DEF_projection_3dgs_interface_tiers(_DiffProjection3DGS_3dgs_fisheye, CameraModelType::FISHEYE, false)
 _DEF_projection_3dgs_interface_tiers(_DiffProjection3DGS_3dgs_equisolid, CameraModelType::EQUISOLID, false)
 _DEF_projection_3dgs_interface(_DiffProjection3DGS_3dgs_equirect_none, CameraModelType::EQUIRECTANGULAR, DistNone, 1, true, false)
 
 _DEF_projection_3dgs_interface_tiers(_DiffProjection3DGS_3dgut_persp, CameraModelType::PINHOLE, true)
-_DEF_projection_3dgs_interface(_DiffProjection3DGS_3dgut_persp_rational, CameraModelType::PINHOLE, DistRational, 8, true, true)
 _DEF_projection_3dgs_interface_tiers(_DiffProjection3DGS_3dgut_fisheye, CameraModelType::FISHEYE, true)
 _DEF_projection_3dgs_interface_tiers(_DiffProjection3DGS_3dgut_equisolid, CameraModelType::EQUISOLID, true)
 _DEF_projection_3dgs_interface(_DiffProjection3DGS_3dgut_equirect_none, CameraModelType::EQUIRECTANGULAR, DistNone, 1, true, true)
@@ -718,13 +710,11 @@ void _projection_3dgs_vjp<let NC : int, ProjT : _DiffProjection3DGS<NC> >(
     _DEF_projection_3dgs_vjp(base##_prism_vjp, iface##_prism, 8)
 
 _DEF_projection_3dgs_vjp_tiers(projection_3dgs_persp, _DiffProjection3DGS_3dgs_persp)
-_DEF_projection_3dgs_vjp(projection_3dgs_persp_rational_vjp, _DiffProjection3DGS_3dgs_persp_rational, 8)
 _DEF_projection_3dgs_vjp_tiers(projection_3dgs_fisheye, _DiffProjection3DGS_3dgs_fisheye)
 _DEF_projection_3dgs_vjp_tiers(projection_3dgs_equisolid, _DiffProjection3DGS_3dgs_equisolid)
 _DEF_projection_3dgs_vjp(projection_3dgs_equirect_none_vjp, _DiffProjection3DGS_3dgs_equirect_none, 1)
 
 _DEF_projection_3dgs_vjp_tiers(projection_3dgut_persp, _DiffProjection3DGS_3dgut_persp)
-_DEF_projection_3dgs_vjp(projection_3dgut_persp_rational_vjp, _DiffProjection3DGS_3dgut_persp_rational, 8)
 _DEF_projection_3dgs_vjp_tiers(projection_3dgut_fisheye, _DiffProjection3DGS_3dgut_fisheye)
 _DEF_projection_3dgs_vjp_tiers(projection_3dgut_equisolid, _DiffProjection3DGS_3dgut_equisolid)
 _DEF_projection_3dgs_vjp(projection_3dgut_equirect_none_vjp, _DiffProjection3DGS_3dgut_equirect_none, 1)

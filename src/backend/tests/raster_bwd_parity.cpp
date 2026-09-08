@@ -181,7 +181,7 @@ int main(int argc, char** argv) {
         {2, false, 0, 0, DistortionType::None, false, DensifyAccumMode::None, true},
         {2, false, 1, 2, DistortionType::D, true, DensifyAccumMode::Max, false},
         {2, false, 0, 1, DistortionType::RGB_D, false, DensifyAccumMode::Sum, false},
-        {2, true, 0, 3, DistortionType::D, false, DensifyAccumMode::Avg, false},
+        {2, true, 0, 2, DistortionType::D, false, DensifyAccumMode::Avg, false},
     };
     const char* cams[4] = {"PINHOLE", "FISHEYE", "EQUISOLID",
                            "EQUIRECTANGULAR"};

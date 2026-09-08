@@ -3,8 +3,8 @@
 // Compile-time selection of the per-tier Slang exports.
 //
 // slangc cannot export a generic, so shaders/projection_utils.slang emits one
-// entry per distortion tier (`_none` / `_opencv` / `_prism` / `_rational`) and
-// these traits pick one from a `CameraDistortionType` template argument.
+// entry per distortion tier (`_none` / `_opencv` / `_prism`) and these traits
+// pick one from a `CameraDistortionType` template argument.
 //
 // INCLUDE ORDER: this header names SlangProjectionUtils::* but does not open
 // that namespace, because generated/projection_utils.cuh is `#pragma once` and
@@ -60,7 +60,6 @@ struct SlangDistortion<CameraDistortionType::TIER> {                            
 _SS_DEF_SLANG_DISTORTION(None,      _none)
 _SS_DEF_SLANG_DISTORTION(OpenCV,    _opencv)
 _SS_DEF_SLANG_DISTORTION(ThinPrism, _prism)
-_SS_DEF_SLANG_DISTORTION(Rational,  _rational)
 
 #undef _SS_DEF_SLANG_DISTORTION
 

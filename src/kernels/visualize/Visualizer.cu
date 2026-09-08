@@ -98,7 +98,6 @@ inline void default_stream_wait_viewer() {
         case CameraDistortionType::None:      BODY(CameraDistortionType::None);      break; \
         case CameraDistortionType::OpenCV:    BODY(CameraDistortionType::OpenCV);    break; \
         case CameraDistortionType::ThinPrism: BODY(CameraDistortionType::ThinPrism); break; \
-        case CameraDistortionType::Rational:  BODY(CameraDistortionType::Rational);  break; \
         default: throw std::runtime_error(                                         \
             "Unknown camera distortion: " + std::string(name));                    \
     } } while (0)
@@ -143,8 +142,6 @@ __device__ __forceinline__ float3 frustum_ray(
             return _frustum_ray<CameraDistortionType::OpenCV>(uv, camera_model, dist_coeffs_buffer, bid);
         case CameraDistortionType::ThinPrism:
             return _frustum_ray<CameraDistortionType::ThinPrism>(uv, camera_model, dist_coeffs_buffer, bid);
-        case CameraDistortionType::Rational:
-            return _frustum_ray<CameraDistortionType::Rational>(uv, camera_model, dist_coeffs_buffer, bid);
         default:
             return _frustum_ray<CameraDistortionType::None>(uv, camera_model, dist_coeffs_buffer, bid);
     }
