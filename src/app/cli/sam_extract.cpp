@@ -83,6 +83,11 @@ void usage() {
     help_row("    --track <i>", H::xh_track);
     help_row("    --threads <n>", H::xh_threads);
 
+    std::fprintf(stderr, "\n%s\n", H::xh_360_section.get());
+    help_row("    --360 <mode>", H::xh_360);
+    help_row("    --360-size <n>", H::xh_360_size);
+    help_row("    --360-orient <y,p,r>", H::xh_360_orient);
+
     std::fprintf(stderr, "\n%s\n", H::xh_masking.get());
     help_row("    --model <file>", H::xh_model);
     help_row("    --text <phrases>", H::xh_text);
@@ -109,6 +114,9 @@ struct Options {
     float  scale = 1.0f;
     int    track = -1;
     int    threads = 0;
+
+    std::string pano_mode = "faces";
+    app::Pano360Options pano;
 
     std::string model, text, neg_text, device;
     std::string mask_mode = "video";
@@ -141,6 +149,19 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--scale") o.scale = std::strtof(next("--scale"), nullptr);
         else if (a == "--track") o.track = std::atoi(next("--track"));
         else if (a == "--threads") o.threads = std::atoi(next("--threads"));
+        else if (a == "--360") o.pano_mode = next("--360");
+        else if (a == "--360-size") o.pano.size = std::atoi(next("--360-size"));
+        else if (a == "--360-orient") {
+            const char* v = next("--360-orient");
+            if (std::sscanf(v, "%f,%f,%f", &o.pano.yaw, &o.pano.pitch,
+                            &o.pano.roll) != 3) {
+                std::fprintf(stderr, "%s\n",
+                             spirula::i18n::format(
+                                 spirula::i18n::msg::cli::sam_flag_needs_value,
+                                 {"--360-orient"}).c_str());
+                return false;
+            }
+        }
         else if (a == "--model") o.model = next("--model");
         else if (a == "--text") o.text = next("--text");
         else if (a == "--neg-text") o.neg_text = next("--neg-text");
@@ -220,6 +241,24 @@ int sam_cli_extract(int argc, char** argv) {
     job.track = o.track;
     job.threads = o.threads;
     job.write_overlay = o.overlay;
+    // A 360 file is recognised by its packing, not by its name, and only then
+    // is there anything for --360 to select.
+    if (o.pano_mode != "off") {
+        std::string err;
+        const std::vector<std::pair<int, int>> tracks =
+            app::video_track_sizes(o.input, err);
+        if (tracks.size() == 2 && tracks[0] == tracks[1] &&
+            app::eac360_detect(2, tracks[0].first, tracks[0].second, job.eac)) {
+            o.pano.mode = o.pano_mode == "equirect" ? app::Pano360Mode::Equirect
+                                                    : app::Pano360Mode::Faces;
+            job.views = app::pano360_views(job.eac, o.pano);
+            std::fprintf(stderr, "360: %d x %d tracks -> %zu view(s) of %dx%d\n",
+                         job.eac.track_w, job.eac.track_h, job.views.size(),
+                         job.views[0].width, job.views[0].height);
+        } else {
+            job.eac = app::Eac360Layout{};
+        }
+    }
     if (!o.model.empty()) {
         job.mask.model = o.model;
         job.mask.device = o.device;

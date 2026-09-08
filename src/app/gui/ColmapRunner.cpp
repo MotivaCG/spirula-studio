@@ -422,6 +422,7 @@ void ColmapRunner::run(ColmapJob job) {
             pj.photo_import = job.photo_import;
             pj.video_fps = job.video_fps;
             pj.sharp_window = job.sharp_window;
+            pj.pano = job.pano;
             pj.max_frames = job.max_frames;
             pj.ffmpeg_exe = job.ffmpeg_exe;
             pj.force_external_decode = job.force_external_decode;

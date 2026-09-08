@@ -591,9 +591,12 @@ port. Ordered by what blocks the most.
 
 10. **Undistortion stage.** Never written. The dataset parser takes distortion
     parameters, so confirm this is wanted before building it.
-11. **Equirectangular end to end.** The mapper writes `EQUIRECTANGULAR`
-    (model 17); `ColmapParser` stops at model 10 and the renderer has no
-    spherical camera, so such a model cannot currently be trained on.
+11. **Equirectangular end to end.** Done: the mapper writes `EQUIRECTANGULAR`
+    (model 17), `ColmapParser` reads it, and the trainer splits it into cube
+    faces (`warp_spherical_to_pinhole`). What is untested is how well the
+    learned front ends match on a panorama's polar distortion, which is one
+    reason a 360 capture is unwrapped into perspective views by default
+    (`docs/datasets.md`, "360 cameras").
 12. **Faster decode.** A scaled JPEG decode straight to the working resolution
     would cut the CPU time. (The *peak* half of this is done: the decoder
     resamples out of stb's RGB buffer instead of building a full-resolution
@@ -636,5 +639,6 @@ port. Ordered by what blocks the most.
 
 **Deliberately out of scope**, so they are not silently skipped: rig
 constraints in the mapper (a rig is used as a ground-truth-free *diagnostic*,
-not a constraint), GPS / geo-registration, MVS / dense reconstruction,
+not a constraint -- `docs/notes/sfm-rig-constraints.md` surveys what changing
+that would cost, and what a 360 capture would get for it), GPS / geo-registration, MVS / dense reconstruction,
 incremental database updates, and relating two models that share no images.

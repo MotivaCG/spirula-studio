@@ -2487,6 +2487,283 @@ SS_MSG(frames_per_second_help,
        "için 1-3 uygundur; daha fazlası yalnızca kamera hızlı hareket ettiyse "
        "işe yarar. Listedeki bütün videolara uygulanır."));
 
+SS_MSG(pano360_clicks_warning,
+    EN("Clicks are drawn on the camera's own frame, which the 360 unwrap "
+       "reshapes: on a 360 capture they land somewhere else. Prompt it with "
+       "text instead."),
+    JA("クリックはカメラ本来のフレーム上に打たれますが、360 の展開はその形を変えます。"
+       "360 撮影ではクリック位置がずれるので、テキストで指示してください。"),
+    ZH_HANS("点击是打在相机原始帧上的，而 360 展开会改变画面形状：在 360 素材上点击"
+            "会落到别处。请改用文字提示。"),
+    ZH_HANT("點擊是打在相機原始影格上的，而 360 展開會改變畫面形狀：在 360 素材上點擊"
+            "會落到別處。請改用文字提示。"),
+    KO("클릭은 카메라 원본 프레임에 찍히지만 360 펼치기가 그 모양을 바꿉니다. 360 "
+       "촬영에서는 클릭이 엉뚱한 곳에 놓이니 텍스트로 지시하세요."),
+    DE("Klicks werden auf dem Originalbild der Kamera gesetzt, das die "
+       "360-Entfaltung umformt: Bei einer 360-Aufnahme landen sie woanders. "
+       "Nimm stattdessen einen Textprompt."),
+    FR("Les clics sont posés sur l'image d'origine de la caméra, que le "
+       "dépliage 360 remodèle : sur une prise 360 ils tombent ailleurs. "
+       "Utilisez plutôt une invite textuelle."),
+    ES("Los clics se ponen sobre el fotograma propio de la cámara, que el "
+       "desplegado 360 reconfigura: en una toma 360 caen en otro sitio. Usa "
+       "mejor una indicación de texto."),
+    PT("Os cliques são dados no quadro original da câmera, que o desdobramento "
+       "360 remodela: numa captura 360 eles caem em outro lugar. Use antes uma "
+       "instrução de texto."),
+    IT("I clic vengono posti sul fotogramma originale della fotocamera, che lo "
+       "sviluppo 360 rimodella: su una ripresa 360 finiscono altrove. Usa "
+       "piuttosto un prompt testuale."),
+    NL("Kliks worden op het eigen beeld van de camera gezet, dat het "
+       "360-uitvouwen hervormt: bij een 360-opname komen ze ergens anders "
+       "terecht. Gebruik in plaats daarvan een tekstprompt."),
+    RU("Клики ставятся на собственный кадр камеры, который развёртка 360 "
+       "перекраивает: на съёмке 360 они попадут не туда. Задайте подсказку "
+       "текстом."),
+    TR("Tıklamalar kameranın kendi karesine konur, ama 360 açımı o kareyi "
+       "yeniden biçimlendirir: bir 360 çekiminde başka yere düşerler. Bunun "
+       "yerine metinle yönlendirin."));
+
+SS_MSG(pano360_output,
+    EN("Unwrap into (360 video)"),
+    JA("展開先（360 動画）"),
+    ZH_HANS("展开为（360 视频）"),
+    ZH_HANT("展開為（360 影片）"),
+    KO("펼칠 형식(360 영상)"),
+    DE("Entfalten zu (360-Video)"),
+    FR("Déplier en (vidéo 360)"),
+    ES("Desplegar en (vídeo 360)"),
+    PT("Desdobrar em (vídeo 360)"),
+    IT("Sviluppa in (video 360)"),
+    NL("Uitvouwen naar (360-video)"),
+    RU("Развернуть в (видео 360)"),
+    TR("Şuna aç (360 video)"));
+
+SS_MSG(pano360_output_faces,
+    EN("Perspective views"),
+    JA("透視投影のビュー"),
+    ZH_HANS("透视视角"),
+    ZH_HANT("透視視角"),
+    KO("원근 뷰"),
+    DE("Perspektivische Ansichten"),
+    FR("Vues en perspective"),
+    ES("Vistas en perspectiva"),
+    PT("Vistas em perspectiva"),
+    IT("Viste prospettiche"),
+    NL("Perspectiefaanzichten"),
+    RU("Перспективные виды"),
+    TR("Perspektif görünümler"));
+
+SS_MSG(pano360_output_equirect,
+    EN("Equirectangular panorama"),
+    JA("正距円筒パノラマ"),
+    ZH_HANS("等距柱状全景"),
+    ZH_HANT("等距柱狀全景"),
+    KO("등장방형 파노라마"),
+    DE("Äquirektanguläres Panorama"),
+    FR("Panorama équirectangulaire"),
+    ES("Panorama equirectangular"),
+    PT("Panorama equirretangular"),
+    IT("Panorama equirettangolare"),
+    NL("Equirectangulair panorama"),
+    RU("Равнопромежуточная панорама"),
+    TR("Eş dikdörtgen panorama"));
+
+SS_MSG(pano360_output_help,
+    EN("Perspective views are what the rest of the pipeline is built for. The "
+       "file is not stitched: its two lenses meet at a seam with real parallax "
+       "across it, so the sphere is cut into ten views, five per lens, none of "
+       "which crosses it -- each is then a real pinhole camera. A panorama "
+       "keeps one image per frame, but it puts both lenses into one camera, "
+       "seam and all, and reconstruction downsamples it to the same working "
+       "size as any other photo."),
+    JA("透視投影のビューは以降の処理が想定している形です。このファイルはスティッチ"
+       "されておらず、2 つのレンズは視差のある継ぎ目で接します。そこで全天球をレンズ"
+       "ごとに 5 枚、計 10 枚へ切り分け、どのビューも継ぎ目をまたぎません。結果として"
+       "各ビューが本物のピンホールカメラになります。パノラマは 1 フレーム 1 枚に"
+       "保てますが、2 つのレンズを継ぎ目ごと 1 台のカメラに押し込み、復元は他の写真と"
+       "同じ作業解像度まで縮小します。"),
+    ZH_HANS("透视视角是后续流程真正为之设计的形式。该文件未做拼接：两只镜头在一条带"
+            "视差的拼缝处相接，因此球面被切成十个视角、每镜头五个，没有一个跨过拼缝—"
+            "—每个视角都是真正的针孔相机。全景每帧只有一张图，却把两只镜头连同拼缝"
+            "塞进同一台相机，而且重建会把它缩小到与普通照片相同的工作分辨率。"),
+    ZH_HANT("透視視角是後續流程真正為之設計的形式。該檔案未做拼接：兩顆鏡頭在一條帶"
+            "視差的拼縫處相接，因此球面被切成十個視角、每鏡頭五個，沒有一個跨過拼縫—"
+            "—每個視角都是真正的針孔相機。全景每格只有一張圖，卻把兩顆鏡頭連同拼縫"
+            "塞進同一台相機，而且重建會把它縮小到與一般照片相同的工作解析度。"),
+    KO("원근 뷰는 이후 단계가 전제로 하는 형식입니다. 이 파일은 스티칭되어 있지 않아 "
+       "두 렌즈가 시차가 있는 이음매에서 만납니다. 그래서 구를 렌즈당 5장씩 모두 "
+       "10개의 뷰로 자르며 어느 뷰도 이음매를 가로지르지 않습니다. 그 결과 각 뷰가 "
+       "진짜 핀홀 카메라가 됩니다. 파노라마는 프레임당 한 장으로 유지되지만 두 렌즈를 "
+       "이음매째 한 카메라에 담고, 재구성이 다른 사진과 같은 작업 해상도로 줄입니다."),
+    DE("Perspektivische Ansichten sind das, worauf der Rest der Kette ausgelegt "
+       "ist. Die Datei ist nicht zusammengesetzt: Ihre beiden Objektive treffen "
+       "sich an einer Naht mit echter Parallaxe, also wird die Kugel in zehn "
+       "Ansichten geschnitten, fünf je Objektiv, von denen keine sie kreuzt -- "
+       "jede ist dann eine echte Lochkamera. Ein Panorama hält jede Aufnahme in "
+       "einem Bild, steckt aber beide Objektive samt Naht in eine Kamera, und "
+       "die Rekonstruktion verkleinert es auf dieselbe Arbeitsgröße wie jedes "
+       "andere Foto."),
+    FR("Les vues en perspective sont ce pour quoi la suite du traitement est "
+       "faite. Le fichier n'est pas assemblé : ses deux objectifs se rejoignent "
+       "sur une couture traversée par une vraie parallaxe, donc la sphère est "
+       "découpée en dix vues, cinq par objectif, dont aucune ne la traverse -- "
+       "chacune est alors un vrai sténopé. Un panorama garde une image par "
+       "prise, mais il met les deux objectifs dans une seule caméra, couture "
+       "comprise, et la reconstruction le réduit à la même taille de travail "
+       "que n'importe quelle photo."),
+    ES("Las vistas en perspectiva son aquello para lo que está hecho el resto "
+       "del proceso. El archivo no está unido: sus dos objetivos se encuentran "
+       "en una costura con paralaje real, así que la esfera se corta en diez "
+       "vistas, cinco por objetivo, y ninguna la cruza; cada una es entonces "
+       "una cámara estenopeica de verdad. Un panorama guarda una imagen por "
+       "toma, pero mete los dos objetivos en una sola cámara, costura incluida, "
+       "y la reconstrucción lo reduce al mismo tamaño de trabajo que cualquier "
+       "foto."),
+    PT("As vistas em perspectiva são aquilo para que o resto do processo foi "
+       "feito. O arquivo não é costurado: suas duas lentes se encontram numa "
+       "emenda com paralaxe real, então a esfera é cortada em dez vistas, cinco "
+       "por lente, e nenhuma a atravessa -- cada uma é então uma câmera "
+       "pinhole de verdade. Um panorama guarda uma imagem por quadro, mas põe "
+       "as duas lentes numa só câmera, emenda inclusive, e a reconstrução o "
+       "reduz ao mesmo tamanho de trabalho de qualquer foto."),
+    IT("Le viste prospettiche sono ciò per cui è fatto il resto della catena. "
+       "Il file non è cucito: i suoi due obiettivi si incontrano su una "
+       "cucitura attraversata da una parallasse reale, quindi la sfera viene "
+       "tagliata in dieci viste, cinque per obiettivo, e nessuna la attraversa: "
+       "ognuna è allora una vera camera a foro stenopeico. Un panorama tiene "
+       "un'immagine per fotogramma, ma mette entrambi gli obiettivi in una sola "
+       "fotocamera, cucitura compresa, e la ricostruzione la riduce alla stessa "
+       "dimensione di lavoro di ogni altra foto."),
+    NL("Perspectiefaanzichten zijn waar de rest van de keten op gebouwd is. Het "
+       "bestand is niet aaneengezet: de twee lenzen komen samen op een naad met "
+       "echte parallax, dus wordt de bol in tien aanzichten gesneden, vijf per "
+       "lens, waarvan er geen enkele die naad kruist -- elk is dan een echte "
+       "gaatjescamera. Een panorama houdt één beeld per opname, maar stopt "
+       "beide lenzen mét naad in één camera, en de reconstructie verkleint het "
+       "tot dezelfde werkmaat als elke andere foto."),
+    RU("Перспективные виды — то, подо что сделана остальная часть обработки. "
+       "Файл не сшит: два его объектива сходятся на шве с настоящим "
+       "параллаксом, поэтому сфера режется на десять видов, по пять на "
+       "объектив, и ни один шов не пересекает — каждый вид тогда настоящая "
+       "камера-обскура. Панорама оставляет один снимок на кадр, но помещает оба "
+       "объектива вместе со швом в одну камеру, а реконструкция уменьшает её до "
+       "того же рабочего размера, что и любое фото."),
+    TR("Perspektif görünümler, işlem zincirinin geri kalanının tasarlandığı "
+       "biçimdir. Dosya birleştirilmemiştir: iki objektifi gerçek paralaksın "
+       "olduğu bir dikişte buluşur, bu yüzden küre objektif başına beş olmak "
+       "üzere on görünüme bölünür ve hiçbiri dikişi kesmez -- böylece her biri "
+       "gerçek bir iğne deliği kamerasıdır. Panorama kare başına tek görüntü "
+       "tutar, ama iki objektifi dikişiyle birlikte tek kameraya koyar ve geri "
+       "çatım onu da her fotoğrafla aynı çalışma boyutuna küçültür."));
+SS_MSG(pano360_size,
+    EN("View size (px, 360 video)"),
+    JA("ビューの大きさ（px、360 動画）"),
+    ZH_HANS("视角尺寸（像素，360 视频）"),
+    ZH_HANT("視角尺寸（像素，360 影片）"),
+    KO("뷰 크기(px, 360 영상)"),
+    DE("Ansichtsgröße (px, 360-Video)"),
+    FR("Taille des vues (px, vidéo 360)"),
+    ES("Tamaño de vista (px, vídeo 360)"),
+    PT("Tamanho da vista (px, vídeo 360)"),
+    IT("Dimensione della vista (px, video 360)"),
+    NL("Grootte van aanzicht (px, 360-video)"),
+    RU("Размер вида (пикс., видео 360)"),
+    TR("Görünüm boyutu (px, 360 video)"));
+
+SS_MSG(pano360_size_help,
+    EN("Pixels a side for the two views on the lens axes; the eight around them "
+       "are 41% as deep. 0 picks a size from the source: a "
+       "90-degree view would need 1.27 times the source face to keep its centre "
+       "resolution and spends the extra on its corners, so the default sits "
+       "between that and the source's own pixel count. For a panorama this is "
+       "its width."),
+    JA("レンズ軸を向く 2 枚のビューの一辺のピクセル数です。周囲の 8 枚は奥行き方向が"
+       "その 41% になります。0 なら入力から決めます。90 度のビューが中心の"
+       "解像度を保つには元の面の約 1.27 倍が必要で、その分は隅に使われるため、既定は"
+       "その値と元の画素数の中間です。パノラマではこの値が幅になります。"),
+    ZH_HANS("朝向镜头轴的两个视角的边长像素；周围八个视角在窄边方向为其 41%。"
+            "0 表示由输入决定：90 度视角要保住中心分辨率约需源面的 1.27 倍，多出的"
+            "像素都花在角落，因此默认取两者之间。全景时此值是宽度。"),
+    ZH_HANT("朝向鏡頭軸的兩個視角的邊長像素；周圍八個視角在窄邊方向為其 41%。"
+            "0 表示由來源決定：90 度視角要保住中心解析度約需來源面的 1.27 倍，多出的"
+            "像素都花在角落，因此預設取兩者之間。全景時此值是寬度。"),
+    KO("렌즈 축을 향한 두 뷰의 한 변 픽셀 수이며, 주위 여덟 개는 좁은 쪽이 그 41%"
+       "입니다. 0이면 입력에서 정합니다. 90도 뷰가 중심 해상도를 "
+       "지키려면 원본 면의 약 1.27배가 필요하고 그 여분은 모서리에 쓰이므로, 기본값은 "
+       "그 값과 원본 화소 수의 사이입니다. 파노라마에서는 이 값이 너비입니다."),
+    DE("Pixel je Kante der beiden Ansichten auf den Objektivachsen; die acht "
+       "ringsum sind zu 41% so tief. 0 wählt eine Größe "
+       "aus der Quelle: Eine 90-Grad-Ansicht bräuchte das 1,27-Fache der "
+       "Quellfläche, um ihre Mittenauflösung zu halten, und gibt den Zuschlag "
+       "an die Ecken; die Vorgabe liegt dazwischen. Bei einem Panorama ist dies "
+       "die Breite."),
+    FR("Pixels de côté pour les deux vues sur les axes des objectifs ; les huit "
+       "autour font 41% de cela dans leur petit côté. 0 choisit une taille "
+       "d'après la source : une vue à 90 degrés demanderait 1,27 fois la face "
+       "source pour garder sa résolution centrale, et le supplément part dans "
+       "les coins ; la valeur par défaut est entre les deux. Pour un panorama, "
+       "c'est sa largeur."),
+    ES("Píxeles de lado de las dos vistas sobre los ejes de los objetivos; las "
+       "ocho de alrededor miden el 41% de eso en su lado corto. 0 elige un "
+       "tamaño según la fuente: una vista de 90 grados necesitaría 1,27 veces "
+       "la cara de origen para mantener su resolución central, y lo añadido se "
+       "va a las esquinas, así que el valor por defecto queda en medio. Para un "
+       "panorama, este es su ancho."),
+    PT("Pixels de lado das duas vistas sobre os eixos das lentes; as oito ao "
+       "redor medem 41% disso no lado curto. 0 escolhe um tamanho "
+       "conforme a fonte: uma vista de 90 graus precisaria de 1,27 vez a face "
+       "de origem para manter a resolução central, e o acréscimo vai para os "
+       "cantos, então o padrão fica entre os dois. Para um panorama, esta é a "
+       "largura."),
+    IT("Pixel di lato per le due viste sugli assi degli obiettivi; le otto "
+       "intorno misurano il 41% di questo sul lato corto. 0 sceglie una "
+       "dimensione dalla sorgente: una vista a 90 gradi richiederebbe 1,27 "
+       "volte la faccia sorgente per mantenere la risoluzione al centro, e il "
+       "sovrappiù va negli angoli, quindi il valore predefinito sta in mezzo. "
+       "Per un panorama questa è la larghezza."),
+    NL("Pixels per zijde van de twee aanzichten op de lensassen; de acht "
+       "eromheen meten daar 41% van op hun korte zijde. 0 kiest een maat uit de "
+       "bron: een aanzicht van 90 graden zou 1,27 keer het bronvlak nodig "
+       "hebben om zijn resolutie in het midden te houden, en geeft de rest aan "
+       "de hoeken, dus de standaard ligt ertussenin. Bij een panorama is dit de "
+       "breedte."),
+    RU("Пикселей на сторону двух видов вдоль осей объективов; восемь вокруг них "
+       "составляют 41% от этого по короткой стороне. 0 — выбрать по источнику: виду в 90 "
+       "градусов понадобилось бы 1,27 размера исходной грани, чтобы сохранить "
+       "разрешение в центре, а прибавка уходит в углы, поэтому значение по "
+       "умолчанию — между этими двумя. Для панорамы это её ширина."),
+    TR("Objektif eksenlerindeki iki görünümün kenar piksel sayısı; çevresindeki "
+       "sekiz görünüm kısa kenarında bunun %41'idir. 0, kaynaktan bir boyut "
+       "seçer: 90 derecelik bir görünümün merkez çözünürlüğünü koruması için "
+       "kaynak yüzünün 1,27 katı gerekir ve fazlası köşelere gider, bu yüzden "
+       "varsayılan ikisinin arasındadır. Panorama için bu, genişliğidir."));
+SS_MSG(pano360_colmap_warning,
+    EN("COLMAP has no spherical camera. Choose perspective views, or "
+       "reconstruct with the built-in engine."),
+    JA("COLMAP には球面カメラがありません。透視投影のビューを選ぶか、内蔵エンジンで"
+       "復元してください。"),
+    ZH_HANS("COLMAP 没有球面相机模型。请改用透视视角，或改用内置引擎重建。"),
+    ZH_HANT("COLMAP 沒有球面相機模型。請改用透視視角，或改用內建引擎重建。"),
+    KO("COLMAP에는 구면 카메라가 없습니다. 원근 뷰를 고르거나 내장 엔진으로 "
+       "재구성하세요."),
+    DE("COLMAP kennt keine sphärische Kamera. Wähle perspektivische Ansichten "
+       "oder rekonstruiere mit der eingebauten Engine."),
+    FR("COLMAP n'a pas de caméra sphérique. Choisissez des vues en perspective, "
+       "ou reconstruisez avec le moteur intégré."),
+    ES("COLMAP no tiene cámara esférica. Elige vistas en perspectiva o "
+       "reconstruye con el motor integrado."),
+    PT("O COLMAP não tem câmera esférica. Escolha vistas em perspectiva ou "
+       "reconstrua com o motor integrado."),
+    IT("COLMAP non ha una fotocamera sferica. Scegli le viste prospettiche "
+       "oppure ricostruisci con il motore integrato."),
+    NL("COLMAP kent geen sferische camera. Kies perspectiefaanzichten of "
+       "reconstrueer met de ingebouwde engine."),
+    RU("В COLMAP нет сферической камеры. Выберите перспективные виды или "
+       "стройте встроенным движком."),
+    TR("COLMAP'te küresel kamera yok. Perspektif görünümleri seçin ya da "
+       "yerleşik motorla geri çatın."));
+
 SS_MSG(sharpness_window,
     EN("Sharpness window"),
     JA("シャープさの判定窓"),

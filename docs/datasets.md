@@ -352,6 +352,112 @@ reconstruction.
 A caller with no image decoders leaves `probe_image_size` null and gets the
 reconstruction's resolution unchanged; the WebAssembly viewer does exactly that.
 
+## 360 cameras (GoPro MAX `.360`)
+
+`src/app/Pano360.h` is the one implementation: it recognises the packing,
+plans the views, and resamples them. Both decode paths go through it -- ffmpeg
+is asked only to decode and to cut the strips out, never to warp, because its
+own `v360=eac` insets every face by 2 px, which puts a 4 px step across the
+seam between the two tracks.
+
+### The frame layout
+
+A `.360` is an MP4 with **two HEVC video tracks** (streams 0 and 5 for the
+video modes, 0 and 4 for timelapse -- enumerate them, do not hardcode).
+Together they are a YouTube-style **EAC 3x2 cubemap**: the first track is the
+top row (LEFT, FRONT, RIGHT), the second the bottom (DOWN rot270, BACK rot90,
+UP rot270). Faces are square and as tall as a track. Each track carries three
+of them plus **two 32 px overlap strips**, inserted at the centre lines of its
+two side faces, which is where the two lenses meet:
+
+| mode | track | face | strips | canvas |
+|---|---|---|---|---|
+| 5.6K | 4096x1344 | 1344 | 2 x 32 | 4032x2688 |
+| 3K   | 2272x736  | 736  | 2 x 32 | 2208x1472 |
+
+So `face = H` and `strip = (W - 3H)/2`, and the canvas is the frame with each
+strip cut at its middle -- which is exactly where each lens's copy of the seam
+ends, so a bilinear tap either side of the cut stays on its own lens.
+Within a face the mapping is equi-angular: `u_cube = tan(pi/4 * u_face)`.
+
+These numbers were measured on the sample captures, not taken from a
+specification: the hard content cuts sit at x=688 and x=3408 in a 5.6K frame,
+and a scan of the seam energy between the two tracks minimises at
+face=1344/strip=32 (1.24 against 1.50 for the constants in ffmpeg's
+unmerged `gopromax_opencl` patch, which are wrong). The canvas the filter
+graph builds is bit-identical to the one the in-process path assembles.
+
+### What it is unwrapped into
+
+`--360 faces` (the default) cuts **ten perspective views, five per lens**;
+`--360 equirect` makes one 2:1 panorama; the GUI offers the same two under
+"Unwrap into". Faces are the default because the raw file is **not stitched**:
+the two lenses meet at azimuth +-90 degrees -- the centre line of the side
+faces -- with real parallax across that seam, and no single camera model
+describes both sides of it.
+
+So the split is per LENS, not per cube. Each lens owns the hemisphere in front
+of it, and that hemisphere is cut the way a cube cuts it: the face on the lens
+axis, plus the near half of each of its four side faces. Every view then reads
+one lens alone and is a true pinhole camera whose pose is that lens's.
+
+| view | size | field of view |
+|---|---|---|
+| on the lens axis | `S` x `S` | 90 x 90 degrees |
+| above / below it | `1.08 S` x `0.41 S` | 97 x 45 |
+| left / right | `0.41 S` x `1.08 S` | 45 x 97 |
+
+Three details are load-bearing:
+
+- The side views are **tilted 67.5 degrees** off the lens axis, so their inner
+  edge meets the axial face's edge and their outer edge lands on the seam.
+- They are **wider than 90 degrees** along the seam. A view tilted off the axis
+  narrows in azimuth as it approaches the seam, so at 90 it would leave a wedge
+  uncovered between neighbours; `atan(1 / cos 22.5deg)` = 47.3 degrees of
+  half-angle circumscribes the half face exactly. Widening that axis is free --
+  it runs parallel to the seam.
+- Each view keeps the sphere's own up, which is why four of them are portrait:
+  all ten then agree on which way gravity is, and a learned detector never sees
+  the same wall rotated 90 degrees.
+
+Measured over a 8-million-direction sweep: no view sees both lenses, and
+0.100% of the sphere is in no view -- a 0.03-degree hairline at the seam, which
+is the rounding margin that keeps a bilinear tap off the other lens. Views
+overlap on 5.9% of the sphere.
+
+All ten share one focal length in pixels (`S/2`), so a single `--focal` covers
+them; `--camera-mode single` then leaves three cameras, one per image shape.
+The pixel budget is 12.6 MP a frame at the default `S`, against 13.6 MP for the
+six-face cube this replaced.
+
+`--360-size` sets `S` (the GUI has it under Advanced); the default is 1.125x
+the source face, 1504 px at 5.6K. Holding the density at the *centre* of a
+rectilinear face would take 4/pi = 1.27x, and the extra goes to the corners.
+
+Ten views per frame multiply the image count, and the views of one frame share
+no features: they are held together by pairs across TIME, so pairing must stay
+content-based (`--pairs auto`, or COLMAP's vocabulary tree) rather than
+sequential, which would give ten disconnected chains. A rig constraint would
+tie them together directly -- `docs/notes/sfm-rig-constraints.md` surveys what
+that would take.
+
+Equirectangular remains available and is one image per frame, but it puts both
+lenses into one spherical camera, seam and all, and reconstruction downsamples
+it to `--max-image-size` (1600 px for the learned front ends at `--quality
+high`) -- about 4.4 px per degree, against 16.7 for a 1504 px face.
+
+### What it cannot do for you
+
+- **Orientation.** A `.360` records nothing about how the camera was mounted,
+  so an inverted mount comes out upside down until `--360-orient 0,0,180` says
+  otherwise. That knob is deliberately CLI-only: the `gpmd` stream carries
+  GRAV, CORI, IORI and GPS5, so levelling belongs to a reader of those rather
+  than to three sliders nobody can visualise. Nothing parses them yet.
+- **Click prompts for masking.** Clicks are recorded on the camera's own
+  frame, which the unwrap reshapes. Prompt a 360 capture with text.
+- **The operator.** Whoever is holding it is in the downward and rearward views
+  of every frame of most captures, and wants masking out.
+
 ## Preprocessing tools
 
 `reference/scripts/` holds standalone Python utilities that produce these

@@ -25,6 +25,7 @@
 // do, so the GUI can say so instead of failing at run time.
 
 #include "app/FrameMask.h"
+#include "app/Pano360.h"
 #include "app/gui/FilmReel.h"
 #include "app/gui/PrepProgress.h"
 
@@ -101,6 +102,10 @@ struct PrepInput {
     // The camera folders found under this input, when it arrived with more
     // than one. Empty means the lens above describes all of it.
     std::vector<SubCamera> subcameras;
+    // The 360 packing this file was found to carry, when it carries one: two
+    // EAC tracks that the job's `pano` plan turns into ordinary views. Detected
+    // rather than asked for, so a capture that is not one cannot be warped.
+    app::Eac360Layout eac360;
     // Areas of the frame that are never scene -- the fisheye border, a
     // watermark, the rig in shot. Per input because it describes a lens, and
     // resolved per camera folder when it asks for the border to be fitted
@@ -181,6 +186,10 @@ struct PrepJob {
     PhotoImport photo_import = PhotoImport::ConvertJpeg;
 
     // ---- video extraction ----
+    // What a 360 capture (PrepInput::eac360) becomes. Dataset-wide: mixing
+    // panoramas and pinhole faces in one image tree describes no camera rig.
+    app::Pano360Options pano;
+
     float video_fps = 2.0f;          // kept frames per second
     int   sharp_window = 3;          // keep the sharpest of N (1 = off)
     int   max_frames = 100000;
@@ -286,6 +295,9 @@ bool is_video_path(const std::string& path);
 // A dual-fisheye Insta360 file: two video tracks, one per lens, and a lens the
 // default camera model does not fit.
 bool is_dual_fisheye_path(const std::string& path);
+// A GoPro MAX .360 by its name. The packing itself is what probe_eac360
+// confirms; this only decides whether it is worth asking.
+bool is_pano360_path(const std::string& path);
 
 // ---- the ffmpeg fallback, for callers that are not a preparation run -------
 //
@@ -303,6 +315,9 @@ struct VideoFacts {
     long long frames = 0;     // duration * fps; the container's own count is
                               // not printed by `ffmpeg -i`
     int width = 0, height = 0;   // one frame, before any scaling
+    // One entry per video stream, in the order ffmpeg lists them, which is the
+    // order `[0:v:N]` and the built-in demuxer both number them by.
+    std::vector<std::pair<int, int>> tracks;
 };
 bool ffmpeg_probe_video(const std::string& ffmpeg_exe, const std::string& path,
                         VideoFacts& out, const std::atomic<bool>& cancel);
@@ -312,6 +327,13 @@ bool ffmpeg_probe_video(const std::string& ffmpeg_exe, const std::string& path,
 bool ffmpeg_extract_frame(const std::string& ffmpeg_exe, const std::string& video,
                           double seconds, const std::string& out_path,
                           const std::atomic<bool>& cancel);
+
+// The 360 packing a video carries, or a layout that is not valid(). Asks the
+// built-in demuxer where there is one and ffmpeg otherwise, so the answer does
+// not depend on which decode path the run will take.
+app::Eac360Layout probe_eac360(const std::string& ffmpeg_exe,
+                               const std::string& path,
+                               const std::atomic<bool>& cancel);
 
 // What a picked folder of photos actually means, by the layout conventions the
 // rest of the project already uses -- `spirula sfm auto`'s own probing and the
@@ -466,6 +488,12 @@ private:
     bool extract_video_ffmpeg(const PrepJob& job, const PrepInput& in,
                               const std::string& images, PrepResult& out,
                               std::string& error);
+    // A 360 capture through ffmpeg: one decode writing the EAC canvas, frame
+    // selection over those, then our own resampler into the views. ffmpeg is
+    // never asked to warp -- see app/Pano360.h.
+    bool extract_360_ffmpeg(const PrepJob& job, const PrepInput& in,
+                            const std::string& images, PrepResult& out,
+                            std::string& error);
     // Photos into the dataset's own images/<subdir>, by whichever of
     // PhotoImport the job asked for -- and the masks they came with into the
     // matching masks/<subdir>, so the two trees still mirror each other.

@@ -1264,6 +1264,13 @@ void GuiApp::add_sources(const std::vector<std::string>& paths, bool replace) {
         _color_space_touched = false;
     }
     for (const std::string& path : inputs) _sources.push_back(make_source(path, _use_found_masks));
+    // What a .360 actually holds, asked once per input: the plan below and the
+    // lens both follow from the packing, not from the extension.
+    for (PrepInput& s : _sources) {
+        if (!s.is_video || s.eac360.valid() || !is_pano360_path(s.path)) continue;
+        static const std::atomic<bool> never{false};
+        s.eac360 = probe_eac360(_ffmpeg_exe, s.path, never);
+    }
     for (const std::string& masks : mask_folders) {
         if (attach_mask_folder(_sources, masks))
             log(i18n::format(dmsg::log_masks_attached, {masks}));
@@ -1304,6 +1311,71 @@ void GuiApp::apply_source_presets() {
         _sfm_job.camera_mode = 1;
         _colmap_job.camera_mode = 1;
     }
+    if (any_pano360()) {
+        // Views of one frame share no features, so temporal neighbours are not
+        // the pairs that hold a 360 dataset together; the same reasoning as the
+        // dual-lens case above, and content-based selection is the answer.
+        _sfm_job.pairs = 0;
+        _colmap_job.matcher = 2;
+        // Every view of every 360 input is the same camera by construction --
+        // one focal, one centre, no distortion -- so folder grouping would hand
+        // bundle adjustment six copies of it to drift apart.
+        bool all = true;
+        for (const PrepInput& s : _sources) all = all && s.eac360.valid();
+        _sfm_job.camera_mode = all ? 0 : 1;
+        _colmap_job.camera_mode = all ? 0 : 1;
+        if (_sfm_job.prep.pano.mode == app::Pano360Mode::Off)
+            _sfm_job.prep.pano.mode = app::Pano360Mode::Faces;
+        reset_pano_size();
+        apply_pano_lens();
+    }
+}
+
+// The size box shows what the run will actually use, not a zero standing for
+// "work it out later": it is the one number here a user might want to change.
+void GuiApp::reset_pano_size() {
+    for (const PrepInput& s : _sources)
+        if (s.eac360.valid()) {
+            _sfm_job.prep.pano.size =
+                app::pano360_default_size(s.eac360, _sfm_job.prep.pano);
+            return;
+        }
+}
+
+bool GuiApp::any_pano360() const {
+    for (const PrepInput& s : _sources)
+        if (s.eac360.valid()) return true;
+    return false;
+}
+
+// The warp decides the lens exactly: a face is a pinhole camera of the field
+// of view it was cut at, and a panorama is the spherical model. Neither is a
+// guess, so both the focal prior and the model are set rather than offered.
+void GuiApp::apply_pano_lens() {
+    const app::Pano360Options& p = _sfm_job.prep.pano;
+    if (p.mode == app::Pano360Mode::Off) return;
+    const bool faces = p.mode == app::Pano360Mode::Faces;
+    // All ten views share one focal length in PIXELS, and the factor is
+    // resolved against the first image in the tree -- cam0, the view on the
+    // lens axis, which is the 90-degree one this halves (build_manifest).
+    const float focal = faces ? 0.5f : 0.0f;
+    for (PrepInput& s : _sources) {
+        if (!s.eac360.valid()) continue;
+        s.camera_model = faces ? "pinhole" : "equirectangular";
+        s.focal_factor = focal;
+        for (SubCamera& sc : s.subcameras) {
+            sc.camera_model.clear();
+            sc.focal_factor = 0.0f;
+        }
+    }
+    if (!_sources.empty() && _sources[0].eac360.valid())
+        _sfm_job.camera_model = _sources[0].camera_model;
+    // COLMAP has no spherical model; only the faces can reach that engine.
+    if (faces) {
+        _colmap_job.camera_model = "PINHOLE";
+        _colmap_job.init_focal_factor = focal;
+    }
+    normalize_source_lenses();
 }
 
 // A folder of EXRs declares its own colour space, and the picker for it is
@@ -1994,6 +2066,7 @@ void GuiApp::sync_dataset_jobs() {
     prep.resume = _resume;
     prep.video_fps = _sfm_job.prep.video_fps;
     prep.sharp_window = _sfm_job.prep.sharp_window;
+    prep.pano = _sfm_job.prep.pano;
     prep.max_frames = _sfm_job.prep.max_frames;
     prep.force_external_decode = _sfm_job.prep.force_external_decode;
     prep.ffmpeg_exe = _ffmpeg_exe;
@@ -2022,6 +2095,7 @@ void GuiApp::sync_dataset_jobs() {
     _colmap_job.resume = prep.resume;
     _colmap_job.video_fps = prep.video_fps;
     _colmap_job.sharp_window = prep.sharp_window;
+    _colmap_job.pano = prep.pano;
     _colmap_job.max_frames = prep.max_frames;
     _colmap_job.force_external_decode = prep.force_external_decode;
     _colmap_job.photo_import = prep.photo_import;
@@ -2463,6 +2537,7 @@ void GuiApp::draw_dataset_basics() {
         ImGui::SetNextItemWidth(px(220.0f));
         ui::SliderInt(dmsg::sharpness_window, &_sfm_job.prep.sharp_window, 1, 8);
         ui::help_on_hover(dmsg::sharpness_window_help);
+        if (any_pano360()) draw_pano360_options();
         if (!backends().builtin_video) {
             // What the note says is a build-configuration diagnostic and
             // stays English; the sentence around it does not.
@@ -2475,6 +2550,36 @@ void GuiApp::draw_dataset_basics() {
     }
     if (dataset_busy()) ui::help_on_hover_disabled(dmsg::step_locked);
 }
+
+// What a 360 capture is unwrapped into, drawn among the video settings only
+// when one was detected. The lens follows the choice exactly (apply_pano_lens),
+// so there is no camera model to pick here.
+void GuiApp::draw_pano360_options() {
+    app::Pano360Options& p = _sfm_job.prep.pano;
+    int mode = p.mode == app::Pano360Mode::Equirect ? 1 : 0;
+    ImGui::SetNextItemWidth(px(220.0f));
+    if (ui::Combo(dmsg::pano360_output, &mode,
+                  {&dmsg::pano360_output_faces, &dmsg::pano360_output_equirect})) {
+        p.mode = mode == 1 ? app::Pano360Mode::Equirect : app::Pano360Mode::Faces;
+        // A face side and a panorama width are not the same number, so the one
+        // in the box is meaningless the moment the other is chosen.
+        reset_pano_size();
+        apply_pano_lens();
+    }
+    ui::help_on_hover(dmsg::pano360_output_help);
+    if (mode == 1 && effective_engine() != Engine::BuiltIn)
+        ui::TextColoredWrapped(kWarn, dmsg::pano360_colmap_warning);
+}
+
+// The size of those views, which is under Advanced because the default is
+// derived from the source and is what almost everyone should use.
+void GuiApp::draw_pano360_size() {
+    ImGui::SetNextItemWidth(px(260.0f));
+    ui::InputInt(dmsg::pano360_size, &_sfm_job.prep.pano.size, 32, 128);
+    if (_sfm_job.prep.pano.size < 0) _sfm_job.prep.pano.size = 0;
+    ui::help_on_hover(dmsg::pano360_size_help);
+}
+
 
 // One lens control for the whole capture has to reach every input:
 // append_camera_overrides emits a --camera-model per input folder, and one
@@ -2635,6 +2740,10 @@ void GuiApp::draw_lens_warning(const std::string& path, bool is_video,
     // COLMAP has no panorama model, so the question only arises for the
     // built-in engine.
     const bool pano = builtin && model == "equirectangular";
+    // A 360 capture's lens describes the WARPED views, which are 2:1 (or square
+    // faces) by construction; the frame this would measure is the packing.
+    for (const PrepInput& s : _sources)
+        if (s.eac360.valid() && s.path == path) return;
     // A dual-lens file is two fisheye circles per frame whatever its pixel
     // dimensions are, so this one needs no measurement.
     if (is_dual_fisheye_path(path)) {
@@ -2745,6 +2854,8 @@ void GuiApp::draw_masking_options() {
             ui::TextColoredWrappedRaw(kErr, _download.status());
         if (entry && !entry->text_prompts && _mask.clicks.empty())
             ui::TextColored(kWarn, dmsg::mask_no_text_prompts);
+        if (any_pano360())
+            ui::TextColoredWrapped(kWarn, dmsg::pano360_clicks_warning);
         if (!_mask.clicks.empty()) {
             int objects = 0;
             for (const MaskClick& c : _mask.clicks)
@@ -3582,6 +3693,7 @@ void GuiApp::draw_sfm_advanced() {
               {&dmsg::capture_photos, &dmsg::capture_video,
                &dmsg::capture_internet});
     ui::help_on_hover(dmsg::capture_type_help);
+    if (any_pano360()) draw_pano360_size();
 
     ImGui::SetNextItemWidth(px(260.0f));
     ui::Combo(dmsg::features, &_sfm_job.features,

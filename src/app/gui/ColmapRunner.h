@@ -105,6 +105,7 @@ struct ColmapJob {
     // Video extraction
     float video_fps = 2.0f;              // kept frames per second
     int sharp_window = 3;                // pick sharpest of N candidates (1 = off)
+    app::Pano360Options pano;            // see PrepJob
     int max_frames = 100000;
 
     // Advanced

@@ -496,6 +496,10 @@ bool is_dual_fisheye_path(const std::string& path) {
     return lower_ext(path) == ".insv" || lower_ext(path) == ".osv";
 }
 
+bool is_pano360_path(const std::string& path) {
+    return lower_ext(path) == ".360";
+}
+
 // ---------------------------------------------------------------------------
 // The ffmpeg fallback, on its own
 // ---------------------------------------------------------------------------
@@ -528,7 +532,8 @@ bool ffmpeg_probe_video(const std::string& ffmpeg_exe, const std::string& path,
                     // The frame size off the same line. The 16-pixel floor is
                     // what rejects the fourcc ("0x31637661"), which is also
                     // digits on both sides of an x.
-                    for (size_t i = 1; i + 1 < line.size() && !out.width; i++) {
+                    int lw = 0, lh = 0;
+                    for (size_t i = 1; i + 1 < line.size() && !lw; i++) {
                         if (line[i] != 'x') continue;
                         size_t b = i, e = i + 1;
                         while (b > 0 && std::isdigit((unsigned char)line[b - 1])) b--;
@@ -536,7 +541,11 @@ bool ffmpeg_probe_video(const std::string& ffmpeg_exe, const std::string& path,
                         if (b == i || e == i + 1) continue;
                         const int w = std::atoi(line.c_str() + b);
                         const int h = std::atoi(line.c_str() + i + 1);
-                        if (w >= 16 && h >= 16) { out.width = w; out.height = h; }
+                        if (w >= 16 && h >= 16) { lw = w; lh = h; }
+                    }
+                    if (lw > 0) {
+                        out.tracks.emplace_back(lw, lh);
+                        if (out.width == 0) { out.width = lw; out.height = lh; }
                     }
                     size_t b = f;
                     while (b > 0 && (std::isdigit((unsigned char)line[b - 1]) ||
@@ -573,6 +582,27 @@ bool ffmpeg_extract_frame(const std::string& ffmpeg_exe, const std::string& vide
         return false;
     }
     return fs::exists(out_path, ec) && fs::file_size(out_path, ec) > 0;
+}
+
+app::Eac360Layout probe_eac360(const std::string& ffmpeg_exe,
+                               const std::string& path,
+                               const std::atomic<bool>& cancel) {
+    app::Eac360Layout layout;
+    std::vector<std::pair<int, int>> tracks;
+#ifdef SS_HAVE_VIDEO
+    {
+        std::string err;
+        tracks = app::video_track_sizes(path, err);
+    }
+#endif
+    if (tracks.empty()) {
+        VideoFacts facts;
+        if (ffmpeg_probe_video(ffmpeg_exe, path, facts, cancel))
+            tracks = facts.tracks;
+    }
+    if (tracks.size() == 2 && tracks[0] == tracks[1])
+        app::eac360_detect(2, tracks[0].first, tracks[0].second, layout);
+    return layout;
 }
 
 namespace {
@@ -893,6 +923,12 @@ int64_t DatasetPrep::estimate_frames(const PrepJob& job, const PrepInput& in,
     // The probe has to match the path the extraction will take: the two count
     // tracks differently, and ffmpeg resamples the video rather than stepping
     // through the frames the container holds.
+
+    // A 360 capture writes one image per view; its two tracks are one frame.
+    const int per_frame =
+        in.eac360.valid()
+            ? (int)app::pano360_views(in.eac360, job.pano).size()
+            : 0;
 #ifdef SS_HAVE_VIDEO
     if (!job.force_external_decode && backends().builtin_video) {
         std::string err;
@@ -900,14 +936,16 @@ int64_t DatasetPrep::estimate_frames(const PrepJob& job, const PrepInput& in,
         video::VideoReader r;
         if (tracks > 0 && r.open(in.path))
             return expected_frames(job, r.info().fps > 1.0 ? r.info().fps : 30.0,
-                                   r.info().frame_count, tracks);
+                                   r.info().frame_count,
+                                   per_frame > 0 ? per_frame : tracks);
     }
 #endif
     VideoFacts facts;
     if (ffmpeg_probe_video(job.ffmpeg_exe, in.path, facts, _cancel) &&
         facts.fps > 1.0)
         return expected_frames(job, facts.fps, facts.frames,
-                               is_dual_fisheye_path(in.path) ? 2 : 1);
+                               per_frame > 0 ? per_frame
+                                             : (is_dual_fisheye_path(in.path) ? 2 : 1));
     return 0;
 }
 
@@ -1192,6 +1230,8 @@ bool DatasetPrep::extract_video(const PrepJob& job, const PrepInput& in,
         // fallback is for, and the user should not have to know which is which.
         log(fmt(lmsg::decode_fallback_ffmpeg, {error}), /*detail=*/false);
     }
+    if (in.eac360.valid() && job.pano.mode != app::Pano360Mode::Off)
+        return extract_360_ffmpeg(job, in, images, out, error);
     return extract_video_ffmpeg(job, in, images, out, error);
 }
 
@@ -1219,7 +1259,11 @@ bool DatasetPrep::extract_video_builtin(const PrepJob& job, const PrepInput& in,
         error = probe_err.empty() ? "no video track" : probe_err;
         return false;
     }
-    if (tracks > 1) out.per_folder_cameras = true;
+    const std::vector<app::Pano360View> views =
+        in.eac360.valid() ? app::pano360_views(in.eac360, job.pano)
+                          : std::vector<app::Pano360View>();
+    if (!views.empty()) out.per_folder_cameras = views.size() > 1;
+    else if (tracks > 1) out.per_folder_cameras = true;
 
     double src_fps = 30.0;
     {
@@ -1236,6 +1280,12 @@ bool DatasetPrep::extract_video_builtin(const PrepJob& job, const PrepInput& in,
     fx.keep = window > 1 ? window : 0;
     fx.max_frames = job.max_frames;
     fx.quality = 95;
+    if (!views.empty()) {
+        fx.eac = in.eac360;
+        fx.views = views;
+        log(fmt(lmsg::pano360_plan, {(long long)views.size(), views[0].width,
+                                     views[0].height}), /*detail=*/false);
+    }
 
     app::FrameExtractSinks sinks;
     sinks.log = [this](const std::string& l) { log(l); };
@@ -1354,6 +1404,145 @@ bool DatasetPrep::extract_video_ffmpeg(const PrepJob& job, const PrepInput& in,
         log(fmt(lmsg::kept_frames, {(long long)kept, out_dir.string()}),
             /*detail=*/false);
     }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// 360 -> views
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The canvas frames selection kept, resampled into the plan's views. One
+// thread per view, each with a share of the cores: the resampler threads and
+// the JPEG encode does not, so overlapping them is what fills the machine.
+bool warp_canvases(const fs::path& from, const fs::path& to,
+                   const app::Eac360Layout& layout,
+                   const std::vector<app::Pano360View>& views,
+                   const std::atomic<bool>& cancel,
+                   const std::function<void(int64_t)>& progress,
+                   std::string& error) {
+    std::error_code ec;
+    std::vector<app::Pano360Remap> maps(views.size());
+    for (size_t i = 0; i < views.size(); i++) {
+        app::pano360_remap(layout, views[i], maps[i]);
+        fs::create_directories(to / views[i].dir, ec);
+    }
+    std::vector<fs::path> files;
+    for (const auto& e : fs::directory_iterator(from, ec))
+        if (e.is_regular_file(ec)) files.push_back(e.path());
+    std::sort(files.begin(), files.end());
+
+    const int cores = std::max(1, (int)std::thread::hardware_concurrency());
+    const int per_view = std::max(1, cores / (int)views.size());
+    int64_t done = 0;
+    for (const fs::path& f : files) {
+        if (cancel.load()) { error = lmsg::err_cancelled.get(); return false; }
+        int w = 0, h = 0, ch = 0;
+        stbi_uc* px = stbi_load(f.string().c_str(), &w, &h, &ch, 3);
+        if (!px || w != layout.canvasW() || h != layout.canvasH()) {
+            if (px) stbi_image_free(px);
+            error = fmt(lmsg::err_360_frame_read, {f.string()});
+            return false;
+        }
+        std::atomic<bool> ok{true};
+        std::vector<std::thread> pool;
+        pool.reserve(views.size());
+        for (size_t i = 0; i < views.size(); i++) {
+            pool.emplace_back([&, i] {
+                std::vector<uint8_t> out((size_t)maps[i].width * maps[i].height * 3);
+                app::pano360_apply(maps[i], px, w, h, per_view, out.data());
+                const std::string path =
+                    (to / views[i].dir / (f.stem().string() + ".jpg")).string();
+                if (!stbi_write_jpg(path.c_str(), maps[i].width, maps[i].height, 3,
+                                    out.data(), kPhotoJpegQuality))
+                    ok = false;
+            });
+        }
+        for (std::thread& t : pool) t.join();
+        stbi_image_free(px);
+        if (!ok) {
+            error = fmt(lmsg::err_360_frame_write, {(to / f.stem()).string()});
+            return false;
+        }
+        if (progress) progress(++done);
+    }
+    return true;
+}
+
+}  // namespace
+
+bool DatasetPrep::extract_360_ffmpeg(const PrepJob& job, const PrepInput& in,
+                                     const std::string& images, PrepResult& out,
+                                     std::string& error) {
+    if (!command_exists(job.ffmpeg_exe)) {
+        error = fmt(lmsg::err_ffmpeg_missing, {job.ffmpeg_exe});
+        return false;
+    }
+    const std::vector<app::Pano360View> views =
+        app::pano360_views(in.eac360, job.pano);
+    if (views.empty()) {
+        error = lmsg::err_ffmpeg_extract_failed.get();
+        return false;
+    }
+    if (views.size() > 1) out.per_folder_cameras = true;
+    log(fmt(lmsg::video_input, {in.path}), /*detail=*/false);
+    log(fmt(lmsg::pano360_plan, {(long long)views.size(), views[0].width,
+                                 views[0].height}), /*detail=*/false);
+
+    const fs::path ws = job.workspace;
+    const int window = std::max(job.sharp_window, 1);
+    std::error_code ec;
+
+    // ffmpeg decodes both tracks and cuts the overlap strips out; the warp is
+    // ours, in both decode paths, because ffmpeg's own EAC sampler insets every
+    // face (app/Pano360.h).
+    enter(Stage::Frames, window > 1 ? lmsg::stage_extract_candidates.get()
+                                    : lmsg::stage_extract_ffmpeg.get());
+    const fs::path cand = ws / "frames_tmp";
+    remove_tree(cand);
+    fs::create_directories(cand, ec);
+    char pre[64];
+    std::snprintf(pre, sizeof pre, "fps=%g", (double)job.video_fps * window);
+    const std::string graph = app::pano360_graph(in.eac360, pre);
+    int rc = exec({job.ffmpeg_exe, "-nostdin", "-y", "-i", in.path,
+                   "-filter_complex", graph,
+                   "-map", std::string("[") + app::pano360_canvas_pad() + "]",
+                   "-qscale:v", "2", (cand / "c_%06d.jpg").string()});
+    if (rc == kCancelled) { error = lmsg::err_cancelled.get(); return false; }
+    if (rc != 0) {
+        error = lmsg::err_ffmpeg_extract_failed.get();
+        return false;
+    }
+
+    // Selection scores the canvas, so a frame is ranked on the whole sphere
+    // rather than on whichever view happens to be pointing at texture.
+    if (window > 1) enter(Stage::Frames, lmsg::stage_select_sharpest.get());
+    const fs::path kept = ws / "canvas_tmp";
+    remove_tree(kept);
+    fs::create_directories(kept, ec);
+    const int n = select_sharpest_frames(
+        cand.string(), kept.string(), "", window, job.max_frames,
+        [this](const std::string& l) { log(l); }, _cancel);
+    remove_tree(cand);
+    if (n < 0) {
+        remove_tree(kept);
+        error = _cancel.load() ? lmsg::err_cancelled.get()
+                               : lmsg::err_ffmpeg_extract_failed.get();
+        return false;
+    }
+
+    enter(Stage::Frames, lmsg::stage_warp_360.get());
+    RateLimitedProgress progress(_prog, Stage::Frames, lmsg::noun_frames_written,
+                                 _frames_tally);
+    const bool ok = warp_canvases(
+        kept, fs::path(images), in.eac360, views, _cancel,
+        [&](int64_t done) { progress.update(done * (int64_t)views.size()); },
+        error);
+    remove_tree(kept);
+    if (!ok) return false;
+    log(fmt(lmsg::kept_frames, {(long long)n * (long long)views.size(), images}),
+        /*detail=*/false);
     return true;
 }
 

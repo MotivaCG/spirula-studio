@@ -182,6 +182,12 @@ private:
     bool builtin_sfm_available() const;
     bool colmap_available() const;
     Engine effective_engine() const;
+    // Does any input carry the 360 packing, and what the plan does to the lens.
+    bool any_pano360() const;
+    void apply_pano_lens();
+    void reset_pano_size();
+    void draw_pano360_options();
+    void draw_pano360_size();
     bool dataset_busy() const;
     // Which step a running job is on, or nullptr when none is. Both runners
     // report through the same object, so the screen reads one thing.

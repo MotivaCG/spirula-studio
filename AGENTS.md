@@ -125,6 +125,9 @@ src/
 │   │                         geometry_main.cpp (depth + normals)
 │   ├── FrameExtract.{h,cpp}  video -> sharp frames (`spirula sam extract` also
 │   │                         masks them in the same pass; the GUI masks after)
+│   ├── Pano360.{h,cpp}     a 360 camera's own frame layout (the GoPro MAX
+│   │                         .360 EAC packing) and the views a dataset wants
+│   │                         out of it -- one implementation, both decode paths
 │   ├── WriterPool.h        threads that encode/write images while the GPU runs
 │   │                         the next frame; every masking loop uses it
 │   ├── AppPaths.{h,cpp}    the config / cache directories and this exe's own path
