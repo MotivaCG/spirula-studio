@@ -6636,6 +6636,365 @@ SS_MSG(flip_found_masks_help,
        "beyazsa -- bunu açın. Çalıştırma onları öyle okur, kendi yazdıklarını "
        "her zamanki gibi yazar; sonrasında hiçbir yere söylemek gerekmez."));
 
+SS_MSG(photo_import,
+    EN("Photos into the dataset"),
+    JA("写真をデータセットへ"),
+    ZH_HANS("照片进入数据集的方式"),
+    ZH_HANT("照片進入資料集的方式"),
+    KO("사진을 데이터셋으로"),
+    DE("Fotos in den Datensatz"),
+    FR("Photos vers le jeu de données"),
+    ES("Fotos hacia el conjunto de datos"),
+    PT("Fotos para o conjunto de dados"),
+    IT("Foto verso il set di dati"),
+    NL("Foto's naar de dataset"),
+    RU("Фотографии в набор данных"),
+    TR("Fotoğraflar veri kümesine"));
+
+SS_MSG(photo_import_help,
+    EN("What happens to a folder of photos on its way in. The first three "
+       "leave the dataset holding an images/ of its own, which is what lets it "
+       "be opened again later without naming the folder the photos came from. "
+       "Video frames are written into the dataset whatever this says."),
+    JA("写真のフォルダーが取り込まれるときの扱いです。上の三つはデータセット自身の "
+       "images/ を残すので、あとで開き直すときに元のフォルダーを指定しなくてすみます。"
+       "動画のフレームは、この設定にかかわらずデータセットに書き出されます。"),
+    ZH_HANS("照片文件夹进入数据集时的处理方式。前三种会让数据集拥有自己的 images/，"
+            "以后重新打开时就不必再指出照片原来的文件夹。视频帧无论这里怎么选，都会"
+            "写入数据集。"),
+    ZH_HANT("照片資料夾進入資料集時的處理方式。前三種會讓資料集擁有自己的 images/，"
+            "以後重新開啟時就不必再指出照片原來的資料夾。影片影格無論這裡怎麼選，都會"
+            "寫入資料集。"),
+    KO("사진 폴더가 들어올 때 무엇이 되는지입니다. 위의 셋은 데이터셋 자신의 "
+       "images/ 를 남기므로, 나중에 다시 열 때 사진이 있던 폴더를 말하지 않아도 "
+       "됩니다. 영상 프레임은 이 설정과 무관하게 데이터셋에 쓰입니다."),
+    DE("Was mit einem Ordner voller Fotos auf dem Weg hinein geschieht. Die "
+       "ersten drei hinterlassen dem Datensatz ein eigenes images/, wodurch er "
+       "sich später wieder öffnen lässt, ohne den Herkunftsordner zu nennen. "
+       "Videobilder werden unabhängig davon in den Datensatz geschrieben."),
+    FR("Ce qui arrive à un dossier de photos en chemin. Les trois premiers "
+       "laissent au jeu de données un images/ à lui, ce qui permet de le "
+       "rouvrir plus tard sans nommer le dossier d'origine. Les images vidéo "
+       "sont écrites dans le jeu de données quoi qu'il en soit."),
+    ES("Qué le pasa a una carpeta de fotos de camino al conjunto de datos. Las "
+       "tres primeras le dejan un images/ propio, que es lo que permite "
+       "volver a abrirlo más adelante sin nombrar la carpeta de origen. Los "
+       "fotogramas de vídeo se escriben en él diga lo que diga esto."),
+    PT("O que acontece a uma pasta de fotos a caminho do conjunto de dados. As "
+       "três primeiras deixam-lhe um images/ próprio, que é o que permite "
+       "reabri-lo mais tarde sem nomear a pasta de origem. Os quadros de vídeo "
+       "são escritos nele diga isto o que disser."),
+    IT("Che cosa succede a una cartella di foto lungo la strada. Le prime tre "
+       "lasciano al set di dati un images/ suo, ed è questo a permettere di "
+       "riaprirlo più tardi senza nominare la cartella di partenza. I "
+       "fotogrammi video ci finiscono comunque, qualunque cosa dica questo."),
+    NL("Wat er met een map foto's gebeurt op weg naar binnen. De eerste drie "
+       "laten de dataset een eigen images/ na, en dat is wat haar later weer "
+       "laat openen zonder de bronmap te noemen. Videobeelden komen hoe dan "
+       "ook in de dataset terecht."),
+    RU("Что происходит с папкой фотографий по пути внутрь. Первые три "
+       "оставляют набору данных собственный images/ — именно это позволяет "
+       "открыть его потом, не называя исходную папку. Кадры видео попадают в "
+       "него при любом выборе."),
+    TR("Bir fotoğraf klasörüne içeri girerken ne olduğu. İlk üçü veri kümesine "
+       "kendi images/ klasörünü bırakır; sonradan onu kaynak klasörü "
+       "söylemeden açmayı sağlayan da budur. Video kareleri burada ne yazarsa "
+       "yazsın veri kümesine yazılır."));
+
+SS_MSG(photo_import_convert,
+    EN("Copy, re-encoded as JPEG"),
+    JA("コピーして JPEG に再エンコード"),
+    ZH_HANS("复制并重新编码为 JPEG"),
+    ZH_HANT("複製並重新編碼為 JPEG"),
+    KO("복사하고 JPEG로 다시 인코딩"),
+    DE("Kopieren, als JPEG neu kodiert"),
+    FR("Copier, réencodées en JPEG"),
+    ES("Copiar, recodificadas como JPEG"),
+    PT("Copiar, recodificadas como JPEG"),
+    IT("Copiare, ricodificate in JPEG"),
+    NL("Kopiëren, opnieuw gecodeerd als JPEG"),
+    RU("Копировать, перекодировав в JPEG"),
+    TR("Kopyala, JPEG olarak yeniden kodla"));
+
+SS_MSG(photo_import_convert_help,
+    EN("PNG and BMP are re-encoded at quality 95, which is several times "
+       "smaller on disk and faster to read every epoch. An alpha channel "
+       "cannot go in a JPEG and is a cut-out rather than decoration, so it is "
+       "written beside the photo as a mask instead, black where it was "
+       "transparent. 16-bit and EXR are copied unchanged, and a photo that is "
+       "already JPEG is never re-encoded."),
+    JA("PNG と BMP を品質 95 で再エンコードします。ディスク上で数分の一になり、"
+       "毎エポックの読み込みも速くなります。アルファチャンネルは JPEG に入れられ"
+       "ず、飾りではなく切り抜きなので、写真のとなりにマスクとして書き出します — "
+       "透明だったところが黒です。16 ビットと EXR はそのままコピーし、もともと "
+       "JPEG の写真は再エンコードしません。"),
+    ZH_HANS("把 PNG 和 BMP 以质量 95 重新编码，占用的磁盘小上几倍，每一轮读取也更"
+            "快。alpha 通道装不进 JPEG，而且它是抠像而非装饰，因此改写成照片旁边"
+            "的掩码，原先透明的地方为黑。16 位和 EXR 原样复制，本来就是 JPEG 的照"
+            "片不会再编码一次。"),
+    ZH_HANT("把 PNG 和 BMP 以品質 95 重新編碼，佔用的磁碟小上幾倍，每一輪讀取也更"
+            "快。alpha 通道裝不進 JPEG，而且它是去背而非裝飾，因此改寫成照片旁邊"
+            "的遮罩，原先透明的地方為黑。16 位元和 EXR 原樣複製，本來就是 JPEG 的"
+            "照片不會再編碼一次。"),
+    KO("PNG와 BMP를 품질 95로 다시 인코딩합니다. 디스크에서 몇 배 작아지고 매 "
+       "에포크의 읽기도 빨라집니다. 알파 채널은 JPEG에 담을 수 없고 장식이 아니라 "
+       "오려낸 자리이므로, 사진 옆에 마스크로 씁니다. 투명했던 곳이 검정입니다. "
+       "16비트와 EXR은 그대로 복사하며, 이미 JPEG인 사진은 다시 인코딩하지 "
+       "않습니다."),
+    DE("PNG und BMP werden mit Qualität 95 neu kodiert, was auf der Platte um "
+       "ein Mehrfaches kleiner ist und sich in jeder Epoche schneller liest. "
+       "Ein Alphakanal passt in kein JPEG und ist ein Freisteller, keine "
+       "Zierde, also wird er stattdessen als Maske neben das Foto geschrieben, "
+       "schwarz, wo er durchsichtig war. 16 Bit und EXR werden unverändert "
+       "kopiert, und ein Foto, das schon JPEG ist, wird nie neu kodiert."),
+    FR("Les PNG et les BMP sont réencodés en qualité 95, ce qui occupe "
+       "plusieurs fois moins de disque et se lit plus vite à chaque époque. Un "
+       "canal alpha ne tient pas dans un JPEG et c'est un détourage, pas une "
+       "décoration : il est donc écrit à côté de la photo comme masque, noir "
+       "là où il était transparent. Le 16 bits et l'EXR sont copiés tels "
+       "quels, et une photo déjà en JPEG n'est jamais réencodée."),
+    ES("Los PNG y los BMP se recodifican con calidad 95, lo que ocupa varias "
+       "veces menos disco y se lee más rápido en cada época. Un canal alfa no "
+       "cabe en un JPEG y es un recorte, no un adorno, así que se escribe "
+       "junto a la foto como máscara, negro donde era transparente. El 16 bits "
+       "y el EXR se copian sin cambios, y una foto que ya es JPEG no se "
+       "recodifica nunca."),
+    PT("Os PNG e os BMP são recodificados com qualidade 95, o que ocupa várias "
+       "vezes menos disco e se lê mais depressa a cada época. Um canal alfa "
+       "não cabe num JPEG e é um recorte, não um enfeite, por isso é escrito "
+       "ao lado da foto como máscara, preto onde era transparente. O 16 bits e "
+       "o EXR são copiados sem mudanças, e uma foto que já é JPEG nunca é "
+       "recodificada."),
+    IT("I PNG e i BMP vengono ricodificati a qualità 95: occupano parecchie "
+       "volte meno disco e si leggono più in fretta a ogni epoca. Un canale "
+       "alfa non entra in un JPEG ed è un ritaglio, non un ornamento, quindi "
+       "viene scritto accanto alla foto come maschera, nero dov'era "
+       "trasparente. Il 16 bit e l'EXR si copiano invariati, e una foto già "
+       "JPEG non si ricodifica mai."),
+    NL("PNG en BMP worden opnieuw gecodeerd op kwaliteit 95, wat meerdere "
+       "malen minder schijf kost en elke epoch sneller leest. Een alfakanaal "
+       "past niet in een JPEG en is een uitsnede, geen versiering, dus het "
+       "wordt naast de foto als masker weggeschreven, zwart waar het "
+       "doorzichtig was. 16 bits en EXR worden onveranderd gekopieerd, en een "
+       "foto die al JPEG is wordt nooit opnieuw gecodeerd."),
+    RU("PNG и BMP перекодируются с качеством 95: на диске в несколько раз "
+       "меньше, и каждая эпоха читает их быстрее. Альфа-канал в JPEG не "
+       "помещается, и это вырезка, а не украшение, поэтому он пишется рядом с "
+       "фотографией маской — чёрной там, где было прозрачно. 16 бит и EXR "
+       "копируются без изменений, а фото, уже бывшее JPEG, не перекодируется "
+       "никогда."),
+    TR("PNG ve BMP dosyaları 95 kalitesinde yeniden kodlanır: diskte birkaç kat "
+       "küçük olur ve her turda daha hızlı okunur. Alfa kanalı bir JPEG'e "
+       "sığmaz ve süs değil bir kesimdir, bu yüzden fotoğrafın yanına maske "
+       "olarak yazılır; saydam olduğu yerde siyahtır. 16 bit ve EXR olduğu "
+       "gibi kopyalanır, zaten JPEG olan bir fotoğraf ise hiç yeniden "
+       "kodlanmaz."));
+
+SS_MSG(photo_import_copy,
+    EN("Copy them"),
+    JA("コピーする"),
+    ZH_HANS("复制"),
+    ZH_HANT("複製"),
+    KO("복사"),
+    DE("Kopieren"),
+    FR("Les copier"),
+    ES("Copiarlas"),
+    PT("Copiá-las"),
+    IT("Copiarle"),
+    NL("Kopiëren"),
+    RU("Копировать"),
+    TR("Kopyala"));
+
+SS_MSG(photo_import_copy_help,
+    EN("The files arrive byte for byte. Hard-linked where the filesystem gives "
+       "one, so a folder of raw captures costs a directory entry rather than a "
+       "second copy of itself; a copy is made where it cannot, across devices "
+       "and on filesystems that have no links."),
+    JA("ファイルはバイト単位でそのまま入ります。ファイルシステムがハードリンクを"
+       "許すならリンクにするので、生の撮影フォルダーは二つ目の実体ではなく"
+       "ディレクトリ項目ひとつですみます。できない場合 — 別のデバイス、リンクの"
+       "ないファイルシステム — はコピーします。"),
+    ZH_HANS("文件逐字节照搬。文件系统允许时用硬链接，于是一整个原始拍摄文件夹只花"
+            "一个目录项，而不是再占一份空间；不允许时——跨设备、或文件系统没有链"
+            "接——就复制。"),
+    ZH_HANT("檔案逐位元組照搬。檔案系統允許時用硬連結，於是一整個原始拍攝資料夾只花"
+            "一個目錄項，而不是再佔一份空間；不允許時——跨裝置、或檔案系統沒有連"
+            "結——就複製。"),
+    KO("파일이 바이트 그대로 들어옵니다. 파일 시스템이 허락하면 하드 링크를 걸어 "
+       "원본 촬영 폴더가 두 번째 실체 대신 디렉터리 항목 하나만 차지합니다. 걸 수 "
+       "없는 곳 — 장치가 다르거나 링크가 없는 파일 시스템 — 에서는 복사합니다."),
+    DE("Die Dateien kommen Byte für Byte an. Hart verlinkt, wo das Dateisystem "
+       "es hergibt, sodass ein Ordner roher Aufnahmen einen Verzeichniseintrag "
+       "kostet statt einer zweiten Kopie seiner selbst; wo das nicht geht -- "
+       "über Geräte hinweg, auf Dateisystemen ohne Links -- wird kopiert."),
+    FR("Les fichiers arrivent octet pour octet. Liés en dur là où le système "
+       "de fichiers le permet, si bien qu'un dossier de prises brutes coûte "
+       "une entrée de répertoire et non une seconde copie de lui-même ; sinon "
+       "-- d'un appareil à l'autre, sur un système sans liens -- il est copié."),
+    ES("Los archivos llegan byte a byte. Enlazados en duro donde el sistema de "
+       "archivos lo permite, de modo que una carpeta de tomas en bruto cuesta "
+       "una entrada de directorio y no una segunda copia de sí misma; donde no "
+       "se puede -- entre dispositivos, en sistemas sin enlaces -- se copia."),
+    PT("Os ficheiros chegam byte a byte. Ligados por hard link onde o sistema "
+       "de ficheiros o dá, de modo que uma pasta de capturas em bruto custa uma "
+       "entrada de diretório e não uma segunda cópia de si mesma; onde não dá "
+       "-- entre dispositivos, em sistemas sem ligações -- copia-se."),
+    IT("I file arrivano byte per byte. Collegati con hard link dove il file "
+       "system lo concede, così una cartella di riprese grezze costa una voce "
+       "di directory e non una seconda copia di sé; dove non si può -- tra "
+       "dispositivi diversi, su file system senza link -- si copia."),
+    NL("De bestanden komen byte voor byte aan. Hard gekoppeld waar het "
+       "bestandssysteem dat toelaat, zodat een map ruwe opnamen één "
+       "mapvermelding kost in plaats van een tweede kopie van zichzelf; waar "
+       "het niet kan -- tussen apparaten, op systemen zonder koppelingen -- "
+       "wordt gekopieerd."),
+    RU("Файлы приходят байт в байт. Там, где файловая система даёт жёсткую "
+       "ссылку, ставится ссылка, и папка исходной съёмки стоит одной записи в "
+       "каталоге, а не второй копии себя; где нельзя — между устройствами, на "
+       "файловых системах без ссылок — делается копия."),
+    TR("Dosyalar bayt bayt gelir. Dosya sistemi izin verdiğinde sabit bağ "
+       "kurulur, böylece ham çekim klasörü kendisinin ikinci bir kopyasına "
+       "değil bir dizin girdisine mal olur; kurulamadığı yerde -- aygıtlar "
+       "arasında, bağ tanımayan dosya sistemlerinde -- kopyalanır."));
+
+SS_MSG(photo_import_move,
+    EN("Move them"),
+    JA("移動する"),
+    ZH_HANS("移动"),
+    ZH_HANT("移動"),
+    KO("옮기기"),
+    DE("Verschieben"),
+    FR("Les déplacer"),
+    ES("Moverlas"),
+    PT("Movê-las"),
+    IT("Spostarle"),
+    NL("Verplaatsen"),
+    RU("Переместить"),
+    TR("Taşı"));
+
+SS_MSG(photo_import_move_help,
+    EN("The photos end up in the dataset and are gone from the folder they "
+       "came from. Pick this when that folder was only somewhere to put them "
+       "until now -- there is no undo, and a second run over the same folder "
+       "finds nothing left in it."),
+    JA("写真はデータセットに入り、元のフォルダーからはなくなります。元のフォルダーが"
+       "一時置き場だった場合に選んでください。取り消しはできず、同じフォルダーに"
+       "対してもう一度実行しても、そこにはもう何も残っていません。"),
+    ZH_HANS("照片进入数据集，原来的文件夹里就没有了。若那个文件夹只是暂时存放的地"
+            "方，就选这个——没有撤销，对同一个文件夹再跑一次也不会再找到东西。"),
+    ZH_HANT("照片進入資料集，原來的資料夾裡就沒有了。若那個資料夾只是暫時存放的地"
+            "方，就選這個——沒有復原，對同一個資料夾再跑一次也不會再找到東西。"),
+    KO("사진이 데이터셋으로 들어가고 원래 폴더에서는 사라집니다. 그 폴더가 잠시 "
+       "두는 자리였을 때 고르십시오. 되돌릴 수 없고, 같은 폴더로 다시 실행해도 "
+       "거기에는 아무것도 남아 있지 않습니다."),
+    DE("Die Fotos landen im Datensatz und sind aus ihrem Herkunftsordner "
+       "verschwunden. Wählen Sie das, wenn dieser Ordner nur ein Zwischenlager "
+       "war -- es gibt kein Zurück, und ein zweiter Lauf über denselben Ordner "
+       "findet nichts mehr darin."),
+    FR("Les photos finissent dans le jeu de données et ne sont plus dans le "
+       "dossier d'où elles viennent. Choisissez ceci quand ce dossier n'était "
+       "qu'un endroit où les poser : il n'y a pas de retour en arrière, et une "
+       "seconde exécution sur le même dossier n'y trouve plus rien."),
+    ES("Las fotos acaban en el conjunto de datos y ya no están en la carpeta de "
+       "la que vinieron. Elija esto cuando esa carpeta solo fuera un sitio "
+       "donde dejarlas: no hay vuelta atrás, y una segunda ejecución sobre la "
+       "misma carpeta ya no encuentra nada."),
+    PT("As fotos acabam no conjunto de dados e desaparecem da pasta de onde "
+       "vieram. Escolha isto quando essa pasta era só um sítio onde as pôr: não "
+       "há como desfazer, e uma segunda execução sobre a mesma pasta já não "
+       "encontra nada."),
+    IT("Le foto finiscono nel set di dati e spariscono dalla cartella da cui "
+       "venivano. Scelga questo quando quella cartella era solo un posto dove "
+       "tenerle: non si torna indietro, e una seconda esecuzione sulla stessa "
+       "cartella non ci trova più nulla."),
+    NL("De foto's belanden in de dataset en zijn weg uit de map waar ze "
+       "vandaan kwamen. Kies dit wanneer die map alleen maar een plek was om ze "
+       "neer te zetten -- er is geen weg terug, en een tweede run over dezelfde "
+       "map vindt er niets meer."),
+    RU("Фотографии оказываются в наборе данных и исчезают из папки, откуда "
+       "пришли. Выбирайте это, когда та папка была лишь местом, куда их "
+       "положили: отменить нельзя, и второй запуск по той же папке уже ничего в "
+       "ней не найдёт."),
+    TR("Fotoğraflar veri kümesine geçer ve geldikleri klasörde kalmaz. O klasör "
+       "yalnızca onları bir yere koymak içindiyse bunu seçin: geri alma yoktur "
+       "ve aynı klasör üzerinde ikinci bir çalıştırma orada bir şey bulamaz."));
+
+SS_MSG(photo_import_inplace,
+    EN("Leave them where they are"),
+    JA("元の場所に置いたままにする"),
+    ZH_HANS("留在原处"),
+    ZH_HANT("留在原處"),
+    KO("있던 자리에 그대로 두기"),
+    DE("Dort lassen, wo sie sind"),
+    FR("Les laisser où elles sont"),
+    ES("Dejarlas donde están"),
+    PT("Deixá-las onde estão"),
+    IT("Lasciarle dove sono"),
+    NL("Laten staan waar ze staan"),
+    RU("Оставить там, где лежат"),
+    TR("Oldukları yerde bırak"));
+
+SS_MSG(photo_import_inplace_help,
+    EN("Nothing is copied: the dataset points at the folder you picked. It "
+       "costs no disk, and it is the one setting whose dataset does not open "
+       "again on its own -- reopening it means putting that folder back into "
+       "image_dir by hand. Only a single folder of photos can be read this "
+       "way; a job with more inputs than that copies them anyway."),
+    JA("何もコピーしません。データセットは選んだフォルダーを指します。ディスクは"
+       "使いませんが、あとで自力では開き直せない唯一の設定でもあり、開くには "
+       "image_dir にそのフォルダーを手で戻す必要があります。この読み方ができるのは"
+       "写真フォルダーがひとつだけのときで、入力がそれより多い実行ではコピーします。"),
+    ZH_HANS("什么都不复制：数据集指向你选的那个文件夹。不占磁盘，但也是唯一一种以后"
+            "无法自行打开的设置——重新打开时得手工把那个文件夹填回 image_dir。只有"
+            "单独一个照片文件夹能这样读；输入不止一个时仍然会复制。"),
+    ZH_HANT("什麼都不複製：資料集指向你選的那個資料夾。不佔磁碟，但也是唯一一種以後"
+            "無法自行開啟的設定——重新開啟時得手工把那個資料夾填回 image_dir。只有"
+            "單獨一個照片資料夾能這樣讀；輸入不只一個時仍然會複製。"),
+    KO("아무것도 복사하지 않습니다. 데이터셋은 고른 폴더를 가리킵니다. 디스크는 "
+       "쓰지 않지만, 나중에 혼자서는 열리지 않는 유일한 설정이기도 해서 다시 열려면 "
+       "image_dir 에 그 폴더를 손으로 되돌려야 합니다. 이렇게 읽을 수 있는 것은 사진 "
+       "폴더 하나뿐이고, 입력이 그보다 많으면 어차피 복사합니다."),
+    DE("Es wird nichts kopiert: der Datensatz zeigt auf den gewählten Ordner. "
+       "Das kostet keine Platte und ist zugleich die einzige Einstellung, deren "
+       "Datensatz sich nicht von allein wieder öffnet -- dazu muss dieser "
+       "Ordner von Hand zurück in image_dir. So lesen lässt sich nur ein "
+       "einzelner Fotoordner; ein Lauf mit mehr Eingaben kopiert ohnehin."),
+    FR("Rien n'est copié : le jeu de données pointe vers le dossier choisi. "
+       "Cela ne coûte pas de disque, et c'est le seul réglage dont le jeu de "
+       "données ne se rouvre pas tout seul -- il faut remettre ce dossier dans "
+       "image_dir à la main. Seul un unique dossier de photos peut être lu "
+       "ainsi ; au-delà, l'exécution copie de toute façon."),
+    ES("No se copia nada: el conjunto de datos apunta a la carpeta que eligió. "
+       "No cuesta disco, y es el único ajuste cuyo conjunto de datos no se "
+       "vuelve a abrir por sí solo: hay que devolver esa carpeta a image_dir a "
+       "mano. Así solo se puede leer una única carpeta de fotos; con más "
+       "entradas la ejecución las copia igualmente."),
+    PT("Nada é copiado: o conjunto de dados aponta para a pasta que escolheu. "
+       "Não custa disco, e é o único ajuste cujo conjunto de dados não se "
+       "reabre sozinho -- é preciso repor essa pasta em image_dir à mão. Assim "
+       "só se pode ler uma única pasta de fotos; com mais entradas a execução "
+       "copia-as de qualquer modo."),
+    IT("Non si copia nulla: il set di dati punta alla cartella scelta. Non "
+       "costa disco, ed è l'unica impostazione il cui set di dati non si "
+       "riapre da solo -- per riaprirlo quella cartella va rimessa a mano in "
+       "image_dir. Così si può leggere una sola cartella di foto; con più "
+       "ingressi l'esecuzione le copia comunque."),
+    NL("Er wordt niets gekopieerd: de dataset wijst naar de map die u koos. Het "
+       "kost geen schijf, en het is de enige instelling waarvan de dataset zich "
+       "niet vanzelf weer opent -- daarvoor moet die map met de hand terug in "
+       "image_dir. Zo laat zich maar één enkele fotomap lezen; een run met meer "
+       "invoer kopieert ze toch."),
+    RU("Ничего не копируется: набор данных указывает на выбранную папку. Диск "
+       "не тратится, но это и единственная настройка, чей набор данных сам "
+       "потом не открывается — придётся вручную вернуть эту папку в image_dir. "
+       "Так читается только одна-единственная папка фотографий; при большем "
+       "числе входов запуск всё равно их копирует."),
+    TR("Hiçbir şey kopyalanmaz: veri kümesi seçtiğiniz klasörü gösterir. Disk "
+       "harcamaz, ama veri kümesi sonradan kendiliğinden açılmayan tek ayar da "
+       "budur -- açmak için o klasörü elle image_dir alanına geri yazmak "
+       "gerekir. Böyle yalnızca tek bir fotoğraf klasörü okunabilir; girdisi "
+       "bundan çok olan bir çalıştırma onları yine de kopyalar."));
+
 SS_MSG(keep_intermediate,
     EN("Keep intermediate files"),
     JA("中間ファイルを残す"),

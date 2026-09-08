@@ -612,6 +612,10 @@ private:
     // Those masks are white where the image is REMOVED, the other convention
     // in the wild. Declared once here; the run normalizes what it writes.
     bool _flip_found_masks = false;
+    // What a folder of photos does on its way into the dataset. The default
+    // gives the dataset an images/ of its own, which is what makes it open
+    // again without image_dir being named by hand.
+    PhotoImport _photo_import = PhotoImport::ConvertJpeg;
 
     // "Clear this project's data": what the modal is about to delete, listed
     // when it opens so the user reads the same paths that go.

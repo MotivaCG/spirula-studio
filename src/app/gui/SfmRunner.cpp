@@ -726,7 +726,7 @@ void SfmRunner::run(SfmJob job) {
             _sweep_dir = job.keep_intermediate ? "" : ws.string();
         }
 
-        if (reads_photos_in_place(job.prep.inputs))
+        if (reads_photos_in_place(job.prep.inputs, job.prep.photo_import))
             log(fmt(lmsg::photos_referenced_in_place, {prep.image_dir_cfg}));
 
         set_stage(Stage::Finishing, lmsg::stage_done.get());

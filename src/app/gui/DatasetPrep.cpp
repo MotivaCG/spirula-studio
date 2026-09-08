@@ -12,7 +12,8 @@
 #include "app_generated/mask_py.h"   // kMaskPy[], from reference/scripts/mask.py
 
 #include "core/ExrImage.h"
-#include "external/stb_image.h"      // stbi_info (image size probe)
+#include "external/stb_image.h"      // stbi_info (image size probe), stbi_load
+#include "external/stb_image_write.h"  // stbi_write_jpg (the photo re-encode)
 
 #ifdef SS_BUILD_SAM
 #include "app/WriterPool.h"
@@ -43,6 +44,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <thread>
 
 namespace fs = std::filesystem;
@@ -733,9 +735,9 @@ void resolve_photo_folder(const std::string& picked, std::string& images,
 }
 
 std::string planned_image_dir(const std::vector<PrepInput>& inputs,
-                              const std::string& workspace) {
+                              const std::string& workspace, PhotoImport mode) {
     std::error_code ec;
-    if (reads_photos_in_place(inputs))
+    if (reads_photos_in_place(inputs, mode))
         return fs::absolute(inputs[0].path, ec).string();
     return workspace.empty() ? std::string()
                              : (fs::path(workspace) / "images").string();
@@ -889,8 +891,8 @@ bool DatasetPrep::run(const PrepJob& job_in, PrepResult& out, std::string& error
     struct Prepared {
         std::string images, masks;      // absolute
         std::string images_rel, masks_rel;  // relative to the workspace
-        // This input's masks already exist: brought along by the input, or
-        // kept by a resumed run.
+        // This input's masks already exist: brought along by the input, taken
+        // from its alpha channel, or kept by a resumed run.
         bool have_masks = false;
         // Segmentation already intersected this input's stencil into them.
         bool stencil_folded = false;
@@ -908,7 +910,7 @@ bool DatasetPrep::run(const PrepJob& job_in, PrepResult& out, std::string& error
     // a run that turned it off -- that is what --no-masks exists to say.
     bool want_masks = job.mask_enable;
 
-    if (reads_photos_in_place(job.inputs)) {
+    if (reads_photos_in_place(job.inputs, job.photo_import)) {
         // Photos are referenced where they are, not copied: a 40 GB folder of
         // raw captures does not want a second copy, and the parsers accept an
         // absolute image_dir.
@@ -991,10 +993,16 @@ bool DatasetPrep::run(const PrepJob& job_in, PrepResult& out, std::string& error
             if (!in.is_video && !in.mask_dir.empty())
                 produced += count_images(p.masks);
             _frames_tally.settle(produced, planned[i]);
-            // Masks an input brought with it are in the dataset now, so they
-            // count even when nothing asked for masking.
-            if (p.have_masks && !in.mask_dir.empty()) want_masks = true;
+            // Masks an input brought with it -- or carried in its alpha --
+            // are in the dataset now, so they count even when nothing asked
+            // for masking.
+            if (p.have_masks) want_masks = true;
         }
+        // A capture that arrived split into cam/, cam0/, cam1/ keeps those
+        // folders on the way in, and they are what make it several cameras --
+        // not only a job whose inputs each got one.
+        if (camera_subfolders(out.image_dir).size() > 1)
+            out.per_folder_cameras = true;
     }
 
     out.n_images = count_images(out.image_dir, skip_dir);
@@ -1053,9 +1061,9 @@ bool DatasetPrep::run(const PrepJob& job_in, PrepResult& out, std::string& error
             // masks an input brought with it are safe.
             if (job.redo_masks && job.inputs[i].mask_dir.empty())
                 clear_generated(per[i].masks, ws);
-            // Already masked by whoever made the masks this input arrived
-            // with. Segmenting over those would replace an answer the user
-            // already has.
+            // Already masked by whoever drew the masks -- or the alpha -- this
+            // input arrived with. Segmenting over those would replace an
+            // answer the user already has.
             if (per[i].have_masks) continue;
             if (!generate_masks(job, job.inputs[i], per[i].images,
                                 per[i].images_rel, per[i].masks, per[i].masks_rel,
@@ -1300,14 +1308,116 @@ bool DatasetPrep::extract_video_ffmpeg(const PrepJob& job, const PrepInput& in,
 // Photos -> the dataset's own images/
 // ---------------------------------------------------------------------------
 
-// Only when the photos cannot be read where they are: a job with more than one
-// input reconstructs from ONE image tree, and the folders under it are what
-// make its inputs separate cameras.
-//
-// Hard links where the filesystem gives one, a copy otherwise. A link costs a
-// directory entry, which matters when the alternative is a second copy of a
-// folder of raw captures; falling back is what makes it work across devices
-// (and on a filesystem that has no links at all).
+namespace {
+
+// Extensions worth handing to the re-encoder. JPEG is already JPEG, EXR is HDR,
+// and the two stb cannot decode (TIFF, WebP) would only reach the fallback.
+bool jpeg_candidate_ext(const fs::path& f) {
+    std::string e = f.extension().string();
+    for (auto& c : e) c = (char)std::tolower((unsigned char)c);
+    return e == ".png" || e == ".bmp";
+}
+
+// Decode, then JPEG. Alpha is a cut-out, not decoration, so it becomes
+// `mask_to` gated at 128 (opaque = keep). The mask is written FIRST: a resumed
+// run reads the photo's existence as proof the pair is complete.
+bool convert_to_jpeg(const fs::path& from, const fs::path& to,
+                     const fs::path& mask_to, bool& wrote_mask) {
+    wrote_mask = false;
+    const std::string src = from.string();
+    int w = 0, h = 0, ch = 0;
+    if (!stbi_info(src.c_str(), &w, &h, &ch)) return false;
+    if (ch < 1 || ch > 4 || stbi_is_16_bit(src.c_str())) return false;
+    const bool alpha = ch == 2 || ch == 4;
+    // Nowhere to put the cut-out: copying keeps it, re-encoding would lose it.
+    if (alpha && mask_to.empty()) return false;
+    stbi_uc* px = stbi_load(src.c_str(), &w, &h, &ch, 0);
+    if (!px) return false;
+
+    const int color = alpha ? ch - 1 : ch;
+    const size_t n = (size_t)w * (size_t)h;
+    std::vector<stbi_uc> opaque, mask;
+    std::error_code ec;
+    bool ok = true;
+    if (alpha) {
+        opaque.resize(n * (size_t)color);
+        mask.resize(n);
+        for (size_t i = 0; i < n; i++) {
+            for (int c = 0; c < color; c++)
+                opaque[i * (size_t)color + (size_t)c] = px[i * (size_t)ch + (size_t)c];
+            mask[i] = px[i * (size_t)ch + (size_t)color] >= 128 ? 255 : 0;
+        }
+        fs::create_directories(mask_to.parent_path(), ec);
+        ok = stbi_write_png(mask_to.string().c_str(), w, h, 1, mask.data(), w) != 0;
+    }
+    if (ok)
+        ok = stbi_write_jpg(to.string().c_str(), w, h, color,
+                            alpha ? opaque.data() : px, kPhotoJpegQuality) != 0;
+    stbi_image_free(px);
+    // A half-written pair is worse than none: the next run would keep it.
+    if (!ok) {
+        fs::remove(to, ec);
+        if (alpha) fs::remove(mask_to, ec);
+        return false;
+    }
+    wrote_mask = alpha;
+    return true;
+}
+
+// One photo's journey. `fallback` is where it goes when the re-encode cannot
+// happen after all -- its own name, which nothing else can have claimed.
+// `mask_to` is empty for a photo that gets no mask of its own.
+struct PhotoMove {
+    fs::path from, to, fallback, mask_to;
+    bool convert = false;
+};
+
+// A re-encoded photo takes the .jpg its bytes now are; the parsers match a
+// mask by stem (find_aux_file), so that is free. A name already spoken for --
+// a.jpg beside a.png, or two stems meeting in `mask_root` -- is not taken twice.
+std::vector<PhotoMove> plan_photo_moves(const std::vector<fs::path>& files,
+                                        const fs::path& from, const fs::path& to,
+                                        const fs::path& mask_root, bool convert) {
+    std::vector<PhotoMove> plan;
+    plan.reserve(files.size());
+    std::set<fs::path> taken, mask_taken;
+    for (const fs::path& f : files)
+        taken.insert(to / under_root(f, from));
+    for (const fs::path& f : files) {
+        PhotoMove m;
+        m.from = f;
+        const fs::path rel = under_root(f, from);
+        m.to = m.fallback = to / rel;
+        if (convert && jpeg_candidate_ext(f)) {
+            const fs::path cand =
+                m.to.parent_path() / (m.to.stem().string() + ".jpg");
+            if (taken.insert(cand).second) {
+                m.to = cand;
+                m.convert = true;
+            }
+        }
+        if (m.convert && !mask_root.empty()) {
+            const fs::path cand =
+                mask_root / rel.parent_path() / (rel.stem().string() + ".png");
+            if (mask_taken.insert(cand).second) m.mask_to = cand;
+        }
+        plan.push_back(std::move(m));
+    }
+    return plan;
+}
+
+// What a run did with one tree, for the line it logs afterwards.
+struct GatherTally {
+    std::atomic<int> converted{0}, linked{0}, copied{0}, moved{0}, kept{0};
+    std::atomic<int> masked{0};
+    std::atomic<int64_t> done{0};
+};
+
+}  // namespace
+
+// Copying hard-links where the filesystem gives one, which costs a directory
+// entry rather than a second copy of a folder of raw captures; falling back to
+// a real copy is what makes it work across devices and where links do not.
 bool DatasetPrep::gather_photos(const PrepJob& job, const PrepInput& in,
                                 const std::string& images,
                                 const std::string& masks, bool& have_masks,
@@ -1329,55 +1439,189 @@ bool DatasetPrep::gather_photos(const PrepJob& job, const PrepInput& in,
     // pasted into an English sentence.
     struct Tree {
         fs::path from, to;
+        bool photos;
         const spirula::i18n::Msg* moving;   // "<kind>: <from> -> <to>"
         const spirula::i18n::Msg* empty;    // "there are no <kind> in <from>"
         const spirula::i18n::Msg* counted;  // what the progress line counts
     };
-    std::vector<Tree> trees{{src, fs::path(images), &lmsg::copying_photos,
+    std::vector<Tree> trees{{src, fs::path(images), true, &lmsg::copying_photos,
                              &lmsg::err_no_photos_in,
                              &lmsg::noun_photos_collected}};
     if (with_masks)
-        trees.push_back({fs::absolute(in.mask_dir, ec), fs::path(masks),
+        trees.push_back({fs::absolute(in.mask_dir, ec), fs::path(masks), false,
                          &lmsg::copying_masks, &lmsg::err_no_masks_in,
                          &lmsg::noun_masks_collected});
 
+    // Masks this pass made out of the photos' alpha, which is what tells the
+    // run there are masks in the dataset even though nothing asked for any.
+    bool derived_any_masks = false;
     for (const Tree& t : trees) {
+        // The output folder is often the input folder -- the point of the
+        // images/ + masks/ layout -- and then there is nothing to do. A
+        // re-encode there would be rewriting the capture.
+        std::error_code same_ec;
+        if (fs::exists(t.to, same_ec) &&
+            fs::equivalent(t.from, t.to, same_ec) && !same_ec) {
+            log(fmt(lmsg::photos_already_in_dataset, {t.to.string()}),
+                /*detail=*/false);
+            continue;
+        }
         log(fmt(*t.moving, {t.from.string(), t.to.string()}), /*detail=*/false);
-        const std::vector<fs::path> files = walk_images(t.from);
+        // A destination nested inside the source would otherwise be walked as
+        // input, so a resumed run would gather its own output.
+        const std::vector<fs::path> files =
+            walk_images(t.from, inside(t.to, t.from) ? t.to : fs::path());
         if (files.empty()) {
             error = fmt(*t.empty, {t.from.string()});
             return false;
         }
-        int linked = 0, copied = 0, kept = 0;
+        // Masks are never re-encoded: they are binary, and JPEG's ringing
+        // around every edge is exactly what a mask cannot survive.
+        const bool convert =
+            t.photos && job.photo_import == PhotoImport::ConvertJpeg;
+        const bool move = job.photo_import == PhotoImport::Move;
+        // An alpha channel becomes a mask -- but not over a masks/ the input
+        // brought, which is the answer its owner already gave and which this
+        // loop fills after the photos.
+        const fs::path derived_masks =
+            convert && !with_masks ? fs::path(masks) : fs::path();
+        const std::vector<PhotoMove> plan =
+            plan_photo_moves(files, t.from, t.to, derived_masks, convert);
+
+        GatherTally tally;
+        std::mutex notes_mu;
+        std::vector<std::string> notes;   // capped in step()
+        std::atomic<size_t> next{0};
+        std::atomic<bool> stop{false};
+        std::string failure;              // guarded by notes_mu
+
+        auto step = [&](const PhotoMove& m) {
+            std::error_code probe_ec;
+            if (fs::exists(m.to, probe_ec)) { tally.kept++; return true; }
+            std::error_code dir_ec;
+            fs::create_directories(m.to.parent_path(), dir_ec);
+            if (dir_ec && !fs::is_directory(m.to.parent_path(), dir_ec)) {
+                std::lock_guard<std::mutex> lk(notes_mu);
+                if (failure.empty())
+                    failure = fmt(lmsg::err_copy_failed,
+                                  {m.from.string(), t.to.string(),
+                                   dir_ec.message()});
+                return false;
+            }
+            if (m.convert) {
+                bool wrote_mask = false;
+                if (convert_to_jpeg(m.from, m.to, m.mask_to, wrote_mask)) {
+                    tally.converted++;
+                    if (wrote_mask) tally.masked++;
+                    return true;
+                }
+                // 16-bit, or a format stb cannot read. Its own name is free --
+                // plan_photo_moves reserved it.
+                std::lock_guard<std::mutex> lk(notes_mu);
+                if (notes.size() < 20)
+                    notes.push_back(fmt(lmsg::photo_kept_unconverted,
+                                        {m.from.string()}));
+            }
+            const fs::path& dst = m.convert ? m.fallback : m.to;
+            if (m.convert && fs::exists(dst, probe_ec)) { tally.kept++; return true; }
+            std::error_code op_ec;
+            if (move) {
+                fs::rename(m.from, dst, op_ec);
+                if (!op_ec) { tally.moved++; return true; }
+                // Another filesystem: copy, then drop the original only once
+                // the copy is on disk.
+                op_ec.clear();
+                fs::copy_file(m.from, dst, op_ec);
+                if (!op_ec) {
+                    std::error_code rm_ec;
+                    fs::remove(m.from, rm_ec);
+                    tally.moved++;
+                    return true;
+                }
+            } else {
+                fs::create_hard_link(m.from, dst, op_ec);
+                if (!op_ec) { tally.linked++; return true; }
+                op_ec.clear();
+                fs::copy_file(m.from, dst, op_ec);
+                if (!op_ec) { tally.copied++; return true; }
+            }
+            std::lock_guard<std::mutex> lk(notes_mu);
+            if (failure.empty())
+                failure = fmt(lmsg::err_copy_failed,
+                              {m.from.string(), t.to.string(), op_ec.message()});
+            return false;
+        };
+
+        // Copying and moving are the disk's work, so one thread; the re-encode
+        // is the CPU's, ~60 ms a photo. Capped at 8 because each worker holds a
+        // decoded frame (24 MB at 4K) that glibc faults in on every call.
+        const unsigned cores = std::thread::hardware_concurrency();
+        const int threads =
+            convert ? (int)std::clamp<unsigned>(cores ? cores : 1u, 1u, 8u) : 1;
+        std::atomic<int> live{0};
+        auto worker = [&] {
+            for (;;) {
+                const size_t i = next.fetch_add(1);
+                if (i >= plan.size() || stop.load() || _cancel.load()) break;
+                if (!step(plan[i])) { stop.store(true); break; }
+                tally.done.fetch_add(1);
+            }
+            live.fetch_sub(1);
+        };
         RateLimitedProgress progress(_prog, Stage::Frames, *t.counted,
                                      _frames_tally);
-        for (const fs::path& f : files) {
-            if (_cancel.load()) { error = lmsg::err_cancelled.get(); return false; }
-            fs::path rel = f.lexically_relative(t.from);
-            if (rel.empty() || *rel.begin() == "..") rel = f.filename();
-            const fs::path out_path = t.to / rel;
-            if (fs::exists(out_path, ec)) { kept++; continue; }
-            fs::create_directories(out_path.parent_path(), ec);
-            std::error_code link_ec;
-            fs::create_hard_link(f, out_path, link_ec);
-            if (!link_ec) {
-                linked++;
-            } else {
-                std::error_code copy_ec;
-                fs::copy_file(f, out_path, copy_ec);
-                if (copy_ec) {
-                    error = fmt(lmsg::err_copy_failed,
-                                {f.string(), t.to.string(), copy_ec.message()});
-                    return false;
-                }
-                copied++;
+        std::vector<std::thread> pool;
+        pool.reserve((size_t)threads);
+        for (int i = 0; i < threads; i++) {
+            live.fetch_add(1);
+            try {
+                pool.emplace_back(worker);
+            } catch (const std::system_error&) {
+                live.fetch_sub(1);
+                break;
             }
-            progress.update(linked + copied + kept);
         }
-        log(fmt(lmsg::linked_copied_kept,
-                 {(long long)linked, (long long)copied, (long long)kept}));
+        if (pool.empty()) {
+            // No thread could be started, so this one does the plan itself.
+            for (size_t i = 0; i < plan.size(); i++) {
+                if (_cancel.load()) break;
+                if (!step(plan[i])) { stop.store(true); break; }
+                tally.done.fetch_add(1);
+                progress.update(tally.done.load());
+            }
+        } else {
+            while (live.load() > 0) {
+                progress.update(tally.done.load());
+                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            }
+            for (std::thread& th : pool) th.join();
+        }
+        progress.update(tally.done.load());
+
+        if (!failure.empty()) { error = failure; return false; }
+        if (_cancel.load()) { error = lmsg::err_cancelled.get(); return false; }
+        for (const std::string& n : notes) log(n);
+        if (move)
+            log(fmt(lmsg::moved_kept,
+                    {(long long)tally.moved.load(), (long long)tally.kept.load()}));
+        else if (convert)
+            log(fmt(lmsg::converted_copied_kept,
+                    {(long long)tally.converted.load(),
+                     (long long)(tally.linked.load() + tally.copied.load()),
+                     (long long)tally.kept.load()}));
+        else
+            log(fmt(lmsg::linked_copied_kept,
+                    {(long long)tally.linked.load(),
+                     (long long)tally.copied.load(),
+                     (long long)tally.kept.load()}));
+        if (tally.masked.load() > 0) {
+            log(fmt(lmsg::masks_from_alpha,
+                    {(long long)tally.masked.load(), masks}),
+                /*detail=*/false);
+            derived_any_masks = true;
+        }
     }
-    if (with_masks) have_masks = true;
+    if (with_masks || derived_any_masks) have_masks = true;
     return true;
 }
 

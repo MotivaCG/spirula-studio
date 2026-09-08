@@ -1,37 +1,15 @@
 #pragma once
 
-// ColmapRunner -- turns raw images or a video into a trainable COLMAP
-// dataset by driving the external `colmap` (>= 4.x; the CLI flags follow
-// reference/scripts/run_colmap.bash) on a worker thread with live log
-// streaming and cancellation.
+// ColmapRunner -- raw images or a video -> a trainable COLMAP dataset, by
+// driving the external `colmap` (>= 4.x; the CLI flags follow
+// reference/scripts/run_colmap.bash) on a worker thread.
 //
-// It is the CUDA build's dataset path and the fallback everywhere else; the
-// Vulkan build defaults to SfmRunner, which needs nothing installed. The two
-// share their first half through DatasetPrep -- frames, sharpest-frame
-// selection, .insv track splitting and masking -- so only what is actually
-// COLMAP-specific lives here.
+// The CUDA build's dataset path and the fallback everywhere else; the Vulkan
+// build defaults to SfmRunner, which needs nothing installed. Both share their
+// first half through DatasetPrep, so only what is COLMAP-specific is here.
 //
-// Pipeline:
-//   DatasetPrep (frames + masks; see DatasetPrep.h)
-//   feature_extractor (SIFT or ALIKED; optional initial camera params) ->
-//           exhaustive / sequential (+ optional vocab-tree loop closure) /
-//           vocab-tree matcher (the tree is auto-found or downloaded;
-//           optional LightGlue matching) -> mapper -> best-effort
-//           model_merger when the scene splits into partial models ->
-//           [optional] bundle_adjuster refinement on the largest model
-//
-// Output layout (what the dataset parsers auto-detect):
-//   <workspace>/database.db
-//   <workspace>/sparse/0/{cameras,images,points3D}.bin
-//   <workspace>/images/            (video input: extracted frames)
-//   <workspace>/masks/             (when masking is enabled)
-//
-// For a folder-of-images input the images are NOT copied; COLMAP indexes
-// them where they are (recursively) and the GUI passes the absolute path as
-// image_dir for the immediate open (the parsers join dataset_dir /
-// image_dir, absolute wins). No marker file is written -- when re-opening
-// such a dataset later, set data.image_dir in the dataparser options (video
-// datasets need nothing: images/ is the default).
+// PhotoImport::InPlace records nothing in the workspace, so re-opening such a
+// dataset means setting data.image_dir in the dataparser options by hand.
 
 #include "app/gui/DatasetPrep.h"   // MaskClick
 #include "app/gui/FilmReel.h"
@@ -99,6 +77,7 @@ struct ColmapJob {
     bool redo_masks = false;
     bool redo_model = false;             // reconstruct again over existing
                                          // frames, masks and features
+    PhotoImport photo_import = PhotoImport::ConvertJpeg;  // see PrepJob
 
     // Cameras
     std::string camera_model = "OPENCV"; // ImageReader.camera_model

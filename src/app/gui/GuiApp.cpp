@@ -1996,6 +1996,7 @@ void GuiApp::sync_dataset_jobs() {
     prep.python_exe = _python_exe;
     prep.mask_enable = _mask_enable;
     prep.flip_found_masks = _use_found_masks && _flip_found_masks;
+    prep.photo_import = _photo_import;
     prep.mask_prompt = _mask.prompt;
     prep.mask_negative_prompt = _mask.negative_prompt;
     prep.mask_keep_subject = _mask.keep_subject;
@@ -2022,6 +2023,7 @@ void GuiApp::sync_dataset_jobs() {
     _colmap_job.sharp_window = prep.sharp_window;
     _colmap_job.max_frames = prep.max_frames;
     _colmap_job.force_external_decode = prep.force_external_decode;
+    _colmap_job.photo_import = prep.photo_import;
     _colmap_job.force_external_masking = prep.force_external_masking;
     _colmap_job.colmap_exe = _colmap_exe;
     _colmap_job.ffmpeg_exe = _ffmpeg_exe;
@@ -2089,6 +2091,37 @@ void GuiApp::start_dataset_job() {
 // ---------------------------------------------------------------------------
 // Source, destination, resume
 // ---------------------------------------------------------------------------
+
+namespace {
+
+// Built by hand rather than with ui::Combo for the same reason as the lens
+// pickers: what each row costs is the whole of the question, and one tooltip
+// on the closed combo cannot answer it row by row.
+void photo_import_combo(PhotoImport* mode, bool several_inputs) {
+    const std::vector<const Msg*> labels{
+        &dmsg::photo_import_convert, &dmsg::photo_import_copy,
+        &dmsg::photo_import_move, &dmsg::photo_import_inplace};
+    const std::vector<const Msg*> helps{
+        &dmsg::photo_import_convert_help, &dmsg::photo_import_copy_help,
+        &dmsg::photo_import_move_help, &dmsg::photo_import_inplace_help};
+    int idx = (int)*mode;
+    ImGui::SetNextItemWidth(px(260.0f));
+    if (ui::BeginCombo(dmsg::photo_import, labels[(size_t)idx]->get())) {
+        for (int i = 0; i < kNumPhotoImports; i++) {
+            const bool blocked =
+                several_inputs && (PhotoImport)i == PhotoImport::InPlace;
+            ImGui::BeginDisabled(blocked);
+            if (ui::Selectable(*labels[(size_t)i], i == idx))
+                *mode = (PhotoImport)i;
+            ImGui::EndDisabled();
+            ui::help_on_hover(*helps[(size_t)i]);
+        }
+        ImGui::EndCombo();
+    }
+    ui::help_on_hover(dmsg::photo_import_help);
+}
+
+}  // namespace
 
 void GuiApp::draw_dataset_source() {
     // One row per input. Several videos reconstruct as one scene -- each gets
@@ -2190,6 +2223,7 @@ void GuiApp::draw_dataset_source() {
             ui::help_on_hover(dmsg::flip_found_masks_help);
             ImGui::Unindent();
         }
+        photo_import_combo(&_photo_import, _sources.size() > 1);
     }
 
     ImGui::SetNextItemWidth(px(-220.0f));
@@ -2805,7 +2839,8 @@ void GuiApp::open_geometry_preview() {
                          : &_sources[(size_t)std::min((size_t)_mask_preview_input,
                                                       _sources.size() - 1)];
     _geometry_panel.open(in ? in->path : std::string(), in && in->is_video,
-                         _workspace, planned_image_dir(_sources, _workspace),
+                         _workspace,
+                         planned_image_dir(_sources, _workspace, _photo_import),
                          in ? in->camera_model : std::string("opencv"),
                          in ? in->focal_factor : 0.0f, _ffmpeg_exe,
                          _sfm_job.prep.force_external_decode);

@@ -618,6 +618,88 @@ SS_MSG(linked_copied_kept,
     RU("  связано: {0}, скопировано: {1}, уже было: {2}"),
     TR("  {0} bağlandı, {1} kopyalandı, {2} zaten vardı"));
 
+SS_MSG(converted_copied_kept,
+    EN("  {0} re-encoded, {1} copied, {2} already there"),
+    JA("  再エンコード {0} 件、コピー {1} 件、既存 {2} 件"),
+    ZH_HANS("  重新编码 {0} 个，复制 {1} 个，已有 {2} 个"),
+    ZH_HANT("  重新編碼 {0} 個，複製 {1} 個，已有 {2} 個"),
+    KO("  다시 인코딩 {0}개, 복사 {1}개, 이미 있던 것 {2}개"),
+    DE("  {0} neu kodiert, {1} kopiert, {2} schon vorhanden"),
+    FR("  {0} réencodées, {1} copiées, {2} déjà présentes"),
+    ES("  {0} recodificadas, {1} copiadas, {2} ya estaban"),
+    PT("  {0} recodificadas, {1} copiadas, {2} já estavam lá"),
+    IT("  {0} ricodificate, {1} copiate, {2} già presenti"),
+    NL("  {0} opnieuw gecodeerd, {1} gekopieerd, {2} stonden er al"),
+    RU("  перекодировано: {0}, скопировано: {1}, уже было: {2}"),
+    TR("  {0} yeniden kodlandı, {1} kopyalandı, {2} zaten vardı"));
+
+SS_MSG(moved_kept,
+    EN("  {0} moved, {1} already there"),
+    JA("  移動 {0} 件、既存 {1} 件"),
+    ZH_HANS("  移动 {0} 个，已有 {1} 个"),
+    ZH_HANT("  移動 {0} 個，已有 {1} 個"),
+    KO("  옮김 {0}개, 이미 있던 것 {1}개"),
+    DE("  {0} verschoben, {1} schon vorhanden"),
+    FR("  {0} déplacées, {1} déjà présentes"),
+    ES("  {0} movidas, {1} ya estaban"),
+    PT("  {0} movidas, {1} já estavam lá"),
+    IT("  {0} spostate, {1} già presenti"),
+    NL("  {0} verplaatst, {1} stonden er al"),
+    RU("  перемещено: {0}, уже было: {1}"),
+    TR("  {0} taşındı, {1} zaten vardı"));
+
+SS_MSG(masks_from_alpha,
+    EN("  {0} masks taken from the photos' alpha channel -> {1}"),
+    JA("  写真のアルファチャンネルから取ったマスク {0} 件 -> {1}"),
+    ZH_HANS("  从照片的 alpha 通道取得掩码 {0} 个 -> {1}"),
+    ZH_HANT("  從照片的 alpha 通道取得遮罩 {0} 個 -> {1}"),
+    KO("  사진의 알파 채널에서 얻은 마스크 {0}개 -> {1}"),
+    DE("  {0} Masken aus dem Alphakanal der Fotos -> {1}"),
+    FR("  {0} masques tirés du canal alpha des photos -> {1}"),
+    ES("  {0} máscaras tomadas del canal alfa de las fotos -> {1}"),
+    PT("  {0} máscaras tiradas do canal alfa das fotos -> {1}"),
+    IT("  {0} maschere ricavate dal canale alfa delle foto -> {1}"),
+    NL("  {0} maskers uit het alfakanaal van de foto's -> {1}"),
+    RU("  масок из альфа-канала фотографий: {0} -> {1}"),
+    TR("  fotoğrafların alfa kanalından alınan {0} maske -> {1}"));
+
+SS_MSG(photos_already_in_dataset,
+    EN("{0} is already the dataset's own folder; its files stay as they are."),
+    JA("{0} はすでにこのデータセット自身のフォルダーで、中のファイルはそのままです。"),
+    ZH_HANS("{0} 已经是这个数据集自己的文件夹，里面的文件保持原样。"),
+    ZH_HANT("{0} 已經是這個資料集自己的資料夾，裡面的檔案保持原樣。"),
+    KO("{0} 은(는) 이미 이 데이터셋 자신의 폴더이고, 안의 파일은 그대로 둡니다."),
+    DE("{0} ist bereits der eigene Ordner des Datensatzes; seine Dateien "
+       "bleiben, wie sie sind."),
+    FR("{0} est déjà le dossier propre au jeu de données : ses fichiers restent "
+       "tels quels."),
+    ES("{0} ya es la carpeta propia del conjunto de datos; sus archivos se "
+       "quedan como están."),
+    PT("{0} já é a pasta do próprio conjunto de dados; os seus ficheiros ficam "
+       "como estão."),
+    IT("{0} è già la cartella del set di dati; i suoi file restano come sono."),
+    NL("{0} is al de eigen map van de dataset; de bestanden erin blijven zoals "
+       "ze zijn."),
+    RU("{0} — уже собственная папка набора данных; файлы в ней остаются как "
+       "есть."),
+    TR("{0} zaten veri kümesinin kendi klasörü; içindeki dosyalar olduğu gibi "
+       "kalıyor."));
+
+SS_MSG(photo_kept_unconverted,
+    EN("{0} was copied unchanged rather than re-encoded."),
+    JA("{0} は再エンコードせず、そのままコピーしました。"),
+    ZH_HANS("{0} 未重新编码，原样复制。"),
+    ZH_HANT("{0} 未重新編碼，原樣複製。"),
+    KO("{0} 은(는) 다시 인코딩하지 않고 그대로 복사했습니다."),
+    DE("{0} wurde unverändert kopiert statt neu kodiert."),
+    FR("{0} a été copiée telle quelle plutôt que réencodée."),
+    ES("{0} se copió sin cambios en vez de recodificarse."),
+    PT("{0} foi copiada sem mudanças em vez de recodificada."),
+    IT("{0} è stata copiata invariata invece che ricodificata."),
+    NL("{0} is onveranderd gekopieerd in plaats van opnieuw gecodeerd."),
+    RU("{0} скопирован без изменений, а не перекодирован."),
+    TR("{0} yeniden kodlanmak yerine olduğu gibi kopyalandı."));
+
 SS_MSG(err_inputs_without_prompt,
     EN("Nothing to mask by for {0}. A clicked object prompts only the input it "
        "was drawn on, so either click the object on every input, or add a text "

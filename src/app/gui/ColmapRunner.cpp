@@ -419,6 +419,7 @@ void ColmapRunner::run(ColmapJob job) {
             pj.resume = job.resume;
             pj.redo_frames = job.redo_frames;
             pj.redo_masks = job.redo_masks;
+            pj.photo_import = job.photo_import;
             pj.video_fps = job.video_fps;
             pj.sharp_window = job.sharp_window;
             pj.max_frames = job.max_frames;
@@ -871,10 +872,9 @@ void ColmapRunner::run(ColmapJob job) {
         // in-memory for the immediate open; on later re-opens the parser
         // default applies (video datasets use images/ anyway) and photo-in-
         // place datasets need data.image_dir set in the dataparser options.
-        if (reads_photos_in_place(job.inputs))
-            log("Note: images are referenced in place; when re-opening this "
-                "dataset later, set image_dir to " + image_dir_cfg +
-                " under the dataset-parsing options");
+        if (reads_photos_in_place(job.inputs, job.photo_import))
+            log(spirula::i18n::format(lmsg::photos_referenced_in_place,
+                                      {image_dir_cfg}));
 
         set_stage(Stage::Finishing, lmsg::stage_done.get());
         _prog.finish(StageStatus::Done);

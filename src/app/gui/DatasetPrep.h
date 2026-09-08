@@ -108,6 +108,21 @@ struct PrepInput {
     app::FrameStencil stencil;
 };
 
+// What a folder of photos does on its way into the dataset. Only `InPlace`
+// leaves it pointing at a folder outside itself, and such a dataset opens
+// again only if `image_dir` is set by hand -- which is why it is not default.
+enum class PhotoImport {
+    ConvertJpeg,   // into images/, re-encoded as JPEG where that loses nothing
+    Copy,          // into images/, unchanged
+    Move,          // into images/, leaving nothing behind
+    InPlace,       // read where they are; only a lone folder can
+};
+inline constexpr int kNumPhotoImports = 4;
+
+// Quality of the re-encode. High enough that the artefacts are below what the
+// photometric loss can tell from sensor noise.
+inline constexpr int kPhotoJpegQuality = 95;
+
 struct PrepJob {
     std::vector<PrepInput> inputs;   // in the order the user added them
     std::string workspace;           // output dataset dir (created)
@@ -122,6 +137,9 @@ struct PrepJob {
     // keep. Applied where those files are read, so everything this run writes
     // is in the one convention every reader uses (sfm/core/Mask.h).
     bool flip_found_masks = false;
+    // How a photo input reaches images/. Videos ignore it -- their frames are
+    // written into the dataset whatever this says.
+    PhotoImport photo_import = PhotoImport::ConvertJpeg;
 
     // ---- video extraction ----
     float video_fps = 2.0f;          // kept frames per second
@@ -169,16 +187,19 @@ struct PrepJob {
     std::string python_exe = "python3";
 };
 
-// The one case where images are read where they are instead of being gathered
-// into the dataset's own images/ (see DatasetPrep::run): one folder of photos.
-inline bool reads_photos_in_place(const std::vector<PrepInput>& inputs) {
-    return inputs.size() == 1 && !inputs[0].is_video;
+// Images read where they are instead of gathered into the dataset's own
+// images/ (see DatasetPrep::run). Several inputs reconstruct from ONE image
+// tree, so there is nowhere for a second one to be read in place from.
+inline bool reads_photos_in_place(const std::vector<PrepInput>& inputs,
+                                  PhotoImport mode) {
+    return mode == PhotoImport::InPlace && inputs.size() == 1 &&
+           !inputs[0].is_video;
 }
 
 // Where a job's images will be, before it has run: what PrepResult::image_dir
 // comes out as, for the panels that must read a dataset a previous run wrote.
 std::string planned_image_dir(const std::vector<PrepInput>& inputs,
-                              const std::string& workspace);
+                              const std::string& workspace, PhotoImport mode);
 
 struct PrepResult {
     std::string image_dir;           // absolute; what SfM should index
@@ -400,8 +421,8 @@ private:
     bool extract_video_ffmpeg(const PrepJob& job, const PrepInput& in,
                               const std::string& images, PrepResult& out,
                               std::string& error);
-    // Photos into the dataset's own images/<subdir>, when they cannot simply be
-    // read where they are (see run()) -- and the masks they came with into the
+    // Photos into the dataset's own images/<subdir>, by whichever of
+    // PhotoImport the job asked for -- and the masks they came with into the
     // matching masks/<subdir>, so the two trees still mirror each other.
     bool gather_photos(const PrepJob& job, const PrepInput& in,
                        const std::string& images, const std::string& masks,
