@@ -57,6 +57,32 @@ struct Reader {
 
 }  // namespace
 
+bool read_status(const std::string& dir, int64_t& mtime, RunStatus& out) {
+    if (dir.empty()) return false;
+    const std::string b = slurp_if_newer(fs::path(dir) / "status.bin", mtime);
+    if (b.size() < 72 || std::memcmp(b.data(), "VKPS", 4) != 0) return false;
+    Reader r{b.data() + 4, b.data() + b.size()};
+    if (r.u32() != 1) return false;
+    RunStatus st;
+    st.stage = r.u32();
+    const uint32_t flags = r.u32();
+    st.finished = (flags & 1u) != 0;
+    st.partial = (flags & 2u) != 0;
+    st.metric = (flags & 4u) != 0;
+    st.done = (int64_t)r.u64();
+    st.total = (int64_t)r.u64();
+    st.registered = (int64_t)r.u64();
+    st.images = (int64_t)r.u64();
+    st.points = (int64_t)r.u64();
+    st.models = (int64_t)r.u64();
+    double mean = 0;
+    r.take(&mean, 8);
+    st.mean_reproj = mean;
+    if (!r.ok) return false;
+    out = st;
+    return true;
+}
+
 bool read_live_model(const std::string& dir, int64_t& mtime, LiveModel& out) {
     const std::string b = slurp_if_newer(fs::path(dir) / "model.bin", mtime);
     if (b.size() < 24 || std::memcmp(b.data(), "VKPM", 4) != 0) return false;

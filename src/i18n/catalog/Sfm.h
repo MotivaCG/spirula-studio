@@ -2660,6 +2660,21 @@ SS_MSG(result_not_metric,
     TR("SONUÇ: METRİK DEĞİL -- model sağlam ama metrik çerçeve oturtulamadı; üstteki "
        "satıra bakın"));
 
+SS_MSG(run_cancelled,
+    EN("Cancelled; the workspace holds whatever the run had finished"),
+    JA("中止しました。ワークスペースには完了済みの成果だけが残っています"),
+    ZH_HANS("已取消; 工作区中保留着已完成的部分"),
+    ZH_HANT("已取消; 工作區中保留著已完成的部分"),
+    KO("취소했습니다. 작업 공간에는 완료된 부분만 남아 있습니다"),
+    DE("Abgebrochen; im Arbeitsverzeichnis liegt, was der Lauf fertig hatte"),
+    FR("Annulé ; l'espace de travail contient ce que l'exécution avait terminé"),
+    ES("Cancelado; el espacio de trabajo conserva lo que la ejecución había terminado"),
+    PT("Cancelado; o espaço de trabalho mantém o que a execução tinha terminado"),
+    IT("Annullato; nello spazio di lavoro resta ciò che l'esecuzione aveva completato"),
+    NL("Afgebroken; de werkmap bevat wat de run af had"),
+    RU("Отменено; в рабочем каталоге осталось то, что успел закончить запуск"),
+    TR("İptal edildi; çalışma klasöründe çalışmanın bitirdiği kadarı duruyor"));
+
 }  // namespace sfm
 }  // namespace msg
 }  // namespace i18n

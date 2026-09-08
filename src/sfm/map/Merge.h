@@ -47,6 +47,7 @@
 #include "sfm/geometry/LinAlg.h"
 #include "sfm/geometry/Triangulation.h"
 #include "sfm/optim/Ransac.h"
+#include "sfm/core/Log.h"
 
 namespace sfm {
 
@@ -1141,16 +1142,16 @@ private:
         alive_[src] = 0;
         a.merged = true;
         if (opt_.verbose)
-            fprintf(stderr,
-                    "[merge] model %zu <- model %zu: %zu %s (%zu inliers, %.2f px), "
-                    "+%zu images, %u -> %u, +%zu points, %zu spliced (%zu disagreed)\n",
-                    dst, src,
-                    a.alignment.from_structure ? a.alignment.structure_pairs
-                                               : a.alignment.common_images,
-                    a.alignment.from_structure ? "shared points" : "shared images",
-                    a.alignment.inliers, a.alignment.mean_error, c.images_added, anchor_imgs,
-                    models_[dst].numRegistered(), c.points_added, c.points_spliced,
-                    c.splice_conflicts);
+            slog::diag(slog::Tag::Merge,
+                       "[merge] model %zu <- model %zu: %zu %s (%zu inliers, %.2f px), "
+                       "+%zu images, %u -> %u, +%zu points, %zu spliced (%zu disagreed)",
+                       dst, src,
+                       a.alignment.from_structure ? a.alignment.structure_pairs
+                       : a.alignment.common_images,
+                       a.alignment.from_structure ? "shared points" : "shared images",
+                       a.alignment.inliers, a.alignment.mean_error, c.images_added, anchor_imgs,
+                       models_[dst].numRegistered(), c.points_added, c.points_spliced,
+                       c.splice_conflicts);
         log_.push_back(a);
         return log_.back();
     }
@@ -1180,8 +1181,9 @@ public:
                 }
                 failed_.insert({c.dst, c.src});
                 if (opt_.verbose)
-                    fprintf(stderr, "[merge] model %zu <- model %zu refused: %s\n", c.dst, c.src,
-                            a.reason.c_str());
+                    slog::diag(slog::Tag::Merge, "[merge] model %zu <- model %zu refused: %s",
+                               c.dst, c.src,
+                               a.reason.c_str());
             }
             if (!progressed) break;
         }

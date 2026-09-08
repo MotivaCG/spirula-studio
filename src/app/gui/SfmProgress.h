@@ -3,7 +3,7 @@
 // The reader for what a running reconstruction writes about itself.
 //
 // The other half of sfm/core/Progress.h: the GUI passes `--progress-dir` to its
-// own child and polls the two files that appear there. Both are written whole
+// own child and polls the three files that appear there. Each is written whole
 // and renamed, so a read either gets the previous snapshot or this one.
 //
 // Polling rather than watching on purpose -- two files at 2 Hz is a pair of
@@ -50,7 +50,27 @@ struct PairMatrix {
     }
 };
 
-// `dir` is the --progress-dir the child was given. Both return false when the
+// Where the run is and how it ended (sfm/core/Progress.h, status.bin). What
+// the dataset screen used to recover by parsing the child's translated stdout
+// and its exit code, which could report only one of "partial" and "not metric".
+struct RunStatus {
+    // sfm::Stage: 0 extract, 1 match, 2 map, 3 merge, 4 orient, 5 finish.
+    uint32_t stage = 0;
+    bool finished = false;
+    bool partial = false;
+    bool metric = true;
+    int64_t done = 0, total = 0;
+    int64_t registered = 0, images = 0, points = 0, models = 0;
+    double mean_reproj = 0.0;
+    // -1 when the stage cannot say, which is every stage before it starts.
+    float fraction() const {
+        return total > 0 ? (float)((double)done / (double)total) : -1.0f;
+    }
+};
+
+bool read_status(const std::string& dir, int64_t& mtime, RunStatus& out);
+
+// `dir` is the --progress-dir the child was given. All return false when the
 // file is absent, unfinished or not newer than `mtime` -- which the caller
 // keeps, so a poll that finds nothing new costs one stat.
 bool read_live_model(const std::string& dir, int64_t& mtime, LiveModel& out);

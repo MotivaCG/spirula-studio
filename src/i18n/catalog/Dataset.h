@@ -7180,6 +7180,88 @@ SS_MSG(section_fallbacks,
     ES("Alternativas"),  PT("Alternativas"), IT("Ripieghi"),
     NL("Terugvalopties"), RU("Запасные пути"), TR("Yedek yollar"));
 
+SS_MSG(sfm_subprocess,
+    EN("Reconstruct in a separate process"),
+    JA("再構成を別プロセスで行う"),
+    ZH_HANS("在单独的进程中重建"),
+    ZH_HANT("在另一個行程中重建"),
+    KO("재구성을 별도 프로세스에서"),
+    DE("Rekonstruktion in einem eigenen Prozess"),
+    FR("Reconstruire dans un processus séparé"),
+    ES("Reconstruir en un proceso aparte"),
+    PT("Reconstruir num processo separado"),
+    IT("Ricostruire in un processo separato"),
+    NL("Reconstructie in een apart proces"),
+    RU("Реконструкция в отдельном процессе"),
+    TR("Yeniden yapılandırmayı ayrı bir süreçte yap"));
+
+SS_MSG(sfm_subprocess_help,
+    EN("Run the reconstruction as a child of this program instead of inside "
+       "it. Slower to report what it is doing -- the picture of a pair's "
+       "matches comes from files rather than from memory -- but a graphics "
+       "driver that gives up under a long solve then takes down only the "
+       "child, and a large capture's memory is handed back the moment it "
+       "ends. Try it if a big reconstruction ends the whole program."),
+    JA("再構成をこのプログラムの中ではなく子プロセスとして実行します。"
+       "状況の伝わり方は遅くなります (画像ペアの対応はメモリではなくファイル経由)。"
+       "そのかわり、長い計算でグラフィックドライバが落ちても子プロセスだけで済み、"
+       "大きな撮影で使ったメモリも終了と同時に返ります。"
+       "大きな再構成でプログラム全体が落ちるときに試してください。"),
+    ZH_HANS("把重建作为本程序的子进程运行，而不是在程序内部。状态反馈会慢一些"
+            "(图像配对的匹配来自文件而不是内存)，但长时间求解时显卡驱动崩溃只会带走"
+            "子进程，大型拍摄占用的内存也会在结束时立刻归还。"
+            "如果大的重建会让整个程序退出，可以试试这个。"),
+    ZH_HANT("把重建當成本程式的子行程執行，而不是在程式內部。狀態回報會慢一些"
+            "(影像配對的對應來自檔案而不是記憶體)，但長時間求解時顯示卡驅動崩潰只會"
+            "帶走子行程，大型拍攝佔用的記憶體也會在結束時立刻歸還。"
+            "如果大的重建會讓整個程式結束，可以試試這個。"),
+    KO("재구성을 이 프로그램 안이 아니라 자식 프로세스로 실행합니다. 진행 상황이 "
+       "전해지는 속도는 느려집니다 (이미지 짝의 대응이 메모리가 아니라 파일에서 "
+       "옵니다). 대신 긴 계산 도중 그래픽 드라이버가 죽어도 자식 프로세스만 "
+       "사라지고, 큰 촬영이 쓴 메모리도 끝나는 즉시 돌아옵니다."),
+    DE("Die Rekonstruktion als Kindprozess dieses Programms laufen lassen statt "
+       "darin. Der Fortschritt kommt langsamer an -- das Bild der Zuordnungen "
+       "eines Paars stammt aus Dateien statt aus dem Speicher -- dafür reißt "
+       "ein Grafiktreiber, der bei einer langen Lösung aufgibt, nur das Kind "
+       "mit, und der Speicher einer großen Aufnahme kommt sofort zurück."),
+    FR("Exécuter la reconstruction comme un processus enfant de ce programme "
+       "plutôt qu'à l'intérieur. L'avancement arrive plus lentement -- l'image "
+       "des correspondances d'une paire vient de fichiers et non de la mémoire "
+       "-- mais un pilote graphique qui abandonne sur un long calcul n'emporte "
+       "que l'enfant, et la mémoire d'une grosse prise est rendue aussitôt."),
+    ES("Ejecutar la reconstrucción como proceso hijo de este programa en lugar "
+       "de dentro de él. El avance llega más despacio -- la imagen de las "
+       "correspondencias de un par viene de ficheros y no de la memoria -- "
+       "pero un controlador gráfico que se rinde en un cálculo largo se lleva "
+       "sólo al hijo, y la memoria de una captura grande vuelve enseguida."),
+    PT("Executar a reconstrução como processo filho deste programa em vez de "
+       "dentro dele. O progresso chega mais devagar -- a imagem das "
+       "correspondências de um par vem de ficheiros e não da memória -- mas um "
+       "controlador gráfico que desiste num cálculo longo leva apenas o filho, "
+       "e a memória de uma captura grande é devolvida logo."),
+    IT("Eseguire la ricostruzione come processo figlio di questo programma "
+       "invece che al suo interno. L'avanzamento arriva più lentamente -- "
+       "l'immagine delle corrispondenze di una coppia viene da file e non "
+       "dalla memoria -- ma un driver grafico che si arrende su un calcolo "
+       "lungo porta via solo il figlio, e la memoria di una ripresa grande "
+       "torna subito."),
+    NL("De reconstructie als kindproces van dit programma draaien in plaats van "
+       "erin. De voortgang komt trager binnen -- het beeld van de "
+       "overeenkomsten van een paar komt uit bestanden en niet uit het "
+       "geheugen -- maar een grafische driver die het opgeeft bij een lange "
+       "berekening neemt alleen het kind mee, en het geheugen van een grote "
+       "opname komt meteen terug."),
+    RU("Выполнять реконструкцию дочерним процессом, а не внутри программы. "
+       "О ходе работы становится известно медленнее -- соответствия пары "
+       "берутся из файлов, а не из памяти, -- зато видеодрайвер, сдавшийся на "
+       "долгом решении, уносит только дочерний процесс, а память большой "
+       "съёмки возвращается сразу же."),
+    TR("Yeniden yapılandırmayı bu programın içinde değil, bir alt süreç olarak "
+       "çalıştırır. Durum daha yavaş bildirilir -- bir çiftin eşleşme resmi "
+       "bellekten değil dosyalardan gelir -- ama uzun bir çözümde pes eden bir "
+       "ekran kartı sürücüsü yalnızca alt süreci götürür ve büyük bir çekimin "
+       "belleği biter bitmez geri verilir."));
+
 SS_MSG(sfm_ba_cpu,
     EN("Bundle adjustment on the CPU"),
     JA("バンドル調整を CPU で行う"),

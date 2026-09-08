@@ -44,6 +44,7 @@
 #include "sfm/core/Model.h"
 #include "sfm/map/Mapper.h"
 #include "sfm/vk/VkContext.h"
+#include "sfm/core/Log.h"
 
 namespace sfm {
 
@@ -268,9 +269,9 @@ inline std::vector<Reconstruction> reconstructAtoms(
                 if (opt.verbose) {
                     const size_t n = ++done;
                     std::lock_guard<std::mutex> lk(log_mu);
-                    fprintf(stderr,
-                            "[bup] atom %zu/%zu: %zu images -> %zu model(s), %u registered\n",
-                            n, atoms.size(), atoms[i].size(), per_atom[i].size(), reg);
+                    slog::diag(slog::Tag::Map,
+                               "[bup] atom %zu/%zu: %zu images -> %zu model(s), %u registered",
+                               n, atoms.size(), atoms[i].size(), per_atom[i].size(), reg);
                 }
             }
         } catch (...) {

@@ -12,6 +12,8 @@
 // registers an image every few milliseconds on a small capture and every few
 // seconds on a large one, and a screen wants the same cadence from both.
 
+#include "sfm/core/Events.h"
+
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -62,6 +64,33 @@ void begin_matching(uint32_t n_images,
 // One verified pair, `inliers` of 0 meaning it did not survive verification.
 // Safe to call from the verification workers.
 void pair(uint32_t image1, uint32_t image2, uint32_t inliers);
+
+// status.bin: "VKPS", u32 version=1, u32 stage, u32 flags (1 finished,
+// 2 partial, 4 metric), i64 done, total, registered, images, points, models,
+// f64 mean_reproj.
+//
+// Where the run is and how it ended, so a front end watching a child reads the
+// same facts an in-process one gets from the event stream instead of parsing
+// the log. Rate-limited like the rest; a stage change or a result forces it.
+void status(const Event& e);
+
+// thumbs/<rel_stem>.jpg: the working copy the extractor has already decoded and
+// downscaled, at kThumbLong on its long side.
+//
+// Without it a screen showing the frames as they are extracted has to decode
+// the source file a second time -- a 24 MP JPEG per frame, on its own thread,
+// which is what made the reel lag the stage it was drawing.
+void thumbnail(const std::string& rel_stem, const uint8_t* rgb, int w, int h);
+inline constexpr int kThumbLong = 640;
+
+// live_matches.bin: a matches.bin whose pair count is `kStreamingPairs`,
+// appended as verification produces each pair, so hovering the match map draws
+// a verified pair instead of nothing until the stage ends.
+void live_matches_begin(const std::vector<std::string>& names,
+                        const std::vector<uint32_t>& num_features);
+void live_pair(uint32_t a, uint32_t b, int32_t config,
+               const uint32_t* idx1, const uint32_t* idx2, size_t stride,
+               uint32_t count);
 
 // Write whatever is buffered, whatever the clock says. Call at the end of a
 // stage so the last state on screen is the final one.

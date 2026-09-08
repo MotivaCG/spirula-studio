@@ -22,6 +22,8 @@
 #include "sfm/ba/Problem.h"
 #include "core/Env.h"
 #include "sfm/core/HostMemory.h"
+#include "sfm/core/Cancel.h"
+#include "sfm/core/Log.h"
 
 namespace bacpu {
 
@@ -50,8 +52,10 @@ public:
         stats_.vram_mb = allocatedMB();
         stats_.solver = useCG_ ? (haveFallback_ ? "cg+fallback" : "cg") : "dense";
         if (opt_.verbose)
-            fprintf(stderr, "[cpu] n_dim = %u, solver = %s, threads = %d, RAM = %.1f MB\n", n_,
-                    stats_.solver, nthreads_, stats_.vram_mb);
+            sfm::slog::diag(sfm::slog::Tag::Map,
+                            "[cpu] n_dim = %u, solver = %s, threads = %d, RAM = %.1f MB",
+                       n_,
+                       stats_.solver, nthreads_, stats_.vram_mb);
     }
 
     double computeCost() {
@@ -91,9 +95,12 @@ public:
         double reject_mult = 2.0;
         int consec_fallbacks = 0;
         for (int it = 0; it < opt_.max_iters; it++) {
+            sfm::cancel::check();
             if (opt_.verbose)
-                fprintf(stderr, "iter %3d: cost = %.9e, damping = %.3g%s\n", it, cost, damping,
-                        reuse ? " (reuse)" : "");
+                sfm::slog::diag(sfm::slog::Tag::Map, "iter %3d: cost = %.9e, damping = %.3g%s", it,
+                                cost,
+                           damping,
+                           reuse ? " (reuse)" : "");
             const bool cg = useCG_;
             double newCost = iterate(damping, reuse, cg);
             stats_.iterations = it + 1;
@@ -114,8 +121,9 @@ public:
                     if (stepOk) consec_fallbacks = 0;
                     if (haveFallback_ && !stepOk) {
                         if (opt_.verbose)
-                            fprintf(stderr, "iter %3d: CG hit %u-iteration cap, dense fallback\n",
-                                    it, usedCap);
+                            sfm::slog::diag(sfm::slog::Tag::Map,
+                                       "iter %3d: CG hit %u-iteration cap, dense fallback",
+                                       it, usedCap);
                         restore();
                         newCost = iterate(damping, true, false);
                         stats_.cg_fallbacks++;
@@ -123,7 +131,8 @@ public:
                             useCG_ = false;
                             stats_.solver = "cg->dense";
                             if (opt_.verbose)
-                                fprintf(stderr, "[cpu] repeated CG stalls, switching to dense\n");
+                                sfm::slog::diag(sfm::slog::Tag::Map,
+                                           "[cpu] repeated CG stalls, switching to dense");
                         }
                     }
                 }
@@ -155,10 +164,10 @@ public:
         stats_.solve_seconds =
             std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
         if (spirula::env("SFM_MAP_PROF"))
-            fprintf(stderr,
-                    "[prof]   cpu ba: jac %.3f prep %.3f schur %.3f linear %.3f "
-                    "back %.3f cost %.3f s\n",
-                    prof_.jac, prof_.prep, prof_.schur, prof_.lin, prof_.back, prof_.cost);
+            sfm::slog::diag(sfm::slog::Tag::Map,
+                            "[prof]   cpu ba: jac %.3f prep %.3f schur %.3f linear %.3f "
+                       "back %.3f cost %.3f s",
+                       prof_.jac, prof_.prep, prof_.schur, prof_.lin, prof_.back, prof_.cost);
     }
 
     const SolverStats& stats() const { return stats_; }
@@ -190,8 +199,9 @@ public:
             xmax = std::max(xmax, std::fabs(g_[i]));
         }
         const double rel = dmax / std::max(xmax, 1e-300);
-        printf("cmp-step lambda=%g: cg %s in %u iters, |dx_cg - dx_dense|_inf/|dx|_inf = %.3e\n",
-               damping, cgConverged_ ? "converged" : "hit cap", cgIters_, rel);
+        sfm::slog::diag(sfm::slog::Tag::Map,
+                   "cmp-step lambda=%g: cg %s in %u iters, |dx_cg - dx_dense|_inf/|dx|_inf = %.3e",
+                   damping, cgConverged_ ? "converged" : "hit cap", cgIters_, rel);
         return rel;
     }
 
@@ -279,7 +289,8 @@ private:
             case SolverSel::Dense: useCG_ = false; break;
             case SolverSel::CG:
                 useCG_ = cgOk;
-                if (!cgOk) fprintf(stderr, "[cpu] warning: no observations, falling back to dense\n");
+                if (!cgOk) sfm::slog::diag(sfm::slog::Tag::Map,
+                                      "[cpu] warning: no observations, falling back to dense");
                 break;
             case SolverSel::Auto:
                 useCG_ = cgOk && (n_ > kDenseMaxDim || denseMB > budget);
@@ -291,14 +302,15 @@ private:
                             (opt_.cg_fallback == CgFallback::Auto && bothMB <= 0.5 * budget);
 
         if (opt_.verbose)
-            fprintf(stderr, "[cpu] RAM estimates: dense %.0f MB, cg %.0f MB (budget %.0f MB)\n",
-                    denseMB, cgMB, budget);
+            sfm::slog::diag(sfm::slog::Tag::Map,
+                       "[cpu] RAM estimates: dense %.0f MB, cg %.0f MB (budget %.0f MB)",
+                       denseMB, cgMB, budget);
         const double needMB = (useCG_ ? cgMB : denseMB) + (haveFallback_ ? denseMB : 0);
         if (needMB > budget) {
             if (opt_.over_budget_throws) throw BAOverBudget(needMB, budget);
-            fprintf(stderr,
-                    "[cpu] warning: the %s solver needs ~%.0f MB and the budget is %.0f MB\n",
-                    useCG_ ? "cg" : "dense", needMB, budget);
+            sfm::slog::diag(sfm::slog::Tag::Map,
+                       "[cpu] warning: the %s solver needs ~%.0f MB and the budget is %.0f MB",
+                       useCG_ ? "cg" : "dense", needMB, budget);
         }
 
         P_.use_pair_schur = false;  // the pair tables are a GPU-only accelerator

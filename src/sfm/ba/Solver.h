@@ -35,6 +35,8 @@
 #include "sfm/vk/EmbeddedSpirv.h"
 #include "sfm/vk/VkContext.h"
 #include "core/Env.h"
+#include "sfm/core/Cancel.h"
+#include "sfm/core/Log.h"
 
 // Can this device run the kernels compiled for `c`?
 //   double - fp64 arithmetic, and an fp64 atomic add for the reductions
@@ -130,10 +132,10 @@ public:
                     first = said.emplace((int)opt_.real, (int)real).second;
                 }
                 if (first)
-                    fprintf(stderr,
-                            "[ba] device does not support '%s' arithmetic; "
-                            "falling back to '%s'\n",
-                            realCfgName(opt_.real), realCfgName(real));
+                    sfm::slog::diag(sfm::slog::Tag::Map,
+                                    "[ba] device does not support '%s' arithmetic; "
+                               "falling back to '%s'",
+                               realCfgName(opt_.real), realCfgName(real));
                 opt_.real = real;
             }
         }
@@ -349,13 +351,15 @@ public:
 
         double t_upload = prof_lap();
         if (spirula::env("SFM_MAP_PROF"))
-            fprintf(stderr, "[prof]   solver init: ctx %.3f buf %.3f pipe %.3f upload %.3f s\n",
-                    t_ctx, t_buf, t_pipe, t_upload);
+            sfm::slog::diag(sfm::slog::Tag::Map,
+                       "[prof]   solver init: ctx %.3f buf %.3f pipe %.3f upload %.3f s",
+                       t_ctx, t_buf, t_pipe, t_upload);
         stats_.vram_mb = ctx_.totalAllocatedMB();
         stats_.solver = useCG_ ? (haveFallback_ ? "cg+fallback" : "cg") : "dense";
         if (opt_.verbose)
-            fprintf(stderr, "[vk] n_dim = %u, solver = %s, VRAM allocated = %.1f MB\n",
-                    P_.n_dim, stats_.solver, stats_.vram_mb);
+            sfm::slog::diag(sfm::slog::Tag::Map,
+                            "[vk] n_dim = %u, solver = %s, VRAM allocated = %.1f MB",
+                       P_.n_dim, stats_.solver, stats_.vram_mb);
     }
 
     // The host solver works on the problem's own parameter vectors, so upload
@@ -407,9 +411,12 @@ public:
         double reject_mult = 2.0;
         int consec_fallbacks = 0;
         for (int it = 0; it < opt_.max_iters; it++) {
+            sfm::cancel::check();
             if (opt_.verbose)
-                fprintf(stderr, "iter %3d: cost = %.9e, damping = %.3g%s\n", it, cost, damping,
-                        reuse ? " (reuse)" : "");
+                sfm::slog::diag(sfm::slog::Tag::Map, "iter %3d: cost = %.9e, damping = %.3g%s", it,
+                                cost,
+                           damping,
+                           reuse ? " (reuse)" : "");
 
             LinSolve path = useCG_ ? LinSolve::CG : densePath_;
             VkCommandBuffer cb = ctx_.begin();
@@ -442,8 +449,9 @@ public:
                         // discard the step and redo this iteration with the
                         // dense solver, reusing the assembly (reject flow)
                         if (opt_.verbose)
-                            fprintf(stderr, "iter %3d: CG hit %u-iteration cap, dense fallback\n",
-                                    it, usedCap);
+                            sfm::slog::diag(sfm::slog::Tag::Map,
+                                       "iter %3d: CG hit %u-iteration cap, dense fallback",
+                                       it, usedCap);
                         restore_pending_ = true;
                         cb = ctx_.begin();
                         recordIteration(cb, (float)damping, true, densePath_);
@@ -454,7 +462,8 @@ public:
                             useCG_ = false;  // CG is not paying off; stay dense
                             stats_.solver = "cg->dense";
                             if (opt_.verbose)
-                                fprintf(stderr, "[vk] repeated CG stalls, switching to dense\n");
+                                sfm::slog::diag(sfm::slog::Tag::Map,
+                                           "[vk] repeated CG stalls, switching to dense");
                         }
                     }
                 }
@@ -556,8 +565,10 @@ public:
             xmax = std::max(xmax, std::fabs(xd[i]));
         }
         double rel = dmax / std::max(xmax, 1e-300);
-        printf("cmp-step lambda=%g: cg %s in %.0f iters, |dx_cg - dx_dense|_inf/|dx|_inf = %.3e\n",
-               damping, conv ? "converged" : "hit cap", cg_iters, rel);
+        sfm::slog::diag(sfm::slog::Tag::Map,
+                        "cmp-step lambda=%g: cg %s in %.0f iters, "
+                        "|dx_cg - dx_dense|_inf/|dx|_inf = %.3e",
+                        damping, conv ? "converged" : "hit cap", cg_iters, rel);
         return rel;
     }
 
@@ -633,7 +644,8 @@ private:
             case SolverSel::CG:
                 useCG_ = cgOk;
                 if (!cgOk) {
-                    fprintf(stderr, "[vk] warning: no observations, falling back to dense\n");
+                    sfm::slog::diag(sfm::slog::Tag::Map,
+                               "[vk] warning: no observations, falling back to dense");
                     if (!denseOk) throw std::runtime_error("no usable solver path");
                 }
                 break;
@@ -650,24 +662,24 @@ private:
                         (opt_.cg_fallback == CgFallback::Auto && bothMB <= 0.5 * budget);
             haveFallback_ = want && pairOk && denseOk;
             if (opt_.cg_fallback == CgFallback::On && !haveFallback_)
-                fprintf(stderr, "[vk] warning: dense fallback unavailable "
-                                "(pair-Schur or packed-index limits)\n");
+                sfm::slog::diag(sfm::slog::Tag::Map, "[vk] warning: dense fallback unavailable "
+                           "(pair-Schur or packed-index limits)");
         }
 
         if (opt_.verbose)
-            fprintf(stderr,
-                    "[vk] VRAM estimates: dense %.0f MB (%s Schur), cg %.0f MB (budget %.0f MB)\n",
-                    denseMB, pairOk ? "pair" : "per-obs", cgMB, budget);
+            sfm::slog::diag(sfm::slog::Tag::Map,
+                       "[vk] VRAM estimates: dense %.0f MB (%s Schur), cg %.0f MB (budget %.0f MB)",
+                       denseMB, pairOk ? "pair" : "per-obs", cgMB, budget);
         // Say so before the driver does. There is nothing below CG to fall back
         // to -- its footprint is the problem data plus a few vectors -- so this
         // is the point at which the answer is a smaller problem or more memory.
         const double needMB = (useCG_ ? cgMB : denseMB) + (haveFallback_ ? denseMB : 0);
         if (needMB > budget) {
             if (opt_.over_budget_throws) throw BAOverBudget(needMB, budget);
-            fprintf(stderr,
-                    "[vk] warning: the %s solver needs ~%.0f MB and the budget is %.0f MB; "
-                    "this may run out of device memory\n",
-                    useCG_ ? "cg" : "dense", needMB, budget);
+            sfm::slog::diag(sfm::slog::Tag::Map,
+                       "[vk] warning: the %s solver needs ~%.0f MB and the budget is %.0f MB; "
+                       "this may run out of device memory",
+                       useCG_ ? "cg" : "dense", needMB, budget);
         }
 
         // host tables for the chosen paths

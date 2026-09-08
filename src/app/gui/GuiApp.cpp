@@ -3138,9 +3138,11 @@ void GuiApp::poll_sfm_progress() {
     // features are read off disk, which is what this watcher is for.
     if (dataset_busy() && dataset_steps()->current() == Stage::Features)
         _features.start(_sfm.sfm_image_dir(), _sfm.sfm_mask_dir(),
-                        _sfm.features_dir(), &_film_features);
+                        _sfm.features_dir(), &_film_features,
+                        _sfm.thumbs_dir());
     _pairs_view.configure(_sfm.sfm_image_dir(), _sfm.sfm_mask_dir(),
-                          _sfm.features_dir(), _sfm.matches_path());
+                          _sfm.features_dir(), _sfm.matches_path(),
+                          _sfm.live_matches_path());
 
     const std::string dir = _sfm.progress_dir();
     if (dir.empty()) return;
@@ -3684,6 +3686,9 @@ void GuiApp::draw_sfm_advanced() {
 
     ui::Checkbox(dmsg::sfm_ba_cpu, &_sfm_job.ba_cpu);
     ui::help_on_hover(dmsg::sfm_ba_cpu_help);
+
+    ui::Checkbox(dmsg::sfm_subprocess, &_sfm_job.subprocess);
+    ui::help_on_hover(dmsg::sfm_subprocess_help);
 }
 
 // ---------------------------------------------------------------------------

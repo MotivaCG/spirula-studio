@@ -161,6 +161,7 @@ add_library(ss_sfm STATIC
     # pulled in when nothing else provides them, so spirula-gui -- which links
     # the engine, and with it the same TUs -- sees no duplicate definition.
     ${SS_SRC}/external/stb_image_impl.cpp
+    ${SS_SRC}/external/stb_image_write_impl.cpp
     ${SS_SRC}/core/ExrImage.cpp
     ${SS_SRC}/external/miniz.c
 )

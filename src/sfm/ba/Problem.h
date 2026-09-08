@@ -15,6 +15,8 @@
 #include <string>
 #include <vector>
 
+#include "sfm/core/Log.h"
+
 // Camera model registry; must match the entry points in sfm/shaders/ba/ba.slang.
 // `n_intr` is how many parameters the kernel *reads* for this model (its
 // ICameraModel::kNumIntr). How many of them bundle adjustment may *change* is
@@ -262,8 +264,8 @@ inline void buildPairTables(BAProblem& P) {
 
     uint64_t total = pairEntryCount(P);
     if (total > kMaxPairEntries) {
-        fprintf(stderr, "[bal] pair-schur disabled (%llu entries)\n",
-                (unsigned long long)total);
+        sfm::slog::diag(sfm::slog::Tag::Map, "[bal] pair-schur disabled (%llu entries)",
+                   (unsigned long long)total);
         return;
     }
 
@@ -303,8 +305,8 @@ inline void buildPairTables(BAProblem& P) {
     }
     P.num_pair_chunks = (uint32_t)(P.pair_chunks.size() / 2);
     P.use_pair_schur = true;
-    fprintf(stderr, "[bal] pair-schur: %llu entries, %u chunks\n",
-            (unsigned long long)total, P.num_pair_chunks);
+    sfm::slog::diag(sfm::slog::Tag::Map, "[bal] pair-schur: %llu entries, %u chunks",
+               (unsigned long long)total, P.num_pair_chunks);
 }
 
 
@@ -329,7 +331,8 @@ inline BAProblem loadBAL(const std::string& path, int model_id, bool shared_intr
     P.num_images = nc;
     P.num_points = np;
     P.num_obs = no;
-    fprintf(stderr, "[bal] %u cameras, %u points, %u observations\n", nc, np, no);
+    sfm::slog::diag(sfm::slog::Tag::Map, "[bal] %u cameras, %u points, %u observations", nc, np,
+                    no);
 
     std::vector<uint32_t> cam_idx(no), pnt_idx(no);
     std::vector<double> xy(2 * (size_t)no);

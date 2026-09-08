@@ -968,6 +968,51 @@ SS_MSG(opt_auto_output,
     TR("Yazılacak çalışma alanı: features/, matches.bin ve sparse/0.. buraya "
        "iner."));
 
+SS_MSG(opt_manifest,
+    EN("Read the capture's description from FILE (YAML or JSON): where the "
+       "images and masks are, how the cameras are grouped, and each group's "
+       "lens and focal length. A flag on the command line beats the file."),
+    JA("撮影内容の説明を FILE (YAML または JSON) から読みます。画像とマスクの場所、"
+       "カメラの分け方、各グループのレンズと焦点距離です。"
+       "コマンドラインの指定のほうが優先されます。"),
+    ZH_HANS("从 FILE (YAML 或 JSON) 读取这次拍摄的描述: 图像和掩码的位置、相机的分组，"
+            "以及每组的镜头和焦距。命令行上的选项优先于文件。"),
+    ZH_HANT("從 FILE (YAML 或 JSON) 讀取這次拍攝的描述: 影像和遮罩的位置、相機的分組，"
+            "以及每組的鏡頭和焦距。命令列上的選項優先於檔案。"),
+    KO("촬영 내용을 FILE (YAML 또는 JSON) 에서 읽습니다. 이미지와 마스크의 위치, "
+       "카메라를 나누는 방법, 그룹마다의 렌즈와 초점 거리입니다. "
+       "명령줄에서 준 값이 파일보다 우선합니다."),
+    DE("Die Beschreibung der Aufnahme aus FILE lesen (YAML oder JSON): wo die "
+       "Bilder und Masken liegen, wie die Kameras gruppiert sind und welches "
+       "Objektiv und welche Brennweite jede Gruppe hat. Ein Flag auf der "
+       "Kommandozeile schlägt die Datei."),
+    FR("Lire la description de la prise depuis FILE (YAML ou JSON) : où sont "
+       "les images et les masques, comment les caméras sont groupées, et "
+       "l'objectif et la focale de chaque groupe. Une option en ligne de "
+       "commande l'emporte sur le fichier."),
+    ES("Leer la descripción de la captura desde FILE (YAML o JSON): dónde están "
+       "las imágenes y las máscaras, cómo se agrupan las cámaras, y el objetivo "
+       "y la focal de cada grupo. Una opción en la línea de órdenes gana al "
+       "fichero."),
+    PT("Ler a descrição da captura de FILE (YAML ou JSON): onde estão as "
+       "imagens e as máscaras, como as câmaras são agrupadas, e a objetiva e a "
+       "distância focal de cada grupo. Uma opção na linha de comandos ganha ao "
+       "ficheiro."),
+    IT("Leggere la descrizione della ripresa da FILE (YAML o JSON): dove sono "
+       "le immagini e le maschere, come sono raggruppate le fotocamere, e "
+       "l'obiettivo e la focale di ogni gruppo. Un'opzione da riga di comando "
+       "vince sul file."),
+    NL("De beschrijving van de opname uit FILE lezen (YAML of JSON): waar de "
+       "beelden en maskers staan, hoe de camera's gegroepeerd zijn, en de lens "
+       "en brandpuntsafstand van elke groep. Een optie op de opdrachtregel "
+       "wint van het bestand."),
+    RU("Прочитать описание съёмки из FILE (YAML или JSON): где лежат снимки и "
+       "маски, как сгруппированы камеры, какой у каждой группы объектив и "
+       "фокусное расстояние. Параметр в командной строке важнее файла."),
+    TR("Çekimin tanımını FILE dosyasından okur (YAML ya da JSON): görüntülerin "
+       "ve maskelerin yeri, kameraların nasıl gruplandığı, her grubun objektifi "
+       "ve odak uzaklığı. Komut satırındaki seçenek dosyayı yener."));
+
 SS_MSG(opt_progress_dir,
     EN("Write snapshots of the run into DIR while it goes -- the current model "
        "and the pair matrix -- for a front end that is watching. Off by "

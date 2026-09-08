@@ -18,7 +18,10 @@ of this file and in the port plan.
   device. Built by default only for `SS_BACKEND=vulkan`.
 - **No heavy dependencies.** Vulkan, Slang, C++17, and the repository's
   vendored `stb_image`. No Ceres, no Eigen on the hot path, no OpenCV, no
-  SQLite, no PyTorch.
+  SQLite, no PyTorch. `core/Manifest.cpp` reads its file through the
+  repository's header-only `data/Json.h` + `data/Yaml.h` rather than growing a
+  second parser; that is the one thing here that reaches outside `sfm/` and
+  `core/`, and it costs nothing at link time.
 - **Compute on the GPU, control flow on the host.** Slang kernels do the
   per-pixel / per-feature / per-observation work; the host owns graph
   structure, RANSAC bookkeeping and the mapper's decisions. RANSAC in

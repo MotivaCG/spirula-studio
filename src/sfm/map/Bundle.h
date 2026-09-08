@@ -22,6 +22,7 @@
 #include "sfm/ba/Solver.h"
 #include "sfm/core/Model.h"
 #include "sfm/map/Profile.h"
+#include "sfm/core/Log.h"
 
 namespace sfm {
 
@@ -341,11 +342,11 @@ inline double runGlobalBA(Reconstruction& rec, const BundleOptions& bopt) {
     g_map_prof.n_ba++;
     g_map_prof.n_ba_iters += stats.iterations;
     if (MapProf::enabled())
-        fprintf(stderr,
-                "[prof] BA #%ld: %u img %u pt %u obs | build %.3f init %.3f solve %.3f "
-                "write %.3f s | %d LM iters\n",
-                (long)g_map_prof.n_ba, P.num_images, P.num_points, P.num_obs, t_build, t_init,
-                t_solve, t_write, stats.iterations);
+        slog::diag(slog::Tag::Map,
+                   "[prof] BA #%ld: %u img %u pt %u obs | build %.3f init %.3f solve %.3f "
+                   "write %.3f s | %d LM iters",
+                   (long)g_map_prof.n_ba, P.num_images, P.num_points, P.num_obs, t_build, t_init,
+                   t_solve, t_write, stats.iterations);
     return stats.final_cost;
 }
 
