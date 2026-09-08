@@ -3821,56 +3821,131 @@ SS_MSG(lens_full_opencv_help,
        "geniş açı objektif, hepsini belirleyecek kadar çok çekildiyse "
        "değer."));
 
-SS_MSG(lens_fisheye_kb,
-    EN("Fisheye (Kannala-Brandt)"),
-    JA("魚眼（Kannala-Brandt）"),
-    ZH_HANS("鱼眼（Kannala-Brandt）"),
-    ZH_HANT("魚眼（Kannala-Brandt）"),
-    KO("어안(Kannala-Brandt)"),
-    DE("Fisheye (Kannala-Brandt)"),
-    FR("Fisheye (Kannala-Brandt)"),
-    ES("Ojo de pez (Kannala-Brandt)"),
-    PT("Olho de peixe (Kannala-Brandt)"),
-    IT("Fisheye (Kannala-Brandt)"),
-    NL("Fisheye (Kannala-Brandt)"),
-    RU("Фишай (Каннала — Брандт)"),
-    TR("Balıkgözü (Kannala-Brandt)"));
+SS_MSG(lens_fisheye_opencv,
+    EN("Fisheye (OpenCV)"),
+    JA("魚眼（OpenCV）"),
+    ZH_HANS("鱼眼（OpenCV）"),
+    ZH_HANT("魚眼（OpenCV）"),
+    KO("어안(OpenCV)"),
+    DE("Fisheye (OpenCV)"),
+    FR("Fisheye (OpenCV)"),
+    ES("Ojo de pez (OpenCV)"),
+    PT("Olho de peixe (OpenCV)"),
+    IT("Fisheye (OpenCV)"),
+    NL("Fisheye (OpenCV)"),
+    RU("Фишай (OpenCV)"),
+    TR("Balıkgözü (OpenCV)"));
 
-SS_MSG(lens_fisheye_kb_help,
+SS_MSG(lens_fisheye_opencv_help,
     EN("A fisheye lens, up to about 180 degrees across. The standard model "
-       "for one fisheye, and for the wide modes of most action cameras."),
+       "for one fisheye, and for the wide modes of most action cameras. It is "
+       "also known as the Kannala-Brandt model, and COLMAP calls it "
+       "OPENCV_FISHEYE."),
     JA("およそ180度までの魚眼レンズです。単一の魚眼、および多くのアクション"
-       "カメラの広角モードの標準的なモデルです。"),
+       "カメラの広角モードの標準的なモデルです。Kannala-Brandt モデルとも呼ばれ、"
+       "COLMAP では OPENCV_FISHEYE という名前です。"),
     ZH_HANS("视场约到 180 度的鱼眼镜头。单个鱼眼的标准模型，多数运动相机的广角"
-            "模式也是这个。"),
+            "模式也是这个。它也叫 Kannala-Brandt 模型，COLMAP 里的名字是 "
+            "OPENCV_FISHEYE。"),
     ZH_HANT("視場約到 180 度的魚眼鏡頭。單個魚眼的標準模型，多數運動相機的廣角"
-            "模式也是這個。"),
+            "模式也是這個。它也叫 Kannala-Brandt 模型，COLMAP 裡的名字是 "
+            "OPENCV_FISHEYE。"),
     KO("대략 180도까지의 어안 렌즈입니다. 어안 하나에 대한 표준 모델이며, 대부분 "
-       "액션캠의 광각 모드도 이것입니다."),
+       "액션캠의 광각 모드도 이것입니다. Kannala-Brandt 모델이라고도 하며, "
+       "COLMAP에서는 OPENCV_FISHEYE입니다."),
     DE("Ein Fischaugenobjektiv bis etwa 180 Grad. Das Standardmodell für ein "
        "einzelnes Fischauge und für die Weitwinkelmodi der meisten "
-       "Actionkameras."),
+       "Actionkameras. Es heißt auch Kannala-Brandt-Modell, in COLMAP "
+       "OPENCV_FISHEYE."),
     FR("Un objectif fisheye, jusqu'à environ 180 degrés. Le modèle standard "
        "pour un fisheye, et pour les modes grand-angle de la plupart des "
-       "caméras d'action."),
+       "caméras d'action. On l'appelle aussi modèle de Kannala-Brandt, et "
+       "COLMAP le nomme OPENCV_FISHEYE."),
     ES("Un objetivo ojo de pez, de hasta unos 180 grados. El modelo estándar "
        "para un ojo de pez, y para los modos angulares de casi todas las "
-       "cámaras de acción."),
+       "cámaras de acción. También se conoce como modelo de Kannala-Brandt, y "
+       "en COLMAP se llama OPENCV_FISHEYE."),
     PT("Uma lente olho de peixe, de até cerca de 180 graus. O modelo padrão "
        "para um olho de peixe, e para os modos grande-angulares da maioria "
-       "das câmeras de ação."),
+       "das câmeras de ação. Também é conhecido como modelo de "
+       "Kannala-Brandt, e no COLMAP chama-se OPENCV_FISHEYE."),
     IT("Un obiettivo fisheye, fino a circa 180 gradi. Il modello standard per "
        "un fisheye singolo e per le modalità grandangolari di quasi tutte le "
-       "action cam."),
+       "action cam. È noto anche come modello di Kannala-Brandt, e in COLMAP "
+       "si chiama OPENCV_FISHEYE."),
     NL("Een fisheye-objectief, tot ongeveer 180 graden. Het standaardmodel "
        "voor één fisheye, en voor de groothoekstanden van de meeste "
-       "actiecamera's."),
+       "actiecamera's. Het heet ook het Kannala-Brandt-model, en in COLMAP "
+       "OPENCV_FISHEYE."),
     RU("Объектив «рыбий глаз» примерно до 180 градусов. Стандартная модель "
        "для одного фишая и для широкоугольных режимов большинства "
-       "экшн-камер."),
+       "экшн-камер. Она же модель Каннала — Брандта, а в COLMAP называется "
+       "OPENCV_FISHEYE."),
     TR("Yaklaşık 180 dereceye kadar bir balıkgözü objektif. Tek balıkgözü "
        "için ve çoğu aksiyon kamerasının geniş açı kipleri için standart "
-       "model."));
+       "model. Kannala-Brandt modeli olarak da bilinir, COLMAP'te adı "
+       "OPENCV_FISHEYE'dir."));
+
+SS_MSG(lens_same_as_above,
+    EN("(same as above)"),
+    JA("（上と同じ）"),   ZH_HANS("（同上）"),  ZH_HANT("（同上）"),
+    KO("(위와 같음)"),   DE("(wie oben)"),    FR("(comme ci-dessus)"),
+    ES("(igual que arriba)"), PT("(igual ao de cima)"), IT("(come sopra)"),
+    NL("(zelfde als hierboven)"), RU("(как выше)"),
+    TR("(yukarıdakiyle aynı)"));
+
+SS_MSG(lens_same_as_above_help,
+    EN("Take the lens model from the row above. Set the first row and every "
+       "row below it follows, which is what a capture shot on one camera "
+       "wants; a row that is a different camera picks its own model, and the "
+       "rows under it follow that one instead."),
+    JA("すぐ上の行と同じレンズモデルを使います。最初の行を決めれば以下の行が"
+       "それに従うので、1台のカメラで撮った素材はこれで済みます。別のカメラの"
+       "行は自分のモデルを選び、その下の行は今度はそちらに従います。"),
+    ZH_HANS("采用上一行的镜头模型。设好第一行，下面各行都跟着它，用一台相机拍的"
+            "素材这样就够了；属于另一台相机的那一行自己选模型，它下面的各行改为"
+            "跟着它。"),
+    ZH_HANT("採用上一行的鏡頭模型。設好第一行，下面各行都跟著它，用一台相機拍的"
+            "素材這樣就夠了；屬於另一台相機的那一行自己選模型，它下面的各行改為"
+            "跟著它。"),
+    KO("바로 위 행의 렌즈 모델을 씁니다. 첫 행만 정하면 아래 행이 모두 따라가므로 "
+       "카메라 한 대로 찍은 촬영본은 이것으로 충분합니다. 다른 카메라인 행은 "
+       "자기 모델을 고르고, 그 아래 행들은 그 모델을 따라갑니다."),
+    DE("Das Objektivmodell der Zeile darüber übernehmen. Stellen Sie die "
+       "erste Zeile ein, und alle folgenden ziehen mit -- das ist, was eine "
+       "mit einer Kamera gedrehte Aufnahme braucht. Eine Zeile mit einer "
+       "anderen Kamera wählt ihr eigenes Modell, und die Zeilen darunter "
+       "folgen dann diesem."),
+    FR("Reprendre le modèle d'objectif de la ligne du dessus. Réglez la "
+       "première ligne et toutes les suivantes suivent, ce qu'il faut pour "
+       "une prise de vues faite avec un seul appareil ; une ligne qui est un "
+       "autre appareil choisit son propre modèle, et les lignes en dessous "
+       "suivent celui-là."),
+    ES("Tomar el modelo de objetivo de la fila de arriba. Ajuste la primera "
+       "fila y todas las de abajo la siguen, que es lo que quiere una toma "
+       "hecha con una sola cámara; una fila que es otra cámara elige su "
+       "propio modelo, y las filas bajo ella siguen ese."),
+    PT("Usar o modelo de lente da linha de cima. Ajuste a primeira linha e "
+       "todas as de baixo acompanham, que é o que uma captura feita com uma "
+       "só câmera quer; uma linha que é outra câmera escolhe o próprio "
+       "modelo, e as linhas abaixo dela passam a acompanhar esse."),
+    IT("Prendere il modello di obiettivo dalla riga sopra. Imposti la prima "
+       "riga e tutte quelle sotto la seguono, che è ciò che serve a una "
+       "ripresa fatta con una sola fotocamera; una riga che è un'altra "
+       "fotocamera sceglie il proprio modello, e le righe sotto seguono "
+       "quello."),
+    NL("Het lensmodel van de rij erboven overnemen. Stel de eerste rij in en "
+       "alle rijen eronder volgen, wat een opname met één camera nodig heeft; "
+       "een rij die een andere camera is, kiest een eigen model, en de rijen "
+       "daaronder volgen dat."),
+    RU("Взять модель объектива из строки выше. Задайте первую строку, и все "
+       "нижние последуют за ней -- именно это нужно съёмке на одну камеру. "
+       "Строка с другой камерой выбирает свою модель, и строки под ней идут "
+       "уже за ней."),
+    TR("Objektif modelini üstteki satırdan al. İlk satırı ayarlayın, "
+       "altındaki bütün satırlar onu izler; tek kamerayla çekilmiş bir "
+       "çekimin istediği budur. Başka bir kamera olan satır kendi modelini "
+       "seçer, altındaki satırlar da onu izler."));
 
 SS_MSG(lens_fisheye_thin_prism,
     EN("Fisheye (thin prism)"),

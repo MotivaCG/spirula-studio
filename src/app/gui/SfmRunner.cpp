@@ -411,42 +411,24 @@ void SfmRunner::note_progress(const std::string& l) {
 // into the panel wins over a preset-derived one.
 void SfmRunner::append_camera_overrides(const SfmJob& job, const PrepResult& prep,
                                         std::vector<std::string>& argv) {
-    // One group per row the panel showed: an input, or a camera folder inside
-    // one. `rel` is the group's path under the image directory, which is what
-    // `--camera-model PREFIX=MODEL` matches an image name against; empty means
-    // the whole capture, and only a lone input with no camera folders is that.
-    struct Group {
-        std::string rel;
-        std::string camera_model;
-        float focal_factor = 0.0f;
-    };
-    std::vector<Group> groups;
-    for (const PrepInput& in : job.prep.inputs) {
-        if (in.subcameras.empty()) {
-            groups.push_back({in.subdir, in.camera_model, in.focal_factor});
-            continue;
-        }
-        for (const SubCamera& sc : in.subcameras) {
-            const std::string rel =
-                in.subdir.empty() ? sc.rel
-                                  : (fs::path(in.subdir) / sc.rel).generic_string();
-            groups.push_back({rel, sc.camera_model.empty() ? in.camera_model
-                                                           : sc.camera_model,
-                              sc.focal_factor > 0 ? sc.focal_factor
-                                                  : in.focal_factor});
-        }
-    }
+    // The rows the panel showed, and the model each one resolved to once "same
+    // as above" was followed through the list (camera_group_models).
+    const std::vector<CameraGroup> groups = camera_groups(job.prep.inputs);
+    const std::vector<std::string> models =
+        camera_group_models(job.prep.inputs, groups, job.camera_model);
 
-    for (const Group& g : groups) {
+    for (size_t i = 0; i < groups.size(); i++) {
+        const CameraGroup& g = groups[i];
+        const float focal = group_focal(job.prep.inputs, g);
         const std::string prefix = g.rel.empty() ? "" : g.rel + "=";
         // For the whole capture the panel's own "Camera / lens" is the single
         // source of truth and has already been passed; only a named group adds
         // one.
-        if (!g.rel.empty() && !g.camera_model.empty()) {
+        if (!g.rel.empty() && !models[i].empty()) {
             argv.push_back("--camera-model");
-            argv.push_back(prefix + g.camera_model);
+            argv.push_back(prefix + models[i]);
         }
-        if (!(g.focal_factor > 0)) continue;
+        if (!(focal > 0)) continue;
         if (g.rel.empty() && job.init_focal_px > 0) continue;
         const std::string dir =
             (g.rel.empty() ? fs::path(prep.image_dir)
@@ -457,12 +439,12 @@ void SfmRunner::append_camera_overrides(const SfmJob& job, const PrepResult& pre
             continue;
         }
         char buf[32];
-        std::snprintf(buf, sizeof buf, "%g", (double)g.focal_factor * W);
+        std::snprintf(buf, sizeof buf, "%g", (double)focal * W);
         argv.push_back("--focal");
         argv.push_back(prefix + buf);
         log(fmt(lmsg::sfm_initial_focal,
                 {g.rel.empty() ? lmsg::sfm_the_capture.get() : g.rel.c_str(),
-                 buf, g.focal_factor, (long long)W}));
+                 buf, focal, (long long)W}));
     }
 }
 

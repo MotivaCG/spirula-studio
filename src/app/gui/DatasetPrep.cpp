@@ -604,18 +604,71 @@ bool any_image(const fs::path& p) {
 
 bool folder_has_images(const std::string& dir) { return any_image(dir); }
 
-std::vector<std::string> camera_subfolders(const std::string& dir) {
-    std::vector<std::string> out;
+namespace {
+
+// Recursion for camera_subfolders. Collects the folder itself when it holds an
+// image directly, then descends -- one readdir per folder, which is what
+// answering both questions at once costs.
+void collect_image_folders(const fs::path& dir, const std::string& rel, int depth,
+                           std::vector<std::string>& out) {
+    if (out.size() >= kMaxCameraFolders) return;
+    std::vector<fs::path> sub;
+    bool here = false;
     std::error_code ec;
-    // One level only, and any_image stops at the first hit, so this stays cheap
-    // enough for the draw that asks it.
     for (fs::directory_iterator it(dir, kWalk, ec), end; !ec && it != end;
          it.increment(ec)) {
-        if (!it->is_directory(ec)) continue;
-        if (is_mask_folder(it->path().string())) continue;
-        if (any_image(it->path())) out.push_back(it->path().filename().string());
+        if (it->is_directory(ec)) {
+            if (!is_mask_folder(it->path().string())) sub.push_back(it->path());
+        } else if (!here && it->is_regular_file(ec) && is_image_file(it->path())) {
+            here = true;
+        }
     }
-    std::sort(out.begin(), out.end());
+    if (here) out.push_back(rel);
+    if (depth >= kMaxCameraFolderDepth) return;
+    std::sort(sub.begin(), sub.end());
+    for (const fs::path& s : sub)
+        collect_image_folders(s, rel.empty() ? s.filename().string()
+                                             : rel + "/" + s.filename().string(),
+                              depth + 1, out);
+}
+
+}  // namespace
+
+std::vector<std::string> camera_subfolders(const std::string& dir) {
+    std::vector<std::string> out;
+    collect_image_folders(dir, "", 0, out);
+    return out;
+}
+
+std::vector<CameraGroup> camera_groups(const std::vector<PrepInput>& inputs) {
+    std::vector<CameraGroup> out;
+    for (size_t i = 0; i < inputs.size(); i++) {
+        const PrepInput& in = inputs[i];
+        if (in.subcameras.empty()) {
+            out.push_back({i, -1, in.subdir});
+            continue;
+        }
+        for (size_t k = 0; k < in.subcameras.size(); k++) {
+            const std::string& rel = in.subcameras[k].rel;
+            std::string full = in.subdir;
+            if (!rel.empty()) full = full.empty() ? rel : full + "/" + rel;
+            out.push_back({i, (int)k, full});
+        }
+    }
+    return out;
+}
+
+std::vector<std::string> camera_group_models(const std::vector<PrepInput>& inputs,
+                                             const std::vector<CameraGroup>& groups,
+                                             const std::string& fallback) {
+    std::vector<std::string> out;
+    out.reserve(groups.size());
+    std::string above = fallback;
+    for (const CameraGroup& g : groups) {
+        const std::string& m = group_model(inputs, g);
+        if (!m.empty()) above = m;
+        out.push_back(above);
+    }
     return out;
 }
 

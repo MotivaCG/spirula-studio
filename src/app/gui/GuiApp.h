@@ -269,6 +269,12 @@ private:
     // The single "Camera / lens" control speaks for the whole capture, so it
     // writes to every input rather than only the first.
     void apply_lens_to_sources(const std::string& model);
+    // Put the per-input lens list back in its canonical shape: a real model on
+    // the first row, "same as above" (an empty model) on every row that only
+    // repeats the row before it.
+    void normalize_source_lenses();
+    // What one input's images are fitted with, resolved down the row list.
+    void source_lens(size_t input, std::string& model, float& focal) const;
     // What the output folder holds, at 1 Hz rather than per frame: the answer
     // now costs a directory scan (a Metashape export is found by extension).
     const WorkspaceState& workspace_state();

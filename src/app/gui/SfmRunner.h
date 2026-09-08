@@ -61,7 +61,7 @@ inline constexpr int kNumSfmCameraModels = 8;
 inline std::vector<const spirula::i18n::Msg*> sfm_camera_model_labels() {
     namespace m = spirula::i18n::msg::dataset;
     return {&m::lens_opencv, &m::lens_pinhole, &m::lens_simple_pinhole,
-            &m::lens_radial, &m::lens_full_opencv, &m::lens_fisheye_kb,
+            &m::lens_radial, &m::lens_full_opencv, &m::lens_fisheye_opencv,
             &m::lens_fisheye_thin_prism, &m::lens_equirectangular};
 }
 
@@ -73,7 +73,7 @@ inline std::vector<const spirula::i18n::Msg*> sfm_camera_model_helps() {
     namespace m = spirula::i18n::msg::dataset;
     return {&m::lens_opencv_help, &m::lens_pinhole_help,
             &m::lens_simple_pinhole_help, &m::lens_radial_help,
-            &m::lens_full_opencv_help, &m::lens_fisheye_kb_help,
+            &m::lens_full_opencv_help, &m::lens_fisheye_opencv_help,
             &m::lens_fisheye_thin_prism_help, &m::lens_equirectangular_help};
 }
 

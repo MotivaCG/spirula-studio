@@ -1105,10 +1105,9 @@ void GuiApp::refresh_sources() {
         _mask.current_object = 0;
     }
 
-    // Camera folders inside each input. A capture that arrives already split
-    // into cam/, cam0/, cam1/ needs one lens each -- one of them being a
-    // fisheye does not make the others one -- and the folders are the only
-    // place that shows.
+    // Camera folders inside each input. A capture that arrives split into
+    // cam0/, cam1/ -- or into 1/cam0, 1/cam1, 2/cam0 ... -- needs one lens
+    // each: one of them being a fisheye does not make the others one.
     for (PrepInput& s : _sources) {
         std::vector<std::string> found;
         if (!s.is_video && !s.path.empty()) {
@@ -1125,12 +1124,17 @@ void GuiApp::refresh_sources() {
         for (const std::string& rel : found) {
             SubCamera sc;
             sc.rel = rel;
+            // Empty means "same as the row above", so a folder nobody has
+            // seen starts on the lens its input's kind suggests -- inheriting
+            // a 360 file's fisheye is what ordinary photos must not do.
+            sc.camera_model = s.camera_model;
             for (const SubCamera& old : s.subcameras)
                 if (old.rel == rel) sc = old;
             next.push_back(std::move(sc));
         }
         s.subcameras.swap(next);
     }
+    normalize_source_lenses();
 
     // The output folder follows the input until the user takes it over.
     if (_workspace.empty() || _workspace == _workspace_auto) {
@@ -2012,9 +2016,6 @@ void GuiApp::sync_dataset_jobs() {
     if (const ModelEntry* e = find_model(_model_id))
         prep.mask_model_name = e->legacy_name;
     _sfm_job.prep = prep;
-    // The dataset-wide lens is the lone input's; with several, each input names
-    // its own and this is only what an image no override covers would get.
-    if (!_sources.empty()) _sfm_job.camera_model = _sources[0].camera_model;
 
     _colmap_job.inputs = prep.inputs;
     _colmap_job.workspace = prep.workspace;
@@ -2269,30 +2270,40 @@ void GuiApp::draw_dataset_source() {
 
 namespace {
 
-// The closed picker's tooltip: what the control decides, then what the model
-// standing in it is for. Two paragraphs rather than one message, because only
-// the second one changes with the selection.
-void lens_tooltip(const Msg& model_help) {
+// Two paragraphs rather than one message, because only the second one changes
+// with the selection. `inherited` names the model too, for a row reading "same
+// as above" -- the picker is no longer showing which lens that is.
+void lens_tooltip(const Msg& model_help, const Msg* inherited = nullptr) {
     if (!ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort) ||
         !ImGui::BeginTooltip())
         return;
     ImGui::PushTextWrapPos(px(420.0f));
     ui::Text(dmsg::camera_lens_help);
     ImGui::Separator();
+    if (inherited) ui::Text(*inherited);
     ui::Text(model_help);
     ImGui::PopTextWrapPos();
     ImGui::EndTooltip();
 }
 
-// The lens pickers. ImGui's Combo takes a flat list of strings and has
-// nowhere to hang a description on a row, so the popup is built by hand:
-// which physical camera each model is for is the whole of the question, and
-// one tooltip on the closed combo cannot answer it row by row.
-bool sfm_lens_combo(const char* id, int* idx) {
+// ImGui's Combo has nowhere to hang a description on a row, so the popup is
+// built by hand: which physical camera each model is for is the whole of the
+// question. `inherit` adds "(same as above)" and makes -1 a selection.
+bool sfm_lens_combo(const char* id, int* idx, bool inherit = false) {
     const auto labels = sfm_camera_model_labels();
     const auto helps = sfm_camera_model_helps();
-    if (!ui::BeginComboRaw(id, labels[(size_t)*idx]->get())) return false;
+    const char* shown = *idx < 0 ? dmsg::lens_same_as_above.get()
+                                 : labels[(size_t)*idx]->get();
+    if (!ui::BeginComboRaw(id, shown)) return false;
     bool changed = false;
+    if (inherit) {
+        if (ui::Selectable(dmsg::lens_same_as_above, *idx < 0)) {
+            *idx = -1;
+            changed = true;
+        }
+        ui::help_on_hover(dmsg::lens_same_as_above_help);
+        ImGui::Separator();
+    }
     for (int i = 0; i < (int)labels.size(); i++) {
         if (ui::Selectable(*labels[(size_t)i], i == *idx)) {
             *idx = i;
@@ -2380,8 +2391,9 @@ void GuiApp::draw_dataset_basics() {
     if (!per_input_lens) {
         ImGui::SetNextItemWidth(px(220.0f));
         if (builtin) {
-            const std::string& model =
-                _sources.empty() ? _sfm_job.camera_model : _sources[0].camera_model;
+            // Kept equal to the first row's by normalize_source_lenses, so
+            // this reads the same lens whichever control last wrote it.
+            const std::string& model = _sfm_job.camera_model;
             int idx = 0;
             for (int i = 0; i < kNumSfmCameraModels; i++)
                 if (model == kSfmCameraModels[i]) idx = i;
@@ -2398,7 +2410,7 @@ void GuiApp::draw_dataset_basics() {
         }
         if (!_sources.empty())
             draw_lens_warning(_sources[0].path, _sources[0].is_video,
-                              builtin ? _sources[0].camera_model
+                              builtin ? _sfm_job.camera_model
                                       : _colmap_job.camera_model,
                               builtin);
         if (!builtin && _sources.size() > 1)
@@ -2473,66 +2485,118 @@ void GuiApp::apply_lens_to_sources(const std::string& model) {
         s.camera_model = model;
         for (SubCamera& sc : s.subcameras) sc.camera_model.clear();
     }
+    normalize_source_lenses();
 }
 
-// One lens per input, in place of the single "Camera / lens" control, once
-// there is more than one input to tell apart. The reconstruction takes these as
-// per-folder overrides (SfmRunner::append_camera_overrides), which is what lets
-// a 360 clip and a phone clip reconstruct as one scene without either being
-// fitted with the other's model.
+// What keeps "same as above" (an empty model) honest: the first row always
+// holds a real model, and a row that merely repeats the row above is emptied,
+// so a later change to that row reaches it too. Runs after every edit.
+void GuiApp::normalize_source_lenses() {
+    const std::vector<CameraGroup> groups = camera_groups(_sources);
+    if (groups.empty()) return;
+    std::string above;
+    for (size_t i = 0; i < groups.size(); i++) {
+        std::string& m = group_model(_sources, groups[i]);
+        if (i == 0) {
+            // Nothing above to inherit from, so a row the removal of the one
+            // above just promoted keeps what it was resolving to.
+            if (m.empty()) m = _sfm_job.camera_model;
+            if (m.empty()) m = default_lens(_sources[groups[i].input].path);
+            above = m;
+            continue;
+        }
+        if (m == above) m.clear();
+        else if (!m.empty()) above = m;
+    }
+    // A group whose images are the whole capture carries no prefix, so nothing
+    // names it on the command line -- the dataset-wide --camera-model is what
+    // it gets. Keep that equal to the first row, which is the row it is.
+    _sfm_job.camera_model = group_model(_sources, groups[0]);
+}
+
+// The lens and starting focal an input's images are fitted with: its first
+// camera group's, once "same as above" has been followed down the list.
+void GuiApp::source_lens(size_t input, std::string& model, float& focal) const {
+    const std::vector<CameraGroup> groups = camera_groups(_sources);
+    const std::vector<std::string> models =
+        camera_group_models(_sources, groups, _sfm_job.camera_model);
+    for (size_t i = 0; i < groups.size(); i++) {
+        if (groups[i].input != input) continue;
+        model = models[i];
+        focal = group_focal(_sources, groups[i]);
+        return;
+    }
+}
+
+// One lens per camera group, in place of the single "Camera / lens" control,
+// once there is more than one camera to tell apart -- which lets a 360 clip and
+// a phone clip reconstruct as one scene, neither fitted with the other's model.
 void GuiApp::draw_source_cameras() {
     ui::Text(dmsg::camera_lens_per_input);
     ui::help_on_hover(dmsg::camera_lens_per_input_help);
     ImGui::Indent();
-    // `label` names the row, `dir` is the folder it measures, and model/focal
-    // are what the row edits -- an input with no camera folders under it is
-    // one row, an input with three is three.
-    auto row = [&](const char* id, const std::string& label,
-                   const std::string& dir, std::string& model, float& focal) {
-        ImGui::PushID(id);
-        ui::TextRaw(label);
+    const std::vector<CameraGroup> groups = camera_groups(_sources);
+    const std::vector<std::string> models =
+        camera_group_models(_sources, groups, _sfm_job.camera_model);
+    const auto labels = sfm_camera_model_labels();
+    const auto helps = sfm_camera_model_helps();
+
+    // A row names the folder it measures, which is also the prefix the
+    // override matches on -- so an input with several camera folders repeats
+    // its own name, and that is what says which rows belong together.
+    std::vector<std::string> names(groups.size());
+    float col = px(200.0f);
+    for (size_t i = 0; i < groups.size(); i++) {
+        fs::path p(_sources[groups[i].input].path);
+        if (p.filename().empty()) p = p.parent_path();   // trailing separator
+        names[i] = groups[i].rel.empty() ? p.filename().string() : groups[i].rel;
+        col = std::max(col, ImGui::CalcTextSize(names[i].c_str()).x + px(24.0f));
+    }
+    col = std::min(col, px(420.0f));
+
+    bool edited = false;
+    for (size_t i = 0; i < groups.size(); i++) {
+        const CameraGroup& g = groups[i];
+        const PrepInput& in = _sources[g.input];
+        const std::string dir =
+            g.sub < 0 ? in.path
+                      : (fs::path(in.path) /
+                         in.subcameras[(size_t)g.sub].rel).string();
+        // The row's own prefix as its ID, so adding or dropping an input does
+        // not carry an open picker or a half-typed focal onto another row.
+        ImGui::PushID(g.rel.c_str());
+        ui::TextRaw(names[i]);
         if (ImGui::IsItemHovered()) ui::SetTooltipRaw(dir);
-        ImGui::SameLine(px(200.0f));
+        // A name too long for the column takes the row and leaves the controls
+        // on the next one, rather than being drawn through them.
+        if (ImGui::CalcTextSize(names[i].c_str()).x + px(8.0f) < col)
+            ImGui::SameLine(col);
         ImGui::SetNextItemWidth(px(220.0f));
-        int idx = 0;
+        std::string& stored = group_model(_sources, g);
+        int idx = stored.empty() ? -1 : 0;
         for (int m = 0; m < kNumSfmCameraModels; m++)
-            if (model == kSfmCameraModels[m]) idx = m;
-        if (sfm_lens_combo("##lens", &idx)) model = kSfmCameraModels[idx];
-        lens_tooltip(*sfm_camera_model_helps()[(size_t)idx]);
+            if (stored == kSfmCameraModels[m]) idx = m;
+        if (sfm_lens_combo("##lens", &idx, /*inherit=*/i > 0)) {
+            stored = idx < 0 ? std::string() : kSfmCameraModels[idx];
+            edited = true;
+        }
+        int shown = 0;
+        for (int m = 0; m < kNumSfmCameraModels; m++)
+            if (models[i] == kSfmCameraModels[m]) shown = m;
+        lens_tooltip(*helps[(size_t)shown],
+                     idx < 0 ? labels[(size_t)shown] : nullptr);
         ImGui::SameLine();
         ImGui::SetNextItemWidth(px(90.0f));
-        ui::InputFloat(dmsg::focal_x_width, &focal, 0, 0, "%.4g");
+        ui::InputFloat(dmsg::focal_x_width, &group_focal(_sources, g), 0, 0,
+                       "%.4g");
         ui::help_on_hover(dmsg::focal_x_width_help);
-        draw_lens_warning(dir, /*is_video=*/false, model, /*builtin=*/true);
-        ImGui::PopID();
-    };
-
-    for (size_t i = 0; i < _sources.size(); i++) {
-        PrepInput& s = _sources[i];
-        ImGui::PushID((int)i);
-        if (s.subcameras.empty()) {
-            const std::string label =
-                s.subdir.empty() ? fs::path(s.path).filename().string() : s.subdir;
-            row("input", label, s.path, s.camera_model, s.focal_factor);
-        } else {
-            // The input itself is a heading here: every image under it is in
-            // one of the camera folders, so the input's own lens covers none.
-            if (_sources.size() > 1) {
-                ui::TextDisabledRaw(s.subdir.empty() ? s.path : s.subdir);
-                ImGui::Indent();
-            }
-            for (size_t k = 0; k < s.subcameras.size(); k++) {
-                SubCamera& sc = s.subcameras[k];
-                if (sc.camera_model.empty()) sc.camera_model = s.camera_model;
-                row(sc.rel.c_str(), sc.rel,
-                    (fs::path(s.path) / sc.rel).string(), sc.camera_model,
-                    sc.focal_factor);
-            }
-            if (_sources.size() > 1) ImGui::Unindent();
-        }
+        draw_lens_warning(dir, in.is_video, models[i], /*builtin=*/true);
         ImGui::PopID();
     }
     ImGui::Unindent();
+    // Only now: the edit is the row's own, and collapsing it into the row above
+    // rewrites what the loop was holding references into.
+    if (edited) normalize_source_lenses();
 }
 
 bool GuiApp::input_pixel_size(const std::string& path, bool is_video,
@@ -2834,15 +2898,18 @@ void GuiApp::open_geometry_preview() {
     // One multi-gigabyte backbone at a time: the mask preview holds SAM and
     // this one holds Metric3D, and the inference layer's pool is process-wide.
     _segment.close();
-    const PrepInput* in =
-        _sources.empty() ? nullptr
-                         : &_sources[(size_t)std::min((size_t)_mask_preview_input,
-                                                      _sources.size() - 1)];
+    const size_t idx =
+        _sources.empty() ? 0
+                         : std::min((size_t)_mask_preview_input,
+                                    _sources.size() - 1);
+    const PrepInput* in = _sources.empty() ? nullptr : &_sources[idx];
+    std::string lens = _sfm_job.camera_model;
+    float focal = 0.0f;
+    if (in) source_lens(idx, lens, focal);
     _geometry_panel.open(in ? in->path : std::string(), in && in->is_video,
                          _workspace,
                          planned_image_dir(_sources, _workspace, _photo_import),
-                         in ? in->camera_model : std::string("opencv"),
-                         in ? in->focal_factor : 0.0f, _ffmpeg_exe,
+                         lens, focal, _ffmpeg_exe,
                          _sfm_job.prep.force_external_decode);
 }
 
@@ -3337,11 +3404,12 @@ void GuiApp::reset_recon_options() {
         s.camera_model = default_lens(s.path);
         s.focal_factor = 0.0f;
         for (SubCamera& sc : s.subcameras) {
-            sc.camera_model.clear();
+            sc.camera_model = s.camera_model;
             sc.focal_factor = 0.0f;
         }
     }
     apply_source_presets();
+    normalize_source_lenses();
     _redo_frames = _redo_masks = _redo_model = _redo_geometry = false;
     _resume = true;
     log(dmsg::reset_options_done.get());

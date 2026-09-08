@@ -108,6 +108,45 @@ struct PrepInput {
     app::FrameStencil stencil;
 };
 
+// One row of the "Camera / lens per input" list. `rel` is the prefix
+// `--camera-model PREFIX=MODEL` matches on, so the panel's rows and the
+// reconstruction's overrides are one list (SfmRunner::append_camera_overrides).
+struct CameraGroup {
+    size_t input = 0;   // index into the job's inputs
+    int sub = -1;       // index into that input's subcameras; -1 = the input
+    std::string rel;    // under images/; "" is the whole capture
+};
+
+// The rows, in the order they are drawn and applied.
+std::vector<CameraGroup> camera_groups(const std::vector<PrepInput>& inputs);
+
+// Where a row's settings are stored.
+inline std::string& group_model(std::vector<PrepInput>& in, const CameraGroup& g) {
+    return g.sub < 0 ? in[g.input].camera_model
+                     : in[g.input].subcameras[(size_t)g.sub].camera_model;
+}
+inline const std::string& group_model(const std::vector<PrepInput>& in,
+                                      const CameraGroup& g) {
+    return g.sub < 0 ? in[g.input].camera_model
+                     : in[g.input].subcameras[(size_t)g.sub].camera_model;
+}
+inline float& group_focal(std::vector<PrepInput>& in, const CameraGroup& g) {
+    return g.sub < 0 ? in[g.input].focal_factor
+                     : in[g.input].subcameras[(size_t)g.sub].focal_factor;
+}
+inline float group_focal(const std::vector<PrepInput>& in, const CameraGroup& g) {
+    const float f = g.sub < 0 ? in[g.input].focal_factor
+                              : in[g.input].subcameras[(size_t)g.sub].focal_factor;
+    return f > 0 ? f : in[g.input].focal_factor;
+}
+
+// The model each row is actually fitted with. An EMPTY model means "the same
+// as the row above" -- a dozen clips off one camera are one decision -- and the
+// first row, having none above it, falls back to `fallback`.
+std::vector<std::string> camera_group_models(const std::vector<PrepInput>& inputs,
+                                             const std::vector<CameraGroup>& groups,
+                                             const std::string& fallback);
+
 // What a folder of photos does on its way into the dataset. Only `InPlace`
 // leaves it pointing at a folder outside itself, and such a dataset opens
 // again only if `image_dir` is set by hand -- which is why it is not default.
@@ -291,10 +330,16 @@ bool ffmpeg_extract_frame(const std::string& ffmpeg_exe, const std::string& vide
 void resolve_photo_folder(const std::string& picked, std::string& images,
                           std::string& masks);
 
-// The immediate sub-folders of `dir` that hold images, sorted -- the camera
-// folders of a capture that was handed over already split. Empty when the
-// images sit in `dir` itself, which is the ordinary case.
+// Every folder under `dir` holding images DIRECTLY, '/'-separated, parents
+// before children, "" being `dir` itself -- exactly the groups `--camera-mode
+// folder` will make, grouping an image on its parent path (core/CameraSetup.h).
 std::vector<std::string> camera_subfolders(const std::string& dir);
+
+// Bounds on that walk: it runs on the UI thread and each entry becomes a panel
+// row. Past them a folder still reconstructs, sharing the nearest listed
+// folder's lens by the overrides' longest-prefix rule.
+inline constexpr int kMaxCameraFolderDepth = 4;
+inline constexpr size_t kMaxCameraFolders = 64;
 
 // Does this folder hold any image at all, at any depth? Follows directory
 // symlinks (a prepared capture's images/ is often a link into the raw one) and

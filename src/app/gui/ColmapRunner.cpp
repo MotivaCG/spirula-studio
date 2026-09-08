@@ -85,26 +85,26 @@ bool is_fisheye_model(const std::string& m) {
 
 // The images one camera can cover: the folder --camera-mode asked for, split
 // by frame size, since a principal point is not shared across sizes.
-struct CameraGroup {
+struct SizeGroup {
     std::string folder;   // empty under one shared camera
     int w = 0, h = 0;
     std::vector<std::string> names;
 };
 
-std::vector<CameraGroup> camera_groups(
+std::vector<SizeGroup> size_groups(
         const std::vector<DatasetPrep::ImageSize>& images, bool per_folder) {
-    std::vector<CameraGroup> out;
+    std::vector<SizeGroup> out;
     for (const DatasetPrep::ImageSize& im : images) {
         std::string folder;
         if (per_folder) {
             const size_t slash = im.name.find_last_of('/');
             if (slash != std::string::npos) folder = im.name.substr(0, slash);
         }
-        CameraGroup* g = nullptr;
-        for (CameraGroup& c : out)
+        SizeGroup* g = nullptr;
+        for (SizeGroup& c : out)
             if (c.folder == folder && c.w == im.w && c.h == im.h) { g = &c; break; }
         if (!g) {
-            out.push_back(CameraGroup{folder, im.w, im.h, {}});
+            out.push_back(SizeGroup{folder, im.w, im.h, {}});
             g = &out.back();
         }
         g->names.push_back(im.name);
@@ -503,14 +503,14 @@ void ColmapRunner::run(ColmapJob job) {
             // COLMAP's ImageReader drops every image whose frame size differs
             // from the first in its camera group -- one warning per image, exit
             // code 0, half a capture missing. Split by size here instead.
-            std::vector<CameraGroup> groups;
+            std::vector<SizeGroup> groups;
             size_t folders = 0;
             if (job.camera_mode == 0 || job.camera_mode == 1) {
-                groups = camera_groups(
+                groups = size_groups(
                     DatasetPrep::image_sizes(images, prep.mask_dir),
                     job.camera_mode == 1);
                 std::set<std::string> seen;
-                for (const CameraGroup& g : groups) seen.insert(g.folder);
+                for (const SizeGroup& g : groups) seen.insert(g.folder);
                 folders = seen.size();
             }
             const bool split_sizes = groups.size() > folders;

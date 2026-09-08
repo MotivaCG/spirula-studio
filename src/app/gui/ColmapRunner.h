@@ -43,8 +43,8 @@ inline std::vector<const spirula::i18n::Msg*> colmap_camera_model_helps() {
     return {&m::lens_opencv_help, &m::lens_pinhole_help,
             &m::lens_simple_pinhole_help, &m::lens_radial_help,
             &m::lens_radial_help, &m::lens_full_opencv_help,
-            &m::lens_fisheye_kb_help, &m::lens_fisheye_thin_prism_help,
-            &m::lens_fisheye_kb_help, &m::lens_fisheye_kb_help};
+            &m::lens_fisheye_opencv_help, &m::lens_fisheye_thin_prism_help,
+            &m::lens_fisheye_opencv_help, &m::lens_fisheye_opencv_help};
 }
 
 inline bool colmap_model_is_fisheye(const std::string& m) {
