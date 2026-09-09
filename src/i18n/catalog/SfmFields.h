@@ -3309,6 +3309,82 @@ SS_MSG(metric_max_error_help,
     TR("Oturtulan konumdan bu kadar metreden uzak kameralar aykırıdır; 0, GPS için 5 ve "
        "konum dosyası için 0,5 seçer"));
 
+SS_MSG(telemetry_help,
+    EN("A video whose IMU and GPS cover the images (Insta360 .insv, GoPro .360/.mp4, DJI .OSV, "
+       "CAMM): up comes from the accelerometer, scale from the accelerometer and the GPS log, "
+       "heading and place from the GPS. Frame names must carry the source frame index, as the "
+       "extractor writes them. A manifest lists one per camera group"),
+    JA("画像を記録した IMU と GPS 付きの動画 (Insta360 .insv、GoPro .360/.mp4、DJI .OSV、CAMM)。"
+       "上方向は加速度計から、縮尺は加速度計と GPS ログから、方位と位置は GPS から求めます。"
+       "フレーム名には抽出時に付く元のフレーム番号が必要です。マニフェストならカメラグループごとに指定できます"),
+    ZH_HANS("记录了这些图像的、带 IMU 和 GPS 的视频 (Insta360 .insv、GoPro .360/.mp4、DJI .OSV、CAMM): "
+            "上方向来自加速度计，缩放来自加速度计和 GPS 记录，朝向和位置来自 GPS。帧文件名须含"
+            "提取器写入的源帧序号。清单可以按相机分组各给一个"),
+    ZH_HANT("記錄了這些影像的、帶 IMU 和 GPS 的影片 (Insta360 .insv、GoPro .360/.mp4、DJI .OSV、CAMM): "
+            "上方向來自加速度計，縮放來自加速度計和 GPS 記錄，朝向和位置來自 GPS。幀檔名須含"
+            "擷取器寫入的來源幀序號。清單可以按相機分組各給一個"),
+    KO("이미지를 담은, IMU 와 GPS 가 있는 영상 (Insta360 .insv, GoPro .360/.mp4, DJI .OSV, CAMM). "
+       "위 방향은 가속도계에서, 축척은 가속도계와 GPS 로그에서, 방위와 위치는 GPS 에서 구합니다. "
+       "프레임 이름에는 추출기가 쓰는 원본 프레임 번호가 있어야 합니다. 매니페스트는 카메라 그룹마다 하나씩 적을 수 있습니다"),
+    DE("Ein Video, dessen IMU und GPS die Bilder abdecken (Insta360 .insv, GoPro .360/.mp4, DJI .OSV, "
+       "CAMM): oben aus dem Beschleunigungssensor, Maßstab aus Beschleunigungssensor und GPS-Log, "
+       "Richtung und Ort aus dem GPS. Frame-Namen müssen den Quell-Frameindex tragen, wie der "
+       "Extraktor sie schreibt. Ein Manifest nennt eines je Kameragruppe"),
+    FR("Une vidéo dont l'IMU et le GPS couvrent les images (Insta360 .insv, GoPro .360/.mp4, DJI .OSV, "
+       "CAMM) : la verticale vient de l'accéléromètre, l'échelle de l'accéléromètre et du journal GPS, "
+       "le cap et la position du GPS. Les noms d'images doivent porter l'index de la trame source, "
+       "tel que l'extracteur les écrit. Un manifeste en liste une par groupe de caméras"),
+    ES("Un vídeo cuya IMU y GPS cubren las imágenes (Insta360 .insv, GoPro .360/.mp4, DJI .OSV, CAMM): "
+       "la vertical sale del acelerómetro, la escala del acelerómetro y del registro GPS, el rumbo y "
+       "la posición del GPS. Los nombres de fotograma deben llevar el índice de origen, tal como los "
+       "escribe el extractor. Un manifiesto lista uno por grupo de cámaras"),
+    PT("Um vídeo cuja IMU e GPS cobrem as imagens (Insta360 .insv, GoPro .360/.mp4, DJI .OSV, CAMM): "
+       "a vertical vem do acelerómetro, a escala do acelerómetro e do registo GPS, o rumo e a posição "
+       "do GPS. Os nomes das imagens têm de trazer o índice de origem, tal como o extrator os escreve. "
+       "Um manifesto lista um por grupo de câmeras"),
+    IT("Un video la cui IMU e GPS coprono le immagini (Insta360 .insv, GoPro .360/.mp4, DJI .OSV, CAMM): "
+       "la verticale viene dall'accelerometro, la scala dall'accelerometro e dal log GPS, la rotta e la "
+       "posizione dal GPS. I nomi dei fotogrammi devono portare l'indice sorgente, come li scrive "
+       "l'estrattore. Un manifesto ne elenca uno per gruppo di camere"),
+    NL("Een video waarvan IMU en GPS de beelden dekken (Insta360 .insv, GoPro .360/.mp4, DJI .OSV, CAMM): "
+       "omhoog komt uit de versnellingsmeter, schaal uit versnellingsmeter en GPS-log, koers en plaats "
+       "uit de GPS. Framenamen moeten de bronframe-index dragen zoals de extractor ze schrijft. Een "
+       "manifest noemt er een per cameragroep"),
+    RU("Видео, чьи IMU и GPS покрывают снимки (Insta360 .insv, GoPro .360/.mp4, DJI .OSV, CAMM): верх "
+       "по акселерометру, масштаб по акселерометру и журналу GPS, курс и место по GPS. Имена кадров "
+       "должны нести индекс исходного кадра, как их пишет экстрактор. Манифест задаёт по одному на "
+       "группу камер"),
+    TR("IMU ve GPS'i görüntüleri kapsayan bir video (Insta360 .insv, GoPro .360/.mp4, DJI .OSV, CAMM): "
+       "yukarı ivmeölçerden, ölçek ivmeölçer ile GPS kaydından, yön ve konum GPS'ten gelir. Kare "
+       "adları çıkarıcının yazdığı kaynak kare indeksini taşımalı. Bir manifest kamera grubu başına "
+       "bir tane listeler"));
+
+SS_MSG(sensor_gauge_help,
+    EN("What the telemetry fixes: `auto` takes up, scale and place from whatever passes its checks, "
+       "`up` the orientation alone, `none` ignores the sensors"),
+    JA("テレメトリで決めるもの: `auto` は検査を通ったものから上方向・縮尺・位置を、`up` は向きだけを"
+       "決め、`none` はセンサーを無視します"),
+    ZH_HANS("遥测决定什么: `auto` 从通过检查的来源取上方向、缩放和位置，`up` 只取朝向，`none` 忽略传感器"),
+    ZH_HANT("遙測決定什麼: `auto` 從通過檢查的來源取上方向、縮放和位置，`up` 只取朝向，`none` 忽略感測器"),
+    KO("텔레메트리로 정하는 것: `auto` 는 검사를 통과한 것에서 위 방향·축척·위치를, `up` 은 방향만 "
+       "정하고, `none` 은 센서를 무시합니다"),
+    DE("Was die Telemetrie festlegt: `auto` nimmt oben, Maßstab und Ort aus allem, was seine "
+       "Prüfungen besteht, `up` nur die Ausrichtung, `none` ignoriert die Sensoren"),
+    FR("Ce que la télémétrie fixe : `auto` prend la verticale, l'échelle et la position de tout ce "
+       "qui passe ses contrôles, `up` l'orientation seule, `none` ignore les capteurs"),
+    ES("Qué fija la telemetría: `auto` toma vertical, escala y posición de lo que pase sus "
+       "comprobaciones, `up` solo la orientación, `none` ignora los sensores"),
+    PT("O que a telemetria fixa: `auto` toma vertical, escala e posição do que passar as suas "
+       "verificações, `up` só a orientação, `none` ignora os sensores"),
+    IT("Cosa fissa la telemetria: `auto` prende verticale, scala e posizione da ciò che supera i "
+       "suoi controlli, `up` solo l'orientamento, `none` ignora i sensori"),
+    NL("Wat de telemetrie vastlegt: `auto` neemt omhoog, schaal en plaats uit alles wat de controles "
+       "doorstaat, `up` alleen de oriëntatie, `none` negeert de sensoren"),
+    RU("Что задаёт телеметрия: `auto` берёт верх, масштаб и место из всего, что прошло проверки, "
+       "`up` только ориентацию, `none` игнорирует датчики"),
+    TR("Telemetrinin belirlediği: `auto` denetimlerini geçen her şeyden yukarı, ölçek ve konumu, "
+       "`up` yalnızca yönü alır, `none` sensörleri yok sayar"));
+
 }  // namespace sfmfield
 }  // namespace msg
 }  // namespace i18n

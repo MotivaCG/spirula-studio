@@ -43,32 +43,19 @@
 
 namespace sfm {
 
-// The similarity taking `rec` into its upright, centred, unit-sized frame.
-// Identity when there is nothing to measure it from (fewer than two registered
-// images, or cameras that all sit in one spot).
-inline Sim3 uprightTransform(const Reconstruction& rec) {
-    Sim3 T;
-    std::vector<Vec3> centers;
-    Vec3 up{0, 0, 0}, mid{0, 0, 0};
-    for (const auto& kv : rec.images) {
-        const Image& im = kv.second;
-        if (!im.registered) continue;
-        // Camera-to-world is [R^T | -R^T t]; its columns are the camera axes in
-        // world coordinates, in the CV convention this pipeline stores (x
-        // right, y DOWN, z forward). The trainer averages the OpenGL up axis,
-        // which is the negated y column -- i.e. minus the second ROW of R.
-        up = up + Vec3{-im.pose.R[3], -im.pose.R[4], -im.pose.R[5]};
-        Vec3 c = mul(transpose(im.pose.R), im.pose.t) * -1.0;
-        centers.push_back(c);
-        mid = mid + c;
-    }
-    if (centers.size() < 2) return T;
-    mid = mid * (1.0 / (double)centers.size());
-    const double un = up.norm();
-    if (!(un > 1e-12)) return T;
-    up = up * (1.0 / un);
+// The cameras' mean up axis in world coordinates, unnormalized. Camera-to-
+// world is [R^T | -R^T t]; its columns are the camera axes in the CV
+// convention (x right, y DOWN, z forward), so up is minus the second ROW of R.
+inline Vec3 meanCameraUp(const Reconstruction& rec) {
+    Vec3 up{0, 0, 0};
+    for (const auto& kv : rec.images)
+        if (kv.second.registered)
+            up = up + Vec3{-kv.second.pose.R[3], -kv.second.pose.R[4], -kv.second.pose.R[5]};
+    return up;
+}
 
-    // Rodrigues rotation taking `up` onto +Z, about up x z.
+// Rodrigues rotation taking the unit vector `up` onto +Z, about up x z.
+inline Mat3 rotationUpToZ(const Vec3& up) {
     Vec3 axis{up.y, -up.x, 0.0};
     const double s = std::sqrt(axis.x * axis.x + axis.y * axis.y);
     const double c = up.z;
@@ -82,6 +69,28 @@ inline Sim3 uprightTransform(const Reconstruction& rec) {
     } else if (c < 0.0) {
         R = Mat3{1, 0, 0, 0, -1, 0, 0, 0, -1};   // up == -z: flip
     }
+    return R;
+}
+
+// The similarity taking `rec` into the frame where `up` is +Z, centred on the
+// cameras and unit-sized. Identity with under two registered images.
+inline Sim3 normalizingTransform(const Reconstruction& rec, Vec3 up) {
+    Sim3 T;
+    std::vector<Vec3> centers;
+    Vec3 mid{0, 0, 0};
+    for (const auto& kv : rec.images) {
+        const Image& im = kv.second;
+        if (!im.registered) continue;
+        Vec3 c = mul(transpose(im.pose.R), im.pose.t) * -1.0;
+        centers.push_back(c);
+        mid = mid + c;
+    }
+    if (centers.size() < 2) return T;
+    mid = mid * (1.0 / (double)centers.size());
+    const double un = up.norm();
+    if (!(un > 1e-12)) return T;
+    up = up * (1.0 / un);
+    const Mat3 R = rotationUpToZ(up);
 
     // Scale so the furthest camera coordinate lands on 1. Per component, not
     // by norm: that is what the trainer does, and the point of doing this here
@@ -93,12 +102,15 @@ inline Sim3 uprightTransform(const Reconstruction& rec) {
         max_abs = std::max(max_abs, std::abs(d.y));
         max_abs = std::max(max_abs, std::abs(d.z));
     }
-    if (!(max_abs > 1e-12)) return T;
-
-    T.scale = 1.0 / max_abs;
+    T.scale = max_abs > 1e-12 ? 1.0 / max_abs : 1.0;
     T.R = R;
     T.t = mul(R, mid) * -T.scale;
     return T;
+}
+
+// The same, with up taken from the cameras themselves.
+inline Sim3 uprightTransform(const Reconstruction& rec) {
+    return normalizingTransform(rec, meanCameraUp(rec));
 }
 
 // Apply it. Poses and 3D points are the only things in a Reconstruction with

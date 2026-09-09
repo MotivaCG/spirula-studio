@@ -97,8 +97,14 @@ static int cmdManifestTest(int, char**) {
                "  - prefix: cam0\n"
                "    model: opencv-fisheye\n"
                "    focal: 350.5\n"
-               "    distortion: [0.1, -0.02]\n");
+               "    distortion: [0.1, -0.02]\n"
+               "captures:\n"
+               "  - prefix: cam0\n"
+               "    telemetry: clip.insv\n"
+               "    fps: 24\n");
     Manifest m = manifest_read(yml);
+    check(m.captures.size() == 1 && m.captures[0].prefix == "cam0" && m.captures[0].fps == 24,
+          "a capture's telemetry and frame rate");
     check(m.image_dir == "pics", "image_dir is kept as the file spells it");
     check(m.base_dir == dir, "and the manifest's own directory with it");
     check(m.camera_mode == "single", "camera_mode");
@@ -127,6 +133,9 @@ static int cmdManifestTest(int, char**) {
           "a prefixed entry becomes an override");
     check(cfg.camera.overrides[0].has_focal && cfg.camera.overrides[0].focal == 350.5,
           "with its focal");
+    check(cfg.telemetry_inputs.size() == 1 &&
+              cfg.telemetry_inputs[0].path == (std::filesystem::path(dir) / "clip.insv").string(),
+          "a capture's telemetry resolves against the manifest");
 
     SfmConfig cfg2;
     cfg2.camera_model = "radial";

@@ -3,9 +3,9 @@
 // content rather than by extension: a GoPro `gpmd` track (GPMF), the Insta360
 // trailer after the MP4, a DJI `djmd` track (protobuf), or a CAMM track.
 //
-// Nothing consumes this yet. docs/notes/imu-gps-for-sfm.md is the plan for
-// what will, and `sfm_telemetry_test FILE` prints what a file carries. Only
-// the sample tables and the telemetry bytes are read, never a picture.
+// map/SensorGauge.h consumes it through core/SensorTimeline.h;
+// `sfm_telemetry_test FILE` prints what a file carries. Only the sample
+// tables and the telemetry bytes are read, never a picture.
 
 #include <cstddef>
 #include <cstdint>
@@ -118,6 +118,13 @@ struct TelemetryCheck {
 };
 
 TelemetryCheck telemetry_check(const Telemetry& t);
+
+// The fixes worth positioning from: valid, with a DOP of 10 or better, and no
+// jump over 50 m/s from the previous distinct position. Returns the count
+// dropped by the last two gates -- one wild MAX fix passed its own DOP.
+size_t telemetry_gps_filter(const Telemetry& t, std::vector<TelemetryGps>& kept);
+bool gps_valid(const TelemetryGps& g);
+double telemetry_haversine_m(double lat1, double lon1, double lat2, double lon2);
 
 // The table `sfm_telemetry_test FILE` prints: a diagnostic, English only.
 std::string telemetry_report(const Telemetry& t, const TelemetryCheck& c);

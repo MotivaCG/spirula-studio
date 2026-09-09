@@ -1,10 +1,12 @@
 # IMU and GPS for SfM: what the cameras record, and how to use it
 
-Written 2026-09-08. Status: **the reader exists and nothing consumes it.**
+Written 2026-09-08. Status: **section 5 is implemented** (same day):
 `src/sfm/core/Telemetry.h` reads what a video file carries and checks that
 the readings look like a working sensor; `sfm_telemetry_test FILE` prints the
-result. This note records what was found in the captures on hand and lays out
-how the readings can give a reconstruction its metric scale and its
+result; `src/sfm/map/SensorGauge.h` consumes it through `--telemetry` and the
+manifest's `captures:` list, and section 5.6 records what it does and what it
+measured. This note records what was found in the captures on hand and lays
+out how the readings give a reconstruction its metric scale and its
 orientation, and, further off, make the reconstruction itself more robust.
 
 The reader has a background in computer vision but not necessarily in inertial
@@ -120,7 +122,7 @@ A fourth file agreed on both counts with no swap, which looked like a
 counter-example until its gravity vector turned out to lie on the Y = Z
 diagonal for the whole ride: the mount made the swap invisible.
 
-**GPS.** Real receiver, 18 Hz, DOP typically 1.5-2.5. One file (GS010018)
+**GPS.** Real receiver, 18 Hz, DOP typically 1.5-2.5. One file
 has a single fix 50 km away with the fix flag set and DOP under 10; the
 reader's implied-speed gate (over 50 m/s from where the previous position was
 first reported) drops it, leaving a 1.16 km path where the raw numbers said
@@ -424,6 +426,92 @@ GPS route is the one to take then.
    the outdoor X5 walks and every MAX file get a metric scale from it that
    5.2 can then be validated against.
 3. **5.2** third, for the indoor captures, which are most of them.
+
+### 5.6 What was built, and what it measured
+
+The three of 5.1-5.3 shipped together as one estimator rather than three
+passes, because they share the calibration and the same unknowns:
+
+- `core/SensorTimeline.h` answers time-indexed queries over one file's
+  telemetry: the IMU rotation between two instants (from the gyro, or from the
+  fused attitude where there is no gyro), the up direction at an instant (the
+  specific force averaged over half a second after each sample is de-rotated
+  into the frame at that instant), a pre-integration over an interval
+  (`core/Preintegration.h`, Forster et al. with first-order bias Jacobians),
+  and the GPS position at an instant, interpolated between the first
+  appearances of distinct fixes. Frame time is the source frame index in the
+  stem over the file's frame rate, plus half the readout.
+- `map/ImuExtrinsic.h` calibrates the IMU-to-lens rotation per camera group
+  from the reconstruction: the hand-eye constraint `A X = X B` between the
+  poses' relative rotations and the gyro's, and the gravity-pair constraint
+  `R_j^T X g_j = R_k^T X g_k`, are both linear in the nine entries of `X`; the
+  null vector of the stacked system, projected onto the orthogonal matrices,
+  is the answer. Two things the note above got wrong: the constraints cannot
+  tell `X` from `-X`, so handedness is not observable from them alone (the
+  sign is settled by the cameras' mean up axis, then by the sign of the
+  accelerometer scale, which must be positive); and a left-handed sensor frame
+  needs the gyro integrated with the opposite sign, so the two signs are run
+  as hypotheses and compared on the gyro pairs' residual in degrees. The IMU
+  clock offset against the video is searched for first, on the rotation angle
+  between consecutive frames, which is invariant to `X`.
+- `map/SensorGauge.h` puts it together: up as the robust mean of the frames'
+  votes; scale from the accelerometer through the velocity-free triple form
+  of Mur-Artal and Tardos, solved linearly together with both biases (on a
+  gentle walk the bias error is as large as the position signal, so scale
+  alone comes out 50 percent wrong); scale, heading and place from the GPS
+  through `fitMetricGauge` in horizontal mode; then one Levenberg-Marquardt
+  solve over the Sim(3), the biases, a lever arm and an extrinsic increment
+  per group, with Huber weights, numerical Jacobians and a per-family sigma
+  taken from the closed forms' residuals. Two scale sources combine by
+  information; beyond three sigma of disagreement the more certain one wins
+  and the run says so.
+
+Measured on a 118 s Insta360 X5 walk (231 frames, two lenses, 1 fps):
+0.26 s for the whole fit; IMU clock offset -14.6 ms; the extrinsic from 114
+frames with the gyro pairs agreeing to 0.43 deg; up votes agreeing to 4.9
+deg median with 24 of 231 outliers over 10 deg; accelerometer scale 7.30 at
+0.3 percent with the solved gravity at 9.83 m/s^2 and 0.3 deg from up; GPS
+scale 6.32 at 19 percent (the phone's fix, 146 of 195 within 5 m), so the
+joint answer 7.42 is the IMU's. The two lenses' centres in the metric model
+sit 2.9 cm apart at the same source index, which is the camera body. The
+cameras' mean up axis came out 11 deg from the IMU's, which is the error
+`--orient` was making on this capture.
+
+On a 146 s DJI Osmo 360 clip (292 frames, two lenses, 1 fps, attitude and
+a 30 Hz accelerometer, no gyro, no GPS): the extrinsic from the attitude
+agrees to 0.20 deg on the rotation pairs and 1.0 deg on the gravity votes,
+the 292 up votes agree to 0.23 deg with no outlier, and the model is written
+levelled with no scale claimed, as a file with no gyro and no GPS should be.
+
+On a GoPro MAX handheld walk (78 s, ten seam-free views per
+frame at 2 fps, 1237 of 1550 registered): every view calibrates with the
+gyro pairs agreeing to 0.2 deg; the IMU clock is 11 ms off the video from
+1077 pairs; up over 1237 votes agrees to 3.1 deg. This capture is what found
+the regression direction: the ten views' centres scatter 5 cm about their
+frame's mean (the mapper places each view on its own), the second difference
+of position over half a second is about 6 cm, and a slope fitted with that
+noise in the regressor came out 10-50 percent low per view. Fitting the
+INVERSE scale with the centres as the response (the pre-integrated prediction
+is the precise side) put every view at 1.02-1.09 of the GPS scale, combined
+1.046 at 0.7 percent against the GPS's 1.000 at 0.3 percent (18 Hz receiver,
+1237 of 1237 within 5 m, 1.6 m RMS). The remaining 4.6 percent is flagged as
+a disagreement and the GPS wins; whether it is the stick's vibration (8 m/s^2
+RMS on the accelerometer) coupling into the 200 Hz accelerometer's
+integration, or the receiver, is open.
+
+On a GoPro MAX bike ride (11 m/s, 2 fps) the reconstruction
+itself collapses into single-lens fragments whose centres sit on two points,
+so the GPS fit is refused on every fragment and the calibration is
+yaw-degenerate (the ride turns about the vertical only): up is still taken,
+the accelerometer scale is withheld, and the handedness flag is not reported
+because the two gyro signs cannot be told apart there. That case is what
+added the `degenerate` path.
+
+Synthetic coverage (`sfm_sensor_gauge_test`): IMU + GPS, IMU alone, a stale
+GPS with mirrored IMU axes and a 37 ms clock offset (recovered to 41 ms), a
+camera that only pans (up, no scale), a camera that never moves (declined),
+GPS alone. Scale within 0.05 percent, up within 0.35 deg, the extrinsic
+within 0.25 deg.
 
 ## 6. Improving the reconstruction itself (not in scope, recorded for later)
 

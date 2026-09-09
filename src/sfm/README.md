@@ -440,6 +440,40 @@ scale error. A gate that passes what it exists to catch is worse than no gate,
 so they are printed as the lower bounds they are. `map/MetricGauge.h` has the
 algebra (D74).
 
+`--telemetry VIDEO` fixes the same gauge from the **video's own sensors**,
+which is the default whenever the GUI extracted the frames from a file that
+carries them (Insta360 `.insv`, GoPro `.360`/`.mp4`, DJI `.OSV`, CAMM): its
+manifest lists one `captures:` entry per video, and the frame stems carry the
+source frame index, which is how a frame gets its time on the sensor clock.
+`map/SensorGauge.h` treats every reading as a factor on one small state (a
+Sim(3), the IMU biases, and per-lens nuisances), initialises each block in
+closed form and refines them together in one robust Levenberg-Marquardt solve:
+
+- **up** from the accelerometer, once the IMU-to-lens rotation is calibrated
+  from the reconstruction itself (`map/ImuExtrinsic.h`: the gyro's relative
+  rotations must match the poses' and every frame's gravity must land on one
+  world vector, both linear in the rotation's nine entries). A left-handed
+  sensor frame and the sign of the gyro integration are tested as hypotheses,
+  and the IMU clock offset against the video is searched for first;
+- **scale** from the accelerometer through pre-integration between
+  consecutive frames (`core/Preintegration.h`), in the velocity-free form of
+  Mur-Artal and Tardós, solved jointly with both biases because on a gentle
+  walk the bias error is as large as the signal. The gravity vector solved
+  alongside is the check: 9.82 m/s² within 0.3° of up on a 118 s X5 walk;
+- **scale, heading and place** from the GPS log, interpolated at each frame
+  and fitted exactly as `--metric-gps horizontal` fits EXIF.
+
+What is missing or degenerate is refused by its own uncertainty rather than
+by a rule: a camera that only pans gets up and no scale, a stale phone fix
+gets no GPS, a file with an attitude stream but no raw gyro (the Osmo 360)
+gets up from the attitude. Two scale sources are combined by information and
+reported separately, and an IMU-versus-GPS disagreement beyond three sigma
+keeps the more certain one and says so. `--sensor-gauge up` takes the
+orientation alone; `none` ignores the sensors. On the X5 walk the whole fit
+takes 0.3 s; a metric reference the user passes still outranks an upright-only
+sensor frame. `docs/notes/imu-gps-for-sfm.md` records what the files carry
+and what was measured.
+
 ### The finishing passes
 
 Reconstruction ends with up to two more global bundle adjustments, on models

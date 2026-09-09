@@ -1209,6 +1209,10 @@ bool DatasetPrep::extract_video(const PrepJob& job, const PrepInput& in,
             std::error_code ec;
             if (fs::is_directory(fs::path(images) / "cam1", ec))
                 out.per_folder_cameras = true;
+            // Kept frames of unknown provenance: the file's own rate is the
+            // built-in extractor's convention, and a wrong one is refused
+            // downstream by the gyro-against-poses check, not misused.
+            out.captures.push_back({in.subdir, in.path, 0.0});
             // Masks a previous run left. Not when this one is re-doing them:
             // `masked` is what makes run() skip the masking pass entirely.
             if (job.mask_enable && !job.redo_masks) {
@@ -1224,15 +1228,20 @@ bool DatasetPrep::extract_video(const PrepJob& job, const PrepInput& in,
 
     const bool want_builtin = !job.force_external_decode && backends().builtin_video;
     if (want_builtin) {
-        if (extract_video_builtin(job, in, images, out, error)) return true;
+        if (extract_video_builtin(job, in, images, out, error)) {
+            out.captures.push_back({in.subdir, in.path, 0.0});
+            return true;
+        }
         if (_cancel.load()) return false;
         // A container or profile the driver cannot decode is exactly what the
         // fallback is for, and the user should not have to know which is which.
         log(fmt(lmsg::decode_fallback_ffmpeg, {error}), /*detail=*/false);
     }
-    if (in.eac360.valid() && job.pano.mode != app::Pano360Mode::Off)
-        return extract_360_ffmpeg(job, in, images, out, error);
-    return extract_video_ffmpeg(job, in, images, out, error);
+    const bool ok = in.eac360.valid() && job.pano.mode != app::Pano360Mode::Off
+                        ? extract_360_ffmpeg(job, in, images, out, error)
+                        : extract_video_ffmpeg(job, in, images, out, error);
+    if (ok) out.captures.push_back({in.subdir, in.path, (double)job.video_fps});
+    return ok;
 }
 
 // Extraction writes frames and nothing else. Masking used to ride along on the

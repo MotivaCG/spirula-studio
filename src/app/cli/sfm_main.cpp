@@ -1054,7 +1054,8 @@ static int cmdMerge(int argc, char** argv) {
     }
     // A metric reference re-gauges a model instead of joining it to another,
     // which is the one thing this command does that one model can want (D74).
-    const bool metric = cfg.metric_gps != "none" || !cfg.metric_positions.empty();
+    const bool metric = cfg.metric_gps != "none" || !cfg.metric_positions.empty() ||
+                        (!cfg.telemetry_inputs.empty() && cfg.sensor_gauge != "none");
     if (models.size() < 2 && !metric) {
         L::fail(Tag::Merge, M::merge_need_two, {(long long)models.size()});
         return 1;

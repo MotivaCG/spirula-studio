@@ -461,6 +461,12 @@ std::string SfmConfig::finalize(uint32_t cmd) {
     // one default cannot serve both; 0 means "the one for this source".
     if (metric_max_error == 0)
         metric_max_error = gps ? 5.0 : 0.5;
+    if (!telemetry.empty()) {
+        bool listed = false;
+        for (const TelemetryInput& t : telemetry_inputs)
+            if (t.prefix.empty() && t.path == telemetry) listed = true;
+        if (!listed) telemetry_inputs.push_back({"", telemetry, 0, 0});
+    }
 
     lightglue.device = device;
     loma.device = loma_match.device = device;

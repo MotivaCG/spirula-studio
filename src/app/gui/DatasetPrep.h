@@ -249,7 +249,17 @@ inline bool reads_photos_in_place(const std::vector<PrepInput>& inputs,
 std::string planned_image_dir(const std::vector<PrepInput>& inputs,
                               const std::string& workspace, PhotoImport mode);
 
+// A video the run extracted frames from, for the manifest's `captures`:
+// the stems carry the source frame index (fps 0, the file's own rate) or,
+// after the ffmpeg fallback, the kept-frame count at `fps`.
+struct PrepCapture {
+    std::string subdir;
+    std::string path;
+    double fps = 0;
+};
+
 struct PrepResult {
+    std::vector<PrepCapture> captures;
     std::string image_dir;           // absolute; what SfM should index
     std::string image_dir_cfg;       // what the trainer's image_dir should be
     std::string mask_dir;            // "" when there are no masks

@@ -28,6 +28,16 @@ struct ManifestCamera {
     std::vector<double> distortion;  // the model's BA order; empty = zeros
 };
 
+// One source video and the telemetry it carries. `telemetry` is the video
+// itself or a file the reader knows; frames under `prefix` are timed by the
+// source frame index in their stem over `fps` (0 = the file's own rate).
+struct ManifestCapture {
+    std::string prefix;
+    std::string telemetry;
+    double fps = 0;
+    double time_offset = 0;   // seconds added to every frame time
+};
+
 struct Manifest {
     // Exactly as the file spells them; `manifest_apply` resolves a relative
     // one against `base_dir`, so a manifest and the capture beside it move
@@ -41,6 +51,7 @@ struct Manifest {
 
     std::string camera_mode;         // "single" | "folder" | "image"; empty = default
     std::vector<ManifestCamera> cameras;
+    std::vector<ManifestCapture> captures;
 
     std::string image_gamut;         // empty = leave the run's own
     int image_linear = -1;           // -1 unset, 0 no, 1 yes

@@ -101,6 +101,25 @@ Manifest manifest_read(const std::string& path) {
             m.cameras.push_back(std::move(mc));
         }
     }
+    if (const JsonValue* caps = root.find("captures")) {
+        if (!caps->is_array()) bad(path, "captures: expected a list");
+        for (const JsonValue& c : caps->arr) {
+            if (!c.is_object()) bad(path, "captures: each entry is a mapping");
+            ManifestCapture mc;
+            if (const JsonValue* v = c.find("prefix")) mc.prefix = str_of(*v, path, "prefix");
+            if (const JsonValue* v = c.find("telemetry")) mc.telemetry = str_of(*v, path, "telemetry");
+            if (mc.telemetry.empty()) bad(path, "captures: each entry names its telemetry file");
+            if (const JsonValue* v = c.find("fps")) {
+                if (v->type != JsonValue::Type::Number || v->num < 0) bad(path, "fps: expected a number");
+                mc.fps = v->num;
+            }
+            if (const JsonValue* v = c.find("time_offset")) {
+                if (v->type != JsonValue::Type::Number) bad(path, "time_offset: expected a number");
+                mc.time_offset = v->num;
+            }
+            m.captures.push_back(std::move(mc));
+        }
+    }
     return m;
 }
 
@@ -150,6 +169,20 @@ std::string manifest_write(const Manifest& m, bool json) {
             cams.arr.push_back(std::move(e));
         }
         root.obj.emplace_back("cameras", std::move(cams));
+    }
+    if (!m.captures.empty()) {
+        JsonValue caps;
+        caps.type = JsonValue::Type::Array;
+        for (const ManifestCapture& c : m.captures) {
+            JsonValue e;
+            e.type = JsonValue::Type::Object;
+            e.obj.emplace_back("prefix", text(c.prefix));
+            e.obj.emplace_back("telemetry", text(c.telemetry));
+            if (c.fps > 0) e.obj.emplace_back("fps", number(c.fps));
+            if (c.time_offset != 0) e.obj.emplace_back("time_offset", number(c.time_offset));
+            caps.arr.push_back(std::move(e));
+        }
+        root.obj.emplace_back("captures", std::move(caps));
     }
     return json ? json_write(root) : yaml_write(root);
 }
@@ -202,6 +235,8 @@ std::string manifest_apply(const Manifest& m, SfmConfig& cfg,
         // was parsed -- so appending here is what lets a flag beat the file.
         cfg.camera.overrides.push_back(o);
     }
+    for (const ManifestCapture& c : m.captures)
+        cfg.telemetry_inputs.push_back({c.prefix, resolve(c.telemetry, base), c.fps, c.time_offset});
     return {};
 }
 

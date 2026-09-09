@@ -1313,6 +1313,36 @@ bool telemetry_read(uint64_t size, const TelemetryRead& read, Telemetry& out, st
     return read_any(src, out, error);
 }
 
+bool gps_valid(const TelemetryGps& g) {
+    return g.fix && std::fabs(g.lat) <= 90 && std::fabs(g.lon) <= 180 && (g.lat != 0 || g.lon != 0);
+}
+
+size_t telemetry_gps_filter(const Telemetry& t, std::vector<TelemetryGps>& kept) {
+    // Speed is measured from where a position was FIRST reported, since a
+    // 1 Hz receiver logged at 10 Hz repeats each fix nine times.
+    kept.clear();
+    size_t outliers = 0;
+    double seen_t = 0;
+    for (const TelemetryGps& g : t.gps) {
+        if (!gps_valid(g)) continue;
+        if (g.dop > 10) { outliers++; continue; }
+        if (kept.empty()) {
+            seen_t = g.t;
+        } else if (const TelemetryGps& p = kept.back(); g.lat != p.lat || g.lon != p.lon) {
+            const double dt = g.t - seen_t;
+            const double d = haversine_m(p.lat, p.lon, g.lat, g.lon);
+            if (dt > 0 && d / dt > 50.0) { outliers++; continue; }
+            seen_t = g.t;
+        }
+        kept.push_back(g);
+    }
+    return outliers;
+}
+
+double telemetry_haversine_m(double lat1, double lon1, double lat2, double lon2) {
+    return haversine_m(lat1, lon1, lat2, lon2);
+}
+
 TelemetryCheck telemetry_check(const Telemetry& t) {
     TelemetryCheck c;
     auto vfinite = [](const TelemetryVec& v) { return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z); };
@@ -1426,13 +1456,9 @@ TelemetryCheck telemetry_check(const Telemetry& t) {
     if (!t.gps.empty()) {
         size_t fixes = 0, frozen = 0, run = 0, longest_run = 0;
         double hold_start = t.gps[0].t;
-        std::vector<const TelemetryGps*> good;
         for (size_t i = 0; i < t.gps.size(); i++) {
             const TelemetryGps& g = t.gps[i];
-            if (g.fix && std::fabs(g.lat) <= 90 && std::fabs(g.lon) <= 180 && (g.lat != 0 || g.lon != 0)) {
-                fixes++;
-                good.push_back(&g);
-            }
+            if (gps_valid(g)) fixes++;
             const bool same = i > 0 && g.lat == t.gps[i - 1].lat && g.lon == t.gps[i - 1].lon;
             if (same) { frozen++; run++; }
             else { c.gps_distinct++; hold_start = g.t; run = 0; }
@@ -1446,23 +1472,10 @@ TelemetryCheck telemetry_check(const Telemetry& t) {
         c.gps_fix_fraction = (double)fixes / (double)t.gps.size();
         c.gps_frozen_fraction = t.gps.size() > 1 ? (double)frozen / (double)(t.gps.size() - 1) : 0.0;
 
-        // A receiver's own outliers: a poor DOP, or a jump no camera makes.
-        // Speed is measured from where a position was FIRST reported, since a
-        // 1 Hz receiver logged at 10 Hz repeats each fix nine times.
+        std::vector<TelemetryGps> kept_v;
+        c.gps_outliers = telemetry_gps_filter(t, kept_v);
         std::vector<const TelemetryGps*> kept;
-        double seen_t = 0;
-        for (const TelemetryGps* g : good) {
-            if (g->dop > 10) { c.gps_outliers++; continue; }
-            if (kept.empty()) {
-                seen_t = g->t;
-            } else if (const TelemetryGps* p = kept.back(); g->lat != p->lat || g->lon != p->lon) {
-                const double dt = g->t - seen_t;
-                const double d = haversine_m(p->lat, p->lon, g->lat, g->lon);
-                if (dt > 0 && d / dt > 50.0) { c.gps_outliers++; continue; }
-                seen_t = g->t;
-            }
-            kept.push_back(g);
-        }
+        for (const TelemetryGps& g : kept_v) kept.push_back(&g);
         if (!kept.empty()) {
             double mlat = 0, mlon = 0;
             for (const TelemetryGps* g : kept) { mlat += g->lat; mlon += g->lon; }

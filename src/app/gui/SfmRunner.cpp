@@ -438,6 +438,13 @@ sfm::Manifest SfmRunner::build_manifest(const SfmJob& job, const PrepResult& pre
         }
         if (!c.model.empty() || c.focal > 0) man.cameras.push_back(std::move(c));
     }
+    for (const PrepCapture& pc : prep.captures) {
+        sfm::ManifestCapture c;
+        c.prefix = pc.subdir;
+        c.telemetry = pc.path;
+        c.fps = pc.fps;
+        man.captures.push_back(std::move(c));
+    }
     return man;
 }
 

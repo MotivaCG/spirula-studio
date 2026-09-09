@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -52,6 +53,7 @@
 #include "sfm/map/Mapper.h"
 #include "sfm/map/MetricGauge.h"
 #include "sfm/map/Orient.h"
+#include "sfm/map/SensorGauge.h"
 #include "sfm/map/Merge.h"
 
 #include "i18n/catalog/Sfm.h"
@@ -162,18 +164,6 @@ void finishFeatures(FeatureSet& fs, const GrayImage& img) {
     fs.exif_camera = exifCameraKey(img.exif, fs.width, fs.height);
 }
 
-// Put every finished model in the upright, centred, unit-sized frame before it
-// is written (sfm/map/Orient.h explains why here rather than downstream).
-// Each model is its own gauge, so each gets its own transform.
-void orientModels(std::vector<Reconstruction>& models, bool enabled, bool verbose) {
-    if (!enabled) return;
-    for (size_t i = 0; i < models.size(); i++) {
-        const Sim3 T = orientModel(models[i]);
-        if (verbose)
-            L::err(Tag::Orient, M::orient_done, {(long long)i, L::num(T.scale, 4)});
-    }
-}
-
 // Why a metric fit was refused, with the numbers, so one line is a complete
 // bug report.
 std::string metricReason(const MetricFit& f) {
@@ -196,16 +186,195 @@ std::string metricReason(const MetricFit& f) {
     return {};
 }
 
-// The gauge every finished model is written in: metric when a reference in
-// metres was given and the fit can carry it, the ordinary orient frame
-// otherwise. False when a metric frame was asked for and not delivered.
+// A telemetry file read once per run, with the queries the gauge fit makes.
+struct LoadedCapture {
+    SensorCapture cap;
+    SensorTimeline timeline;
+};
+
+std::vector<std::unique_ptr<LoadedCapture>> loadCaptures(const SfmConfig& cfg, bool verbose) {
+    std::vector<std::unique_ptr<LoadedCapture>> out;
+    if (cfg.sensor_gauge == "none") return out;
+    for (const TelemetryInput& in : cfg.telemetry_inputs) {
+        Telemetry t;
+        std::string err;
+        if (!telemetry_read(in.path, t, err) || t.empty()) {
+            L::warn(Tag::Orient, M::sensor_file_bad, {in.path, err.empty() ? "-" : err});
+            continue;
+        }
+        const TelemetryCheck c = telemetry_check(t);
+        auto lc = std::make_unique<LoadedCapture>();
+        if (!lc->timeline.init(t, c, err)) {
+            L::warn(Tag::Orient, M::sensor_file_bad, {in.path, err});
+            continue;
+        }
+        lc->cap.prefix = in.prefix;
+        lc->cap.path = in.path;
+        lc->cap.camera = t.camera;
+        lc->cap.fps = in.fps > 0 ? in.fps : t.video_fps;
+        lc->cap.time_offset = in.time_offset;
+        lc->cap.readout = t.frame_readout;
+        lc->cap.timeline = &lc->timeline;
+        L::out(Tag::Orient, M::sensor_file,
+               {in.path, t.camera.empty() ? "?" : t.camera, L::num(c.gyro.rate_hz, 0),
+                L::num(c.accel.rate_hz, 0), L::num(c.orientation.rate_hz, 0),
+                (long long)c.gps_distinct, L::num(c.gps_path_m, 0)});
+        if (!(lc->cap.fps > 0)) {
+            L::warn(Tag::Orient, M::sensor_file_no_fps, {in.path});
+            continue;
+        }
+        if (verbose)
+            for (const std::string& w : c.warnings) L::err_raw(Tag::Orient, w);
+        out.push_back(std::move(lc));
+    }
+    return out;
+}
+
+const spirula::i18n::Msg& extrinsicReason(ExtrinsicFail f) {
+    switch (f) {
+        case ExtrinsicFail::Frames: return M::sensor_calib_fail_frames;
+        case ExtrinsicFail::Pairs: return M::sensor_calib_fail_pairs;
+        case ExtrinsicFail::Disagree: return M::sensor_calib_fail_disagree;
+        case ExtrinsicFail::NoStream: return M::sensor_calib_fail_nostream;
+        case ExtrinsicFail::Degenerate: return M::sensor_calib_fail_degenerate;
+        case ExtrinsicFail::None: break;
+    }
+    return M::sensor_calib_fail_pairs;
+}
+
+const spirula::i18n::Msg& noScaleReason(SensorNoScale r) {
+    switch (r) {
+        case SensorNoScale::NotAsked: return M::sensor_no_scale_not_asked;
+        case SensorNoScale::ImuWeak: return M::sensor_no_scale_imu_weak;
+        case SensorNoScale::GpsRefused: return M::sensor_no_scale_gps_refused;
+        case SensorNoScale::Disagree: return M::sensor_no_scale_disagree;
+        case SensorNoScale::NoSource:
+        case SensorNoScale::None: break;
+    }
+    return M::sensor_no_scale_no_source;
+}
+
+void reportSensorGauge(size_t i, const SensorGaugeResult& r,
+                       const std::vector<std::unique_ptr<LoadedCapture>>& caps, bool verbose) {
+    const long long model = (long long)i;
+    if (r.fail == SensorFail::NoFrames || r.fail == SensorFail::NoTelemetry) {
+        L::err(Tag::Orient, M::sensor_declined, {model, M::sensor_fail_frames.get()});
+        return;
+    }
+    if (r.frames_untimed > 0)
+        L::err(Tag::Orient, M::sensor_untimed,
+               {model, (long long)r.frames_untimed, (long long)(r.frames_untimed + r.frames_timed)});
+    for (size_t c = 0; c < r.time_offsets.size() && c < caps.size(); c++)
+        if (r.time_offsets[c].found)
+            L::err(Tag::Orient, M::sensor_time_offset,
+                   {caps[c]->cap.path, L::num(1000.0 * r.time_offsets[c].offset, 1),
+                    (long long)r.time_offsets[c].pairs});
+    for (const SensorGroupReport& g : r.groups) {
+        const std::string name = g.name.empty() ? std::string(".") : g.name;
+        if (!g.fit.ok) {
+            L::err(Tag::Orient, M::sensor_calib_failed, {name, extrinsicReason(g.fit.reason).get()});
+            continue;
+        }
+        if (verbose) {
+            L::err(Tag::Orient, M::sensor_calib,
+                   {name, (long long)g.fit.frames, L::num(g.fit.sig_rot_deg, 2),
+                    L::num(g.fit.sig_grav_deg, 2)});
+            L::diag(Tag::Orient, "[orient] %s: det %+.0f, gyro sign %+.0f, gap %.1f, degenerate %d, "
+                    "sigma per axis %.2f/%.2f/%.2f deg\n", name.c_str(), det3(g.fit.R_ci),
+                    g.fit.gyro_sign, g.fit.gap, (int)g.fit.degenerate, g.fit.sigma_deg.x,
+                    g.fit.sigma_deg.y, g.fit.sigma_deg.z);
+            if (g.triples > 0)
+                L::err(Tag::Orient, M::sensor_calib_scale,
+                       {name, L::num(g.scale, 6), L::num(100.0 * g.scale_sigma, 2),
+                        (long long)g.triples, L::num(g.g_norm, 2), L::num(g.g_angle_deg, 1)});
+        }
+        if (g.fit.mirrored && !g.fit.degenerate)
+            L::err(Tag::Orient, M::sensor_calib_mirrored, {name});
+        if (g.fit.degenerate) L::err(Tag::Orient, M::sensor_calib_yaw_free, {name});
+    }
+    if (r.up_from_imu)
+        L::out(Tag::Orient, M::sensor_up,
+               {model, (long long)r.up.votes, L::num(r.up.spread_deg, 2), (long long)r.up.outliers});
+    if (r.fail == SensorFail::NoUp) {
+        L::err(Tag::Orient, M::sensor_declined, {model, M::sensor_fail_noup.get()});
+        return;
+    }
+    if (r.scale_imu_sigma > 0) {
+        int triples = 0;
+        double g_norm = 0, g_angle = 0;
+        for (const SensorGroupReport& g : r.groups) {
+            triples += g.triples;
+            if (g.triples > 0 && g.g_norm > 0) { g_norm = g.g_norm; g_angle = g.g_angle_deg; }
+        }
+        if (r.scale_from_imu || r.disagree)
+            L::out(Tag::Orient, M::sensor_scale_imu,
+                   {model, L::num(r.scale_imu, 6), L::num(100.0 * r.scale_imu_sigma, 2),
+                    (long long)triples, L::num(g_norm, 2), L::num(g_angle, 1)});
+        else
+            L::err(Tag::Orient, M::sensor_scale_imu_weak,
+                   {model, L::num(100.0 * r.scale_imu_sigma, 1), (long long)triples});
+    }
+    if (r.gps_frames > 0) {
+        if (r.gps.ok)
+            L::out(Tag::Orient, M::sensor_scale_gps,
+                   {model, L::num(r.scale_gps, 6), L::num(100.0 * r.scale_gps_sigma, 2),
+                    (long long)r.gps_frames, L::num(r.gps.max_error, 1), (long long)r.gps.inliers,
+                    (long long)r.gps.n, L::num(r.gps.rms, 2)});
+        else
+            L::err(Tag::Orient, M::sensor_scale_gps_failed, {model, metricReason(r.gps)});
+    }
+    if (r.disagree)
+        L::warn(Tag::Orient, M::sensor_disagree, {model, L::num(r.scale_imu, 6), L::num(r.scale_gps, 6)});
+    if (!r.applied) return;
+    if (!r.metric) {
+        L::out(Tag::Orient, M::sensor_up_only,
+               {model, L::num(r.T.scale, 4), noScaleReason(r.no_scale).get()});
+        return;
+    }
+    const spirula::i18n::Msg& src = r.scale_from_imu && r.scale_from_gps ? M::sensor_src_both
+                                    : r.scale_from_imu                    ? M::sensor_src_imu
+                                                                          : M::sensor_src_gps;
+    L::out(Tag::Orient, M::sensor_done,
+           {model, src.get(), L::num(r.T.scale, 6), L::num(100.0 * r.scale_sigma, 2),
+            L::num(r.tilt_sigma_deg, 2)});
+}
+
+// The gauge every finished model is written in: the video's sensors when
+// named and the fit holds, else a metric reference when given and fitted,
+// else the orient frame. False when a metric frame was asked for and missed.
 bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
                      const std::string& imagedir, bool verbose) {
     const bool gps = cfg.metric_gps != "none";
     const bool flat = cfg.metric_gps == "horizontal";
     const bool file = !cfg.metric_positions.empty();
+
+    std::vector<char> settled(models.size(), 0);
+    const std::vector<std::unique_ptr<LoadedCapture>> loaded = loadCaptures(cfg, verbose);
+    if (!loaded.empty()) {
+        std::vector<SensorCapture> caps;
+        for (const auto& lc : loaded) caps.push_back(lc->cap);
+        SensorGaugeOptions opt;
+        opt.mode = cfg.sensor_gauge == "up" ? SensorMode::Up : SensorMode::Auto;
+        opt.gps_full = cfg.metric_gps == "full";
+        opt.gps_max_error = gps ? cfg.metric_max_error : 5.0;
+        opt.verbose = verbose;
+        for (size_t i = 0; i < models.size(); i++) {
+            const SensorGaugeResult r = fitSensorGauge(models[i], caps, opt);
+            reportSensorGauge(i, r, loaded, verbose);
+            if (!r.applied) continue;
+            applySim3(models[i], r.T);
+            // A metric reference the user gave still outranks an upright-only
+            // sensor frame; a metric sensor frame settles the model.
+            settled[i] = r.metric || !(gps || file);
+        }
+    }
+
     if (!gps && !file) {
-        orientModels(models, cfg.orient, verbose);
+        for (size_t i = 0; i < models.size(); i++)
+            if (!settled[i] && cfg.orient) {
+                const Sim3 T = orientModel(models[i]);
+                if (verbose) L::err(Tag::Orient, M::orient_done, {(long long)i, L::num(T.scale, 4)});
+            }
         return true;
     }
     std::map<std::string, Vec3> positions;
@@ -213,12 +382,14 @@ bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
         std::string err;
         if (!readMetricPositions(cfg.metric_positions, positions, err)) {
             L::fail(Tag::Orient, M::metric_positions_bad, {cfg.metric_positions, err});
-            orientModels(models, cfg.orient, verbose);
+            for (size_t i = 0; i < models.size(); i++)
+                if (!settled[i] && cfg.orient) orientModel(models[i]);
             return false;
         }
     }
     bool all = true;
     for (size_t i = 0; i < models.size(); i++) {
+        if (settled[i]) continue;
         MetricRef ref;
         if (file) {
             const MetricPairCounts pc = pairMetricRef(models[i], positions, ref);
