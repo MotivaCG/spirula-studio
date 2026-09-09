@@ -452,7 +452,9 @@ high`) -- about 4.4 px per degree, against 16.7 for a 1504 px face.
   so an inverted mount comes out upside down until `--360-orient 0,0,180` says
   otherwise. That knob is deliberately CLI-only: the `gpmd` stream carries
   GRAV, CORI, IORI and GPS5, so levelling belongs to a reader of those rather
-  than to three sliders nobody can visualise. Nothing parses them yet.
+  than to three sliders nobody can visualise. `src/sfm/core/Telemetry.h` reads
+  them and `viewer/telemetry.html` plots them, but nothing consumes them yet;
+  `docs/notes/imu-gps-for-sfm.md` is the plan for what will.
 - **Click prompts for masking.** Clicks are recorded on the camera's own
   frame, which the unwrap reshapes. Prompt a 360 capture with text.
 - **The operator.** Whoever is holding it is in the downward and rearward views

@@ -192,6 +192,9 @@ core/        types shared by every stage, no Vulkan:
                Pose                   Rigid3, Sim3, angle-axis conversions
                Image / ImageLoader    decode, grayscale, the batch decode pool
                Exif                   focal prior + camera identity from headers
+               Telemetry              the IMU / GPS a video carries (GPMF, Insta360,
+                                        DJI, CAMM), read by content; unconsumed --
+                                        docs/notes/imu-gps-for-sfm.md
                Features / Matches     the on-disk feature and match formats
                Mask                   keypoint masking, sampled in uv
                Model                  Reconstruction + COLMAP binary IO
@@ -511,6 +514,7 @@ PASS/FAIL and returns 0/1 — the same convention as `src/backend/tests/`.
 | `sfm_geometry_test` | F, H, E, P3P, triangulation, RANSAC, SVD/eigen kernels | no |
 | `sfm_merge_test` | Sim(3) algebra, model alignment, track splicing, fold detection | no |
 | `sfm_mask_test` | mask uv sampling, decode, file discovery | no |
+| `sfm_telemetry_test` | the four telemetry carriers on synthetic files, and the sanity checks; `sfm_telemetry_test FILE` prints what a video carries | no |
 
 End to end, the check that matters is a reconstruction on a public dataset
 scored against the reference that ships with it: `tools/sfm/eval_poses.py` reads

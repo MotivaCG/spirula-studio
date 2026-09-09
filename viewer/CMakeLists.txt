@@ -1,11 +1,12 @@
-# Standalone WebGL viewer — WASM module build.
+# Standalone WebGL viewers — WASM module build.
 #
 # Configure with the Emscripten toolchain via emcmake, e.g.:
 #   emcmake cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 #   cmake --build build
-# Output: build/ssv_wasm.js + build/ssv_wasm.wasm, copied to js/.
+# Two independent modules, copied to js/: ssv_wasm (index.html) and
+# ssv_telemetry (telemetry.html); editing one rebuilds only that one.
 #
-# Two kinds of native code are linked in:
+# ssv_wasm links two kinds of native code:
 #   1. src/viewer.cpp — dependency-free, performance-critical PLY/OBJ parsing,
 #      depth sorting, and statistics (kept -ffast-math / -fno-exceptions).
 #   2. The trainer's dataset parsers (COLMAP / Nerfstudio / Metashape), reused
@@ -104,5 +105,46 @@ add_custom_command(TARGET ssv_wasm POST_BUILD
   COMMENT "Copying WASM artifacts into js/"
 )
 
-# Last: makes ssv_wasm depend on the repo's comment-length lint (docs/build.md).
+# ---------------------------------------------------------------------------
+# Second module, for telemetry.html: the trainer's IMU/GPS reader
+# (src/sfm/core/Telemetry.cpp, in place) behind a C ABI. Separate from
+# ssv_wasm on purpose -- editing one viewer's sources rebuilds only it, and
+# neither page pays for the other's code.
+# ---------------------------------------------------------------------------
+add_executable(ssv_telemetry src/telemetry_bridge.cpp "${SS_SRC}/sfm/core/Telemetry.cpp")
+target_include_directories(ssv_telemetry PRIVATE "${SS_SRC}")
+target_compile_definitions(ssv_telemetry PRIVATE SS_SOURCE_ROOT="${SS_ROOT}")
+set_source_files_properties(src/telemetry_bridge.cpp "${SS_SRC}/sfm/core/Telemetry.cpp"
+  PROPERTIES COMPILE_OPTIONS "-O3;-fno-exceptions;-fno-rtti")
+
+# No filesystem and no exceptions: the parser is fed bytes through a callback
+# the worker answers from a File slice, so a multi-GB capture never lands in
+# the heap.
+target_link_options(ssv_telemetry PRIVATE
+  -O3
+  "-sMODULARIZE=1"
+  "-sEXPORT_NAME=SSTModule"
+  "-sEXPORT_ES6=1"
+  "-sENVIRONMENT=web,worker"
+  "-sALLOW_MEMORY_GROWTH=1"
+  "-sMAXIMUM_MEMORY=2gb"
+  "-sINITIAL_MEMORY=32mb"
+  "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','UTF8ToString','HEAPU8','HEAPF32','HEAPF64']"
+)
+
+set_target_properties(ssv_telemetry PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+  OUTPUT_NAME "ssv_telemetry"
+  SUFFIX ".js"
+)
+
+add_custom_command(TARGET ssv_telemetry POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${CMAKE_BINARY_DIR}/ssv_telemetry.js" "${CMAKE_SOURCE_DIR}/js/ssv_telemetry.js"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${CMAKE_BINARY_DIR}/ssv_telemetry.wasm" "${CMAKE_SOURCE_DIR}/js/ssv_telemetry.wasm"
+  COMMENT "Copying telemetry WASM artifacts into js/"
+)
+
+# Last: makes both modules depend on the repo's comment-length lint (docs/build.md).
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/SsChecks.cmake)
