@@ -3,6 +3,7 @@
 #include "sfm/core/Events.h"
 
 #include <mutex>
+#include <vector>
 
 namespace sfm {
 namespace events {
@@ -10,6 +11,12 @@ namespace events {
 namespace {
 std::mutex g_mu;
 Sink g_sink;
+
+// The mapping bar's own state, behind its own lock: map_placed is called from
+// the atom workers while a sink runs on whichever thread emitted.
+std::mutex g_map_mu;
+std::vector<char> g_placed;
+int64_t g_placed_n = 0;
 }  // namespace
 
 void set_sink(Sink s) {
@@ -51,6 +58,25 @@ void progress(Stage s, int64_t done, int64_t total) {
     e.done = done;
     e.total = total;
     emit(e);
+}
+
+void map_begin(size_t n_images) {
+    std::lock_guard<std::mutex> lk(g_map_mu);
+    g_placed.assign(n_images, 0);
+    g_placed_n = 0;
+}
+
+void map_placed(uint32_t image) {
+    int64_t done = 0, total = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_map_mu);
+        if (image >= g_placed.size() || g_placed[image]) return;
+        g_placed[image] = 1;
+        done = ++g_placed_n;
+        total = (int64_t)g_placed.size();
+    }
+    // Once per image over the whole stage, so there is nothing to rate-limit.
+    progress(Stage::Map, done, total);
 }
 
 }  // namespace events

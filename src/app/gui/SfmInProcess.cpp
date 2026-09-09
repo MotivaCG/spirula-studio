@@ -42,8 +42,11 @@ struct LinePrinter {
 // cannot tell the two apart.
 struct StatusFold {
     RunStatus st;
-    void apply(const sfm::Event& e) {
+    // False when the event moved nothing a screen shows, which is every pair
+    // matching verifies -- and there are hundreds of thousands of those.
+    bool apply(const sfm::Event& e) {
         using K = sfm::Event::Kind;
+        if (e.kind == K::PairVerified) return false;
         st.stage = (uint32_t)e.stage;
         switch (e.kind) {
             case K::StageBegin: st.done = 0; st.total = e.total; break;
@@ -51,11 +54,11 @@ struct StatusFold {
             case K::Progress:
             case K::ImageExtracted: st.done = e.done; st.total = e.total; break;
             case K::ModelUpdated:
+                // Not done/total: mapping's bar is events::map_placed, which
+                // counts the capture rather than the attempt in hand.
                 st.registered = e.registered;
                 st.images = e.images;
                 st.points = e.points;
-                st.done = e.registered;
-                st.total = e.images;
                 break;
             case K::Result:
                 st.finished = true;
@@ -69,6 +72,7 @@ struct StatusFold {
                 break;
             default: break;
         }
+        return true;
     }
 };
 
@@ -107,8 +111,7 @@ InProcessResult run_sfm_in_process(
         // The child writes the same snapshot from the same stream; this is
         // that writer, for a front end reading it live instead.
         sfm::progress::status(e);
-        fold.apply(e);
-        if (on_status) on_status(fold.st);
+        if (fold.apply(e) && on_status) on_status(fold.st);
     });
 
     try {

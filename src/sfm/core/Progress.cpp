@@ -9,10 +9,13 @@
 #include "sfm/core/Matches.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -30,6 +33,97 @@ using Clock = std::chrono::steady_clock;
 // times a second.
 constexpr double kInterval = 1.5;
 
+// A capture with 700k verified pairs would append 1.4 GB here, beside the
+// matches.bin that is the actual output. Past this the file simply stops
+// growing: a reader already treats what is not there as a pair it cannot draw.
+constexpr uint64_t kLiveCap = 256ull << 20;
+
+// A thumbnail on its way to disk: already downscaled, so a queued one is
+// ~1 MB rather than the working copy it came from.
+struct ThumbJob {
+    fs::path dst;
+    std::vector<uint8_t> rgb;
+    int w = 0, h = 0;
+};
+
+// A JPEG per image cost a sixth of the extraction stage on the consumer
+// thread, which is the one the GPU runs on. The bounded queue drops its oldest
+// rather than stall it: without a thumbnail a reel decodes the source frame.
+class ThumbWriter {
+public:
+    ~ThumbWriter() { stop(); }
+
+    void push(ThumbJob j) {
+        std::unique_lock<std::mutex> lk(mu_);
+        if (!worker_.joinable()) {
+            quit_ = false;
+            worker_ = std::thread([this] { run(); });
+        }
+        while (q_.size() >= kQueue) q_.pop_front();
+        q_.push_back(std::move(j));
+        lk.unlock();
+        cv_.notify_one();
+    }
+
+    // Everything pushed so far is on disk when this returns.
+    void drain() {
+        std::unique_lock<std::mutex> lk(mu_);
+        if (!worker_.joinable()) return;
+        idle_.wait(lk, [this] { return q_.empty() && !busy_; });
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (!worker_.joinable()) return;
+            quit_ = true;
+        }
+        cv_.notify_all();
+        worker_.join();
+        std::lock_guard<std::mutex> lk(mu_);
+        q_.clear();
+    }
+
+private:
+    static constexpr size_t kQueue = 8;
+
+    void run() {
+        fs::path made;   // last directory created, which every stem but the
+        std::error_code ec;   // first of a folder shares
+        for (;;) {
+            ThumbJob j;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [this] { return quit_ || !q_.empty(); });
+                if (q_.empty()) return;   // quit_, with nothing left
+                j = std::move(q_.front());
+                q_.pop_front();
+                busy_ = true;
+            }
+            const fs::path parent = j.dst.parent_path();
+            if (parent != made) {
+                fs::create_directories(parent, ec);
+                made = parent;
+            }
+            const fs::path tmp = fs::path(j.dst) += ".tmp";
+            if (stbi_write_jpg(tmp.string().c_str(), j.w, j.h, 3, j.rgb.data(), 88))
+                fs::rename(tmp, j.dst, ec);
+            if (ec) fs::remove(tmp, ec);
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                busy_ = false;
+            }
+            idle_.notify_all();
+        }
+    }
+
+    std::mutex mu_;
+    std::condition_variable cv_, idle_;
+    std::deque<ThumbJob> q_;
+    std::thread worker_;
+    bool quit_ = false, busy_ = false;
+};
+
 struct State {
     std::mutex mu;
     std::string dir;
@@ -46,10 +140,17 @@ struct State {
     // stays open for the stage rather than reopening per pair.
     std::mutex live_mu;
     std::ofstream live;
+    Clock::time_point live_at{};
+    bool live_started = false;
+    uint64_t live_bytes = 0;
+
+    bool gauge_oriented = false, gauge_metric = false;
 
     Clock::time_point status_at{};
     bool status_started = false;
     Event last;                  // what the next unforced write would say
+
+    ThumbWriter thumbs;
 };
 
 State& state() {
@@ -122,6 +223,8 @@ size_t cell_of(const State& s, uint32_t image1, uint32_t image2, size_t& mirror)
 
 void set_dir(const std::string& dir) {
     State& s = state();
+    // Before the directory moves: what is queued was addressed to the old one.
+    s.thumbs.stop();
     {
         // Closed here, not left to the process: a second run in the same
         // process must not append to the first one's file.
@@ -131,6 +234,7 @@ void set_dir(const std::string& dir) {
     }
     std::lock_guard<std::mutex> lk(s.mu);
     s.dir = dir;
+    s.gauge_oriented = s.gauge_metric = false;
     if (dir.empty()) return;
     std::error_code ec;
     fs::create_directories(dir, ec);
@@ -159,7 +263,8 @@ void model(const Reconstruction& rec, bool force, const PointColor& color) {
     std::string b;
     b.reserve(64 + imgs.size() * 128 + (size_t)(n_pts / stride + 1) * 15);
     put(b, "VKPM", 4);
-    put_u32(b, 2);
+    put_u32(b, 3);
+    put_u32(b, (s.gauge_oriented ? 1u : 0u) | (s.gauge_metric ? 2u : 0u));
     put_u32(b, (uint32_t)rec.images.size());
     put_u32(b, (uint32_t)imgs.size());
     put_u64(b, n_pts);
@@ -213,6 +318,13 @@ void model(const Reconstruction& rec, bool force, const PointColor& color) {
     write_atomic("model.bin", b);
 }
 
+void gauge(bool oriented, bool metric) {
+    State& s = state();
+    std::lock_guard<std::mutex> lk(s.mu);
+    s.gauge_oriented = oriented;
+    s.gauge_metric = metric;
+}
+
 void begin_matching(uint32_t n_images,
                     const std::vector<std::pair<uint32_t, uint32_t>>& pairs) {
     State& s = state();
@@ -256,6 +368,9 @@ void status(const Event& e) {
     std::lock_guard<std::mutex> lk(s.mu);
     if (s.dir.empty()) return;
     using K = Event::Kind;
+    // Nothing here is keyed on a pair, and matching emits one per pair from
+    // its workers: taking the lock for it would serialize the stage on this.
+    if (e.kind == K::PairVerified) return;
     // A stage boundary and the verdict are the two things a screen must not
     // miss; a fraction can wait for the clock.
     const bool force = e.kind == K::StageBegin || e.kind == K::StageEnd ||
@@ -265,12 +380,12 @@ void status(const Event& e) {
         s.last.done = e.done;
         s.last.total = e.total;
     } else if (e.kind == K::ModelUpdated) {
+        // Model size, not the bar: mapping's fraction comes from
+        // events::map_placed, because this count falls back on a seed retry.
         s.last.stage = e.stage;
         s.last.registered = e.registered;
         s.last.images = e.images;
         s.last.points = e.points;
-        s.last.done = e.registered;
-        s.last.total = e.images;
     } else if (force) {
         Event keep = s.last;
         s.last = e;
@@ -315,6 +430,8 @@ void live_matches_begin(const std::vector<std::string>& names,
     s.live.open(fs::path(dir) / "live_matches.bin",
                 std::ios::binary | std::ios::trunc);
     if (!s.live) return;
+    s.live_started = false;
+    s.live_bytes = 0;
     const uint32_t version = 3, nimg = (uint32_t)names.size();
     s.live.write("VKMT", 4);
     s.live.write((const char*)&version, 4);
@@ -331,27 +448,33 @@ void live_matches_begin(const std::vector<std::string>& names,
     s.live.flush();
 }
 
-// Flushed per pair: a reader that sees a record must be able to read it, and
-// the index walk stops at a torn tail rather than guessing.
+// Packed before the lock and written once: this is the verification workers'
+// inner loop, and a stream write per index queued them behind each other.
+// Flushed on a clock -- a reader already has to stop at a torn tail.
 void live_pair(uint32_t a, uint32_t b, int32_t config,
                const uint32_t* idx1, const uint32_t* idx2, size_t stride,
                uint32_t count) {
+    std::string rec;
+    rec.reserve(16 + (size_t)count * 8);
+    put_u32(rec, a);
+    put_u32(rec, b);
+    put(rec, &config, 4);
+    put_u32(rec, count);
+    for (uint32_t i = 0; i < count; i++) {
+        put(rec, (const char*)idx1 + i * stride, 4);
+        put(rec, (const char*)idx2 + i * stride, 4);
+    }
     State& s = state();
     std::lock_guard<std::mutex> lk(s.live_mu);
-    if (!s.live) return;
-    s.live.write((const char*)&a, 4);
-    s.live.write((const char*)&b, 4);
-    s.live.write((const char*)&config, 4);
-    s.live.write((const char*)&count, 4);
-    for (uint32_t i = 0; i < count; i++) {
-        s.live.write((const char*)((const char*)idx1 + i * stride), 4);
-        s.live.write((const char*)((const char*)idx2 + i * stride), 4);
-    }
-    s.live.flush();
+    if (!s.live || s.live_bytes > kLiveCap) return;
+    s.live.write(rec.data(), (std::streamsize)rec.size());
+    s.live_bytes += rec.size();
+    if (due(s.live_at, s.live_started)) s.live.flush();
 }
 
 // Box-filtered, which is enough for a preview and avoids pulling a resampler
-// in. Written per image, so it must not cost more than the extraction did.
+// in. The downscale happens here because it reads the caller's buffer, which
+// is gone by the time the writer runs; everything after it is the writer's.
 void thumbnail(const std::string& rel_stem, const uint8_t* rgb, int w, int h) {
     State& s = state();
     std::string dir;
@@ -363,10 +486,13 @@ void thumbnail(const std::string& rel_stem, const uint8_t* rgb, int w, int h) {
     if (!rgb || w <= 0 || h <= 0) return;
     const int longest = w > h ? w : h;
     const int step = longest > kThumbLong ? (longest + kThumbLong - 1) / kThumbLong : 1;
-    const int tw = (w + step - 1) / step, th = (h + step - 1) / step;
-    std::vector<uint8_t> out((size_t)tw * th * 3);
-    for (int y = 0; y < th; y++) {
-        for (int x = 0; x < tw; x++) {
+    ThumbJob j;
+    j.w = (w + step - 1) / step;
+    j.h = (h + step - 1) / step;
+    j.dst = fs::path(dir) / "thumbs" / (rel_stem + ".jpg");
+    j.rgb.resize((size_t)j.w * j.h * 3);
+    for (int y = 0; y < j.h; y++) {
+        for (int x = 0; x < j.w; x++) {
             uint32_t acc[3] = {0, 0, 0};
             uint32_t n = 0;
             for (int dy = 0; dy < step; dy++) {
@@ -380,21 +506,20 @@ void thumbnail(const std::string& rel_stem, const uint8_t* rgb, int w, int h) {
                     n++;
                 }
             }
-            uint8_t* d = out.data() + ((size_t)y * tw + x) * 3;
+            uint8_t* d = j.rgb.data() + ((size_t)y * j.w + x) * 3;
             for (int c = 0; c < 3; c++) d[c] = n ? (uint8_t)(acc[c] / n) : 0;
         }
     }
-    const fs::path dst = fs::path(dir) / "thumbs" / (rel_stem + ".jpg");
-    std::error_code ec;
-    fs::create_directories(dst.parent_path(), ec);
-    const fs::path tmp = fs::path(dst) += ".tmp";
-    if (stbi_write_jpg(tmp.string().c_str(), tw, th, 3, out.data(), 88))
-        fs::rename(tmp, dst, ec);
-    if (ec) fs::remove(tmp, ec);
+    s.thumbs.push(std::move(j));
 }
 
 void flush() {
     State& s = state();
+    s.thumbs.drain();
+    {
+        std::lock_guard<std::mutex> lk(s.live_mu);
+        if (s.live) s.live.flush();
+    }
     std::lock_guard<std::mutex> lk(s.mu);
     if (s.dir.empty()) return;
     write_pairs_locked();

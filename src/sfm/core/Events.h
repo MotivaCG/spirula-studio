@@ -70,5 +70,11 @@ void stage_begin(Stage s, int64_t total = 0);
 void stage_end(Stage s);
 void progress(Stage s, int64_t done, int64_t total);
 
+// How far mapping is, over the capture rather than over one model: a seed
+// retry resets the model and an atom numbers from zero, so a bar taken from
+// either runs forward and falls back. Idempotent, and safe from the workers.
+void map_begin(size_t n_images);
+void map_placed(uint32_t image);
+
 }  // namespace events
 }  // namespace sfm

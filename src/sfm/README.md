@@ -404,8 +404,9 @@ fitted from the camera centres with LO-RANSAC over the same `estimateSim3` that
 model merging uses, and `--metric-max-error` is its inlier radius in metres (0
 picks 5 for GPS, 0.5 for a positions file).
 
-`--metric-gps` takes `none` (the default), `horizontal` or `full`, and the
-difference is the altitude. `full` fits all seven parameters, so the reference's
+`--metric-gps` takes `none` (the CLI default; the GUI asks for `horizontal`),
+`horizontal` or `full`, and the difference is the altitude.
+`full` fits all seven parameters, so the reference's
 vertical sets the model's tilt; `horizontal` fits only scale, heading and place,
 against latitude and longitude, and leaves which way is up to the cameras' own
 mean up axis — the same claim `--orient` makes. A phone's altitude is the worst
@@ -424,8 +425,7 @@ that do not spread wider than the inlier radius, under half the cameras inlying,
 or (full only) cameras lying so close to a line that the reference amplifies
 orientation error more than 20x — each reports its own reason with the numbers
 behind it; the model is then still written, in the ordinary orient gauge, and
-the exit status is 4. A run that is *also* partial exits 3, since the
-reconstruction's own verdict outranks the gauge's, but prints both RESULT lines.
+the exit status is 4.
 
 `merge` accepts a single model when a metric reference is given: there is
 nothing to merge, and it re-gauges the model in place. That is the way to put
@@ -473,6 +473,21 @@ orientation alone; `none` ignores the sensors. On the X5 walk the whole fit
 takes 0.3 s; a metric reference the user passes still outranks an upright-only
 sensor frame. `docs/notes/imu-gps-for-sfm.md` records what the files carry
 and what was measured.
+
+The sources run in that order and read each other: `gauge.txt`'s two bits are
+the state as well as the record, so a reference is not fitted over a model the
+sensors already made metric, `horizontal` skips its own upright pre-transform
+where the sensors already levelled the model, and the mean-camera-up fallback
+runs in exactly one place, over models nothing measured. A gauge a sensor
+settled is never overwritten by the guess it was consulted to replace.
+
+Whatever settled a model's gauge, `sparse/N/gauge.txt` records it beside the
+model — `oriented` (is +Z up because something measured it, rather than the
+mean camera up axis guessing), `metric` (is a unit a metre), and which source
+each came from. Plain text, and read by the viewer: a model that says
+`oriented 1` is shown in its own frame with the up guess switched off, and its
+grid legend is in metres. Nothing else depends on the file, so a reconstruction
+COLMAP wrote is simply one that says nothing.
 
 ### The finishing passes
 

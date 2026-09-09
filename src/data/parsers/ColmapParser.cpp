@@ -18,6 +18,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <stdexcept>
 
 namespace fs = std::filesystem;
@@ -100,6 +101,23 @@ int colmap_model_id(const std::string& name) {
 
 }  // namespace
 
+
+// gauge.txt beside the model (sfm/Pipeline.h): what the frame is worth. Absent
+// for every reconstruction not made here, and then the answer is "nothing".
+void read_gauge(const std::string& recon_dir, ParsedDataset& ds) {
+    std::ifstream f(recon_dir + "/gauge.txt");
+    if (!f) return;
+    // Line at a time, so a comment with an odd number of words cannot shift
+    // every key onto the wrong value.
+    std::string line;
+    while (std::getline(f, line)) {
+        std::istringstream in(line);
+        std::string key, value;
+        if (!(in >> key >> value) || key[0] == '#') continue;
+        if (key == "oriented") ds.gauge_oriented = value == "1";
+        else if (key == "metric") ds.gauge_metric = value == "1";
+    }
+}
 
 std::map<int32_t, ColmapCamera> read_cameras_binary(const std::string& recon_dir) {
     BinReader r(recon_dir + "/cameras.bin");
@@ -781,8 +799,9 @@ ParsedDataset parse_colmap_dataset(const std::string& dataset_dir,
     // frames (train + eval, matching the Python dataparser, which splits
     // after normalization). No applied_transform on the COLMAP path, so
     // train_to_normalized = inv(T_n_from_camera). -----------------------------
-    double T_n[16], T_inv[16];
-    double scale_factor = dsparse::compute_normalized_transform(c2w_all, n_all, T_n);
+    double T_n[16], T_inv[16], R_align[9];
+    double scale_factor =
+        dsparse::compute_normalized_transform(c2w_all, n_all, T_n, R_align);
     dsparse::invert_affine4x4(T_n, T_inv);
     float train_frame_scale = (float)(scale_factor != 0.0 ? 1.0 / scale_factor : 1.0);
 
@@ -798,6 +817,8 @@ ParsedDataset parse_colmap_dataset(const std::string& dataset_dir,
     ds.num_cameras = N;
     ds.train_frame_scale = train_frame_scale;
     for (int k = 0; k < 16; k++) ds.train_to_normalized[k] = (float)T_inv[k];
+    for (int k = 0; k < 9; k++) ds.normalized_rotation[k] = (float)R_align[k];
+    read_gauge(recon_dir, ds);
     ds.camera_models.reserve(N);
     ds.camera_distortions.reserve(N);
     ds.image_filenames.reserve(N);

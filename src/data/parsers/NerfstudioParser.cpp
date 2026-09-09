@@ -492,9 +492,9 @@ ParsedDataset parse_nerfstudio_meta(const JsonValue& meta,
 
     // ---- train_frame_scale + normalized-frame similarity (all post-outlier
     // frames, pre-split). ------------------------------------------------------
-    double T_n_from_camera[16];
+    double T_n_from_camera[16], R_align[9];
     double scale_factor = dsparse::compute_normalized_transform(
-        c2w_all, n_all, T_n_from_camera);
+        c2w_all, n_all, T_n_from_camera, R_align);
 
     // ---- eval_mode train subset ----------------------------------------------
     std::vector<std::string> names(n_all);
@@ -756,6 +756,7 @@ ParsedDataset parse_nerfstudio_meta(const JsonValue& meta,
     double T_remap[16];
     dsparse::invert_affine4x4(T_n_from_train, T_remap);
     for (int k = 0; k < 16; k++) ds.train_to_normalized[k] = (float)T_remap[k];
+    for (int k = 0; k < 9; k++) ds.normalized_rotation[k] = (float)R_align[k];
 
     // validation_fraction holds out part of the TRAIN set; the eval split is
     // already a held-out set, so it is all "train" from the DataManager's

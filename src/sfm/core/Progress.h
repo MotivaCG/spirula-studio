@@ -37,11 +37,14 @@ inline constexpr uint32_t kMaxPoints = 50000;
 void set_dir(const std::string& dir);
 bool enabled();
 
-// model.bin: "VKPM", u32 version=2, u32 images, u32 registered, u64 points,
-// then per registered image { f32 c2w[12] (OpenGL camera-to-world), u32 w, u32
-// h, u32 colmap_model_id, u32 num_params, f64 params[num_params] }, then u32
-// count and that many { f32 xyz[3], u8 rgb[3] }.
-//
+// What the model's frame is worth, carried into the next model.bin so a front
+// end drawing it can say whether a unit is a metre (sfm/Pipeline.h ModelGauge).
+void gauge(bool oriented, bool metric);
+
+// model.bin: "VKPM", u32 version=3, flags (1 oriented, 2 metric), images,
+// registered, u64 points; per registered image { f32 c2w[12] OpenGL, u32 w, h,
+// colmap_model_id, nparams, f64 params[] }; u32 count, { f32 xyz, u8 rgb }.
+
 // The model as it stands, subsampled to kMaxPoints. Call it as often as is
 // convenient; it returns immediately until the interval has passed, unless
 // `force` says this is the last word on a stage.

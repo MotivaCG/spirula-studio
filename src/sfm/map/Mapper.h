@@ -331,6 +331,10 @@ struct MapperOptions {
     // 0 = hardware_concurrency.
     int threads = 0;
     bool verbose = true;
+    // Whether this mapper speaks for the run: it writes the snapshot a front
+    // end draws and counts its registrations towards the bar. False for an
+    // atom's private mapper, which is neither (sfm/map/Atoms.h).
+    bool report_progress = true;
 };
 
 class Mapper {
@@ -2799,6 +2803,10 @@ private:
         rec_.images[a].registered = true;
         rec_.images[b].pose = g.pose;
         rec_.images[b].registered = true;
+        if (opt_.report_progress) {
+            events::map_placed(a);   // the seed never reaches registerImage
+            events::map_placed(b);
+        }
 
         std::vector<double> angles;
         int created = 0;
@@ -3124,17 +3132,22 @@ private:
         // one point at which the model visibly grows. The colouring runs only
         // over the points a snapshot writes, which is why it is a callback and
         // not an assignColors pass per registration.
-        progress::model(rec_, false,
-                        [this](const Point3D& p, uint8_t rgb[3]) {
-                            pointColor(p, rgb);
-                        });
-        Event ev;
-        ev.kind = Event::Kind::ModelUpdated;
-        ev.stage = Stage::Map;
-        ev.registered = rec_.numRegistered();
-        ev.images = (int64_t)db_.images.size();
-        ev.points = (int64_t)rec_.points3D.size();
-        events::emit(ev);
+        if (opt_.report_progress) {
+            progress::model(rec_, false,
+                            [this](const Point3D& p, uint8_t rgb[3]) {
+                                pointColor(p, rgb);
+                            });
+            Event ev;
+            ev.kind = Event::Kind::ModelUpdated;
+            ev.stage = Stage::Map;
+            ev.registered = rec_.numRegistered();
+            ev.images = (int64_t)db_.images.size();
+            ev.points = (int64_t)rec_.points3D.size();
+            events::emit(ev);
+            // The bar, which counts the capture and not this attempt: a seed
+            // retry resets the model, so `numRegistered` falls back to nothing.
+            events::map_placed(img);
+        }
         return true;
     }
 

@@ -2198,6 +2198,37 @@ void photo_import_combo(PhotoImport* mode, bool several_inputs) {
 
 }  // namespace
 
+// What the IMU and GPS of this input hold, beside the row that chose it. The
+// reconstruction uses them without being asked (SfM's sensor gauge), so what
+// is worth seeing here is whether there is anything for it to use.
+void GuiApp::draw_sensor_badge(const PrepInput& s) {
+    std::error_code ec;
+    if (s.path.empty() ||
+        (s.is_video ? !fs::is_regular_file(s.path, ec)
+                    : !fs::is_directory(s.path, ec)))
+        return;
+    const TelemetryInfo t = _telemetry.get(s.path, s.is_video);
+    ImGui::SameLine();
+    if (!t.done) {
+        ui::TextDisabled(dmsg::sensors_reading);
+        return;
+    }
+    if (!s.is_video) {
+        if (t.photos == 0) return;
+        if (t.with_gps == 0) { ui::TextDisabled(dmsg::sensors_none); return; }
+        ui::TextDisabled(dmsg::sensors_photo_gps,
+                         {(long long)t.with_gps, (long long)t.photos});
+        return;
+    }
+    const bool imu = t.gyro || t.accel || t.attitude;
+    if (!imu && !t.gps) { ui::TextDisabled(dmsg::sensors_none); return; }
+    ui::TextDisabled(imu && t.gps ? dmsg::sensors_imu_gps
+                     : imu        ? dmsg::sensors_imu
+                                  : dmsg::sensors_gps);
+    if (!t.carrier.empty() && ImGui::IsItemHovered())
+        ui::SetTooltip(dmsg::sensors_carrier_tooltip, {t.carrier});
+}
+
 void GuiApp::draw_dataset_source() {
     // One row per input. Several videos reconstruct as one scene -- each gets
     // its own folder of frames under images/, and so its own camera.
@@ -2206,9 +2237,9 @@ void GuiApp::draw_dataset_source() {
     for (size_t i = 0; i < _sources.size(); i++) {
         PrepInput& s = _sources[i];
         ImGui::PushID((int)i);
-        // Room for Browse + Remove + where the frames go, which is longer than
-        // any other row on the screen.
-        ImGui::SetNextItemWidth(px(-380.0f));
+        // Room for Browse + Remove + where the frames go + what sensors it
+        // carries, which is longer than any other row on the screen.
+        ImGui::SetNextItemWidth(px(-500.0f));
         if (ui::InputTextRaw("##in", &s.path)) {
             std::error_code ec;
             s.is_video = !fs::is_directory(s.path, ec) && is_video_path(s.path);
@@ -2254,6 +2285,7 @@ void GuiApp::draw_dataset_source() {
         }
         if (masked && ImGui::IsItemHovered())
             ui::SetTooltip(dmsg::existing_masks_tooltip, {s.mask_dir});
+        draw_sensor_badge(s);
         ImGui::PopID();
     }
     if (remove >= 0) {
@@ -3270,13 +3302,10 @@ void GuiApp::poll_sfm_progress() {
     if (read_live_model(dir, _model_mtime, lm)) {
         _live_model = std::move(lm);
         // The mapper's own output is a wall of per-registration detail, so the
-        // default log used to go quiet for the whole of the longest step. The
-        // snapshot has the exact counts and needs no line parsed out of a
-        // translated sentence, so say it here instead -- and give the step a
-        // real bar rather than a spinner.
+        // default log used to go quiet for the longest step. These are the
+        // model in hand, not the bar -- a seed retry starts one over.
         if (dataset_busy() && _live_model.n_images) {
             RunProgress& p = _sfm.steps();
-            p.count(Stage::Mapping, _live_model.n_registered, _live_model.n_images);
             p.note(Stage::Mapping,
                    i18n::format(dmsg::model_live_counts,
                                 {(long long)_live_model.n_registered,
@@ -3769,11 +3798,23 @@ void GuiApp::draw_sfm_advanced() {
     ui::InputInt(dmsg::max_image_size_auto, &_sfm_job.max_image_size);
     ui::help_on_hover(dmsg::max_image_size_auto_help);
 
+    // ---- what the sensors are allowed to settle ----
+    // Two sources, two controls: a video's own IMU and GPS track, and the
+    // per-photograph EXIF position. Either can be the only one an input has.
+    ImGui::Spacing();
+    ui::SeparatorText(dmsg::section_sensors);
+    ImGui::SetNextItemWidth(px(260.0f));
+    ui::Combo(dmsg::sfm_sensor_gauge, &_sfm_job.sensor_gauge,
+              {&dmsg::sfm_sensor_gauge_off, &dmsg::sfm_sensor_gauge_up,
+               &dmsg::sfm_sensor_gauge_auto});
+    ui::help_on_hover(dmsg::sfm_sensor_gauge_help);
+
     ImGui::SetNextItemWidth(px(260.0f));
     ui::Combo(dmsg::sfm_metric_gps, &_sfm_job.metric_gps,
               {&dmsg::sfm_metric_gps_off, &dmsg::sfm_metric_gps_horizontal,
                &dmsg::sfm_metric_gps_full});
     ui::help_on_hover(dmsg::sfm_metric_gps_help);
+    ImGui::Spacing();
 
     ui::Checkbox(dmsg::keep_intermediate, &_sfm_job.keep_intermediate);
     ui::help_on_hover(dmsg::keep_intermediate_help);

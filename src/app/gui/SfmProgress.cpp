@@ -90,8 +90,14 @@ bool read_live_model(const std::string& dir, int64_t& mtime, LiveModel& out) {
     if (b.size() < 24 || std::memcmp(b.data(), "VKPM", 4) != 0) return false;
 
     Reader r{b.data() + 4, b.data() + b.size()};
-    if (r.u32() != 2) return false;
+    const uint32_t version = r.u32();
+    if (version != 2 && version != 3) return false;
     LiveModel m;
+    if (version >= 3) {
+        const uint32_t flags = r.u32();
+        m.ds.gauge_oriented = (flags & 1u) != 0;
+        m.ds.gauge_metric = (flags & 2u) != 0;
+    }
     m.n_images = r.u32();
     m.n_registered = r.u32();
     m.n_points = r.u64();

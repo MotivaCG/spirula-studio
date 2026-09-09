@@ -63,6 +63,7 @@ const char* kMapper[] = {"flat", "bottom-up"};
 const char* kFeatures[] = {"sift", "aliked-n16rot", "aliked-n32", "loma-b128",
                            "loma-b"};
 const char* kMetricGps[] = {"none", "horizontal", "full"};
+const char* kSensorGauge[] = {"none", "up", "auto"};
 
 template <int N>
 const char* pick(const char* const (&table)[N], int i, int fallback = 0) {
@@ -237,6 +238,7 @@ void SfmRunner::take_reconstruction(SfmJob& job) {
     job.features = _live.features;
     job.matcher = _live.matcher;
     job.metric_gps = _live.metric_gps;
+    job.sensor_gauge = _live.sensor_gauge;
     job.keep_intermediate = _live.keep_intermediate;
     job.ba_cpu = _live.ba_cpu;
     job.extra_args = _live.extra_args;
@@ -521,6 +523,10 @@ std::vector<std::string> SfmRunner::recon_args(const SfmJob& job,
     if (job.metric_gps > 0) {
         argv.push_back("--metric-gps");
         argv.push_back(pick(kMetricGps, job.metric_gps));
+    }
+    if (job.sensor_gauge != 2) {
+        argv.push_back("--sensor-gauge");
+        argv.push_back(pick(kSensorGauge, job.sensor_gauge, 2));
     }
     if (!job.image_gamut.empty()) {
         argv.push_back("--image-gamut");

@@ -2233,6 +2233,54 @@ SS_MSG(viewport_grid,
     PT("grade"),         IT("griglia"),      NL("raster"),       RU("сетка"),
     TR("ızgara"));
 
+SS_MSG(viewport_level_cameras,
+    EN("auto-level"),    JA("自動水平"),      ZH_HANS("自动摆正"),  ZH_HANT("自動擺正"),
+    KO("자동 수평"),      DE("autom. Ausrichtung"), FR("mise à niveau"),
+    ES("nivelado autom."),
+    PT("nivelamento autom."), IT("livellamento autom."), NL("autom. waterpas"),
+    RU("автовыравнивание"), TR("otom. tesviye"));
+
+SS_MSG(viewport_level_cameras_help,
+    EN("Turn the view so the cameras' average up axis points up. That is a "
+       "guess, and a poor one for a tilted or upside-down 360 capture; off "
+       "uses the model's own axes, which a measured orientation has levelled."),
+    JA("カメラの平均的な上方向が上を向くように視点を回転します。これは推定であり、"
+       "傾いた、または上下が逆の360度撮影では外れます。オフにするとモデル自身の"
+       "座標軸を使います。向きが実測されていれば、それはすでに水平です。"),
+    ZH_HANS("旋转视图，使各相机的平均朝上方向指向上方。这只是推测，对倾斜或倒置的"
+            "360 度拍摄往往不准；关闭后使用模型自身的坐标轴，若方向已实测则本就是"
+            "水平的。"),
+    ZH_HANT("旋轉檢視，使各相機的平均朝上方向指向上方。這只是推測，對傾斜或倒置的"
+            "360 度拍攝往往不準；關閉後使用模型自身的座標軸，若方向已實測則本就是"
+            "水平的。"),
+    KO("카메라들의 평균 위쪽 축이 위를 향하도록 시점을 돌립니다. 이는 추정이며 "
+       "기울거나 뒤집힌 360도 촬영에서는 잘 맞지 않습니다. 끄면 모델 자체의 축을 "
+       "쓰며, 방향이 측정된 모델은 이미 수평입니다."),
+    DE("Dreht die Ansicht so, dass die mittlere Oben-Achse der Kameras nach "
+       "oben zeigt. Das ist geraten und bei einer geneigten oder "
+       "kopfstehenden 360-Aufnahme schlecht; aus nutzt die Achsen des Modells."),
+    FR("Oriente la vue pour que l'axe haut moyen des caméras pointe vers le "
+       "haut. C'est une supposition, mauvaise pour une capture 360 inclinée ou "
+       "retournée ; désactivé, la vue suit les axes propres du modèle."),
+    ES("Gira la vista para que el eje superior medio de las cámaras apunte "
+       "hacia arriba. Es una suposición, mala en una captura 360 inclinada o "
+       "invertida; al desactivarla se usan los ejes propios del modelo."),
+    PT("Roda a vista para que o eixo superior médio das câmaras aponte para "
+       "cima. É uma suposição, má numa captura 360 inclinada ou invertida; "
+       "desligada, usa os eixos do próprio modelo."),
+    IT("Ruota la vista perché l'asse alto medio delle fotocamere punti verso "
+       "l'alto. È una supposizione, sbagliata in una ripresa 360 inclinata o "
+       "capovolta; disattivata, usa gli assi propri del modello."),
+    NL("Draait het beeld zodat de gemiddelde omhoog-as van de camera's omhoog "
+       "wijst. Dat is een gok, en een slechte bij een gekantelde of "
+       "omgekeerde 360-opname; uit gebruikt de assen van het model zelf."),
+    RU("Поворачивает вид так, чтобы средняя ось «вверх» камер смотрела вверх. "
+       "Это догадка, плохая для наклонной или перевёрнутой 360-съёмки; "
+       "выключено — используются собственные оси модели."),
+    TR("Görünümü, kameraların ortalama yukarı ekseni yukarı bakacak biçimde "
+       "döndürür. Bu bir tahmindir ve eğik ya da ters 360 çekimlerde kötüdür; "
+       "kapalıyken modelin kendi eksenleri kullanılır."));
+
 SS_MSG(viewport_scale,
     EN("resolution"),    JA("解像度"),       ZH_HANS("分辨率"),   ZH_HANT("解析度"),
     KO("해상도"),        DE("Auflösung"),   FR("résolution"),  ES("resolución"),
@@ -6202,6 +6250,36 @@ SS_MSG(overlay_points,
     NL("Punten: {0}"),
     RU("Точки: {0}"),
     TR("Nokta: {0}"));
+
+SS_MSG(overlay_grid_metric,
+    EN("Grid: {0}"),
+    JA("グリッド: {0}"),
+    ZH_HANS("网格：{0}"),
+    ZH_HANT("格線：{0}"),
+    KO("격자: {0}"),
+    DE("Raster: {0}"),
+    FR("Grille : {0}"),
+    ES("Cuadrícula: {0}"),
+    PT("Grelha: {0}"),
+    IT("Griglia: {0}"),
+    NL("Raster: {0}"),
+    RU("Сетка: {0}"),
+    TR("Izgara: {0}"));
+
+SS_MSG(overlay_grid_relative,
+    EN("Grid: {0} (no metric scale)"),
+    JA("グリッド: {0}（実寸不明）"),
+    ZH_HANS("网格：{0}（无实际尺度）"),
+    ZH_HANT("格線：{0}（無實際尺度）"),
+    KO("격자: {0} (실척 없음)"),
+    DE("Raster: {0} (kein metrischer Maßstab)"),
+    FR("Grille : {0} (pas d'échelle métrique)"),
+    ES("Cuadrícula: {0} (sin escala métrica)"),
+    PT("Grelha: {0} (sem escala métrica)"),
+    IT("Griglia: {0} (nessuna scala metrica)"),
+    NL("Raster: {0} (geen metrische schaal)"),
+    RU("Сетка: {0} (масштаб не в метрах)"),
+    TR("Izgara: {0} (metrik ölçek yok)"));
 
 
 // ===========================================================================

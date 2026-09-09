@@ -987,10 +987,11 @@ static int cmdMap(int argc, char** argv) {
                 (long long)db.images.size()});
         printExtraModels(models, feats);
     }
-    const bool map_metric = fixGauge(models, cfg, cfg.image_dir, opt.verbose);
+    std::vector<sfm::ModelGauge> map_gauge;
+    const bool map_metric = fixGauge(models, cfg, cfg.image_dir, opt.verbose, map_gauge);
     recolorPoints(models, cfg);
     splitCamerasBySize(models, feats);
-    if (!output.empty()) writeModels(models, output, opt.verbose);
+    if (!output.empty()) writeModels(models, output, opt.verbose, map_gauge);
     return map_metric ? 0 : 4;
 }
 
@@ -1087,9 +1088,10 @@ static int cmdMerge(int argc, char** argv) {
                    {(long long)covered_after, (long long)covered_before});
     }
 
-    const bool merge_metric = fixGauge(models, cfg, cfg.image_dir, mo.verbose);
+    std::vector<sfm::ModelGauge> merge_gauge;
+    const bool merge_metric = fixGauge(models, cfg, cfg.image_dir, mo.verbose, merge_gauge);
     recolorPoints(models, cfg);
-    writeModels(models, fs::path(output), mo.verbose);
+    writeModels(models, fs::path(output), mo.verbose, merge_gauge);
     // In place, the models that were absorbed must not stay behind as stale
     // directories claiming to be reconstructions.
     if (cfg.in_place)

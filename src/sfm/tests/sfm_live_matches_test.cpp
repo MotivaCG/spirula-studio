@@ -46,6 +46,7 @@ static int cmdLiveMatchesTest(int, char**) {
         progress::live_pair(ends[i][0], ends[i][1], 2, &pairs[i][0].idx1,
                             &pairs[i][0].idx2, sizeof(FeatureMatch),
                             (uint32_t)pairs[i].size());
+    progress::flush();   // the writer flushes on a clock, not per pair
 
     MatchesIndex idx;
     check(indexMatches(path, idx), "index a streaming file");

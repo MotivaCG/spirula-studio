@@ -333,3 +333,32 @@ three defects on its own:
   the extractor has already decoded and downscaled. Measured on 25 images of
   Mip-NeRF 360 garden: extraction 0.73–0.75 s without, 0.78–0.88 s with,
   against a full decode saved per frame the reel draws.
+
+## 11. What watching cost, once it was measured
+
+Both of the above are written from the thread the stage runs on, and on a
+larger capture that showed. Fixed, with the numbers, on 92 images of the same
+capture at `--max-image-size 1600`:
+
+- **The thumbnail's JPEG encode and file write moved to their own thread**,
+  leaving only the box downscale (which has to read the caller's buffer) on
+  the extractor's consumer thread — the one the GPU stage runs on. Extraction
+  went from 2.65 s bare / 3.16 s watched to 2.65 / 2.86: the cost of being
+  watched fell from 18 percent to 8. The queue is bounded and drops its oldest
+  rather than stall the stage; a missing thumbnail makes the reel decode the
+  source frame, which is what it did before thumbnails existed.
+- **`live_matches.bin` is packed once and flushed on a clock**, not written
+  index by index and flushed per pair while holding a global lock, and it
+  stops growing past 256 MB — a capture with 700k verified pairs would
+  otherwise append 1.4 GB beside the `matches.bin` that is the actual output.
+- **The match stage's `Progress` event is emitted ~400 times over the stage**
+  rather than once per pair, and a `PairVerified` no longer wakes the status
+  writer or the GUI's fold, neither of which keys on it.
+
+The mapping bar was the other defect: it was `registered / images` of whatever
+reconstruction was in hand, and the mapper resets the model between seed
+attempts while a bottom-up run numbers each atom from zero — so it ran forward
+and fell back, sometimes several times. It is now `events::map_placed`, a
+union over the capture's images that only rises; atoms report themselves in
+database ids once done, and their private mappers report nothing (which also
+stops one atom appearing on screen as "the model").

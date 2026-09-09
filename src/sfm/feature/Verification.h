@@ -647,6 +647,15 @@ inline std::vector<TwoViewMatches> verifyPairs(
     const size_t batch = std::max<size_t>(1, (size_t)opt.match_batch_pairs);
     std::vector<std::vector<FeatureMatch>> batch_out;
 
+    // The stage's fraction, at most a few hundred steps over the whole of it.
+    // Per pair it is a global lock the workers are already contending for, and
+    // a screen cannot show 700k of anything.
+    const size_t step = std::max<size_t>(1, pairs.size() / 400);
+    auto tick = [&](size_t p) {
+        if ((p + 1) % step == 0 || p + 1 == pairs.size())
+            events::progress(Stage::Match, (int64_t)p + 1, (int64_t)pairs.size());
+    };
+
     if (nthreads <= 1) {
         for (size_t b = 0; b < pairs.size(); b += batch) {
             size_t e = std::min(b + batch, pairs.size());
@@ -656,7 +665,7 @@ inline std::vector<TwoViewMatches> verifyPairs(
                 putative += m.size();
                 verifyOne(p, m);
                 if (progress) progress(p + 1, pairs.size());
-                events::progress(Stage::Match, (int64_t)p + 1, (int64_t)pairs.size());
+                tick(p);
                 cancel::check();
             }
         }
@@ -707,7 +716,7 @@ inline std::vector<TwoViewMatches> verifyPairs(
                 }
                 cv_job.notify_one();
                 if (progress) progress(p + 1, pairs.size());
-                events::progress(Stage::Match, (int64_t)p + 1, (int64_t)pairs.size());
+                tick(p);
                 if (cancel::requested()) { stop = true; break; }
             }
         }

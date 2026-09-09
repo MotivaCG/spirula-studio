@@ -513,6 +513,29 @@ camera that only pans (up, no scale), a camera that never moves (declined),
 GPS alone. Scale within 0.05 percent, up within 0.35 deg, the extrinsic
 within 0.25 deg.
 
+### 5.7 What the result says about itself
+
+The fit is worth nothing to a viewer that cannot tell it happened. Every
+written model now carries `sparse/N/gauge.txt` — `oriented`, `metric`, and
+which source settled each — and the same two bits travel in the progress
+snapshot the GUI draws while a run is going (`model.bin` version 3).
+
+Two things read it. The dataset parsers fill `ParsedDataset::gauge_oriented`
+/ `gauge_metric`, and the viewport uses the first to default its **auto-level**
+switch off: the parsers rotate every dataset so the mean camera up axis
+becomes +Z, which on the X5 walk is 11.4 deg from the IMU's answer, and that
+rotation is what turntable and first-person navigation orbit about. The switch
+is offered wherever the rotation is not the identity, and undoes only that
+rotation — an `applied_transform` a file came with is left alone. The second
+bit puts the grid's cell size on screen as a length, so a metric model can be
+measured by looking at it.
+
+The GUI also stopped hiding the inputs. Each video row says whether the file
+carries IMU, GPS, both or nothing (read on its own thread, `TelemetryProbe`),
+each photo folder says how many of its files have an EXIF position, and a
+**Sensors** block under Advanced holds both controls: `--sensor-gauge` for the
+video track and `--metric-gps` for the photographs.
+
 ## 6. Improving the reconstruction itself (not in scope, recorded for later)
 
 Using the sensors to change what the mapper does rather than how the result

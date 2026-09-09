@@ -279,10 +279,6 @@ void reportSensorGauge(size_t i, const SensorGaugeResult& r,
             L::err(Tag::Orient, M::sensor_calib,
                    {name, (long long)g.fit.frames, L::num(g.fit.sig_rot_deg, 2),
                     L::num(g.fit.sig_grav_deg, 2)});
-            L::diag(Tag::Orient, "[orient] %s: det %+.0f, gyro sign %+.0f, gap %.1f, degenerate %d, "
-                    "sigma per axis %.2f/%.2f/%.2f deg\n", name.c_str(), det3(g.fit.R_ci),
-                    g.fit.gyro_sign, g.fit.gap, (int)g.fit.degenerate, g.fit.sigma_deg.x,
-                    g.fit.sigma_deg.y, g.fit.sigma_deg.z);
             if (g.triples > 0)
                 L::err(Tag::Orient, M::sensor_calib_scale,
                        {name, L::num(g.scale, 6), L::num(100.0 * g.scale_sigma, 2),
@@ -343,12 +339,18 @@ void reportSensorGauge(size_t i, const SensorGaugeResult& r,
 // named and the fit holds, else a metric reference when given and fitted,
 // else the orient frame. False when a metric frame was asked for and missed.
 bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
-                     const std::string& imagedir, bool verbose) {
+                     const std::string& imagedir, bool verbose,
+                     std::vector<ModelGauge>& gauge) {
     const bool gps = cfg.metric_gps != "none";
     const bool flat = cfg.metric_gps == "horizontal";
     const bool file = !cfg.metric_positions.empty();
 
-    std::vector<char> settled(models.size(), 0);
+    // `gauge[i]` is the state, not just the record: `oriented` and `metric` say
+    // what a source has already settled, and every source below reads them
+    // before touching what an earlier one answered.
+    gauge.assign(models.size(), ModelGauge());
+
+    // ---- the video's own sensors -----------------------------------------
     const std::vector<std::unique_ptr<LoadedCapture>> loaded = loadCaptures(cfg, verbose);
     if (!loaded.empty()) {
         std::vector<SensorCapture> caps;
@@ -363,33 +365,32 @@ bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
             reportSensorGauge(i, r, loaded, verbose);
             if (!r.applied) continue;
             applySim3(models[i], r.T);
-            // A metric reference the user gave still outranks an upright-only
-            // sensor frame; a metric sensor frame settles the model.
-            settled[i] = r.metric || !(gps || file);
+            gauge[i].oriented = true;
+            gauge[i].up = "sensors";
+            if (r.metric) {
+                gauge[i].metric = true;
+                gauge[i].scale = r.scale_from_imu && r.scale_from_gps ? "imu+gps"
+                                 : r.scale_from_imu                   ? "imu"
+                                                                     : "gps";
+                gauge[i].scale_sigma = r.scale_sigma;
+            }
         }
     }
 
-    if (!gps && !file) {
-        for (size_t i = 0; i < models.size(); i++)
-            if (!settled[i] && cfg.orient) {
-                const Sim3 T = orientModel(models[i]);
-                if (verbose) L::err(Tag::Orient, M::orient_done, {(long long)i, L::num(T.scale, 4)});
-            }
-        return true;
-    }
+    // ---- an outside metric reference --------------------------------------
+    bool all = true;
     std::map<std::string, Vec3> positions;
     if (file) {
         std::string err;
         if (!readMetricPositions(cfg.metric_positions, positions, err)) {
             L::fail(Tag::Orient, M::metric_positions_bad, {cfg.metric_positions, err});
-            for (size_t i = 0; i < models.size(); i++)
-                if (!settled[i] && cfg.orient) orientModel(models[i]);
-            return false;
+            all = false;
         }
     }
-    bool all = true;
-    for (size_t i = 0; i < models.size(); i++) {
-        if (settled[i]) continue;
+    for (size_t i = 0; i < models.size() && all && (gps || file); i++) {
+        // A metric sensor frame settles the model; a second reference over it
+        // could only disagree with the one already applied.
+        if (gauge[i].metric) continue;
         MetricRef ref;
         if (file) {
             const MetricPairCounts pc = pairMetricRef(models[i], positions, ref);
@@ -402,20 +403,30 @@ bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
                    {(long long)gc.matched, (long long)(gc.matched + gc.no_gps),
                     (long long)gc.no_alt});
         }
-        // Horizontal mode takes the tilt from the cameras' own up axis, so its
-        // fit -- scale, heading and place -- runs in the upright frame.
-        const Sim3 pre = flat ? uprightTransform(models[i]) : Sim3{};
+        // Horizontal mode takes the tilt from the caller's up axis, so its fit
+        // -- scale, heading and place -- runs in an upright frame. Where a
+        // sensor already levelled the model, that frame is the one it is in.
+        const Sim3 pre = flat && !gauge[i].oriented ? uprightTransform(models[i]) : Sim3{};
         for (Vec3& c : ref.centres) c = transformPoint(pre, c);
         const MetricFit fit =
             fitMetricGauge(ref, cfg.metric_max_error,
                            flat ? MetricAxes::Horizontal : MetricAxes::Full);
         if (!fit.ok) {
             all = false;
-            if (cfg.orient) orientModel(models[i]);
-            L::fail(Tag::Orient, M::metric_failed, {(long long)i, metricReason(fit)});
-            continue;
+            L::warn(Tag::Orient, M::metric_failed, {(long long)i, metricReason(fit)});
         }
         applySim3(models[i], composeSim3(fit.T, pre));
+        gauge[i].metric = true;
+        gauge[i].scale = file ? "positions" : "gps";
+        gauge[i].scale_sigma = fit.scale_unc;
+        // Horizontal fits scale, heading and place only, so which way is up is
+        // still whatever `pre` left it as: the sensors, or the cameras.
+        if (!flat) {
+            gauge[i].oriented = true;
+            gauge[i].up = file ? "positions" : "gps";
+        } else if (!gauge[i].oriented) {
+            gauge[i].up = "cameras";
+        }
         L::out(Tag::Orient, M::metric_done,
                {(long long)i,
                 spirula::i18n::format(!gps    ? M::metric_source_positions
@@ -442,7 +453,18 @@ bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
                 L::num(std::sqrt(u / m), 4),
                 L::num(metricUpDisagreementDeg(models[i]), 2)});
     }
-    return all;
+
+    // ---- whatever no source settled ---------------------------------------
+    // The only place that falls back on the cameras' mean up axis, so a model
+    // something measured cannot be re-levelled by the guess it replaced.
+    if (cfg.orient)
+        for (size_t i = 0; i < models.size(); i++) {
+            if (gauge[i].oriented || gauge[i].metric) continue;
+            const Sim3 T = orientModel(models[i]);
+            gauge[i].up = "cameras";
+            if (verbose) L::err(Tag::Orient, M::orient_done, {(long long)i, L::num(T.scale, 4)});
+        }
+    return true;
 }
 
 // An EXR carries its own colour space. Reading it needs no declaration -- the
@@ -541,15 +563,30 @@ void splitCamerasBySize(std::vector<Reconstruction>& models,
     }
 }
 
+// gauge.txt beside the model: whether +Z is up and whether a unit is a metre.
+// Plain text and not hidden, because it is as much for the user reading the
+// folder as for the viewer that stops guessing an up axis when it is there.
+void writeGauge(const fs::path& dir, const ModelGauge& g) {
+    std::ofstream f(dir / "gauge.txt", std::ios::trunc);
+    if (!f) return;
+    f << "# What this model's frame means, from spirula sfm.\n";
+    f << "oriented " << (g.oriented ? 1 : 0) << "\n";
+    f << "metric " << (g.metric ? 1 : 0) << "\n";
+    f << "up " << g.up << "\n";
+    f << "scale " << g.scale << "\n";
+    if (g.scale_sigma > 0) f << "scale_sigma " << g.scale_sigma << "\n";
+}
+
 // Every reconstruction as <dir>/0, <dir>/1, ... (D41) -- COLMAP's layout for a
 // view graph that is not connected. `sparse/0` has the most 3D points, so a
 // single-model dataset still writes exactly `sparse/0`.
 void writeModels(const std::vector<Reconstruction>& models, const fs::path& dir,
-                 bool verbose) {
+                 bool verbose, const std::vector<ModelGauge>& gauge) {
     for (size_t i = 0; i < models.size(); i++) {
         fs::path p = dir / std::to_string(i);
         fs::create_directories(p);
         models[i].writeBinary(p.string());
+        if (i < gauge.size()) writeGauge(p, gauge[i]);
         if (verbose)
             L::err(Tag::Map, M::map_wrote_model,
                    {(long long)i, (long long)models[i].numRegistered(),
@@ -1361,6 +1398,7 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
 
     t0 = now();
     events::stage_begin(Stage::Map, (int64_t)db.images.size());
+    events::map_begin(db.images.size());
     Mapper mapper(db, feats, mapopt, cs.ids);
     AssembleStats ast;
     std::vector<Reconstruction> models = runMapper(mapper, db, feats, cfg, ast);
@@ -1374,13 +1412,19 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     events::stage_end(Stage::Map);
 
     resolveImageNames(models, _imagedir);
-    const bool auto_metric = fixGauge(models, cfg, _imagedir, verbose);
+    std::vector<ModelGauge> gauge;
+    const bool auto_metric = fixGauge(models, cfg, _imagedir, verbose, gauge);
     recolorPoints(models, cfg);
+    // The gauge is what a screen was missing: every snapshot before this one is
+    // in the seed pair's frame, so a run watched to the end left a tilted model
+    // on display until the user opened the written one.
+    if (!gauge.empty()) progress::gauge(gauge[0].oriented, gauge[0].metric);
+    if (!models.empty()) progress::model(models.front(), /*force=*/true);
     // Before the split: the summary reports what was estimated, and the file's
     // one camera per frame size is not that.
     const size_t n_cameras = models.empty() ? 0 : models.front().cameras.size();
     splitCamerasBySize(models, feats);
-    writeModels(models, sparsedir, verbose);
+    writeModels(models, sparsedir, verbose, gauge);
 
     // The mapper reports its own breakdown when `run()` returns; the passes
     // that assemble its models accumulate into the same counters.

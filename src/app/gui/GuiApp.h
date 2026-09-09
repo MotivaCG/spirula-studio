@@ -24,6 +24,7 @@
 #include "app/gui/ModelCache.h"
 #include "app/gui/SegmentPanel.h"
 #include "app/gui/SfmRunner.h"
+#include "app/gui/TelemetryProbe.h"
 #include "app/gui/TrainPreset.h"
 #include "app/gui/TrainRunner.h"
 #include "app/gui/ViewportPanel.h"
@@ -217,6 +218,7 @@ private:
     void draw_home_banner(float avail, float indent);
     void draw_new_dataset();
     void draw_dataset_source();       // input list / output / resume
+    void draw_sensor_badge(const PrepInput& s);
     void draw_dataset_basics();       // the four or five knobs a beginner needs
     void draw_source_cameras();       // one lens per input, when there are several
     // The line under a lens picker when the input contradicts the model --
@@ -491,6 +493,9 @@ private:
     // that runs instead of a parallel copy of it: a video file or photo folder
     // each, plus the sub-folder and the lens that belong to it.
     std::vector<PrepInput> _sources;
+    // What each input's IMU / GPS holds, read on its own thread and keyed by
+    // path, so re-choosing a file already read costs nothing.
+    TelemetryProbe _telemetry;
     std::string _workspace;
     // The output folder this screen derived from the inputs. Kept so a folder
     // the user typed is never overwritten when the input list changes.

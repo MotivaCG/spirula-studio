@@ -98,16 +98,29 @@ std::vector<Reconstruction> finishModels(Mapper& mapper,
                                          const SfmConfig& cfg, bool verbose,
                                          double& seconds);
 
+// What a model's frame means, written beside it as `gauge.txt`. `up` and
+// `scale` are tokens rather than prose ("sensors", "gps", "cameras", "none"):
+// the file is read by programs, and the log is where the sentences are.
+struct ModelGauge {
+    bool oriented = false;   // +Z is up because something measured it
+    bool metric = false;     // one unit is one metre
+    std::string up = "none";
+    std::string scale = "none";
+    double scale_sigma = 0;  // relative; 0 when nothing estimated one
+};
+
 // Levelling, centring and the metric gauge. False when no metric frame fitted.
 bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
-              const std::string& imagedir, bool verbose);
+              const std::string& imagedir, bool verbose,
+              std::vector<ModelGauge>& gauge);
 
 void resolveImageNames(std::vector<Reconstruction>& models, const std::string& imagedir);
 void recolorPoints(std::vector<Reconstruction>& models, const SfmConfig& cfg);
 void splitCamerasBySize(std::vector<Reconstruction>& models,
                         const std::vector<FeatureSet>& feats);
 void writeModels(const std::vector<Reconstruction>& models,
-                 const std::filesystem::path& dir, bool verbose);
+                 const std::filesystem::path& dir, bool verbose,
+                 const std::vector<ModelGauge>& gauge = {});
 
 // ---------------------------------------------------------------------------
 // Reporting helpers the summary is built from
