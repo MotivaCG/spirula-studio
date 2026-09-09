@@ -359,10 +359,19 @@ does not.
   pan from a fixed spot has no baseline and no scale to recover and the
   linear system says so through its conditioning, which must be reported
   the way `MetricGauge.h` reports collinearity, not silently accepted.
-- A raw gyro. The DJI writes none: the fused attitude can stand in for the
+- A raw gyro. The DJI writes none, and the fused attitude stands in for the
   rotation part (it is the camera's own gyro integration with gravity
-  correction), and the per-frame accelerometer at 30 Hz is too sparse for
-  the position integral. On the DJI this method is unavailable as it stands.
+  correction), which leaves no gyro bias to estimate. `SensorTimeline`
+  pre-integrates from it directly at the accelerometer's own instants.
+- A sample rate the position integral can live with. A per-frame
+  accelerometer aliases the vibration a 1 kHz stream resolves and integrates
+  away, and that noise lands in the *regressor*: 0.06 (m/s^2)/sqrt(Hz) on
+  the DJI, which over 1 s pairs attenuates the fitted 1/s by 10 per cent.
+  The noise density is measured per capture from the second differences of
+  the accelerometer, and its own contribution to the normal matrix is taken
+  back out (corrected least squares) in both the closed form and the joint
+  solve. Decimating an X5 log to 30 Hz is the check: the attenuation is 0.83
+  per cent measured against the full-rate answer, 0.86 predicted.
 - Frame rate: the pair spacing in a dataset is 2-10 fps after extraction,
   and pre-integration over 0.1-0.5 s is well inside where biases are
   harmless. Extraction keeps the source index so the exact interval is known.
@@ -480,8 +489,15 @@ cameras' mean up axis came out 11 deg from the IMU's, which is the error
 On a 146 s DJI Osmo 360 clip (292 frames, two lenses, 1 fps, attitude and
 a 30 Hz accelerometer, no gyro, no GPS): the extrinsic from the attitude
 agrees to 0.20 deg on the rotation pairs and 1.0 deg on the gravity votes,
-the 292 up votes agree to 0.23 deg with no outlier, and the model is written
-levelled with no scale claimed, as a file with no gyro and no GPS should be.
+and the 292 up votes agree to 0.23 deg with no outlier. The two lenses'
+accelerometer scales, fitted separately, are 31.01 and 30.93 at 1.5 per cent
+each (0.27 per cent apart) with the solved gravity at 9.83 m/s^2 and 0.0 deg
+from up; the joint solve, with each lens's IMU lever arm free, ends at 28.91
+at 1.1 per cent. The levers come out 4.7 and 4.3 cm and place the IMU within
+1.4 cm of one point, which is a camera body 2.1 cm across; that lever is
+worth 6.6 per cent of the scale here. Nothing outside the capture measures
+it: the camera sits 1.9 m over the ground on a stick above the operator's
+head, and 94.6 m of path over 146 s is the stroll the video shows.
 
 On a GoPro MAX handheld walk (78 s, ten seam-free views per
 frame at 2 fps, 1237 of 1550 registered): every view calibrates with the

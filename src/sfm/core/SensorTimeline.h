@@ -90,6 +90,7 @@ public:
         std::stable_sort(_att.begin(), _att.end(),
                          [](const StampedQuat& a, const StampedQuat& b) { return a.t < b.t; });
 
+        noise.accel = std::max(ImuNoise().accel, accelNoiseDensity());
         _use_gyro = _gyro.size() >= 2 && _gyro_rate >= 50;
         _use_att = !_use_gyro && _att.size() >= 2;
         if (_use_gyro) buildCumulative(+1.0, _q_plus);
@@ -118,8 +119,14 @@ public:
     }
 
     bool hasRotation() const { return _use_gyro || _use_att; }
+    bool hasGyro() const { return _use_gyro; }
     bool hasUp() const { return !_accel.empty(); }
-    bool canPreintegrate() const { return _use_gyro && _accel_rate >= 50 && _accel.size() >= 2; }
+    // 20 Hz admits a camera writing one accelerometer reading per frame (the
+    // DJI's 30 Hz); the position integral over a 0.1-1 s pair still has
+    // samples to work with, and the fit's own sigma says when it does not.
+    bool canPreintegrate() const {
+        return hasRotation() && _accel_rate >= 20 && _accel.size() >= 2;
+    }
     bool hasGps() const { return _gps_usable; }
     double imuFirst() const { return _use_gyro ? _gyro.front().t : _use_att ? _att.front().t : 0; }
     double imuLast() const { return _use_gyro ? _gyro.back().t : _use_att ? _att.back().t : 0; }
@@ -133,13 +140,7 @@ public:
     // t1 into the IMU frame at t0. `sign` -1 integrates the gyro negated,
     // the left-handed-axes hypothesis map/ImuExtrinsic.h tests.
     bool rotationBetween(double t0, double t1, Mat3& R, double sign = 1.0) const {
-        using namespace timeline_detail;
-        Quat q0, q1;
-        if (!orientationAt(t0 + time_offset, q0, sign) || !orientationAt(t1 + time_offset, q1, sign))
-            return false;
-        const Mat3 Rb = quaternionToRotation(quatMul(quatConj(q0), q1));
-        R = _use_att ? mul(mul(transpose(_P), Rb), _P) : Rb;
-        return true;
+        return rotationBetweenImu(t0 + time_offset, t1 + time_offset, R, sign);
     }
 
     // The specific force averaged over +-half_window around t, each sample
@@ -192,7 +193,9 @@ public:
         Preintegration P;
         if (!canPreintegrate()) return P;
         const double a = t0 + time_offset, b = t1 + time_offset;
-        if (!(b > a) || a < _gyro.front().t || b > _gyro.back().t) return P;
+        if (!(b > a)) return P;
+        if (!_use_gyro) return preintegrateFromAttitude(a, b, ba);
+        if (a < _gyro.front().t || b > _gyro.back().t) return P;
         std::vector<ImuSample> s;
         auto push = [&](double t, const Vec3& w) {
             Vec3 acc;
@@ -246,6 +249,55 @@ private:
     Vec3 _world_up{0, 0, 1};
     double _gyro_rate = 0, _accel_rate = 0;
     bool _use_gyro = false, _use_att = false, _gps_usable = false;
+
+    // What the double integral cannot recover: a per-frame accelerometer
+    // aliases the vibration a 1 kHz stream resolves and integrates away. The
+    // second difference of a smooth signal is that content and nothing else.
+    double accelNoiseDensity() const {
+        if (_accel.size() < 32 || !(_accel_rate > 0)) return 0;
+        std::vector<double> d;
+        d.reserve(3 * (_accel.size() - 2));
+        for (size_t k = 1; k + 1 < _accel.size(); k++) {
+            const Vec3 v = _accel[k - 1].v - _accel[k].v * 2.0 + _accel[k + 1].v;
+            d.push_back(std::fabs(v.x));
+            d.push_back(std::fabs(v.y));
+            d.push_back(std::fabs(v.z));
+        }
+        std::nth_element(d.begin(), d.begin() + (long)d.size() / 2, d.end());
+        const double sigma = d[d.size() / 2] / (0.6745 * std::sqrt(6.0));
+        return sigma / std::sqrt(_accel_rate);
+    }
+
+    bool rotationBetweenImu(double ta, double tb, Mat3& R, double sign) const {
+        using namespace timeline_detail;
+        Quat q0, q1;
+        if (!orientationAt(ta, q0, sign) || !orientationAt(tb, q1, sign)) return false;
+        const Mat3 Rb = quaternionToRotation(quatMul(quatConj(q0), q1));
+        R = _use_att ? mul(mul(transpose(_P), Rb), _P) : Rb;
+        return true;
+    }
+
+    // Both ends must be covered by the accelerometer: a shortened interval
+    // would leave `dt` disagreeing with the frame spacing the caller pairs it
+    // with.
+    Preintegration preintegrateFromAttitude(double a, double b, const Vec3& ba) const {
+        Preintegration P;
+        if (a < _att.front().t || b > _att.back().t) return P;
+        if (a < _accel.front().t || b > _accel.back().t) return P;
+        std::vector<AttitudeSample> s;
+        auto push = [&](double t) {
+            AttitudeSample x;
+            x.t = t;
+            if (!interpolate(_accel, t, x.a) || !rotationBetweenImu(a, t, x.R, 1.0)) return;
+            s.push_back(x);
+        };
+        push(a);
+        auto it = std::upper_bound(_accel.begin(), _accel.end(), a,
+                                   [](double x, const Stamped& g) { return x < g.t; });
+        for (; it != _accel.end() && it->t < b; ++it) push(it->t);
+        push(b);
+        return preintegrateAttitude(s, ba, noise);
+    }
 
     void buildCumulative(double sign, std::vector<Quat>& q) const {
         using namespace timeline_detail;

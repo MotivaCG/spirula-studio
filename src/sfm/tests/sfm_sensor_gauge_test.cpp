@@ -48,6 +48,10 @@ struct Scenario {
     Vec3 bg{0.004, -0.003, 0.002};
     Vec3 ba{0.03, -0.02, 0.05};
     double gyro_noise = 0.002, accel_noise = 0.02;
+    // A camera writing a fused attitude and one accelerometer reading per
+    // frame instead of a raw gyro: the DJI Osmo 360.
+    bool attitude_only = false;
+    double accel_rate = 0;   // 0 keeps the 1 kHz the gyro is written at
     unsigned seed = 7;
 };
 
@@ -98,10 +102,17 @@ static Telemetry synthesize(const Scenario& sc, const Mat3& R_ci) {
         const Mat3 R_wi = mul(R1, R_ci);
         const Vec3 omega_i = mul(transpose(R_ci), omega_c);
         const Vec3 f_i = mul(transpose(R_wi), acc_w - g_w);
+        const double adt = sc.accel_rate > 0 ? 1.0 / sc.accel_rate : dt;
         Vec3 wm = mul(D, omega_i + sc.bg + Vec3{N(rng), N(rng), N(rng)} * (sc.gyro_noise / std::sqrt(dt)));
-        Vec3 am = mul(D, f_i + sc.ba + Vec3{N(rng), N(rng), N(rng)} * (sc.accel_noise / std::sqrt(dt)));
+        Vec3 am = mul(D, f_i + sc.ba + Vec3{N(rng), N(rng), N(rng)} * (sc.accel_noise / std::sqrt(adt)));
         const double tv = ti + sc.clock_offset;
-        t.gyro.push_back({tv, wm.x, wm.y, wm.z});
+        if (sc.attitude_only) {
+            const Quat q = rotationToQuaternion(mul(R_wi, transpose(D)));
+            t.orientation.push_back({tv, q[0], q[1], q[2], q[3]});
+        } else {
+            t.gyro.push_back({tv, wm.x, wm.y, wm.z});
+        }
+        if (sc.accel_rate > 0 && std::fmod(ti + 0.5, adt) >= dt) continue;
         t.accel.push_back({tv, am.x, am.y, am.z});
     }
     if (sc.gps) {
@@ -319,6 +330,26 @@ int cmdSensorGaugeTest(int, char**) {
                     r.applied, r.metric, r.T.scale, M.scale, r.gps_frames, r.gps.inliers);
         check(r.applied && r.metric && r.scale_from_gps && !r.up_from_imu, "T6 metric from GPS");
         check(std::fabs(r.T.scale / M.scale - 1.0) < 0.03, "T6 scale within 3%");
+    }
+    // ---- T7: a fused attitude and one accelerometer reading per frame ---------
+    {
+        Scenario sc;
+        sc.gps = false;
+        sc.attitude_only = true;
+        sc.accel_rate = 30;
+        sc.accel_noise = 0.06;   // what the DJI's own stream measures at 30 Hz
+        RunResult rr = runScenario(sc);
+        const SensorGaugeResult& r = rr.r;
+        std::printf("T7 attitude, 30 Hz accel: up=%.3f deg scale_err=%.4f sigma=%.2f%% "
+                    "triples=%d g=%.2f m/s^2 %.2f deg\n",
+                    rr.up_err_deg, rr.scale_err, 100 * r.scale_imu_sigma, r.groups[0].triples,
+                    r.groups[0].g_norm, r.groups[0].g_angle_deg);
+        printGroups(r);
+        check(r.applied && r.metric && r.scale_from_imu, "T7 metric with no gyro");
+        check(std::fabs(rr.scale_err) < 0.03, "T7 scale within 3%");
+        check(rr.up_err_deg < 1.0, "T7 up within 1 deg");
+        check(rr.calib_err_deg < 1.0, "T7 extrinsic within 1 deg");
+        check(std::fabs(r.groups[0].g_norm - 9.81) < 0.3, "T7 gravity norm");
     }
     std::printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;

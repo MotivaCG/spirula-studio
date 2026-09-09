@@ -113,4 +113,39 @@ inline Preintegration preintegrate(const std::vector<ImuSample>& s, const Vec3& 
     return P;
 }
 
+// A fused attitude in place of a gyro: `R` at each sample is R_i(t0) <- i(t),
+// so there is no gyro bias and the Jacobians against one stay zero.
+struct AttitudeSample {
+    double t = 0;
+    Vec3 a;   // m/s^2, specific force
+    Mat3 R = mat3Identity();
+};
+
+inline Preintegration preintegrateAttitude(const std::vector<AttitudeSample>& s, const Vec3& ba,
+                                           const ImuNoise& noise) {
+    Preintegration P;
+    P.samples = s.size();
+    if (s.size() < 2) return P;
+    for (size_t k = 0; k + 1 < s.size(); k++) {
+        const double dt = s[k + 1].t - s[k].t;
+        if (!(dt > 0)) continue;
+        const Mat3 R = mat3Scale(mat3Add(s[k].R, s[k + 1].R), 0.5);
+        const Vec3 a = (s[k].a + s[k + 1].a) * 0.5 - ba;
+        const Vec3 f = mul(R, a);
+
+        P.dp = P.dp + P.dv * dt + f * (0.5 * dt * dt);
+        P.dp_dba = mat3Add(P.dp_dba, mat3Add(mat3Scale(P.dv_dba, dt), mat3Scale(R, -0.5 * dt * dt)));
+        P.dv = P.dv + f * dt;
+        P.dv_dba = mat3Add(P.dv_dba, mat3Scale(R, -dt));
+
+        const double an = a.norm();
+        P.var_p += P.var_v * dt * dt + noise.accel * noise.accel * dt * dt * dt / 3.0;
+        P.var_v += noise.accel * noise.accel * dt + an * an * dt * dt * P.var_r;
+        P.var_r += noise.gyro * noise.gyro * dt;
+        P.dt += dt;
+    }
+    P.dR = s.back().R;
+    return P;
+}
+
 }  // namespace sfm

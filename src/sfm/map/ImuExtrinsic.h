@@ -148,7 +148,7 @@ inline ExtrinsicFit calibrateImuExtrinsic(const std::vector<SensorFrame>& frames
         best.reason = ExtrinsicFail::Frames;
         return best;
     }
-    const bool attitude_only = !tl.canPreintegrate() && tl.hasRotation();
+    const bool attitude_only = !tl.hasGyro() && tl.hasRotation();
     double best_score = 1e300;
     ExtrinsicFail fail = ExtrinsicFail::Pairs;
     for (double sign : {1.0, -1.0}) {

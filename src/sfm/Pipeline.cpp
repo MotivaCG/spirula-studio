@@ -411,9 +411,13 @@ bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
         const MetricFit fit =
             fitMetricGauge(ref, cfg.metric_max_error,
                            flat ? MetricAxes::Horizontal : MetricAxes::Full);
+        // A refused fit leaves the model in the frame it came in with -- the
+        // sensors', or the normalized one the fallback below writes. Applying
+        // the identity it returns would still claim the metre.
         if (!fit.ok) {
             all = false;
             L::warn(Tag::Orient, M::metric_failed, {(long long)i, metricReason(fit)});
+            continue;
         }
         applySim3(models[i], composeSim3(fit.T, pre));
         gauge[i].metric = true;

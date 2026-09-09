@@ -466,10 +466,12 @@ closed form and refines them together in one robust Levenberg-Marquardt solve:
 What is missing or degenerate is refused by its own uncertainty rather than
 by a rule: a camera that only pans gets up and no scale, a stale phone fix
 gets no GPS, a file with an attitude stream but no raw gyro (the Osmo 360)
-gets up from the attitude. Two scale sources are combined by information and
-reported separately, and an IMU-versus-GPS disagreement beyond three sigma
-keeps the more certain one and says so. `--sensor-gauge up` takes the
-orientation alone; `none` ignores the sensors. On the X5 walk the whole fit
+pre-integrates from the attitude instead, and a per-frame accelerometer has
+the attenuation its own aliasing noise causes taken back out. Two scale
+sources are combined by information and reported separately, and an
+IMU-versus-GPS disagreement beyond three sigma keeps the more certain one
+and says so. `--sensor-gauge up` takes the orientation alone; `none` ignores
+the sensors. On the X5 walk the whole fit
 takes 0.3 s; a metric reference the user passes still outranks an upright-only
 sensor frame. `docs/notes/imu-gps-for-sfm.md` records what the files carry
 and what was measured.

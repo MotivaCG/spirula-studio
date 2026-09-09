@@ -358,12 +358,10 @@ private:
                 pm.k = fi[k];
                 if (tl->canPreintegrate()) {
                     pm.P = tl->preintegrate(a.t, b.t, {0, 0, 0}, {0, 0, 0}, _gyro_sign[g]);
-                    if (!pm.P.ok()) continue;
-                    pm.has_preint = true;
-                    pm.B = pm.P.dR;
-                } else if (!tl->rotationBetween(a.t, b.t, pm.B, _gyro_sign[g])) {
-                    continue;
+                    pm.has_preint = pm.P.ok();
                 }
+                if (pm.has_preint) pm.B = pm.P.dR;
+                else if (!tl->rotationBetween(a.t, b.t, pm.B, _gyro_sign[g])) continue;
                 _pairs[g].push_back(pm);
             }
         }
@@ -425,6 +423,7 @@ private:
                     for (int c = 0; c < n; c++) N[(size_t)a * n + c] += wi * row[a] * row[c];
                 }
             };
+            double noise_n00 = 0;
             for (size_t i = 0; i < ids.size(); i++) {
                 const Triple& tr = _triples[ids[i].first][ids[i].second];
                 const TripleTerms T = tripleTerms(ids[i].first, tr, _X[ids[i].first], bg, {0, 0, 0}, {0, 0, 0});
@@ -436,7 +435,12 @@ private:
                     if (with_g) row[4 + r] = T.Gs;
                     add_row(row, (&T.L.x)[r], w[i]);
                 }
+                noise_n00 += w[i] * 3.0 * tripleNoise(ids[i].first, tr);
             }
+            // The pre-integrated regressor carries the accelerometer's own
+            // noise, which attenuates k -- 10% on the DJI's 30 Hz stream over
+            // 1 s pairs. Corrected least squares takes that variance back out.
+            N[0] = std::max(N[0] - noise_n00, 0.5 * N[0]);
             const double prior = 0.2 * std::max(k, 0.05);   // 0.2 m/s^2 on the bias itself
             for (int c = 0; c < 3; c++) {
                 double row[7] = {0, 0, 0, 0, 0, 0, 0};
@@ -509,6 +513,7 @@ private:
             std::vector<Triple>& tr = _triples[g];
             for (size_t p = 1; p < pairs.size(); p++) {
                 if (pairs[p - 1].k != pairs[p].j) continue;
+                if (!pairs[p - 1].has_preint || !pairs[p].has_preint) continue;
                 Triple t;
                 t.j = pairs[p - 1].j;
                 t.k = pairs[p].j;
@@ -636,6 +641,15 @@ private:
         return T;
     }
 
+    // Variance of one component of a triple's pre-integrated position, for
+    // white accelerometer noise of density q: (q/3) d1^2 d2^2 (d1 + d2), the
+    // velocity-free combination of two random walks.
+    double tripleNoise(size_t g, const sensor_detail::Triple& t) const {
+        const double q = _caps[(size_t)_group_capture[g]].timeline->noise.accel;
+        const double d1 = _pairs[g][(size_t)t.p1].P.dt, d2 = _pairs[g][(size_t)t.p2].P.dt;
+        return q * q * d1 * d1 * d2 * d2 * (d1 + d2) / 3.0;
+    }
+
     // ---- the joint solve --------------------------------------------------
 
     struct Params {
@@ -745,9 +759,11 @@ private:
 
     // Residuals, each already divided by its sigma; `w` carries the robust
     // weight assigned at the previous evaluation (IRLS).
-    void residuals(const Params& p, std::vector<double>& r) const {
+    void residuals(const Params& p, std::vector<double>& r,
+                   std::vector<double>* noise = nullptr) const {
         using namespace sensor_detail;
         r.clear();
+        if (noise) noise->clear();
         const double s = _base_s * std::exp(p.log_s);
         const Mat3 R = mul(so3Exp(p.rot), _base_R);
         const Vec3 t = _base_t + p.t;
@@ -784,6 +800,10 @@ private:
                 r.push_back(e.x / _sig_trip);
                 r.push_back(e.y / _sig_trip);
                 r.push_back(e.z / _sig_trip);
+                if (noise) {
+                    noise->resize(r.size() - 3, 0.0);
+                    noise->resize(r.size(), tripleNoise(g, tr));
+                }
             }
         }
         if (_use_gps)
@@ -802,6 +822,7 @@ private:
             for (int k = 0; k < 3; k++) r.push_back((&p.lever[g].x)[k] / 0.1);   // metres
             for (int k = 0; k < 3; k++) r.push_back((&p.dX[g].x)[k] / 0.05);     // rad
         }
+        if (noise) noise->resize(r.size(), 0.0);
     }
 
     Layout layout() const {
@@ -821,7 +842,8 @@ private:
             for (size_t g = 0; g < _group_name.size(); g++)
                 if (_group_capture[g] == (int)c && _group_ok[g] && !_pairs[g].empty() && _pairs[g][0].has_preint)
                     has = true;
-            add(L.i_bg[c], 3, has);
+            const bool gyro = _caps[c].timeline && _caps[c].timeline->hasGyro();
+            add(L.i_bg[c], 3, has && gyro);
             add(L.i_ba[c], 3, has && _use_imu);
         }
         L.i_lever.resize(_group_name.size());
@@ -908,11 +930,25 @@ private:
         if (act.empty()) return;
         const int m = (int)act.size();
 
-        std::vector<double> r, r2, w;
+        std::vector<double> r, r2, w, noise;
         auto eval = [&](const std::vector<double>& xv, std::vector<double>& rv) {
             Params q = p;
             unpack(L, xv, q);
             residuals(q, rv);
+        };
+        residuals(p, r, &noise);
+        int i_scale = -1;
+        for (int i = 0; i < (int)act.size(); i++)
+            if (act[(size_t)i] == L.i_s) i_scale = i;
+        // solveScale's correction, in the curvature: the scale column of a
+        // triple row is the noisy pre-integrated regressor, and left alone the
+        // solve would take the attenuation back.
+        auto noiseCurvature = [&](double s) {
+            if (i_scale < 0) return 0.0;
+            double c = 0;
+            for (size_t i = 0; i < noise.size() && i < w.size(); i++)
+                c += w[i] * noise[i] / (s * s * _sig_trip * _sig_trip);
+            return c;
         };
         auto cost = [&](const std::vector<double>& rv) {
             double c = 0;
@@ -950,6 +986,12 @@ private:
                     g[(size_t)a] += w[i] * Ji[a] * r[i];
                     for (int b = 0; b < m; b++) H[(size_t)a * (size_t)m + (size_t)b] += w[i] * Ji[a] * Ji[b];
                 }
+            }
+            const double c_n = noiseCurvature(_base_s * std::exp(p.log_s + x[(size_t)L.i_s]));
+            if (i_scale >= 0) {
+                const size_t d = (size_t)i_scale * (size_t)m + (size_t)i_scale;
+                g[(size_t)i_scale] += c_n;
+                H[d] = std::max(H[d] - c_n, 0.5 * H[d]);
             }
             bool accepted = false;
             for (int tries = 0; tries < 8 && !accepted; tries++) {
@@ -996,6 +1038,10 @@ private:
                 const double* Ji = &J[i * (size_t)m];
                 for (int a = 0; a < m; a++)
                     for (int b = 0; b < m; b++) H[(size_t)a * (size_t)m + (size_t)b] += w[i] * Ji[a] * Ji[b];
+            }
+            if (i_scale >= 0) {
+                const size_t d = (size_t)i_scale * (size_t)m + (size_t)i_scale;
+                H[d] = std::max(H[d] - noiseCurvature(_base_s * std::exp(p.log_s)), 0.5 * H[d]);
             }
             std::vector<double> ev, V;
             jacobiEigenSymmetric(H, m, ev, V);
