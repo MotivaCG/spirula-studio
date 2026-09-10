@@ -2,6 +2,7 @@
 
 #include "app/gui/SfmInProcess.h"
 
+#ifdef SS_TOOL_SFM
 #include "sfm/Pipeline.h"
 #include "sfm/core/Cancel.h"
 #include "sfm/core/Events.h"
@@ -128,3 +129,23 @@ InProcessResult run_sfm_in_process(
 }
 
 }  // namespace gui
+
+#else  // no SfM module: SfmRunner::availability() refuses the run before this
+
+#include "i18n/catalog/Log.h"
+
+namespace gui {
+
+InProcessResult run_sfm_in_process(const std::vector<std::string>&,
+                                   const std::function<void(const std::string&)>&,
+                                   const std::function<void(const RunStatus&)>&,
+                                   const std::atomic<bool>&) {
+    InProcessResult out;
+    out.exit_code = 1;
+    out.error = spirula::i18n::msg::log::err_no_sfm_module.get();
+    return out;
+}
+
+}  // namespace gui
+
+#endif
