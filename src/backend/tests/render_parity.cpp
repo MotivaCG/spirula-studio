@@ -198,8 +198,8 @@ int main(int argc, char** argv) {
         {0, false, 1, 2, DistortionType::D, false},
         {2, false, 3, 0, DistortionType::None, true},
         {0, true, 3, 0, DistortionType::None, false},
-        {1, true, 0, 3, DistortionType::D, false},
-        {2, true, 0, 3, DistortionType::None, false},
+        {1, true, 0, 2, DistortionType::D, false},
+        {2, true, 0, 2, DistortionType::None, false},
     };
 
     for (const Cfg& cfg : cfgs) {

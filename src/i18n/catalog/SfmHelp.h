@@ -872,6 +872,35 @@ SS_MSG(desc_merge_1,
        "hepsine açılır. Farklı özniteliklerden kurulmuş modeller "
        "birleştirilemez."));
 
+SS_MSG(desc_merge_3,
+    EN("A single model is accepted only with --metric-positions or --metric-gps: "
+       "there is nothing to merge, and the run only re-gauges it in metres."),
+    JA("モデルが 1 つだけの場合は --metric-positions か --metric-gps を"
+       "指定したときにのみ受け付けます。統合するものはなく、メートル座標系に"
+       "直すだけの実行になります。"),
+    ZH_HANS("只有一个模型时，仅在给出 --metric-positions 或 --metric-gps 的情况下才接受："
+            "没有可合并的内容，这次运行只是把它改写为米制坐标系。"),
+    ZH_HANT("只有一個模型時，僅在給出 --metric-positions 或 --metric-gps 的情況下才接受："
+            "沒有可合併的內容，這次執行只是把它改寫為公尺座標系。"),
+    KO("모델이 하나뿐일 때는 --metric-positions 또는 --metric-gps 를 준 경우에만 "
+       "받습니다. 병합할 것이 없고, 미터 좌표계로 다시 맞추기만 합니다."),
+    DE("Ein einzelnes Modell wird nur mit --metric-positions oder --metric-gps "
+       "angenommen: es gibt nichts zu vereinen, der Lauf setzt es nur in Meter."),
+    FR("Un modèle seul n'est accepté qu'avec --metric-positions ou --metric-gps : "
+       "il n'y a rien à fusionner, la passe ne fait que le remettre en mètres."),
+    ES("Un solo modelo se acepta únicamente con --metric-positions o "
+       "--metric-gps: no hay nada que fusionar y la pasada solo lo pone en metros."),
+    PT("Um único modelo só é aceite com --metric-positions ou --metric-gps: não "
+       "há nada a fundir e a passagem apenas o volta a pôr em metros."),
+    IT("Un solo modello è accettato unicamente con --metric-positions o "
+       "--metric-gps: non c'è nulla da fondere, la passata lo rimette in metri."),
+    NL("Eén model wordt alleen met --metric-positions of --metric-gps aanvaard: "
+       "er valt niets samen te voegen, de run zet het enkel in meters."),
+    RU("Одна модель принимается только с --metric-positions или --metric-gps: "
+       "сливать нечего, прогон лишь переводит её в метры."),
+    TR("Tek bir model yalnızca --metric-positions ya da --metric-gps ile kabul "
+       "edilir: birleştirilecek bir şey yoktur, çalıştırma onu yalnızca metreye çevirir."));
+
 SS_MSG(desc_merge_2,
     EN("A merged model is two independently optimized halves glued along a seam "
        "no bundle adjustment has ever seen, so one runs across it afterwards "
@@ -938,6 +967,55 @@ SS_MSG(opt_auto_output,
        "sparse/0.."),
     TR("Yazılacak çalışma alanı: features/, matches.bin ve sparse/0.. buraya "
        "iner."));
+
+SS_MSG(opt_manifest,
+    EN("Read the capture's description from FILE (YAML or JSON): where the "
+       "images and masks are, how the cameras are grouped, each group's "
+       "lens and focal length, and the videos whose IMU and GPS cover them. "
+       "A flag on the command line beats the file."),
+    JA("撮影内容の説明を FILE (YAML または JSON) から読みます。画像とマスクの場所、"
+       "カメラの分け方、各グループのレンズと焦点距離、そして IMU と GPS を記録した動画です。"
+       "コマンドラインの指定のほうが優先されます。"),
+    ZH_HANS("从 FILE (YAML 或 JSON) 读取这次拍摄的描述: 图像和掩码的位置、相机的分组、"
+            "每组的镜头和焦距，以及记录了 IMU 和 GPS 的视频。命令行上的选项优先于文件。"),
+    ZH_HANT("從 FILE (YAML 或 JSON) 讀取這次拍攝的描述: 影像和遮罩的位置、相機的分組、"
+            "每組的鏡頭和焦距，以及記錄了 IMU 和 GPS 的影片。命令列上的選項優先於檔案。"),
+    KO("촬영 내용을 FILE (YAML 또는 JSON) 에서 읽습니다. 이미지와 마스크의 위치, "
+       "카메라를 나누는 방법, 그룹마다의 렌즈와 초점 거리, 그리고 IMU 와 GPS 를 담은 영상입니다. "
+       "명령줄에서 준 값이 파일보다 우선합니다."),
+    DE("Die Beschreibung der Aufnahme aus FILE lesen (YAML oder JSON): wo die "
+       "Bilder und Masken liegen, wie die Kameras gruppiert sind, welches "
+       "Objektiv und welche Brennweite jede Gruppe hat, und welche Videos IMU "
+       "und GPS dazu tragen. Ein Flag auf der Kommandozeile schlägt die Datei."),
+    FR("Lire la description de la prise depuis FILE (YAML ou JSON) : où sont "
+       "les images et les masques, comment les caméras sont groupées, "
+       "l'objectif et la focale de chaque groupe, et les vidéos dont l'IMU et "
+       "le GPS les couvrent. Une option en ligne de commande l'emporte sur le "
+       "fichier."),
+    ES("Leer la descripción de la captura desde FILE (YAML o JSON): dónde están "
+       "las imágenes y las máscaras, cómo se agrupan las cámaras, el objetivo "
+       "y la focal de cada grupo, y los vídeos cuya IMU y GPS las cubren. Una "
+       "opción en la línea de órdenes gana al fichero."),
+    PT("Ler a descrição da captura de FILE (YAML ou JSON): onde estão as "
+       "imagens e as máscaras, como as câmaras são agrupadas, a objetiva e a "
+       "distância focal de cada grupo, e os vídeos cuja IMU e GPS as cobrem. "
+       "Uma opção na linha de comandos ganha ao ficheiro."),
+    IT("Leggere la descrizione della ripresa da FILE (YAML o JSON): dove sono "
+       "le immagini e le maschere, come sono raggruppate le fotocamere, "
+       "l'obiettivo e la focale di ogni gruppo, e i video la cui IMU e GPS le "
+       "coprono. Un'opzione da riga di comando vince sul file."),
+    NL("De beschrijving van de opname uit FILE lezen (YAML of JSON): waar de "
+       "beelden en maskers staan, hoe de camera's gegroepeerd zijn, de lens "
+       "en brandpuntsafstand van elke groep, en de video's waarvan IMU en GPS "
+       "ze dekken. Een optie op de opdrachtregel wint van het bestand."),
+    RU("Прочитать описание съёмки из FILE (YAML или JSON): где лежат снимки и "
+       "маски, как сгруппированы камеры, какой у каждой группы объектив и "
+       "фокусное расстояние, и какие видео несут IMU и GPS к ним. Параметр в "
+       "командной строке важнее файла."),
+    TR("Çekimin tanımını FILE dosyasından okur (YAML ya da JSON): görüntülerin "
+       "ve maskelerin yeri, kameraların nasıl gruplandığı, her grubun objektifi "
+       "ve odak uzaklığı, ve IMU ile GPS'i bunları kapsayan videolar. Komut "
+       "satırındaki seçenek dosyayı yener."));
 
 SS_MSG(opt_progress_dir,
     EN("Write snapshots of the run into DIR while it goes -- the current model "
@@ -1241,6 +1319,21 @@ SS_MSG(exit_3,
 // ===========================================================================
 // `spirula sfm ba` -- the solver benchmark
 // ===========================================================================
+
+SS_MSG(exit_4,
+    EN("the model was written, but not in the metric frame that was asked for"),
+    JA("モデルは書き出されましたが、要求されたメートル座標系ではありません"),
+    ZH_HANS("模型已写出，但不是所要求的米制坐标系"),
+    ZH_HANT("模型已寫出，但不是所要求的公尺座標系"),
+    KO("모델은 썼지만 요청한 미터 좌표계는 아닙니다"),
+    DE("das Modell wurde geschrieben, aber nicht im verlangten metrischen Rahmen"),
+    FR("le modèle a été écrit, mais pas dans le repère métrique demandé"),
+    ES("el modelo se escribió, pero no en el marco métrico solicitado"),
+    PT("o modelo foi escrito, mas não no referencial métrico pedido"),
+    IT("il modello è stato scritto, ma non nel sistema metrico richiesto"),
+    NL("het model is geschreven, maar niet in het gevraagde metrische stelsel"),
+    RU("модель записана, но не в запрошенной метрической системе"),
+    TR("model yazıldı, ancak istenen metrik çerçevede değil"));
 
 SS_MSG(ba_desc_1,
     EN("Runs the GPU bundle adjuster directly on a problem in Bundle Adjustment "

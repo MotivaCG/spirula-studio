@@ -586,7 +586,8 @@ public:
                 double dt = std::chrono::duration<double>(
                                 std::chrono::steady_clock::now() - t0).count();
                 if (dt > 0.1)
-                    fprintf(stderr, "[prof]   pipeline %s: %.2f s\n", e.c_str(), dt);
+                    sfm::slog::diag(sfm::slog::Tag::Device, "[prof]   pipeline %s: %.2f s",
+                                    e.c_str(), dt);
             }
         }
     }

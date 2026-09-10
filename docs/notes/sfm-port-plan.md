@@ -5,9 +5,11 @@ separate private tree) into Spirula Studio, making this its permanent home,
 and retiring the COLMAP subprocess for Vulkan builds.
 
 Status: **phases 1-2 landed** (mechanical import; one configuration surface),
-**phase 5 landed in a different shape than planned** (2026-08-01, see below).
-Phase 3 is what unblocks the rest. This document is the plan; delete the phase
-checklists as they land and fold the surviving content into
+**phase 5 landed in a different shape than planned** (2026-08-01, see below),
+**phase 4 landed piecemeal**. Phases 3 and 5 are superseded by
+[`sfm-in-process-plan.md`](sfm-in-process-plan.md), which plans the library
+seam and the GUI's use of it as one change. This document is the plan; delete
+the phase checklists as they land and fold the surviving content into
 `src/sfm/README.md`.
 
 ---
@@ -81,7 +83,7 @@ Resulting targets:
 
 ```
 SS_BUILD_SFM=ON                 ss_sfm            (static lib)
-  + SS_BUILD_CLI=ON             spirula sfm            (CLI, alongside
+  (always)                      spirula sfm            (CLI, alongside
                                                            spirula train and,
                                                            on CUDA, spirula mesh)
   + SS_BUILD_GUI=ON             the GUI gains the built-in SfM path
@@ -193,7 +195,7 @@ in the import commit message and in `src/sfm/README.md`.
    `sfm_mask_test`, `sfm_merge_test`, `sfm_cholesky_test` — built the way
    `src/backend/tests/*.cpp` are (glob → one exe per file, same name).
 
-*Done when:* `bash build_develop.bash -DSS_BACKEND=vulkan -DSS_BUILD_CLI=ON`
+*Done when:* `bash build_develop.bash -DSS_BACKEND=vulkan`
 builds `spirula train` and `spirula sfm`, every `sfm_*_test` passes, and
 `spirula sfm auto` reproduces a known-good reconstruction on a public dataset
 (Mip-NeRF 360 `garden`, 25-frame subset) with the same registered count and
@@ -226,78 +228,45 @@ Two deliberate behaviour changes, both in `src/sfm/README.md`: `auto
 `--no-manage` added to `auto` for the old meaning, and `auto` accepts the
 advanced flags of the stages it runs.
 
-### Phase 3 — library-ization (3–4 days)
+### Phase 3 — library-ization — **superseded**
 
-The module is currently a CLI that prints to stdout/stderr and cannot be
-stopped. To live inside the GUI it needs three things it does not have.
+The module is a CLI that prints to stdout/stderr and cannot be stopped. The
+three seams it needs to live inside the GUI — log sink, progress, cancellation
+— and the header/translation-unit split are planned in
+[`sfm-in-process-plan.md`](sfm-in-process-plan.md) §3 and §8, together with the
+two this phase did not have: hoisting `auto`'s stage sequencing out of the CLI,
+and read accessors on a job that is still running.
 
-1. **Log sink.** `src/sfm/Log.h`: levels, a sink callback, and
-   `SFM_LOG_*` macros replacing all ~350 `printf`/`fprintf(stderr, ...)` sites.
-   The sink is process-global, set by whoever drives the run — the same
-   singleton shape the engine uses, with the same constraint written down:
-   one SfM job per process at a time. The CLI installs a sink that prints
-   exactly what it prints today.
-2. **Progress.** A `(stage label, fraction, counts)` callback fired at stage
-   boundaries and at a bounded rate inside the per-image, per-pair and
-   per-registration loops. The stage labels are the ones the GUI shows, so
-   write them for a user, not a developer.
-3. **Cancellation.** A cancel token checked at the same points, unwinding
-   through a `sfm::Cancelled` exception caught at the job boundary. GPU work
-   must be drained and the `VkContext` torn down before the job returns —
-   the leak fix in the source tree (`~VkCtx` frees every buffer it handed
-   out) is what makes this safe; do not regress it.
-4. **Header → translation unit split.** ~20k lines of header-only code compiled
-   into every consumer is not this repo's convention and costs real build time
-   once the CLI, the GUI and six test binaries each include it. Split
-   directory by directory (`core` → `geometry` → `optim` → `feature` → `ba` →
-   `map`), keeping the build green after each; templates and small hot inline
-   helpers stay in headers. Add `src/sfm/*.cpp` globs to `SsSfm.cmake`
-   (not to `cmake/sources.txt` — that file is the engine/pip source list).
+### Phase 4 — dataset-parser and format checks — **mostly landed**
 
-*Done when:* the reconstruction is unchanged, `spirula sfm` output is unchanged,
-a `SIGINT` mid-run exits cleanly, and a from-scratch build of `ss_sfm` is
-measurably faster than the header-only one.
+Whether every camera model the mapper emits survives the round trip into
+training.
 
-### Phase 4 — dataset-parser and format checks (1 day)
-
-The mapper can emit camera models this repo cannot consume.
-
-1. `ColmapParser` handles model ids 0–10. The SfM mapper can also write
-   `EQUIRECTANGULAR` (id 17), which neither the parser nor the renderer
-   supports. Decide and implement one of: reject the combination up front with
-   a clear message, or carry equirectangular through the parser and the render
-   path. Until then the CLI must refuse `--camera-model equirectangular` when
-   the output is destined for training, and say why.
+1. **Landed:** `EQUIRECTANGULAR` (id 17) is carried rather than refused —
+   `ColmapParser` reads it and checks the 2:1 aspect, the projection kernels
+   have variants, and the GUI offers it. One gap left: `unproject_raydir`
+   (`src/shaders/pixel_wise.slang`) falls back to pinhole for it, so depth and
+   normal supervision on an equirect camera is silently wrong.
 2. Verify a round trip for every other model the mapper emits: reconstruct,
    parse, train one step. `THIN_PRISM_FISHEYE` and `OPENCV_FISHEYE` in
    particular.
-3. Decide whether intermediates (`features/`, `matches.bin`) are kept in the
-   workspace. Default: delete on success, `--keep-intermediate` to keep. The
-   GUI exposes it as a checkbox, off.
+3. **Landed:** intermediates are deleted on success, `--keep-intermediate`
+   keeps them, and the GUI exposes it as a checkbox, off.
 
 *Done when:* every camera model the mapper can produce either trains or is
 refused with an actionable message.
 
 ### Phase 5 — GUI integration — **landed 2026-08-01, out of order**
 
-It landed while the segmentation stack was being merged,
-and it landed **without phase 3** — which
-changes one thing from the plan below and nothing else.
+It landed while the segmentation stack was being merged, and it landed
+**without phase 3**: `SfmRunner` drives `spirula sfm` as a **child process**
+rather than calling the library in-process, reading stage and progress out of
+the child's stdout and its `--progress-dir` snapshots. The reasons that shape
+was chosen are in `SfmRunner.h`; what it costs, and what replaces it, are in
+[`sfm-in-process-plan.md`](sfm-in-process-plan.md).
 
-`SfmRunner` drives `spirula sfm` as a **child process** rather than calling the
-library in-process (item 2 below). That is deliberate for now:
-
-- phase 3 has not happened, so the library still prints to stdout and cannot be
-  cancelled; in-process it could be neither stopped nor reported on;
-- global BA on a large model and a live trainer must not share a VRAM budget,
-  and a child process gives that separation for free;
-- it keeps one Vulkan device live in the GUI process instead of two — §10's own
-  first risk.
-
-The user still installs nothing: it is our binary, shipped next to the GUI and
-found via `AppPaths::sibling_tool`, not via PATH. The cost is that progress is
-read out of the child's stdout (`SfmRunner::note_progress`), which phase 3
-removes. **When phase 3 lands, only `SfmRunner::run`'s body changes.**
+The user installs nothing either way: the child is our own binary, found via
+`AppPaths::exe_path`, not via PATH.
 
 Everything else landed as written: `DatasetPrep` (item 1, and it grew built-in
 video decoding and masking with the ffmpeg/Python subprocesses kept as
@@ -310,52 +279,6 @@ user needs, plus a free-form "extra spirula sfm flags" field that reaches the
 other ~120. That is a deliberate trade for now: mirroring the table into ImGui
 widgets is real work, and the flag field costs nothing and cannot go stale.
 Revisit if users actually reach for it.
-
-Phase 4 (dataset-parser and format checks) is still **not done**. What the GUI
-does instead is not offer `equirectangular` in the camera-model list at all
-(`kSfmCameraModels`), so the combination the parser cannot read is unreachable
-from the GUI — the CLI can still produce it and still should refuse it.
-
-The original plan, for reference:
-
-### Phase 5 — GUI integration (3–4 days)
-
-1. **Factor the shared half out of `ColmapRunner`** into
-   `src/app/gui/DatasetPrep.{h,cpp}`: ffmpeg frame extraction, sharpest-frame
-   selection (`FrameSelect`), multi-track `.insv` splitting into
-   `images/cam<N>/`, AI masking via the embedded `reference/scripts/mask.py`, image
-   counting and dimension probing, and the resume semantics that let an
-   interrupted run reuse what it left behind. Move it verbatim; `ColmapRunner`
-   keeps working through it.
-2. **`SfmRunner`** with the same public shape as `ColmapRunner`
-   (`start`/`cancel`/`state`/`stage`/`error`/`dataset_dir`/`image_dir`/`drain_log`)
-   plus a progress fraction. It runs `DatasetPrep`, then the pipeline
-   in-process on a worker thread with the phase-3 sinks wired to its log
-   buffer. Masks produced by `DatasetPrep` feed the SfM `--masks` path
-   natively — no separate mask handling.
-3. **`GuiApp`**: rename `Screen::Colmap` to `Screen::NewDataset`. Add an SfM
-   engine selector at the top of the screen — "Built-in (GPU)" when
-   `SS_BUILD_SFM` compiled it in, "COLMAP (external)" when a `colmap`
-   binary is on PATH. Built-in is the default when available; the selector
-   disappears entirely when only one option exists, so a Vulkan user never
-   sees COLMAP mentioned and a CUDA user sees no dead option.
-4. **Beginner path unchanged in shape:** the basic panel keeps today's
-   controls — quality, camera model, camera sharing, features/matcher choice
-   (mapped onto `--pairs exhaustive|sequential|prefilter`), video fps and
-   sharpness window, masking — with the same auto-detection GuiApp already
-   does (a multi-track 360 file preselects the fisheye model, per-folder
-   camera sharing and the known focal factor). Everything else is defaulted.
-5. **Advanced path:** an "All SfM options" editor over the phase-2 descriptor
-   table, reusing `ConfigUI`'s search box, group collapsing, tooltips,
-   modified-highlighting and right-click-reset. Factor those widgets out of
-   `ConfigUI.cpp` into a small shared helper so both config trees use one
-   implementation rather than two that drift.
-6. Persist the SfM engine choice and any tool paths in the existing settings
-   file.
-
-*Done when:* on a Vulkan GUI build, dropping a folder of photos or a video on
-the window produces a trainable dataset with no `colmap` binary installed,
-cancellation works mid-stage, and the CUDA GUI build is unchanged.
 
 ### Phase 6 — one Vulkan device (2–3 days)
 

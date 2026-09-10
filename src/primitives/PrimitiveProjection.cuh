@@ -62,7 +62,6 @@ struct Slang3DGSProj<CameraModelType::MODEL, CameraDistortionType::TIER> {      
     _SS_DEF_3DGS_PROJ(MODEL, ThinPrism, MODEL_SUFFIX, _prism)
 
 _SS_DEF_3DGS_PROJ_TIERS(PINHOLE, persp)
-_SS_DEF_3DGS_PROJ(PINHOLE, Rational, persp, _rational)
 _SS_DEF_3DGS_PROJ_TIERS(FISHEYE, fisheye)
 _SS_DEF_3DGS_PROJ_TIERS(EQUISOLID, equisolid)
 _SS_DEF_3DGS_PROJ(EQUIRECTANGULAR, None, equirect, _none)

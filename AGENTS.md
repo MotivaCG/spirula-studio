@@ -125,6 +125,9 @@ src/
 │   │                         geometry_main.cpp (depth + normals)
 │   ├── FrameExtract.{h,cpp}  video -> sharp frames (`spirula sam extract` also
 │   │                         masks them in the same pass; the GUI masks after)
+│   ├── Pano360.{h,cpp}     a 360 camera's own frame layout (the GoPro MAX
+│   │                         .360 EAC packing) and the views a dataset wants
+│   │                         out of it -- one implementation, both decode paths
 │   ├── WriterPool.h        threads that encode/write images while the GPU runs
 │   │                         the next frame; every masking loop uses it
 │   ├── AppPaths.{h,cpp}    the config / cache directories and this exe's own path
@@ -164,18 +167,19 @@ Always use the dev scripts; they run codegen first and pick a sane job count.
 
 ```bash
 # Linux
-bash build_develop.bash -DSS_BUILD_CLI=ON -DSS_BUILD_GUI=ON -DSS_BACKEND=cuda
-bash build_develop.bash -DSS_BUILD_CLI=ON -DSS_BACKEND=vulkan   # separate build dir advised
+bash build_develop.bash -DSS_BACKEND=cuda
+bash build_develop.bash -DSS_BACKEND=vulkan   # separate build dir advised
 # Windows (cmd)
-build_develop.bat -DSS_BUILD_CLI=ON -DSS_BACKEND=vulkan
+build_develop.bat -DSS_BACKEND=vulkan
 ```
 
 Use
 `build_develop.bash`; it runs codegen first and picks a RAM-aware job count.
 
 Everything builds into **one executable**, `build/spirula`: no arguments opens
-the GUI, `spirula sfm|train|sam|mesh` are the command-line tools, and a symlink
-named `spirula-sfm` runs that tool directly (`src/app/Tools.h`);
+the GUI (`-DSS_BUILD_GUI=OFF` leaves a headless binary that needs neither a
+display nor GL), `spirula sfm|train|sam|mesh` are the command-line tools, and
+a symlink named `spirula-sfm` runs that tool directly (`src/app/Tools.h`);
 `spirula geometry` estimates depth and normals for a dataset. The GUI runs
 reconstruction and that estimation by re-running itself as a child process, so
 there is no sibling binary to keep next to it. `-DSS_SEPARATE_TOOLS=ON` also builds the old
@@ -183,7 +187,7 @@ per-tool executables.
 
 Backends build into different trees; keep them separate (`-B build_cuda`,
 `-B build`) so you can test both without reconfiguring. Options:
-`SS_BACKEND` (`cuda`|`vulkan`), `SS_BUILD_CLI`, `SS_BUILD_GUI`,
+`SS_BACKEND` (`cuda`|`vulkan`), `SS_BUILD_GUI`,
 `SS_BUILD_BACKEND_TESTS`, `SS_DEBUG_SYMBOLS`,
 `SS_BUILD_SFM`, `SS_BUILD_SAM`, `SS_ENABLE_PATENTED`,
 `SS_SEPARATE_TOOLS`.

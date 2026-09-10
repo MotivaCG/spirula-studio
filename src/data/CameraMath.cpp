@@ -52,13 +52,6 @@ void distort_lens(double u, double v, int tier, const float* d, double out[2]) {
         out[1] = v*radial + 2*d[3]*u*v + d[2]*(r2 + 2*v*v);
         return;
     }
-    if (tier == (int)CameraDistortionType::Rational) {
-        double radial = (1 + r2*(d[0] + r2*(d[1] + r2*d[2])))
-                      / (1 + r2*(d[3] + r2*(d[4] + r2*d[5])));
-        out[0] = u*radial + 2*d[6]*u*v + d[7]*(r2 + 2*u*u);
-        out[1] = v*radial + 2*d[7]*u*v + d[6]*(r2 + 2*v*v);
-        return;
-    }
     double radial = 1 + r2*(d[0] + r2*(d[1] + r2*(d[2] + r2*d[3])));
     out[0] = u*radial + 2*d[4]*u*v + d[5]*(r2 + 2*u*u) + d[6]*r2;
     out[1] = v*radial + 2*d[5]*u*v + d[4]*(r2 + 2*v*v) + d[7]*r2;

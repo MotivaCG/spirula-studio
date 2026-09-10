@@ -35,9 +35,13 @@ namespace dsparse {
 // docs/notes/pose-normalization.md.
 // ---------------------------------------------------------------------------
 double compute_normalized_transform(const std::vector<float>& c2w, int64_t n,
-                                     double T_out[16]) {
+                                     double T_out[16], double R_out[9]) {
     std::fill(T_out, T_out + 16, 0.0);
     T_out[0] = T_out[5] = T_out[10] = T_out[15] = 1.0;
+    if (R_out) {
+        std::fill(R_out, R_out + 9, 0.0);
+        R_out[0] = R_out[4] = R_out[8] = 1.0;
+    }
     if (n <= 0) return 1.0;
     double up[3] = {0, 0, 0}, center[3] = {0, 0, 0};
     for (int64_t i = 0; i < n; i++) {
@@ -66,6 +70,8 @@ double compute_normalized_transform(const std::vector<float>& c2w, int64_t n,
     } else if (c < 0.0) {
         R[1][1] = -1.0; R[2][2] = -1.0;                 // up == -z: flip
     }
+
+    if (R_out) std::copy(&R[0][0], &R[0][0] + 9, R_out);
 
     double max_abs = 0.0;
     for (int64_t i = 0; i < n; i++) {

@@ -153,7 +153,7 @@ inline int train_tier_rank(const char* tier) {
     X(std::string, primitive, "3dgs", "splats", "basic", "3dgs|mip|3dgut")   \
     X(int, sh_degree, 3, "splats", "basic", "")                              \
     X(int, sh_degree_warmup_every, 1000, "splats", "expert", "")             \
-    X(std::string, background_mode, "black", "splats", "basic", "black|noise|sh") \
+    X(std::string, background_mode, "black", "splats", "basic", "black|noise|sh|pseudorandom") \
     X(int, background_sh_degree, 4, "splats", "basic", "")                   \
     X(int, background_noise_warmup, 2000, "splats", "expert", "")            \
     X(float, background_noise_pre_warmup, 0.25f, "splats", "expert", "")     \
@@ -211,6 +211,8 @@ inline int train_tier_rank(const char* tier) {
     X(int, num_loss_scales, 0, "loss", "advanced", "")                       \
     X(float, alpha_loss_weight, 0.1f, "loss", "basic", "")                   \
     X(float, alpha_loss_weight_under, 0.0f, "loss", "basic", "")             \
+    X(float, loss_saturation_threshold, -1.0f, "loss", "advanced", "")       \
+    X(bool, normalize_loss_by_luminance, false, "loss", "advanced", "")      \
                                                                              \
     /* ==== geometry -- how crisp the surfaces come out, and depth/normal guidance ==== */ \
     X(std::string, floater_suppression, "off", "geometry", "basic", "off|mild|strong") \
@@ -291,10 +293,10 @@ inline int train_tier_rank(const char* tier) {
                                                                              \
     /* ==== colorspace -- linear vs display encoding, and which gamut ==== */\
     X(std::optional<bool>, image_color_is_linear, std::nullopt, "colorspace", "basic", "") \
-    X(std::string, image_color_transfer, "", "colorspace", "basic", "srgb|srgb-clamped|aces|filmic|uncharted2|none") \
+    X(std::string, image_color_transfer, "", "colorspace", "advanced", "srgb|srgb-clamped|aces|filmic|uncharted2|none") \
     X(std::string, image_color_gamut, "", "colorspace", "basic", "Rec.709|ACES2065-1|ACEScg|Rec.2020|AdobeRGB|DCI-P3|none") \
     X(std::optional<bool>, splat_color_is_linear, std::nullopt, "colorspace", "basic", "") \
-    X(std::string, splat_color_transfer, "", "colorspace", "basic", "srgb|srgb-clamped|aces|filmic|uncharted2|none") \
+    X(std::string, splat_color_transfer, "", "colorspace", "advanced", "srgb|srgb-clamped|aces|filmic|uncharted2|none") \
     X(std::string, splat_color_gamut, "", "colorspace", "basic", "Rec.709|ACES2065-1|ACEScg|Rec.2020|AdobeRGB|DCI-P3|none") \
     X(std::optional<bool>, convert_initial_point_cloud_color, std::nullopt, "colorspace", "basic", "") \
                                                                              \
@@ -380,7 +382,8 @@ inline constexpr TrainPresetInfo kTrainPresets[] = {
     {"3dgs"},
     {"360-camera"},
     {"in-the-wild"},
-    {"linear-color"},
+    {"centered-object"},
+    {"hdr"},
     {"synthetic"},
     {"meshing"},
     // {"academic-baseline"},  // hidden by default, uncomment to enable
@@ -416,22 +419,34 @@ inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
         c.means_lr_final = 1e-07f;
         return true;
     }
-    if (name == "linear-color") {
+    if (name == "centered-object") {
+        c.cap_max = 200000;
+        c.apply_loss_for_mask = true;
+        c.center_method = "focus";
+        c.background_mode = "sh";
+        c.depth_distortion_reg = 0.01f;
+        c.rgb_distortion_reg = 0.01f;
+        c.erank_reg = 0.05f;
+        return true;
+    }
+    if (name == "hdr") {
         c.splat_color_gamut = "ACEScg";
         c.splat_color_is_linear = true;
         c.image_color_gamut = "Rec.709";
         c.image_color_is_linear = false;
         // c.image_color_transfer = "srgb-clamped";
-        c.ppisp_param_type = "no_crf_no_vig_clamp";
         // c.apply_ppisp_before_color_space = true;
         // c.ppisp_adagrad_lr = 0.25f;
         c.ppisp_exposure_from_exif = true;
-        c.background_mode = "noise";
-        c.depth_distortion_reg = 0.01f;
+        // c.background_mode = "noise";
+        // c.depth_distortion_reg = 0.01f;
+        c.loss_saturation_threshold = 0.98f;
+        c.normalize_loss_by_luminance = true;
         c.dc_reg = 0.0f;
         c.max_screen_size = 0.15f;
-        c.features_dc_lr = 0.0015f;
-        c.features_sh_lr = 0.000075f;
+        // c.features_dc_lr = 0.0015f;
+        c.features_sh_lr = 0.0001f;
+        c.ssim_lambda = 0.1f;
         return true;
     }
     if (name == "synthetic") {
@@ -443,7 +458,7 @@ inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
         return true;
     }
     if (name == "meshing") {
-        c.primitive = "3dgut";
+        c.primitive = "mip";
         c.sh_degree = 0;
         c.dc_reg = 10.0f;
         c.sh_reg = 10.0f;

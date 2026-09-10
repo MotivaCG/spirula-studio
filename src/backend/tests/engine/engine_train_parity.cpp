@@ -193,9 +193,9 @@ int main(int argc, char** argv) {
         auto gt_alpha = r.bytes((int64_t)C * H * W);
         for (auto& v : gt_alpha) v = v < 220 ? 1 : 0;
 
-        // One step per tier: PINHOLE compiles all four, and the tier is
+        // One step per tier: PINHOLE compiles all three, and the tier is
         // orthogonal to everything the step does with the GT.
-        for (int s = 0; s < 4; s++, step++) {
+        for (int s = 0; s < 3; s++, step++) {
             auto losses = engine_train_step(
                 step, max_steps, "3dgs", 3, /*packed=*/false, W, H,
                 "PINHOLE", dist_fixture::kTierNames[s],

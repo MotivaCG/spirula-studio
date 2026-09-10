@@ -123,12 +123,14 @@ float srgb_to_linear_rgb_grad(float x) {
 [CudaDeviceExport]
 float splat_dc_encode(float dc) {
     const float kSh0 = 0.28209479177387814f;
-#if 1
+#if 0
     const float a = 1.0f / 255.0f;            // sqrt of the black floor
     float s = sqrt(0.5f + a * a);
     float u = kSh0 * dc + 0.5f;
     float w = u >= 0.0f ? 2.0f * sqrt(u + a * a) : 2.0f * a + u / a;
     return (w - 2.0f * s) * s / kSh0;
+#elif 1
+    return 2.0 * log(max(2.0 * kSh0 * dc + 1.0, 1e-12f));
 #else
     return linear_rgb_to_srgb(0.5f + kSh0 * dc) * (1.0f / kSh0) - 0.5f;
 #endif
@@ -138,12 +140,14 @@ float splat_dc_encode(float dc) {
 [CudaDeviceExport]
 float splat_dc_decode(float x) {
     const float kSh0 = 0.28209479177387814f;
-#if 1
+#if 0
     const float a = 1.0f / 255.0f;
     float s = sqrt(0.5f + a * a);
     float w = x * kSh0 / s + 2.0f * s;
     float u = w >= 2.0f * a ? 0.25f * w * w - a * a : (w - 2.0f * a) * a;
     return (u - 0.5f) / kSh0;
+#elif 1
+    return (exp(0.5 * x) - 1.0) * (0.5 / kSh0);
 #else
     return max(srgb_to_linear_rgb(0.5f + kSh0 * x), 0.0f) * (1.0f / kSh0) - 0.5f;
 #endif
@@ -170,11 +174,11 @@ void xfer_pass_grad(inout DifferentialPair<float> dp, float v_out) {
     dp = diffPair(dp.p, v_out);
 }
 
-// [BackwardDerivative(xfer_pass_grad)]
+[BackwardDerivative(xfer_pass_grad)]
 [Differentiable]
 float xfer_clamp01(float x) { return clamp(x, 0.0f, 1.0f); }
 
-// [BackwardDerivative(xfer_pass_grad)]
+[BackwardDerivative(xfer_pass_grad)]
 [Differentiable]
 float xfer_max0(float x) { return max(x, 0.0f); }
 
@@ -645,6 +649,5 @@ void depth_normal_loss_vjp<D : ICameraDistortion>(
 _DEF_PIXELWISE_DIST_ENTRIES(_none, DistNone, 1)
 _DEF_PIXELWISE_DIST_ENTRIES(_opencv, DistOpenCV, 4)
 _DEF_PIXELWISE_DIST_ENTRIES(_prism, DistThinPrism, 8)
-_DEF_PIXELWISE_DIST_ENTRIES(_rational, DistRational, 8)
 
 #undef _DEF_PIXELWISE_DIST_ENTRIES

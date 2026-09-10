@@ -13,13 +13,18 @@
 //   next_train_batch().
 
 #include "core/Camera.h"         // camera_model_to_string
+#include "core/ColorSpace.h"
 #include "data/DataManager.h"
 #include "engine/Engine.h"
 #include "engine/EngineInternal.h"
 #include "engine/EngineState.h"
 #include "i18n/catalog/Log.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <vector>
 
@@ -52,6 +57,7 @@ void engine_setup_data_manager(
     // Drop the existing manager first so its scheduler / worker threads are
     // joined before we begin spinning up new ones.
     engine().dm.reset();
+    engine().gt_mean_luma.clear();
 
     engine().dm = std::make_unique<DataManager>(
         std::move(cfg), std::move(camera_models), std::move(camera_distortions),
@@ -119,6 +125,86 @@ static EngineStepConfig _resolve_split_vs_fpbo(const EngineStepConfig& cfg,
 }
 
 
+// Mean Rec.709 luma of one reference image, in display code values.
+static float _sampled_mean_luma(uint64_t base, int64_t n_px, int64_t width,
+                                uint32_t elem) {
+    int64_t stride = std::max<int64_t>(1, n_px / 256);
+    // Coprime with the row length, or the walk samples one column of pixels.
+    while (std::gcd(stride, width) != 1) stride++;
+
+    const auto& cs = engine().color_space;
+    const auto transfer = (colorspace::Transfer)cs.image_transfer;
+    const uint64_t pitch = 3 * (uint64_t)elem;
+
+    double sum = 0.0;
+    int64_t n = 0;
+    for (int64_t i = 0; i < n_px; i += stride, n++) {
+        const void* p = (const void*)(base + (uint64_t)i * pitch);
+        float c[3];
+        if (elem == 1) {
+            const uint8_t* q = (const uint8_t*)p;
+            for (int k = 0; k < 3; k++) c[k] = q[k] * (1.0f / 255.0f);
+        } else if (elem == 2) {
+            const uint16_t* q = (const uint16_t*)p;
+            for (int k = 0; k < 3; k++) c[k] = q[k] * (1.0f / 65535.0f);
+        } else {
+            const float* q = (const float*)p;
+            for (int k = 0; k < 3; k++) c[k] = q[k];
+        }
+        // What _engine_color_space_apply_to_gt does to the same pixels on the
+        // GPU (working_to_display in shaders/pixel_wise.slang).
+        if (cs.image_enabled) {
+            if (!cs.image_is_linear)
+                for (int k = 0; k < 3; k++) c[k] = colorspace::srgb_to_linear(c[k]);
+            colorspace::apply3x3(cs.image_color_matrix_host, c);
+            for (int k = 0; k < 3; k++) c[k] = colorspace::tone_encode(c[k], transfer);
+        }
+        sum += 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    }
+    return (float)(sum / (double)n);
+}
+
+
+// LossConfig::normalize_by_luminance: the photometric weights divided by
+// 0.5 / max(mean sRGB luma, 1/255). Leaves them alone when the step carries
+// no reference image to measure.
+static void _normalize_weights_by_luminance(LossConfig& loss, const TrainStep& stp) {
+    std::vector<float>& cache = engine().gt_mean_luma;
+    double sum = 0.0, total_px = 0.0;
+    for (const auto& sub : stp.subs) {
+        const TorchTensorView& rgb = sub->rgb_view;
+        const auto& shape = std::get<2>(rgb);
+        const uint64_t base = std::get<0>(rgb);
+        if (base == 0 || shape.size() != 4 || shape[3] != 3) continue;
+        const int64_t B = shape[0], px = shape[1] * shape[2];
+        if (px <= 0 || (int64_t)sub->indices.size() != B) continue;
+        const uint32_t elem = std::get<1>(rgb);
+
+        for (int64_t j = 0; j < B; j++) {
+            const int32_t id = sub->indices[(size_t)j];
+            if (id < 0) continue;
+            if ((size_t)id >= cache.size())
+                cache.resize((size_t)id + 1, std::numeric_limits<float>::quiet_NaN());
+            if (std::isnan(cache[(size_t)id]))
+                cache[(size_t)id] = _sampled_mean_luma(
+                    base + (uint64_t)(j * px) * 3 * elem, px, shape[2], elem);
+            sum += (double)cache[(size_t)id] * (double)px;
+            total_px += (double)px;
+        }
+    }
+    if (total_px <= 0.0) return;
+
+    const float scale = (float)(0.5 / std::max(sum / total_px, 1.0 / 255.0));
+    constexpr LossWeightIndex photometric[] = {
+        LossWeightIndex::RgbSupL1, LossWeightIndex::RgbSupL2,
+        LossWeightIndex::YSupL1,   LossWeightIndex::YSupL2,
+        LossWeightIndex::USupL2,   LossWeightIndex::VSupL2,
+    };
+    for (LossWeightIndex i : photometric) loss.weights[(int)i] *= scale;
+    loss.w_ssim *= scale;
+}
+
+
 std::map<std::string, float> engine_train_step_managed(
     int step, int max_steps,
     std::string primitive,
@@ -135,13 +221,16 @@ std::map<std::string, float> engine_train_step_managed(
     // Resolve split_batch vs FPBO using the DataManager's view of the
     // dataset (max train batch size × max K). Done once per session via
     // the static warned flag inside the helper.
-    const EngineStepConfig cfg = _resolve_split_vs_fpbo(
+    EngineStepConfig cfg = _resolve_split_vs_fpbo(
         cfg_in, engine().dm->max_input_batch_size(),
         engine().dm->max_face_passes());
 
     const TrainStep& stp = engine().dm->next_train_step();
     if (stp.subs.empty())
         throw std::runtime_error("engine_train_step_managed: empty training step");
+
+    if (cfg.loss.normalize_by_luminance)
+        _normalize_weights_by_luminance(cfg.loss, stp);
 
     // Build a POST-split bilagrid cam-index buffer for one sub-batch.
     // bilagrid_cam_indices must be the POST-split camera id, not the input

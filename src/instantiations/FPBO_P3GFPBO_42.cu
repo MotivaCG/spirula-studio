@@ -6,8 +6,8 @@
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<2>,
-    CameraModelType::PINHOLE,
-    CameraDistortionType::Rational,
+    CameraModelType::EQUISOLID,
+    CameraDistortionType::OpenCV,
     true,
     false,
     0
@@ -66,8 +66,8 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<2>,
-    CameraModelType::PINHOLE,
-    CameraDistortionType::Rational,
+    CameraModelType::EQUISOLID,
+    CameraDistortionType::OpenCV,
     true,
     false,
     1
@@ -126,8 +126,8 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<2>,
-    CameraModelType::PINHOLE,
-    CameraDistortionType::Rational,
+    CameraModelType::EQUISOLID,
+    CameraDistortionType::OpenCV,
     false,
     true,
     0
@@ -186,8 +186,8 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<2>,
-    CameraModelType::PINHOLE,
-    CameraDistortionType::Rational,
+    CameraModelType::EQUISOLID,
+    CameraDistortionType::OpenCV,
     false,
     true,
     1
@@ -246,8 +246,8 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<2>,
-    CameraModelType::PINHOLE,
-    CameraDistortionType::Rational,
+    CameraModelType::EQUISOLID,
+    CameraDistortionType::OpenCV,
     false,
     false,
     0
@@ -306,8 +306,8 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<2>,
-    CameraModelType::PINHOLE,
-    CameraDistortionType::Rational,
+    CameraModelType::EQUISOLID,
+    CameraDistortionType::OpenCV,
     false,
     false,
     1
@@ -366,8 +366,8 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<2>,
-    CameraModelType::FISHEYE,
-    CameraDistortionType::None,
+    CameraModelType::EQUISOLID,
+    CameraDistortionType::ThinPrism,
     true,
     true,
     0
@@ -426,8 +426,8 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<2>,
-    CameraModelType::FISHEYE,
-    CameraDistortionType::None,
+    CameraModelType::EQUISOLID,
+    CameraDistortionType::ThinPrism,
     true,
     true,
     1
@@ -486,8 +486,8 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<2>,
-    CameraModelType::FISHEYE,
-    CameraDistortionType::None,
+    CameraModelType::EQUISOLID,
+    CameraDistortionType::ThinPrism,
     true,
     false,
     0

@@ -59,17 +59,16 @@ set(SS_TOOL_SOURCES "")
 set(SS_TOOL_DEFS "")
 set(SS_TOOL_LIBS "")
 
-# What every app target has whichever subsystems this build carries: the static
-# frame stencil, and the two files src/app/Main.cpp needs to arm the crash
-# handler for every subcommand -- including the ones the GUI spawns.
-if(SS_BUILD_CLI OR SS_BUILD_GUI)
-    list(APPEND SS_TOOL_SOURCES
-         ${SS_SRC}/app/FrameMask.cpp
-         ${SS_SRC}/app/AppPaths.cpp
-         ${SS_SRC}/app/CrashLog.cpp)
-    if(WIN32)
-        list(APPEND SS_TOOL_LIBS dbghelp)   # CrashLog.cpp's stack walk
-    endif()
+# What every app target has: the static frame stencil, and the two files
+# src/app/Main.cpp needs to arm the crash handler for every subcommand --
+# including the ones the GUI spawns.
+list(APPEND SS_TOOL_SOURCES
+     ${SS_SRC}/app/FrameMask.cpp
+     ${SS_SRC}/app/Pano360.cpp
+     ${SS_SRC}/app/AppPaths.cpp
+     ${SS_SRC}/app/CrashLog.cpp)
+if(WIN32)
+    list(APPEND SS_TOOL_LIBS dbghelp)   # CrashLog.cpp's stack walk
 endif()
 
 # Localization settings every app target gets. SS_DEFAULT_LANG is an
@@ -81,20 +80,17 @@ if(SS_FONT_CJK STREQUAL "none")
     list(APPEND SS_I18N_DEFS SS_FONT_CJK_NONE=1)
 endif()
 
-if(SS_BUILD_CLI)
-    # ---- trainer: no Python at runtime ----
-    list(APPEND SS_TOOL_SOURCES ${SS_SRC}/app/cli/main.cpp)
-    list(APPEND SS_TOOL_DEFS SS_TOOL_TRAIN=1)
+# ---- trainer: no Python at runtime ----
+list(APPEND SS_TOOL_SOURCES ${SS_SRC}/app/cli/main.cpp)
+list(APPEND SS_TOOL_DEFS SS_TOOL_TRAIN=1)
 
-    # ---- mesh extraction ----
-    # Both backends: the pipeline's host side is portable
-    # (mesh/OccupancyEvaluator.cpp) and its kernels exist on each
-    # (mesh/Meshing.cu, backend/vulkan/kernels/Meshing.cpp).
-    list(APPEND SS_TOOL_SOURCES ${SS_SRC}/app/cli/mesh_main.cpp)
-    list(APPEND SS_TOOL_DEFS SS_TOOL_MESH=1)
-endif()
+# ---- mesh extraction ----
+# Both backends: the host side is portable (mesh/OccupancyEvaluator.cpp) and
+# each has kernels (mesh/Meshing.cu, backend/vulkan/kernels/Meshing.cpp).
+list(APPEND SS_TOOL_SOURCES ${SS_SRC}/app/cli/mesh_main.cpp)
+list(APPEND SS_TOOL_DEFS SS_TOOL_MESH=1)
 
-if((SS_BUILD_CLI OR SS_BUILD_GUI) AND SS_BUILD_SFM)
+if(SS_BUILD_SFM)
     # ---- structure from motion ----
     # The SfM module carries its own Vulkan context and SPIR-V and shares
     # nothing with the training engine.
@@ -105,7 +101,7 @@ if((SS_BUILD_CLI OR SS_BUILD_GUI) AND SS_BUILD_SFM)
     list(APPEND SS_TOOL_LIBS ss_sfm)
 endif()
 
-if((SS_BUILD_CLI OR SS_BUILD_GUI) AND SS_BUILD_SAM)
+if(SS_BUILD_SAM)
     # ---- segmentation / frame extraction ----
     list(APPEND SS_TOOL_SOURCES ${SS_SRC}/app/cli/sam_main.cpp)
     list(APPEND SS_TOOL_DEFS SS_TOOL_SAM=1)
@@ -252,85 +248,74 @@ endif()
 # ---------------------------------------------------------------------------
 # spirula -- the executable
 # ---------------------------------------------------------------------------
-if(SS_BUILD_CLI OR SS_BUILD_GUI)
-    # FrameExtract is claimed by both the segmentation tool and the GUI.
-    list(REMOVE_DUPLICATES SS_TOOL_SOURCES)
-    list(REMOVE_DUPLICATES SS_TOOL_LIBS)
+# FrameExtract is claimed by both the segmentation tool and the GUI.
+list(REMOVE_DUPLICATES SS_TOOL_SOURCES)
+list(REMOVE_DUPLICATES SS_TOOL_LIBS)
 
-    # app.rc is the icon Explorer and the taskbar draw; utf8.manifest makes the
-    # PROCESS code page UTF-8, so the -A Win32 calls, the CRT, argv and getenv
-    # agree with "/utf-8". A source, not /MANIFESTINPUT: CMake runs mt.exe too.
-    if(WIN32)
-        enable_language(RC)
-        list(APPEND SS_TOOL_SOURCES ${SS_SRC}/app/app.rc
-                                    ${SS_SRC}/app/utf8.manifest)
-    endif()
+# app.rc is the icon Explorer and the taskbar draw; utf8.manifest makes the
+# PROCESS code page UTF-8, so the -A Win32 calls, the CRT, argv and getenv
+# agree with "/utf-8". A source, not /MANIFESTINPUT: CMake runs mt.exe too.
+if(WIN32)
+    enable_language(RC)
+    list(APPEND SS_TOOL_SOURCES ${SS_SRC}/app/app.rc
+                                ${SS_SRC}/app/utf8.manifest)
+endif()
 
-    add_executable(spirula ${SS_SRC}/app/Main.cpp ${SS_TOOL_SOURCES})
-    ss_configure_app(spirula)
-    target_link_libraries(spirula PRIVATE ${SS_TOOL_LIBS})
-    target_compile_definitions(spirula PRIVATE
-        ${SS_TOOL_DEFS} SS_VERSION="${SS_VERSION}" ${SS_I18N_DEFS})
-    if(WIN32)
-        target_link_libraries(spirula PRIVATE ws2_32)
-    endif()
+add_executable(spirula ${SS_SRC}/app/Main.cpp ${SS_TOOL_SOURCES})
+ss_configure_app(spirula)
+target_link_libraries(spirula PRIVATE ${SS_TOOL_LIBS})
+target_compile_definitions(spirula PRIVATE
+    ${SS_TOOL_DEFS} SS_VERSION="${SS_VERSION}" ${SS_I18N_DEFS})
+if(WIN32)
+    target_link_libraries(spirula PRIVATE ws2_32)
+endif()
 
-    # A regional build ships its face beside the executable; Fonts.cpp looks
-    # in <exe dir>/fonts before the cache directory.
-    if(SS_BUILD_GUI AND NOT SS_FONT_CJK MATCHES "^(fetch|none)$")
-        add_custom_command(TARGET spirula POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_directory
-                    ${CMAKE_BINARY_DIR}/fonts
-                    $<TARGET_FILE_DIR:spirula>/fonts
-            COMMENT "Bundling CJK font(s) for SS_FONT_CJK=${SS_FONT_CJK}")
-    endif()
+# A regional build ships its face beside the executable; Fonts.cpp looks
+# in <exe dir>/fonts before the cache directory.
+if(SS_BUILD_GUI AND NOT SS_FONT_CJK MATCHES "^(fetch|none)$")
+    add_custom_command(TARGET spirula POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                ${CMAKE_BINARY_DIR}/fonts
+                $<TARGET_FILE_DIR:spirula>/fonts
+        COMMENT "Bundling CJK font(s) for SS_FONT_CJK=${SS_FONT_CJK}")
+endif()
 
-    # ---- the standalone CLI tools, on request ----
-    # Same dispatcher, one tool compiled into each: src/app/Main.cpp reads its
-    # own argv[0], so `spirula-sfm auto ...` reaches the SfM tool with its
-    # arguments untouched, --help and all.
-    #
-    # Only these two, and deliberately: built alone they skip
-    # ss_configure_app(), so neither drags in the training engine, which
-    # is the entire reason to want them separate -- spirula-sfm is 24 MB
-    # against the combined binary's 61 MB. A separate
-    # spirula-train or spirula-mesh would be byte-for-byte the work `spirula` does
-    # anyway, and a separate spirula-gui would be worse than the combined one:
-    # it could not run reconstruction, since that is this binary re-running
-    # itself. Symlink `spirula` if you want those names.
-    if(SS_SEPARATE_TOOLS)
-        function(ss_tool_exe name sources defs libs)
-            if(WIN32)
-                list(APPEND sources ${SS_SRC}/app/utf8.manifest)
-            endif()
-            # ss_i18n is linked explicitly: these targets deliberately do not
-            # link the engine library, and Main.cpp's `--lang` handling needs
-            # it. It is a leaf (cmake/SsI18n.cmake), so this costs nothing.
-            add_executable(${name} ${SS_SRC}/app/Main.cpp ${sources})
-            target_include_directories(${name} PRIVATE ${SS_SRC} ${CMAKE_BINARY_DIR})
-            target_link_libraries(${name} PRIVATE ${libs} ss_i18n)
-            target_compile_definitions(${name} PRIVATE
-                ${defs} SS_VERSION="${SS_VERSION}" ${SS_I18N_DEFS})
-            target_compile_options(${name} PRIVATE
-                $<$<COMPILE_LANGUAGE:CXX>:${SPLAT_CXX_FLAGS}>)
-            set_property(TARGET ${name} PROPERTY CXX_STANDARD 17)
-        endfunction()
-
-        if(SS_BUILD_SFM)
-            ss_tool_exe(spirula-sfm
-                "${SS_SRC}/app/cli/sfm_main.cpp;${SS_SRC}/app/cli/sfm_ba.cpp"
-                "SS_TOOL_SFM=1" "ss_sfm")
+# ---- the standalone CLI tools, on request ----
+# Only these two: built alone they skip ss_configure_app() and so never link
+# the training engine -- 24 MB against the combined binary's 61 MB.
+if(SS_SEPARATE_TOOLS)
+    function(ss_tool_exe name sources defs libs)
+        if(WIN32)
+            list(APPEND sources ${SS_SRC}/app/utf8.manifest)
         endif()
-        if(SS_BUILD_SAM)
-            set(_sam_src ${SS_SRC}/app/cli/sam_main.cpp ${SS_SRC}/app/FrameMask.cpp)
-            set(_sam_lib ss_sam)
-            if(SS_ENABLE_PATENTED)
-                list(APPEND _sam_src ${SS_SRC}/app/cli/sam_extract.cpp
-                                     ${SS_SRC}/app/FrameExtract.cpp)
-                list(APPEND _sam_lib ss_video)
-            endif()
-            ss_tool_exe(spirula-sam "${_sam_src}" "SS_TOOL_SAM=1" "${_sam_lib}")
+        # ss_i18n is linked explicitly: these targets deliberately do not
+        # link the engine library, and Main.cpp's `--lang` handling needs
+        # it. It is a leaf (cmake/SsI18n.cmake), so this costs nothing.
+        add_executable(${name} ${SS_SRC}/app/Main.cpp ${sources})
+        target_include_directories(${name} PRIVATE ${SS_SRC} ${CMAKE_BINARY_DIR})
+        target_link_libraries(${name} PRIVATE ${libs} ss_i18n)
+        target_compile_definitions(${name} PRIVATE
+            ${defs} SS_VERSION="${SS_VERSION}" ${SS_I18N_DEFS})
+        target_compile_options(${name} PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:${SPLAT_CXX_FLAGS}>)
+        set_property(TARGET ${name} PROPERTY CXX_STANDARD 17)
+    endfunction()
+
+    if(SS_BUILD_SFM)
+        ss_tool_exe(spirula-sfm
+            "${SS_SRC}/app/cli/sfm_main.cpp;${SS_SRC}/app/cli/sfm_ba.cpp"
+            "SS_TOOL_SFM=1" "ss_sfm")
+    endif()
+    if(SS_BUILD_SAM)
+        set(_sam_src ${SS_SRC}/app/cli/sam_main.cpp ${SS_SRC}/app/FrameMask.cpp
+                     ${SS_SRC}/app/Pano360.cpp)
+        set(_sam_lib ss_sam)
+        if(SS_ENABLE_PATENTED)
+            list(APPEND _sam_src ${SS_SRC}/app/cli/sam_extract.cpp
+                                 ${SS_SRC}/app/FrameExtract.cpp)
+            list(APPEND _sam_lib ss_video)
         endif()
+        ss_tool_exe(spirula-sam "${_sam_src}" "SS_TOOL_SAM=1" "${_sam_lib}")
     endif()
 endif()
 

@@ -2190,6 +2190,21 @@ SS_MSG(merge_need_two,
     RU("для слияния нужно не меньше двух моделей, а их {0}"),
     TR("birleştirme en az iki model ister, burada {0} tane var"));
 
+SS_MSG(merge_metric_only,
+    EN("one model: nothing to merge, fixing its metric gauge alone"),
+    JA("モデルは 1 つ: 統合するものはなく、メートル座標系だけを合わせます"),
+    ZH_HANS("只有一个模型: 没有可合并的内容，只确定米制坐标系"),
+    ZH_HANT("只有一個模型: 沒有可合併的內容，只確定公尺座標系"),
+    KO("모델이 1개: 병합할 것이 없어 미터 좌표계만 맞춥니다"),
+    DE("ein Modell: nichts zu vereinen, nur der metrische Rahmen wird gesetzt"),
+    FR("un seul modèle : rien à fusionner, seul le repère métrique est fixé"),
+    ES("un solo modelo: nada que fusionar, solo se fija el marco métrico"),
+    PT("um só modelo: nada a fundir, só se fixa o referencial métrico"),
+    IT("un solo modello: niente da fondere, si fissa solo il sistema metrico"),
+    NL("één model: niets samen te voegen, alleen het metrische stelsel wordt gezet"),
+    RU("одна модель: сливать нечего, задаётся только метрическая система"),
+    TR("tek model: birleştirilecek bir şey yok, yalnızca metrik çerçeve belirlenir"));
+
 SS_MSG(merge_summary,
     EN("merged {0} models into {1} in {2} s (merges: {3}, refused: {4})"),
     JA("{0} 個のモデルを {1} 個に統合しました（{2} 秒、統合: {3}、拒否: {4}）"),
@@ -2387,6 +2402,804 @@ SS_MSG(merge_rebundled,
        "точек: {3}; осталось точек: {4}"),
     TR("model {0} yeniden dengelendi (maliyet {1}); elenen gözlem: {2}, "
        "nokta: {3}; kalan nokta: {4}"));
+
+SS_MSG(metric_source_gps,
+    EN("EXIF GPS"),        JA("EXIF の GPS"),  ZH_HANS("EXIF GPS"), ZH_HANT("EXIF GPS"),
+    KO("EXIF GPS"),        DE("EXIF-GPS"),     FR("le GPS EXIF"),   ES("el GPS EXIF"),
+    PT("o GPS EXIF"),      IT("il GPS EXIF"),  NL("de EXIF-GPS"),   RU("GPS из EXIF"),
+    TR("EXIF GPS"));
+
+SS_MSG(metric_source_gps_flat,
+    EN("EXIF GPS (latitude and longitude only)"),
+    JA("EXIF の GPS (緯度と経度のみ)"),
+    ZH_HANS("EXIF GPS (只用经纬度)"),
+    ZH_HANT("EXIF GPS (只用經緯度)"),
+    KO("EXIF GPS (위도와 경도만)"),
+    DE("EXIF-GPS (nur Breite und Länge)"),
+    FR("le GPS EXIF (latitude et longitude seules)"),
+    ES("el GPS EXIF (solo latitud y longitud)"),
+    PT("o GPS EXIF (só latitude e longitude)"),
+    IT("il GPS EXIF (solo latitudine e longitudine)"),
+    NL("de EXIF-GPS (alleen breedte en lengte)"),
+    RU("GPS из EXIF (только широта и долгота)"),
+    TR("EXIF GPS (yalnızca enlem ve boylam)"));
+
+SS_MSG(metric_source_positions,
+    EN("the positions file"), JA("位置ファイル"), ZH_HANS("位置文件"), ZH_HANT("位置檔"),
+    KO("위치 파일"),          DE("die Positionsdatei"), FR("le fichier de positions"),
+    ES("el archivo de posiciones"), PT("o ficheiro de posições"),
+    IT("il file di posizioni"), NL("het positiebestand"), RU("файл позиций"),
+    TR("konum dosyası"));
+
+SS_MSG(metric_done,
+    EN("Model {0}: metric frame from {1} -- scale {2}, cameras within {3} m: {4}/{5}, "
+       "RMS {6} m; assuming uncorrelated reference error, which is a lower bound, "
+       "scale uncertainty {7}% and orientation uncertainty {8} deg"),
+    JA("モデル {0}: {1} によるメートル座標系 -- 縮尺 {2}、{3} m 以内のカメラ: {4}/{5}、"
+       "RMS {6} m。基準の誤差が無相関という下限の仮定で、縮尺の不確かさ {7}%、向きの不確かさ {8} 度"),
+    ZH_HANS("模型 {0}: 由{1}确定的米制坐标系 -- 缩放 {2}，{3} m 以内的相机: {4}/{5}，"
+            "RMS {6} m; 按参考误差互不相关这一下限假设，缩放不确定度 {7}%、朝向不确定度 {8} 度"),
+    ZH_HANT("模型 {0}: 由{1}確定的公尺座標系 -- 縮放 {2}，{3} m 以內的相機: {4}/{5}，"
+            "RMS {6} m; 按參考誤差互不相關這一下限假設，縮放不確定度 {7}%、朝向不確定度 {8} 度"),
+    KO("모델 {0}: {1} 기준 미터 좌표계 -- 배율 {2}, {3} m 이내 카메라: {4}/{5}, "
+       "RMS {6} m; 기준 오차가 무상관이라는 하한 가정에서 배율 불확실도 {7}%, 방향 불확실도 {8} 도"),
+    DE("Modell {0}: metrischer Rahmen aus {1} -- Maßstab {2}, Kameras innerhalb {3} m: "
+       "{4}/{5}, RMS {6} m; unter der Untergrenzannahme unkorrelierter Referenzfehler "
+       "Maßstabsunsicherheit {7}% und Orientierungsunsicherheit {8} Grad"),
+    FR("Modèle {0} : repère métrique d'après {1} -- échelle {2}, caméras à moins de {3} m : "
+       "{4}/{5}, RMS {6} m ; en supposant une erreur de référence non corrélée, ce qui est "
+       "une borne inférieure, incertitude d'échelle {7}% et d'orientation {8} degrés"),
+    ES("Modelo {0}: marco métrico a partir de {1} -- escala {2}, cámaras dentro de {3} m: "
+       "{4}/{5}, RMS {6} m; suponiendo error de referencia no correlacionado, que es una cota "
+       "inferior, incertidumbre de escala {7}% y de orientación {8} grados"),
+    PT("Modelo {0}: referencial métrico a partir de {1} -- escala {2}, câmeras dentro de {3} m: "
+       "{4}/{5}, RMS {6} m; supondo erro de referência não correlacionado, que é um limite "
+       "inferior, incerteza de escala {7}% e de orientação {8} graus"),
+    IT("Modello {0}: sistema metrico da {1} -- scala {2}, camere entro {3} m: {4}/{5}, "
+       "RMS {6} m; assumendo errore di riferimento non correlato, che è un limite inferiore, "
+       "incertezza di scala {7}% e di orientamento {8} gradi"),
+    NL("Model {0}: metrisch stelsel uit {1} -- schaal {2}, camera's binnen {3} m: {4}/{5}, "
+       "RMS {6} m; uitgaande van ongecorreleerde referentiefout, wat een ondergrens is, "
+       "schaalonzekerheid {7}% en oriëntatieonzekerheid {8} graden"),
+    RU("Модель {0}: метрическая система по источнику {1} -- масштаб {2}, камер в пределах "
+       "{3} м: {4}/{5}, СКО {6} м; в предположении некоррелированной ошибки эталона, что даёт "
+       "нижнюю границу, неопределённость масштаба {7}% и ориентации {8} градусов"),
+    TR("Model {0}: {1} kaynaklı metrik çerçeve -- ölçek {2}, {3} m içindeki kameralar: "
+       "{4}/{5}, RMS {6} m; ilişkisiz referans hatası varsayımıyla, ki bu bir alt sınırdır, "
+       "ölçek belirsizliği {7}% ve yönelim belirsizliği {8} derece"));
+
+SS_MSG(metric_failed,
+    EN("Model {0}: metric frame NOT applied, written in the normalized frame instead -- {1}"),
+    JA("モデル {0}: メートル座標系は適用せず、正規化座標系で書き出しました -- {1}"),
+    ZH_HANS("模型 {0}: 未应用米制坐标系，改为按归一化坐标系写出 -- {1}"),
+    ZH_HANT("模型 {0}: 未套用公尺座標系，改為按正規化座標系寫出 -- {1}"),
+    KO("모델 {0}: 미터 좌표계를 적용하지 않고 정규화 좌표계로 썼습니다 -- {1}"),
+    DE("Modell {0}: metrischer Rahmen NICHT angewandt, stattdessen im normalisierten "
+       "Rahmen geschrieben -- {1}"),
+    FR("Modèle {0} : repère métrique NON appliqué, écrit dans le repère normalisé -- {1}"),
+    ES("Modelo {0}: marco métrico NO aplicado, escrito en el marco normalizado -- {1}"),
+    PT("Modelo {0}: referencial métrico NÃO aplicado, escrito no referencial normalizado -- {1}"),
+    IT("Modello {0}: sistema metrico NON applicato, scritto nel sistema normalizzato -- {1}"),
+    NL("Model {0}: metrisch stelsel NIET toegepast, in het genormaliseerde stelsel "
+       "geschreven -- {1}"),
+    RU("Модель {0}: метрическая система НЕ применена, записано в нормализованной "
+       "системе -- {1}"),
+    TR("Model {0}: metrik çerçeve UYGULANMADI, normalize çerçevede yazıldı -- {1}"));
+
+SS_MSG(metric_fail_pairs,
+    EN("cameras with a metric position: {0}, need 3"),
+    JA("メートル位置を持つカメラ: {0}、3 台必要です"),
+    ZH_HANS("有米制位置的相机: {0}，需要 3 台"),
+    ZH_HANT("有公尺位置的相機: {0}，需要 3 台"),
+    KO("미터 위치가 있는 카메라: {0}, 3대가 필요합니다"),
+    DE("Kameras mit metrischer Position: {0}, benötigt werden 3"),
+    FR("caméras avec une position métrique : {0}, il en faut 3"),
+    ES("cámaras con posición métrica: {0}, hacen falta 3"),
+    PT("câmeras com posição métrica: {0}, são precisas 3"),
+    IT("camere con una posizione metrica: {0}, ne servono 3"),
+    NL("camera's met een metrische positie: {0}, er zijn er 3 nodig"),
+    RU("камер с метрической позицией: {0}, нужно 3"),
+    TR("metrik konumu olan kamera: {0}, 3 gerekli"));
+
+SS_MSG(metric_fail_spread,
+    EN("the metric positions do not spread out (radius {0} m); nothing to fit a scale to"),
+    JA("メートル位置に広がりがありません (半径 {0} m)。縮尺を合わせる手がかりがありません"),
+    ZH_HANS("米制位置没有展开 (半径 {0} m)，无从拟合缩放"),
+    ZH_HANT("公尺位置沒有展開 (半徑 {0} m)，無從擬合縮放"),
+    KO("미터 위치가 퍼져 있지 않습니다 (반지름 {0} m). 배율을 맞출 근거가 없습니다"),
+    DE("die metrischen Positionen streuen nicht (Radius {0} m); nichts, woran ein "
+       "Maßstab passt"),
+    FR("les positions métriques ne s'étalent pas (rayon {0} m) ; rien pour ajuster une échelle"),
+    ES("las posiciones métricas no se dispersan (radio {0} m); nada a lo que ajustar una escala"),
+    PT("as posições métricas não se espalham (raio {0} m); nada a que ajustar uma escala"),
+    IT("le posizioni metriche non si distribuiscono (raggio {0} m); niente su cui "
+       "stimare una scala"),
+    NL("de metrische posities spreiden niet (straal {0} m); niets om een schaal op te passen"),
+    RU("метрические позиции не разнесены (радиус {0} м); не к чему подгонять масштаб"),
+    TR("metrik konumlar yayılmıyor (yarıçap {0} m); ölçeği oturtacak bir şey yok"));
+
+SS_MSG(metric_fail_inliers,
+    EN("cameras within {0} m of the fit: {1}/{2}, need half"),
+    JA("当てはめから {0} m 以内のカメラ: {1}/{2}、半数必要です"),
+    ZH_HANS("与拟合相差 {0} m 以内的相机: {1}/{2}，需要半数"),
+    ZH_HANT("與擬合相差 {0} m 以內的相機: {1}/{2}，需要半數"),
+    KO("맞춤에서 {0} m 이내인 카메라: {1}/{2}, 절반이 필요합니다"),
+    DE("Kameras innerhalb {0} m der Anpassung: {1}/{2}, nötig ist die Hälfte"),
+    FR("caméras à moins de {0} m de l'ajustement : {1}/{2}, il en faut la moitié"),
+    ES("cámaras dentro de {0} m del ajuste: {1}/{2}, hace falta la mitad"),
+    PT("câmeras dentro de {0} m do ajuste: {1}/{2}, é precisa metade"),
+    IT("camere entro {0} m dalla stima: {1}/{2}, ne serve la metà"),
+    NL("camera's binnen {0} m van de fit: {1}/{2}, de helft is nodig"),
+    RU("камер в пределах {0} м от подгонки: {1}/{2}, нужна половина"),
+    TR("uyuma {0} m içinde olan kamera: {1}/{2}, yarısı gerekli"));
+
+SS_MSG(metric_fail_collinear,
+    EN("the cameras lie too close to a line: the spread across it is {0}% of the whole "
+       "and {1}% is the minimum, so this reference amplifies orientation error {2}x"),
+    JA("カメラがほぼ一直線に並んでいます。直線を横切る広がりは全体の {0}% で、最小は {1}% です。"
+       "この基準では向きの誤差が {2} 倍に拡大します"),
+    ZH_HANS("相机太接近一条直线: 横向展开只占整体的 {0}%，最小需要 {1}%，这样的参考会把朝向误差"
+            "放大 {2} 倍"),
+    ZH_HANT("相機太接近一條直線: 橫向展開只占整體的 {0}%，最小需要 {1}%，這樣的參考會把朝向誤差"
+            "放大 {2} 倍"),
+    KO("카메라가 거의 일직선에 놓여 있습니다. 직선을 가로지르는 퍼짐이 전체의 {0}% 이고 최소는 "
+       "{1}% 입니다. 이런 기준은 방향 오차를 {2} 배로 키웁니다"),
+    DE("die Kameras liegen zu nah an einer Linie: die Streuung quer dazu ist {0}% des Ganzen, "
+       "das Minimum ist {1}%, also verstärkt diese Referenz den Orientierungsfehler um das "
+       "{2}-fache"),
+    FR("les caméras sont trop proches d'une ligne : l'étalement en travers vaut {0}% du total "
+       "et le minimum est {1}%, donc cette référence amplifie l'erreur d'orientation {2} fois"),
+    ES("las cámaras están demasiado cerca de una línea: la dispersión transversal es el {0}% "
+       "del total y el mínimo es {1}%, así que esta referencia amplifica el error de "
+       "orientación {2} veces"),
+    PT("as câmeras estão demasiado perto de uma linha: a dispersão transversal é {0}% do total "
+       "e o mínimo é {1}%, portanto esta referência amplifica o erro de orientação {2} vezes"),
+    IT("le camere sono troppo vicine a una linea: la dispersione trasversale è il {0}% del "
+       "totale e il minimo è {1}%, quindi questo riferimento amplifica l'errore di "
+       "orientamento {2} volte"),
+    NL("de camera's liggen te dicht bij een lijn: de spreiding dwars erop is {0}% van het "
+       "geheel en {1}% is het minimum, dus deze referentie versterkt de oriëntatiefout {2} keer"),
+    RU("камеры лежат слишком близко к прямой: разброс поперёк неё составляет {0}% от общего "
+       "при минимуме {1}%, поэтому такой эталон усиливает ошибку ориентации в {2} раз"),
+    TR("kameralar bir doğruya fazla yakın: enine yayılım bütünün {0}% kadarı ve en az {1}% "
+       "olmalı, yani bu referans yönelim hatasını {2} kat büyütür"));
+
+SS_MSG(metric_matched,
+    EN("Positions file: matched {0}/{1} cameras (names not in the model: {2})"),
+    JA("位置ファイル: {0}/{1} 台のカメラと対応しました (モデルにない名前: {2})"),
+    ZH_HANS("位置文件: 匹配了 {0}/{1} 台相机 (模型中没有的名字: {2})"),
+    ZH_HANT("位置檔: 對應了 {0}/{1} 台相機 (模型中沒有的名稱: {2})"),
+    KO("위치 파일: 카메라 {0}/{1} 대와 대응했습니다 (모델에 없는 이름: {2})"),
+    DE("Positionsdatei: {0}/{1} Kameras zugeordnet (Namen, die das Modell nicht hat: {2})"),
+    FR("Fichier de positions : {0}/{1} caméras appariées (noms absents du modèle : {2})"),
+    ES("Archivo de posiciones: {0}/{1} cámaras emparejadas (nombres que no están en el "
+       "modelo: {2})"),
+    PT("Ficheiro de posições: {0}/{1} câmeras emparelhadas (nomes que o modelo não tem: {2})"),
+    IT("File di posizioni: {0}/{1} camere abbinate (nomi assenti dal modello: {2})"),
+    NL("Positiebestand: {0}/{1} camera's gekoppeld (namen die het model niet heeft: {2})"),
+    RU("Файл позиций: сопоставлено камер {0}/{1} (имён нет в модели: {2})"),
+    TR("Konum dosyası: {0}/{1} kamera eşleşti (modelde olmayan adlar: {2})"));
+
+SS_MSG(metric_gps_read,
+    EN("EXIF GPS: {0}/{1} cameras carry a fix ({2} of them without an altitude)"),
+    JA("EXIF の GPS: {0}/{1} 台のカメラに測位があります (うち高度なし: {2})"),
+    ZH_HANS("EXIF GPS: {0}/{1} 台相机带有定位 (其中没有高度的: {2})"),
+    ZH_HANT("EXIF GPS: {0}/{1} 台相機帶有定位 (其中沒有高度的: {2})"),
+    KO("EXIF GPS: 카메라 {0}/{1} 대에 측위가 있습니다 (그중 고도 없음: {2})"),
+    DE("EXIF-GPS: {0}/{1} Kameras haben eine Position ({2} davon ohne Höhe)"),
+    FR("GPS EXIF : {0}/{1} caméras ont un point ({2} d'entre elles sans altitude)"),
+    ES("GPS EXIF: {0}/{1} cámaras traen una posición ({2} de ellas sin altitud)"),
+    PT("GPS EXIF: {0}/{1} câmeras trazem uma posição ({2} delas sem altitude)"),
+    IT("GPS EXIF: {0}/{1} camere hanno un punto ({2} di esse senza quota)"),
+    NL("EXIF-GPS: {0}/{1} camera's hebben een fix ({2} daarvan zonder hoogte)"),
+    RU("GPS из EXIF: у {0}/{1} камер есть отсчёт ({2} из них без высоты)"),
+    TR("EXIF GPS: {0}/{1} kamerada konum var ({2} tanesi yükseklik olmadan)"));
+
+SS_MSG(metric_axes,
+    EN("Residual RMS per reference axis: {0}/{1}/{2} m; fitted up axis vs the "
+       "cameras' mean up: {3} deg"),
+    JA("基準軸ごとの残差 RMS: {0}/{1}/{2} m。当てはめた上方向とカメラの平均上方向の差: {3} 度"),
+    ZH_HANS("按参考轴的残差 RMS: {0}/{1}/{2} m; 拟合的上方向与相机平均上方向相差 {3} 度"),
+    ZH_HANT("按參考軸的殘差 RMS: {0}/{1}/{2} m; 擬合的上方向與相機平均上方向相差 {3} 度"),
+    KO("기준 축별 잔차 RMS: {0}/{1}/{2} m; 맞춘 상 방향과 카메라 평균 상 방향 차이: {3} 도"),
+    DE("Residuen-RMS je Referenzachse: {0}/{1}/{2} m; angepasste Hochachse gegen die "
+       "mittlere Hochachse der Kameras: {3} Grad"),
+    FR("RMS des résidus par axe de référence : {0}/{1}/{2} m ; axe vertical ajusté "
+       "contre le haut moyen des caméras : {3} degrés"),
+    ES("RMS de residuos por eje de referencia: {0}/{1}/{2} m; eje vertical ajustado "
+       "frente al arriba medio de las cámaras: {3} grados"),
+    PT("RMS dos resíduos por eixo de referência: {0}/{1}/{2} m; eixo vertical ajustado "
+       "contra o cima médio das câmeras: {3} graus"),
+    IT("RMS dei residui per asse di riferimento: {0}/{1}/{2} m; asse verticale stimato "
+       "rispetto all'alto medio delle camere: {3} gradi"),
+    NL("Residu-RMS per referentie-as: {0}/{1}/{2} m; gefitte omhoog-as tegen de "
+       "gemiddelde omhoog van de camera's: {3} graden"),
+    RU("СКО остатков по каждой оси эталона: {0}/{1}/{2} м; подогнанная вертикаль против "
+       "средней вертикали камер: {3} градусов"),
+    TR("Referans ekseni başına artık RMS: {0}/{1}/{2} m; oturtulan yukarı ekseni "
+       "kameraların ortalama yukarısına karşı: {3} derece"));
+
+SS_MSG(metric_positions_bad,
+    EN("Positions file {0} cannot be read: {1}"),
+    JA("位置ファイル {0} を読み取れません: {1}"),
+    ZH_HANS("无法读取位置文件 {0}: {1}"),
+    ZH_HANT("無法讀取位置檔 {0}: {1}"),
+    KO("위치 파일 {0} 을 읽을 수 없습니다: {1}"),
+    DE("Positionsdatei {0} lässt sich nicht lesen: {1}"),
+    FR("Le fichier de positions {0} est illisible : {1}"),
+    ES("No se puede leer el archivo de posiciones {0}: {1}"),
+    PT("Não é possível ler o ficheiro de posições {0}: {1}"),
+    IT("Impossibile leggere il file di posizioni {0}: {1}"),
+    NL("Positiebestand {0} kan niet gelezen worden: {1}"),
+    RU("Не удаётся прочитать файл позиций {0}: {1}"),
+    TR("Konum dosyası {0} okunamıyor: {1}"));
+
+// ===========================================================================
+// The sensor gauge (map/SensorGauge.h)
+// ===========================================================================
+
+SS_MSG(sensor_file,
+    EN("Telemetry from {0} ({1}): gyro {2} Hz, accelerometer {3} Hz, attitude {4} Hz, "
+       "GPS {5} distinct positions over {6} m"),
+    JA("{0} のテレメトリ ({1}): ジャイロ {2} Hz、加速度計 {3} Hz、姿勢 {4} Hz、"
+       "GPS の異なる位置 {5} 点、経路 {6} m"),
+    ZH_HANS("来自 {0} 的遥测 ({1}): 陀螺仪 {2} Hz、加速度计 {3} Hz、姿态 {4} Hz、"
+            "GPS 不同位置 {5} 个，路径 {6} m"),
+    ZH_HANT("來自 {0} 的遙測 ({1}): 陀螺儀 {2} Hz、加速度計 {3} Hz、姿態 {4} Hz、"
+            "GPS 不同位置 {5} 個，路徑 {6} m"),
+    KO("{0} 의 텔레메트리 ({1}): 자이로 {2} Hz, 가속도계 {3} Hz, 자세 {4} Hz, "
+       "GPS 서로 다른 위치 {5} 개, 경로 {6} m"),
+    DE("Telemetrie aus {0} ({1}): Gyro {2} Hz, Beschleunigungssensor {3} Hz, Lage {4} Hz, "
+       "GPS {5} verschiedene Positionen über {6} m"),
+    FR("Télémétrie de {0} ({1}) : gyro {2} Hz, accéléromètre {3} Hz, attitude {4} Hz, "
+       "GPS {5} positions distinctes sur {6} m"),
+    ES("Telemetría de {0} ({1}): giroscopio {2} Hz, acelerómetro {3} Hz, actitud {4} Hz, "
+       "GPS {5} posiciones distintas en {6} m"),
+    PT("Telemetria de {0} ({1}): giroscópio {2} Hz, acelerómetro {3} Hz, atitude {4} Hz, "
+       "GPS {5} posições distintas em {6} m"),
+    IT("Telemetria da {0} ({1}): giroscopio {2} Hz, accelerometro {3} Hz, assetto {4} Hz, "
+       "GPS {5} posizioni distinte su {6} m"),
+    NL("Telemetrie uit {0} ({1}): gyro {2} Hz, versnellingsmeter {3} Hz, stand {4} Hz, "
+       "GPS {5} verschillende posities over {6} m"),
+    RU("Телеметрия из {0} ({1}): гироскоп {2} Гц, акселерометр {3} Гц, ориентация {4} Гц, "
+       "GPS {5} различных позиций на {6} м"),
+    TR("{0} telemetrisi ({1}): jiroskop {2} Hz, ivmeölçer {3} Hz, duruş {4} Hz, "
+       "GPS {5} farklı konum, {6} m yol"));
+
+SS_MSG(sensor_file_bad,
+    EN("Telemetry: cannot read {0} -- {1}"),
+    JA("テレメトリ: {0} を読み取れません -- {1}"),
+    ZH_HANS("遥测: 无法读取 {0} -- {1}"),
+    ZH_HANT("遙測: 無法讀取 {0} -- {1}"),
+    KO("텔레메트리: {0} 을 읽을 수 없습니다 -- {1}"),
+    DE("Telemetrie: {0} lässt sich nicht lesen -- {1}"),
+    FR("Télémétrie : {0} est illisible -- {1}"),
+    ES("Telemetría: no se puede leer {0} -- {1}"),
+    PT("Telemetria: não é possível ler {0} -- {1}"),
+    IT("Telemetria: impossibile leggere {0} -- {1}"),
+    NL("Telemetrie: {0} kan niet gelezen worden -- {1}"),
+    RU("Телеметрия: не удаётся прочитать {0} -- {1}"),
+    TR("Telemetri: {0} okunamıyor -- {1}"));
+
+SS_MSG(sensor_file_no_fps,
+    EN("Telemetry: {0} states no frame rate, so its frames cannot be timed; give `fps` in the manifest"),
+    JA("テレメトリ: {0} にフレームレートがなく、フレームに時刻を付けられません。マニフェストで `fps` を指定してください"),
+    ZH_HANS("遥测: {0} 没有帧率，无法给帧标定时间; 请在清单中给出 `fps`"),
+    ZH_HANT("遙測: {0} 沒有幀率，無法給幀標定時間; 請在清單中給出 `fps`"),
+    KO("텔레메트리: {0} 에 프레임 속도가 없어 프레임에 시각을 붙일 수 없습니다. 매니페스트에 `fps` 를 적어 주십시오"),
+    DE("Telemetrie: {0} nennt keine Bildrate, die Frames lassen sich nicht zeitlich einordnen; `fps` im Manifest angeben"),
+    FR("Télémétrie : {0} n'indique pas de cadence, ses images ne peuvent pas être datées ; indiquez `fps` dans le manifeste"),
+    ES("Telemetría: {0} no indica la cadencia, así que sus fotogramas no se pueden fechar; indique `fps` en el manifiesto"),
+    PT("Telemetria: {0} não indica a cadência, por isso as suas imagens não podem ser datadas; indique `fps` no manifesto"),
+    IT("Telemetria: {0} non indica la cadenza, quindi i suoi fotogrammi non si possono datare; indicare `fps` nel manifesto"),
+    NL("Telemetrie: {0} noemt geen beeldfrequentie, dus de frames krijgen geen tijd; geef `fps` op in het manifest"),
+    RU("Телеметрия: {0} не указывает частоту кадров, кадры нельзя привязать ко времени; задайте `fps` в манифесте"),
+    TR("Telemetri: {0} kare hızı belirtmiyor, kareler zamanlanamaz; manifestte `fps` verin"));
+
+SS_MSG(sensor_time_offset,
+    EN("{0}: IMU clock {1} ms off the video, from {2} frame pairs"),
+    JA("{0}: IMU の時計は映像に対して {1} ms ずれています ({2} 組のフレームから)"),
+    ZH_HANS("{0}: IMU 时钟与视频相差 {1} ms (由 {2} 对帧得出)"),
+    ZH_HANT("{0}: IMU 時鐘與影片相差 {1} ms (由 {2} 對幀得出)"),
+    KO("{0}: IMU 시계가 영상과 {1} ms 어긋납니다 ({2} 개 프레임 쌍에서)"),
+    DE("{0}: IMU-Uhr {1} ms gegen das Video versetzt, aus {2} Bildpaaren"),
+    FR("{0} : horloge IMU décalée de {1} ms par rapport à la vidéo, d'après {2} paires d'images"),
+    ES("{0}: reloj IMU desfasado {1} ms respecto al vídeo, según {2} pares de fotogramas"),
+    PT("{0}: relógio IMU desfasado {1} ms do vídeo, segundo {2} pares de imagens"),
+    IT("{0}: orologio IMU sfasato di {1} ms rispetto al video, da {2} coppie di fotogrammi"),
+    NL("{0}: IMU-klok {1} ms verschoven ten opzichte van de video, uit {2} frameparen"),
+    RU("{0}: часы IMU смещены на {1} мс относительно видео, по {2} парам кадров"),
+    TR("{0}: IMU saati videoya göre {1} ms kaymış, {2} kare çiftinden"));
+
+SS_MSG(sensor_calib,
+    EN("Camera {0}: IMU-to-lens rotation from {1} frames; gyro pairs agree to {2} deg, "
+       "gravity votes to {3} deg"),
+    JA("カメラ {0}: {1} フレームから IMU とレンズ間の回転を求めました。ジャイロ対の一致 {2} 度、"
+       "重力票の一致 {3} 度"),
+    ZH_HANS("相机 {0}: 由 {1} 帧求得 IMU 到镜头的旋转; 陀螺仪对一致到 {2} 度，重力投票一致到 {3} 度"),
+    ZH_HANT("相機 {0}: 由 {1} 幀求得 IMU 到鏡頭的旋轉; 陀螺儀對一致到 {2} 度，重力投票一致到 {3} 度"),
+    KO("카메라 {0}: {1} 개 프레임에서 IMU-렌즈 회전을 구했습니다. 자이로 쌍 일치 {2} 도, "
+       "중력 투표 일치 {3} 도"),
+    DE("Kamera {0}: Rotation IMU zu Objektiv aus {1} Frames; Gyro-Paare stimmen auf {2} Grad, "
+       "Schwerkraftstimmen auf {3} Grad überein"),
+    FR("Caméra {0} : rotation IMU vers objectif d'après {1} images ; paires gyro cohérentes à {2} "
+       "degrés, votes de gravité à {3} degrés"),
+    ES("Cámara {0}: rotación IMU a objetivo de {1} fotogramas; pares de giroscopio coherentes "
+       "hasta {2} grados, votos de gravedad hasta {3} grados"),
+    PT("Câmera {0}: rotação IMU para objetiva de {1} imagens; pares de giroscópio coerentes até "
+       "{2} graus, votos de gravidade até {3} graus"),
+    IT("Camera {0}: rotazione IMU-obiettivo da {1} fotogrammi; coppie giroscopio coerenti a {2} "
+       "gradi, voti di gravità a {3} gradi"),
+    NL("Camera {0}: rotatie IMU naar lens uit {1} frames; gyroparen komen tot {2} graden overeen, "
+       "zwaartekrachtstemmen tot {3} graden"),
+    RU("Камера {0}: поворот IMU к объективу по {1} кадрам; пары гироскопа сходятся до {2} град., "
+       "голоса гравитации до {3} град."),
+    TR("Kamera {0}: {1} kareden IMU-lens dönüşü; jiroskop çiftleri {2} dereceye, yerçekimi "
+       "oyları {3} dereceye kadar uyuşuyor"));
+
+SS_MSG(sensor_calib_scale,
+    EN("Camera {0}: accelerometer scale on its own {1} (uncertainty {2}%) over {3} intervals; "
+       "gravity {4} m/s^2, {5} deg from up"),
+    JA("カメラ {0}: 単独での加速度計による縮尺 {1} (不確かさ {2}%)、{3} 区間。重力 {4} m/s^2、"
+       "上方向から {5} 度"),
+    ZH_HANS("相机 {0}: 单独的加速度计缩放 {1} (不确定度 {2}%)，共 {3} 段; 重力 {4} m/s^2，"
+            "与上方向夹角 {5} 度"),
+    ZH_HANT("相機 {0}: 單獨的加速度計縮放 {1} (不確定度 {2}%)，共 {3} 段; 重力 {4} m/s^2，"
+            "與上方向夾角 {5} 度"),
+    KO("카메라 {0}: 단독 가속도계 축척 {1} (불확실도 {2}%), {3} 개 구간. 중력 {4} m/s^2, "
+       "위 방향에서 {5} 도"),
+    DE("Kamera {0}: Beschleunigungssensor-Maßstab für sich {1} (Unsicherheit {2}%) über {3} "
+       "Intervalle; Schwerkraft {4} m/s^2, {5} Grad von oben"),
+    FR("Caméra {0} : échelle de l'accéléromètre seule {1} (incertitude {2}%) sur {3} "
+       "intervalles ; gravité {4} m/s^2, à {5} degrés de la verticale"),
+    ES("Cámara {0}: escala del acelerómetro por sí sola {1} (incertidumbre {2}%) en {3} "
+       "intervalos; gravedad {4} m/s^2, a {5} grados de la vertical"),
+    PT("Câmera {0}: escala do acelerómetro por si só {1} (incerteza {2}%) em {3} intervalos; "
+       "gravidade {4} m/s^2, a {5} graus da vertical"),
+    IT("Camera {0}: scala dell'accelerometro da sola {1} (incertezza {2}%) su {3} intervalli; "
+       "gravità {4} m/s^2, a {5} gradi dalla verticale"),
+    NL("Camera {0}: versnellingsmeterschaal op zichzelf {1} (onzekerheid {2}%) over {3} "
+       "intervallen; zwaartekracht {4} m/s^2, {5} graden van omhoog"),
+    RU("Камера {0}: масштаб по акселерометру сам по себе {1} (неопределённость {2}%) на {3} "
+       "интервалах; гравитация {4} м/с^2, {5} град. от вертикали"),
+    TR("Kamera {0}: tek başına ivmeölçer ölçeği {1} (belirsizlik %{2}), {3} aralık; yerçekimi "
+       "{4} m/s^2, yukarıdan {5} derece"));
+
+SS_MSG(sensor_calib_mirrored,
+    EN("Camera {0}: the IMU axes are left-handed with respect to the lens"),
+    JA("カメラ {0}: IMU の軸はレンズに対して左手系です"),
+    ZH_HANS("相机 {0}: IMU 坐标轴相对镜头是左手系"),
+    ZH_HANT("相機 {0}: IMU 座標軸相對鏡頭是左手系"),
+    KO("카메라 {0}: IMU 축이 렌즈에 대해 왼손 좌표계입니다"),
+    DE("Kamera {0}: die IMU-Achsen sind gegenüber dem Objektiv linkshändig"),
+    FR("Caméra {0} : les axes de l'IMU sont indirects par rapport à l'objectif"),
+    ES("Cámara {0}: los ejes de la IMU son levógiros respecto al objetivo"),
+    PT("Câmera {0}: os eixos da IMU são levógiros em relação à objetiva"),
+    IT("Camera {0}: gli assi dell'IMU sono levogiri rispetto all'obiettivo"),
+    NL("Camera {0}: de IMU-assen zijn linkshandig ten opzichte van de lens"),
+    RU("Камера {0}: оси IMU левосторонние относительно объектива"),
+    TR("Kamera {0}: IMU eksenleri lense göre sol elli"));
+
+SS_MSG(sensor_calib_yaw_free,
+    EN("Camera {0}: the capture turned about one axis only, so the IMU-to-lens rotation "
+       "is known up to a turn about it: up is used, the accelerometer scale is not"),
+    JA("カメラ {0}: 撮影中の回転が一軸のみで、IMU とレンズ間の回転はその軸まわりを除いてしか"
+       "決まりません。上方向は使い、加速度計の縮尺は使いません"),
+    ZH_HANS("相机 {0}: 拍摄只绕一个轴转动，IMU 到镜头的旋转只确定到绕该轴的转角: 使用上方向，"
+            "不使用加速度计缩放"),
+    ZH_HANT("相機 {0}: 拍攝只繞一個軸轉動，IMU 到鏡頭的旋轉只確定到繞該軸的轉角: 使用上方向，"
+            "不使用加速度計縮放"),
+    KO("카메라 {0}: 촬영이 한 축으로만 돌아 IMU-렌즈 회전이 그 축 둘레의 회전만큼 미정입니다. "
+       "위 방향은 쓰고 가속도계 축척은 쓰지 않습니다"),
+    DE("Kamera {0}: die Aufnahme drehte sich nur um eine Achse, die Rotation IMU zu Objektiv "
+       "ist bis auf eine Drehung darum bekannt: oben wird verwendet, der "
+       "Beschleunigungssensor-Maßstab nicht"),
+    FR("Caméra {0} : la prise n'a tourné qu'autour d'un axe, la rotation IMU vers objectif "
+       "n'est connue qu'à une rotation près autour de lui : la verticale est utilisée, "
+       "l'échelle de l'accéléromètre non"),
+    ES("Cámara {0}: la toma solo giró en torno a un eje, así que la rotación IMU a objetivo se "
+       "conoce salvo un giro en torno a él: se usa la vertical, no la escala del acelerómetro"),
+    PT("Câmera {0}: a captura só rodou em torno de um eixo, por isso a rotação IMU para "
+       "objetiva só se conhece a menos de uma rotação em torno dele: usa-se a vertical, não a "
+       "escala do acelerómetro"),
+    IT("Camera {0}: la ripresa ha ruotato attorno a un solo asse, quindi la rotazione "
+       "IMU-obiettivo è nota a meno di un giro attorno a esso: si usa la verticale, non la "
+       "scala dell'accelerometro"),
+    NL("Camera {0}: de opname draaide alleen om één as, dus de rotatie IMU naar lens is tot op "
+       "een draai daarom bekend: omhoog wordt gebruikt, de versnellingsmeterschaal niet"),
+    RU("Камера {0}: съёмка вращалась только вокруг одной оси, поэтому поворот IMU к объективу "
+       "известен с точностью до поворота вокруг неё: верх используется, масштаб по "
+       "акселерометру нет"),
+    TR("Kamera {0}: çekim yalnızca bir eksen etrafında döndü, IMU-lens dönüşü o eksen "
+       "etrafındaki bir dönüşe kadar bilinir: yukarı kullanılır, ivmeölçer ölçeği kullanılmaz"));
+
+SS_MSG(sensor_calib_failed,
+    EN("Camera {0}: IMU-to-lens rotation not calibrated -- {1}"),
+    JA("カメラ {0}: IMU とレンズ間の回転を較正できません -- {1}"),
+    ZH_HANS("相机 {0}: 未能标定 IMU 到镜头的旋转 -- {1}"),
+    ZH_HANT("相機 {0}: 未能標定 IMU 到鏡頭的旋轉 -- {1}"),
+    KO("카메라 {0}: IMU-렌즈 회전을 보정하지 못했습니다 -- {1}"),
+    DE("Kamera {0}: Rotation IMU zu Objektiv nicht kalibriert -- {1}"),
+    FR("Caméra {0} : rotation IMU vers objectif non calibrée -- {1}"),
+    ES("Cámara {0}: rotación IMU a objetivo sin calibrar -- {1}"),
+    PT("Câmera {0}: rotação IMU para objetiva não calibrada -- {1}"),
+    IT("Camera {0}: rotazione IMU-obiettivo non calibrata -- {1}"),
+    NL("Camera {0}: rotatie IMU naar lens niet gekalibreerd -- {1}"),
+    RU("Камера {0}: поворот IMU к объективу не откалиброван -- {1}"),
+    TR("Kamera {0}: IMU-lens dönüşü kalibre edilemedi -- {1}"));
+
+SS_MSG(sensor_calib_fail_frames,
+    EN("fewer than 3 frames"), JA("フレームが 3 未満"), ZH_HANS("帧数少于 3"), ZH_HANT("幀數少於 3"),
+    KO("프레임이 3 개 미만"), DE("weniger als 3 Frames"), FR("moins de 3 images"),
+    ES("menos de 3 fotogramas"), PT("menos de 3 imagens"), IT("meno di 3 fotogrammi"),
+    NL("minder dan 3 frames"), RU("меньше 3 кадров"), TR("3 kareden az"));
+
+SS_MSG(sensor_calib_fail_pairs,
+    EN("too few frame pairs with sensor coverage"),
+    JA("センサーが記録しているフレーム対が少なすぎます"),
+    ZH_HANS("有传感器覆盖的帧对太少"), ZH_HANT("有感測器覆蓋的幀對太少"),
+    KO("센서가 기록된 프레임 쌍이 너무 적습니다"),
+    DE("zu wenige Bildpaare mit Sensordaten"), FR("trop peu de paires d'images couvertes par les capteurs"),
+    ES("muy pocos pares de fotogramas con datos de sensores"),
+    PT("poucos pares de imagens com dados dos sensores"),
+    IT("troppo poche coppie di fotogrammi coperte dai sensori"),
+    NL("te weinig frameparen met sensordekking"), RU("слишком мало пар кадров с данными датчиков"),
+    TR("sensör verisi olan kare çifti çok az"));
+
+SS_MSG(sensor_calib_fail_disagree,
+    EN("the gyro and the poses disagree"), JA("ジャイロと姿勢が一致しません"),
+    ZH_HANS("陀螺仪与位姿不一致"), ZH_HANT("陀螺儀與位姿不一致"), KO("자이로와 포즈가 맞지 않습니다"),
+    DE("Gyro und Posen widersprechen sich"), FR("le gyro et les poses ne concordent pas"),
+    ES("el giroscopio y las poses no concuerdan"), PT("o giroscópio e as poses não concordam"),
+    IT("il giroscopio e le pose non concordano"), NL("gyro en poses spreken elkaar tegen"),
+    RU("гироскоп и позы не согласуются"), TR("jiroskop ile pozlar uyuşmuyor"));
+
+SS_MSG(sensor_calib_fail_nostream,
+    EN("no rotation or accelerometer stream"), JA("回転も加速度計のストリームもありません"),
+    ZH_HANS("没有旋转或加速度计数据流"), ZH_HANT("沒有旋轉或加速度計資料流"),
+    KO("회전이나 가속도계 스트림이 없습니다"), DE("kein Rotations- oder Beschleunigungsstrom"),
+    FR("pas de flux de rotation ni d'accéléromètre"), ES("sin flujo de rotación ni de acelerómetro"),
+    PT("sem fluxo de rotação nem de acelerómetro"), IT("nessun flusso di rotazione o accelerometro"),
+    NL("geen rotatie- of versnellingsstroom"), RU("нет потока вращения или акселерометра"),
+    TR("dönüş ya da ivmeölçer akışı yok"));
+
+SS_MSG(sensor_calib_fail_degenerate,
+    EN("the camera did not turn enough"), JA("カメラの回転が足りません"),
+    ZH_HANS("相机转动得不够"), ZH_HANT("相機轉動得不夠"), KO("카메라가 충분히 돌지 않았습니다"),
+    DE("die Kamera hat sich zu wenig gedreht"), FR("la caméra n'a pas assez tourné"),
+    ES("la cámara no giró lo suficiente"), PT("a câmera não girou o suficiente"),
+    IT("la camera non ha ruotato abbastanza"), NL("de camera draaide te weinig"),
+    RU("камера недостаточно поворачивалась"), TR("kamera yeterince dönmedi"));
+
+SS_MSG(sensor_up,
+    EN("Model {0}: up from the IMU over {1} frames; votes agree to {2} deg, {3} outliers"),
+    JA("モデル {0}: {1} フレームの IMU から上方向を決定。票の一致 {2} 度、外れ値 {3}"),
+    ZH_HANS("模型 {0}: 由 {1} 帧的 IMU 确定上方向; 投票一致到 {2} 度，外点 {3} 个"),
+    ZH_HANT("模型 {0}: 由 {1} 幀的 IMU 確定上方向; 投票一致到 {2} 度，外點 {3} 個"),
+    KO("모델 {0}: {1} 개 프레임의 IMU 로 위 방향을 정했습니다. 투표 일치 {2} 도, 이상치 {3} 개"),
+    DE("Modell {0}: oben aus der IMU über {1} Frames; Stimmen stimmen auf {2} Grad überein, {3} Ausreißer"),
+    FR("Modèle {0} : verticale depuis l'IMU sur {1} images ; votes cohérents à {2} degrés, {3} aberrants"),
+    ES("Modelo {0}: vertical desde la IMU en {1} fotogramas; votos coherentes hasta {2} grados, {3} atípicos"),
+    PT("Modelo {0}: vertical a partir da IMU em {1} imagens; votos coerentes até {2} graus, {3} atípicos"),
+    IT("Modello {0}: verticale dall'IMU su {1} fotogrammi; voti coerenti a {2} gradi, {3} anomali"),
+    NL("Model {0}: omhoog uit de IMU over {1} frames; stemmen komen tot {2} graden overeen, {3} uitschieters"),
+    RU("Модель {0}: верх по IMU на {1} кадрах; голоса сходятся до {2} град., выбросов {3}"),
+    TR("Model {0}: {1} karede IMU'dan yukarı; oylar {2} dereceye kadar uyuşuyor, {3} aykırı"));
+
+SS_MSG(sensor_scale_imu,
+    EN("Model {0}: accelerometer scale {1} (uncertainty {2}%) over {3} intervals; gravity came "
+       "out at {4} m/s^2, {5} deg from up"),
+    JA("モデル {0}: 加速度計による縮尺 {1} (不確かさ {2}%)、{3} 区間。重力は {4} m/s^2、"
+       "上方向から {5} 度"),
+    ZH_HANS("模型 {0}: 加速度计缩放 {1} (不确定度 {2}%)，共 {3} 段; 解出的重力 {4} m/s^2，"
+            "与上方向夹角 {5} 度"),
+    ZH_HANT("模型 {0}: 加速度計縮放 {1} (不確定度 {2}%)，共 {3} 段; 解出的重力 {4} m/s^2，"
+            "與上方向夾角 {5} 度"),
+    KO("모델 {0}: 가속도계 축척 {1} (불확실도 {2}%), {3} 개 구간. 중력은 {4} m/s^2, "
+       "위 방향에서 {5} 도"),
+    DE("Modell {0}: Beschleunigungssensor-Maßstab {1} (Unsicherheit {2}%) über {3} Intervalle; "
+       "Schwerkraft ergab {4} m/s^2, {5} Grad von oben"),
+    FR("Modèle {0} : échelle de l'accéléromètre {1} (incertitude {2}%) sur {3} intervalles ; "
+       "gravité obtenue {4} m/s^2, à {5} degrés de la verticale"),
+    ES("Modelo {0}: escala del acelerómetro {1} (incertidumbre {2}%) en {3} intervalos; gravedad "
+       "obtenida {4} m/s^2, a {5} grados de la vertical"),
+    PT("Modelo {0}: escala do acelerómetro {1} (incerteza {2}%) em {3} intervalos; gravidade "
+       "obtida {4} m/s^2, a {5} graus da vertical"),
+    IT("Modello {0}: scala dell'accelerometro {1} (incertezza {2}%) su {3} intervalli; gravità "
+       "ottenuta {4} m/s^2, a {5} gradi dalla verticale"),
+    NL("Model {0}: versnellingsmeterschaal {1} (onzekerheid {2}%) over {3} intervallen; "
+       "zwaartekracht kwam uit op {4} m/s^2, {5} graden van omhoog"),
+    RU("Модель {0}: масштаб по акселерометру {1} (неопределённость {2}%) на {3} интервалах; "
+       "гравитация получилась {4} м/с^2, {5} град. от вертикали"),
+    TR("Model {0}: ivmeölçer ölçeği {1} (belirsizlik %{2}), {3} aralık; yerçekimi {4} m/s^2, "
+       "yukarıdan {5} derece çıktı"));
+
+SS_MSG(sensor_scale_imu_weak,
+    EN("Model {0}: accelerometer scale not usable (uncertainty {1}% over {2} intervals): the "
+       "camera moved too smoothly, or too little"),
+    JA("モデル {0}: 加速度計による縮尺は使えません ({2} 区間で不確かさ {1}%)。カメラの動きが"
+       "滑らかすぎるか小さすぎます"),
+    ZH_HANS("模型 {0}: 加速度计缩放不可用 ({2} 段的不确定度 {1}%): 相机动得太平稳，或太少"),
+    ZH_HANT("模型 {0}: 加速度計縮放不可用 ({2} 段的不確定度 {1}%): 相機動得太平穩，或太少"),
+    KO("모델 {0}: 가속도계 축척을 쓸 수 없습니다 ({2} 개 구간에서 불확실도 {1}%). 카메라가 너무 "
+       "부드럽게, 또는 너무 적게 움직였습니다"),
+    DE("Modell {0}: Beschleunigungssensor-Maßstab nicht brauchbar (Unsicherheit {1}% über {2} "
+       "Intervalle): die Kamera bewegte sich zu gleichmäßig oder zu wenig"),
+    FR("Modèle {0} : échelle de l'accéléromètre inutilisable (incertitude {1}% sur {2} "
+       "intervalles) : la caméra a bougé trop régulièrement, ou trop peu"),
+    ES("Modelo {0}: escala del acelerómetro no utilizable (incertidumbre {1}% en {2} intervalos): "
+       "la cámara se movió demasiado suave, o demasiado poco"),
+    PT("Modelo {0}: escala do acelerómetro não utilizável (incerteza {1}% em {2} intervalos): "
+       "a câmera moveu-se de forma demasiado suave, ou pouco"),
+    IT("Modello {0}: scala dell'accelerometro non utilizzabile (incertezza {1}% su {2} "
+       "intervalli): la camera si è mossa troppo dolcemente, o troppo poco"),
+    NL("Model {0}: versnellingsmeterschaal onbruikbaar (onzekerheid {1}% over {2} intervallen): "
+       "de camera bewoog te gelijkmatig, of te weinig"),
+    RU("Модель {0}: масштаб по акселерометру непригоден (неопределённость {1}% на {2} "
+       "интервалах): камера двигалась слишком плавно или слишком мало"),
+    TR("Model {0}: ivmeölçer ölçeği kullanılamaz ({2} aralıkta belirsizlik %{1}): kamera çok "
+       "düzgün ya da çok az hareket etti"));
+
+SS_MSG(sensor_scale_gps,
+    EN("Model {0}: GPS scale {1} (uncertainty {2}%) over {3} frames; cameras within {4} m: "
+       "{5}/{6}, RMS {7} m"),
+    JA("モデル {0}: GPS による縮尺 {1} (不確かさ {2}%)、{3} フレーム。{4} m 以内のカメラ: "
+       "{5}/{6}、RMS {7} m"),
+    ZH_HANS("模型 {0}: GPS 缩放 {1} (不确定度 {2}%)，共 {3} 帧; {4} m 以内的相机: {5}/{6}，RMS {7} m"),
+    ZH_HANT("模型 {0}: GPS 縮放 {1} (不確定度 {2}%)，共 {3} 幀; {4} m 以內的相機: {5}/{6}，RMS {7} m"),
+    KO("모델 {0}: GPS 축척 {1} (불확실도 {2}%), {3} 개 프레임. {4} m 이내 카메라: {5}/{6}, RMS {7} m"),
+    DE("Modell {0}: GPS-Maßstab {1} (Unsicherheit {2}%) über {3} Frames; Kameras innerhalb {4} m: "
+       "{5}/{6}, RMS {7} m"),
+    FR("Modèle {0} : échelle GPS {1} (incertitude {2}%) sur {3} images ; caméras à moins de {4} m : "
+       "{5}/{6}, RMS {7} m"),
+    ES("Modelo {0}: escala GPS {1} (incertidumbre {2}%) en {3} fotogramas; cámaras a menos de {4} m: "
+       "{5}/{6}, RMS {7} m"),
+    PT("Modelo {0}: escala GPS {1} (incerteza {2}%) em {3} imagens; câmeras a menos de {4} m: "
+       "{5}/{6}, RMS {7} m"),
+    IT("Modello {0}: scala GPS {1} (incertezza {2}%) su {3} fotogrammi; camere entro {4} m: "
+       "{5}/{6}, RMS {7} m"),
+    NL("Model {0}: GPS-schaal {1} (onzekerheid {2}%) over {3} frames; camera's binnen {4} m: "
+       "{5}/{6}, RMS {7} m"),
+    RU("Модель {0}: масштаб по GPS {1} (неопределённость {2}%) на {3} кадрах; камер в пределах "
+       "{4} м: {5}/{6}, RMS {7} м"),
+    TR("Model {0}: GPS ölçeği {1} (belirsizlik %{2}), {3} kare; {4} m içindeki kameralar: "
+       "{5}/{6}, RMS {7} m"));
+
+SS_MSG(sensor_scale_gps_failed,
+    EN("Model {0}: GPS log not usable for scale -- {1}"),
+    JA("モデル {0}: GPS ログは縮尺に使えません -- {1}"),
+    ZH_HANS("模型 {0}: GPS 记录不能用于缩放 -- {1}"),
+    ZH_HANT("模型 {0}: GPS 記錄不能用於縮放 -- {1}"),
+    KO("모델 {0}: GPS 로그를 축척에 쓸 수 없습니다 -- {1}"),
+    DE("Modell {0}: GPS-Log für den Maßstab nicht brauchbar -- {1}"),
+    FR("Modèle {0} : journal GPS inutilisable pour l'échelle -- {1}"),
+    ES("Modelo {0}: registro GPS no utilizable para la escala -- {1}"),
+    PT("Modelo {0}: registo GPS não utilizável para a escala -- {1}"),
+    IT("Modello {0}: log GPS non utilizzabile per la scala -- {1}"),
+    NL("Model {0}: GPS-log onbruikbaar voor de schaal -- {1}"),
+    RU("Модель {0}: журнал GPS непригоден для масштаба -- {1}"),
+    TR("Model {0}: GPS kaydı ölçek için kullanılamaz -- {1}"));
+
+SS_MSG(sensor_disagree,
+    EN("Model {0}: accelerometer scale {1} and GPS scale {2} disagree; keeping the more certain one"),
+    JA("モデル {0}: 加速度計の縮尺 {1} と GPS の縮尺 {2} が食い違います。確かなほうを採用します"),
+    ZH_HANS("模型 {0}: 加速度计缩放 {1} 与 GPS 缩放 {2} 不一致; 保留更可靠的一个"),
+    ZH_HANT("模型 {0}: 加速度計縮放 {1} 與 GPS 縮放 {2} 不一致; 保留更可靠的一個"),
+    KO("모델 {0}: 가속도계 축척 {1} 과 GPS 축척 {2} 가 맞지 않습니다. 더 확실한 쪽을 씁니다"),
+    DE("Modell {0}: Beschleunigungssensor-Maßstab {1} und GPS-Maßstab {2} widersprechen sich; "
+       "der sicherere bleibt"),
+    FR("Modèle {0} : l'échelle de l'accéléromètre {1} et l'échelle GPS {2} divergent ; la plus "
+       "sûre est conservée"),
+    ES("Modelo {0}: la escala del acelerómetro {1} y la escala GPS {2} discrepan; se conserva la "
+       "más segura"),
+    PT("Modelo {0}: a escala do acelerómetro {1} e a escala GPS {2} divergem; fica a mais segura"),
+    IT("Modello {0}: la scala dell'accelerometro {1} e la scala GPS {2} discordano; si tiene la "
+       "più sicura"),
+    NL("Model {0}: versnellingsmeterschaal {1} en GPS-schaal {2} verschillen; de zekerste blijft"),
+    RU("Модель {0}: масштаб по акселерометру {1} и по GPS {2} расходятся; остаётся более надёжный"),
+    TR("Model {0}: ivmeölçer ölçeği {1} ile GPS ölçeği {2} uyuşmuyor; daha kesin olan tutuluyor"));
+
+SS_MSG(sensor_src_imu,
+    EN("the IMU"), JA("IMU"), ZH_HANS("IMU"), ZH_HANT("IMU"), KO("IMU"), DE("der IMU"),
+    FR("l'IMU"), ES("la IMU"), PT("a IMU"), IT("l'IMU"), NL("de IMU"), RU("IMU"), TR("IMU"));
+
+SS_MSG(sensor_src_gps,
+    EN("the GPS log"), JA("GPS ログ"), ZH_HANS("GPS 记录"), ZH_HANT("GPS 記錄"), KO("GPS 로그"),
+    DE("dem GPS-Log"), FR("le journal GPS"), ES("el registro GPS"), PT("o registo GPS"),
+    IT("il log GPS"), NL("de GPS-log"), RU("журнала GPS"), TR("GPS kaydı"));
+
+SS_MSG(sensor_src_both,
+    EN("the IMU and the GPS log"), JA("IMU と GPS ログ"), ZH_HANS("IMU 和 GPS 记录"),
+    ZH_HANT("IMU 和 GPS 記錄"), KO("IMU 와 GPS 로그"), DE("der IMU und dem GPS-Log"),
+    FR("l'IMU et le journal GPS"), ES("la IMU y el registro GPS"), PT("a IMU e o registo GPS"),
+    IT("l'IMU e il log GPS"), NL("de IMU en de GPS-log"), RU("IMU и журнала GPS"),
+    TR("IMU ve GPS kaydı"));
+
+SS_MSG(sensor_done,
+    EN("Model {0}: sensor frame from {1} -- scale {2}, uncertainty {3}%, tilt uncertainty {4} deg"),
+    JA("モデル {0}: {1} によるセンサー座標系 -- 縮尺 {2}、不確かさ {3}%、傾きの不確かさ {4} 度"),
+    ZH_HANS("模型 {0}: 由{1}确定的传感器坐标系 -- 缩放 {2}，不确定度 {3}%，倾斜不确定度 {4} 度"),
+    ZH_HANT("模型 {0}: 由{1}確定的感測器座標系 -- 縮放 {2}，不確定度 {3}%，傾斜不確定度 {4} 度"),
+    KO("모델 {0}: {1} 로 정한 센서 좌표계 -- 축척 {2}, 불확실도 {3}%, 기울기 불확실도 {4} 도"),
+    DE("Modell {0}: Sensorrahmen aus {1} -- Maßstab {2}, Unsicherheit {3}%, Neigungsunsicherheit {4} Grad"),
+    FR("Modèle {0} : repère capteurs d'après {1} -- échelle {2}, incertitude {3}%, incertitude "
+       "d'inclinaison {4} degrés"),
+    ES("Modelo {0}: marco de sensores según {1} -- escala {2}, incertidumbre {3}%, incertidumbre "
+       "de inclinación {4} grados"),
+    PT("Modelo {0}: referencial dos sensores segundo {1} -- escala {2}, incerteza {3}%, incerteza "
+       "de inclinação {4} graus"),
+    IT("Modello {0}: sistema dei sensori da {1} -- scala {2}, incertezza {3}%, incertezza di "
+       "inclinazione {4} gradi"),
+    NL("Model {0}: sensorstelsel uit {1} -- schaal {2}, onzekerheid {3}%, kantelonzekerheid {4} graden"),
+    RU("Модель {0}: система по данным {1} -- масштаб {2}, неопределённость {3}%, неопределённость "
+       "наклона {4} град."),
+    TR("Model {0}: {1} ile sensör çerçevesi -- ölçek {2}, belirsizlik %{3}, eğim belirsizliği {4} derece"));
+
+SS_MSG(sensor_up_only,
+    EN("Model {0}: levelled from the IMU and centred on the cameras, scaled by {1}; no metric "
+       "scale -- {2}"),
+    JA("モデル {0}: IMU で水平を取りカメラに中心を合わせ、{1} 倍に縮尺しました。メートル縮尺なし -- {2}"),
+    ZH_HANS("模型 {0}: 按 IMU 摆正并按相机居中，缩放 {1} 倍; 没有米制缩放 -- {2}"),
+    ZH_HANT("模型 {0}: 依 IMU 擺正並依相機置中，縮放 {1} 倍; 沒有公尺縮放 -- {2}"),
+    KO("모델 {0}: IMU 로 수평을 잡고 카메라에 중심을 맞춰 {1} 배로 조정했습니다. 미터 축척 없음 -- {2}"),
+    DE("Modell {0}: nach der IMU ausgerichtet und auf die Kameras zentriert, um {1} skaliert; kein "
+       "metrischer Maßstab -- {2}"),
+    FR("Modèle {0} : mis d'aplomb par l'IMU et centré sur les caméras, mis à l'échelle de {1} ; "
+       "pas d'échelle métrique -- {2}"),
+    ES("Modelo {0}: nivelado por la IMU y centrado en las cámaras, escalado por {1}; sin escala "
+       "métrica -- {2}"),
+    PT("Modelo {0}: nivelado pela IMU e centrado nas câmeras, escalado por {1}; sem escala "
+       "métrica -- {2}"),
+    IT("Modello {0}: raddrizzato dall'IMU e centrato sulle fotocamere, scalato di {1}; nessuna "
+       "scala metrica -- {2}"),
+    NL("Model {0}: waterpas gezet met de IMU en op de camera's gecentreerd, geschaald met {1}; "
+       "geen metrische schaal -- {2}"),
+    RU("Модель {0}: выровнена по IMU и центрирована по камерам, масштаб {1}; метрического "
+       "масштаба нет -- {2}"),
+    TR("Model {0}: IMU ile düzlendi ve kameralara göre ortalandı, {1} ile ölçeklendi; metrik "
+       "ölçek yok -- {2}"));
+
+SS_MSG(sensor_no_scale_not_asked,
+    EN("only the orientation was asked for"), JA("向きだけが求められました"),
+    ZH_HANS("只要求了朝向"), ZH_HANT("只要求了朝向"), KO("방향만 요청되었습니다"),
+    DE("nur die Ausrichtung war verlangt"), FR("seule l'orientation était demandée"),
+    ES("solo se pidió la orientación"), PT("só a orientação foi pedida"),
+    IT("era richiesto solo l'orientamento"), NL("alleen de oriëntatie was gevraagd"),
+    RU("запрашивалась только ориентация"), TR("yalnızca yön istenmişti"));
+
+SS_MSG(sensor_no_scale_no_source,
+    EN("no scale source"), JA("縮尺の情報源がありません"), ZH_HANS("没有缩放来源"),
+    ZH_HANT("沒有縮放來源"), KO("축척 정보원이 없습니다"), DE("keine Maßstabsquelle"),
+    FR("aucune source d'échelle"), ES("sin fuente de escala"), PT("sem fonte de escala"),
+    IT("nessuna fonte di scala"), NL("geen schaalbron"), RU("нет источника масштаба"),
+    TR("ölçek kaynağı yok"));
+
+SS_MSG(sensor_no_scale_imu_weak,
+    EN("the accelerometer scale is too uncertain"), JA("加速度計の縮尺が不確かすぎます"),
+    ZH_HANS("加速度计缩放太不确定"), ZH_HANT("加速度計縮放太不確定"),
+    KO("가속도계 축척이 너무 불확실합니다"), DE("der Beschleunigungssensor-Maßstab ist zu unsicher"),
+    FR("l'échelle de l'accéléromètre est trop incertaine"),
+    ES("la escala del acelerómetro es demasiado incierta"),
+    PT("a escala do acelerómetro é demasiado incerta"),
+    IT("la scala dell'accelerometro è troppo incerta"),
+    NL("de versnellingsmeterschaal is te onzeker"), RU("масштаб по акселерометру слишком неопределён"),
+    TR("ivmeölçer ölçeği fazla belirsiz"));
+
+SS_MSG(sensor_no_scale_gps_refused,
+    EN("the GPS fit was refused"), JA("GPS の当てはめが拒否されました"), ZH_HANS("GPS 拟合被拒绝"),
+    ZH_HANT("GPS 擬合被拒絕"), KO("GPS 맞춤이 거부되었습니다"), DE("die GPS-Anpassung wurde verworfen"),
+    FR("l'ajustement GPS a été refusé"), ES("el ajuste GPS fue rechazado"),
+    PT("o ajuste GPS foi recusado"), IT("la stima GPS è stata rifiutata"),
+    NL("de GPS-fit is geweigerd"), RU("подгонка по GPS отклонена"), TR("GPS uyumu reddedildi"));
+
+SS_MSG(sensor_no_scale_disagree,
+    EN("the scale sources disagree"), JA("縮尺の情報源が食い違います"), ZH_HANS("缩放来源不一致"),
+    ZH_HANT("縮放來源不一致"), KO("축척 정보원들이 맞지 않습니다"), DE("die Maßstabsquellen widersprechen sich"),
+    FR("les sources d'échelle divergent"), ES("las fuentes de escala discrepan"),
+    PT("as fontes de escala divergem"), IT("le fonti di scala discordano"),
+    NL("de schaalbronnen verschillen"), RU("источники масштаба расходятся"),
+    TR("ölçek kaynakları uyuşmuyor"));
+
+SS_MSG(sensor_declined,
+    EN("Model {0}: sensors not used -- {1}"),
+    JA("モデル {0}: センサーは使いませんでした -- {1}"),
+    ZH_HANS("模型 {0}: 未使用传感器 -- {1}"), ZH_HANT("模型 {0}: 未使用感測器 -- {1}"),
+    KO("모델 {0}: 센서를 쓰지 않았습니다 -- {1}"), DE("Modell {0}: Sensoren nicht verwendet -- {1}"),
+    FR("Modèle {0} : capteurs non utilisés -- {1}"), ES("Modelo {0}: sensores no utilizados -- {1}"),
+    PT("Modelo {0}: sensores não utilizados -- {1}"), IT("Modello {0}: sensori non utilizzati -- {1}"),
+    NL("Model {0}: sensoren niet gebruikt -- {1}"), RU("Модель {0}: датчики не использованы -- {1}"),
+    TR("Model {0}: sensörler kullanılmadı -- {1}"));
+
+SS_MSG(sensor_fail_frames,
+    EN("no registered image has a sensor time (frame stems must carry the source frame index)"),
+    JA("センサー時刻を持つ登録済み画像がありません (フレーム名に元のフレーム番号が必要です)"),
+    ZH_HANS("没有已注册图像带有传感器时间 (帧文件名须含源帧序号)"),
+    ZH_HANT("沒有已註冊影像帶有感測器時間 (幀檔名須含來源幀序號)"),
+    KO("센서 시각이 있는 등록 이미지가 없습니다 (프레임 이름에 원본 프레임 번호가 있어야 합니다)"),
+    DE("kein registriertes Bild hat eine Sensorzeit (Frame-Namen müssen den Quell-Frameindex tragen)"),
+    FR("aucune image enregistrée n'a de temps capteur (les noms d'images doivent porter l'index de la "
+       "trame source)"),
+    ES("ninguna imagen registrada tiene tiempo de sensor (los nombres deben llevar el índice del "
+       "fotograma de origen)"),
+    PT("nenhuma imagem registada tem tempo de sensor (os nomes têm de trazer o índice da imagem "
+       "de origem)"),
+    IT("nessuna immagine registrata ha un tempo sensore (i nomi devono portare l'indice del "
+       "fotogramma sorgente)"),
+    NL("geen geregistreerd beeld heeft een sensortijd (framenamen moeten de bronframe-index dragen)"),
+    RU("ни один зарегистрированный кадр не имеет времени датчиков (имена кадров должны нести "
+       "индекс исходного кадра)"),
+    TR("kayıtlı hiçbir görüntünün sensör zamanı yok (kare adları kaynak kare indeksini taşımalı)"));
+
+SS_MSG(sensor_fail_noup,
+    EN("the IMU up votes do not agree and no scale source passed"),
+    JA("IMU の上方向の票が一致せず、縮尺の情報源も通りませんでした"),
+    ZH_HANS("IMU 的上方向投票不一致，且没有通过的缩放来源"),
+    ZH_HANT("IMU 的上方向投票不一致，且沒有通過的縮放來源"),
+    KO("IMU 위 방향 투표가 맞지 않고 통과한 축척 정보원도 없습니다"),
+    DE("die IMU-Stimmen für oben stimmen nicht überein und keine Maßstabsquelle hielt"),
+    FR("les votes de verticale de l'IMU ne concordent pas et aucune source d'échelle n'a tenu"),
+    ES("los votos de vertical de la IMU no concuerdan y ninguna fuente de escala pasó"),
+    PT("os votos de vertical da IMU não concordam e nenhuma fonte de escala passou"),
+    IT("i voti di verticale dell'IMU non concordano e nessuna fonte di scala ha retto"),
+    NL("de IMU-stemmen voor omhoog komen niet overeen en geen schaalbron hield stand"),
+    RU("голоса IMU за вертикаль не сходятся, и ни один источник масштаба не прошёл"),
+    TR("IMU yukarı oyları uyuşmuyor ve hiçbir ölçek kaynağı geçmedi"));
+
+SS_MSG(sensor_untimed,
+    EN("Model {0}: {1} of {2} registered images matched no telemetry"),
+    JA("モデル {0}: 登録済み {2} 枚のうち {1} 枚はテレメトリに対応しません"),
+    ZH_HANS("模型 {0}: {2} 张已注册图像中有 {1} 张没有对应的遥测"),
+    ZH_HANT("模型 {0}: {2} 張已註冊影像中有 {1} 張沒有對應的遙測"),
+    KO("모델 {0}: 등록 이미지 {2} 장 중 {1} 장에 맞는 텔레메트리가 없습니다"),
+    DE("Modell {0}: {1} von {2} registrierten Bildern passten zu keiner Telemetrie"),
+    FR("Modèle {0} : {1} des {2} images enregistrées ne correspondent à aucune télémétrie"),
+    ES("Modelo {0}: {1} de {2} imágenes registradas no coinciden con ninguna telemetría"),
+    PT("Modelo {0}: {1} de {2} imagens registadas não correspondem a nenhuma telemetria"),
+    IT("Modello {0}: {1} di {2} immagini registrate non corrispondono a nessuna telemetria"),
+    NL("Model {0}: {1} van de {2} geregistreerde beelden pasten bij geen telemetrie"),
+    RU("Модель {0}: {1} из {2} зарегистрированных кадров не сопоставились ни с какой телеметрией"),
+    TR("Model {0}: kayıtlı {2} görüntüden {1} tanesi hiçbir telemetriyle eşleşmedi"));
+
+SS_MSG(result_not_metric,
+    EN("RESULT: NOT METRIC -- the model is sound but the metric frame could not be fitted; "
+       "see the line above"),
+    JA("結果: メートル座標系なし -- モデル自体は健全ですが、メートル座標系を当てはめられません"
+       "でした。上の行を参照してください"),
+    ZH_HANS("结果: 非米制 -- 模型本身没问题，但无法拟合米制坐标系; 见上一行"),
+    ZH_HANT("結果: 非公尺 -- 模型本身沒問題，但無法擬合公尺座標系; 見上一行"),
+    KO("결과: 미터 좌표계 아님 -- 모델 자체는 온전하지만 미터 좌표계를 맞추지 못했습니다. "
+       "위 줄을 보십시오"),
+    DE("ERGEBNIS: NICHT METRISCH -- das Modell ist in Ordnung, aber der metrische Rahmen "
+       "ließ sich nicht anpassen; siehe die Zeile darüber"),
+    FR("RÉSULTAT : NON MÉTRIQUE -- le modèle est sain mais le repère métrique n'a pas pu "
+       "être ajusté ; voir la ligne ci-dessus"),
+    ES("RESULTADO: NO MÉTRICO -- el modelo está bien pero no se pudo ajustar el marco "
+       "métrico; vea la línea anterior"),
+    PT("RESULTADO: NÃO MÉTRICO -- o modelo está bem mas o referencial métrico não pôde ser "
+       "ajustado; veja a linha acima"),
+    IT("RISULTATO: NON METRICO -- il modello è valido ma il sistema metrico non si è potuto "
+       "stimare; vedere la riga sopra"),
+    NL("RESULTAAT: NIET METRISCH -- het model deugt, maar het metrische stelsel kon niet "
+       "gefit worden; zie de regel hierboven"),
+    RU("РЕЗУЛЬТАТ: НЕ МЕТРИЧЕСКИЙ -- модель исправна, но метрическую систему подогнать не "
+       "удалось; см. строку выше"),
+    TR("SONUÇ: METRİK DEĞİL -- model sağlam ama metrik çerçeve oturtulamadı; üstteki "
+       "satıra bakın"));
+
+SS_MSG(run_cancelled,
+    EN("Cancelled; the workspace holds whatever the run had finished"),
+    JA("中止しました。ワークスペースには完了済みの成果だけが残っています"),
+    ZH_HANS("已取消; 工作区中保留着已完成的部分"),
+    ZH_HANT("已取消; 工作區中保留著已完成的部分"),
+    KO("취소했습니다. 작업 공간에는 완료된 부분만 남아 있습니다"),
+    DE("Abgebrochen; im Arbeitsverzeichnis liegt, was der Lauf fertig hatte"),
+    FR("Annulé ; l'espace de travail contient ce que l'exécution avait terminé"),
+    ES("Cancelado; el espacio de trabajo conserva lo que la ejecución había terminado"),
+    PT("Cancelado; o espaço de trabalho mantém o que a execução tinha terminado"),
+    IT("Annullato; nello spazio di lavoro resta ciò che l'esecuzione aveva completato"),
+    NL("Afgebroken; de werkmap bevat wat de run af had"),
+    RU("Отменено; в рабочем каталоге осталось то, что успел закончить запуск"),
+    TR("İptal edildi; çalışma klasöründe çalışmanın bitirdiği kadarı duruyor"));
 
 }  // namespace sfm
 }  // namespace msg

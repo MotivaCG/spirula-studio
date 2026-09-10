@@ -37,6 +37,8 @@
 #include "sfm/geometry/AbsolutePose.h"
 #include "sfm/geometry/Triangulation.h"
 #include "sfm/geometry/TwoView.h"
+#include "sfm/core/Cancel.h"
+#include "sfm/core/Events.h"
 #include "sfm/core/Log.h"
 #include "sfm/map/Bundle.h"
 #include "i18n/catalog/Sfm.h"
@@ -329,6 +331,10 @@ struct MapperOptions {
     // 0 = hardware_concurrency.
     int threads = 0;
     bool verbose = true;
+    // Whether this mapper speaks for the run: it writes the snapshot a front
+    // end draws and counts its registrations towards the bar. False for an
+    // atom's private mapper, which is neither (sfm/map/Atoms.h).
+    bool report_progress = true;
 };
 
 class Mapper {
@@ -372,6 +378,7 @@ public:
         size_t seed_from = 0;
         seeded_.clear();  // seed blocking is a device of this loop alone (D58)
         for (int attempt = 0; attempt < std::max(1, opt_.max_init_trials); attempt++) {
+            cancel::check();
             resetModel();
             bool seeded;
             {
@@ -421,7 +428,7 @@ public:
             std::string why;
             if (i > 0 && !admitModel(attempts[i], why)) {
                 if (opt_.verbose)
-                    fprintf(stderr, "[map] seed attempt discarded: %s\n", why.c_str());
+                    slog::diag(slog::Tag::Map, "[map] seed attempt discarded: %s", why.c_str());
                 continue;
             }
             claimImages(attempts[i]);
@@ -750,8 +757,9 @@ public:
         } catch (const BAOverBudget& e) {
             ba_over_budget_throws_ = false;
             if (opt_.verbose)
-                fprintf(stderr, "[map] a %u-image refinement needs %.0f MB against a %.0f MB "
-                        "budget; declining it\n", m.numRegistered(), e.need_mb, e.budget_mb);
+                slog::diag(slog::Tag::Map,
+                           "[map] a %u-image refinement needs %.0f MB against a %.0f MB "
+                           "budget; declining it", m.numRegistered(), e.need_mb, e.budget_mb);
             return false;
         }
         ba_over_budget_throws_ = false;
@@ -795,9 +803,9 @@ public:
                 const Vec2& b = before[kv.first];
                 const double d = std::hypot(kv.second.cx - b.x, kv.second.cy - b.y);
                 if (d > 1e-9)
-                    fprintf(stderr,
-                            "[map] camera %u principal point %.1f,%.1f -> %.1f,%.1f (%.1f px)\n",
-                            kv.first, b.x, b.y, kv.second.cx, kv.second.cy, d);
+                    slog::diag(slog::Tag::Map,
+                               "[map] camera %u principal point %.1f,%.1f -> %.1f,%.1f (%.1f px)",
+                               kv.first, b.x, b.y, kv.second.cx, kv.second.cy, d);
             }
         return snapshotModel();
     }
@@ -905,8 +913,9 @@ public:
         ProfTimer audit_pt(g_map_prof.audit_fix);
         if (!repairs.empty()) {
             if (opt_.verbose)
-                fprintf(stderr, "[map] audit: %u/%u image(s) sit where the rest of the model "
-                        "contradicts them; moving\n", st.unsupported, st.checked);
+                slog::diag(slog::Tag::Map,
+                           "[map] audit: %u/%u image(s) sit where the rest of the model "
+                           "contradicts them; moving", st.unsupported, st.checked);
             // Detach first, all of them: their old observations are evidence
             // for the old pose and must not survive it.
             for (const auto& r : repairs) deregisterImage(r.first);
@@ -961,9 +970,10 @@ public:
                unclaimedImages() >= need) {
             if (++trials > std::max(1, opt_.max_model_trials)) {
                 if (opt_.verbose)
-                    fprintf(stderr, "[map] sub-model search hit its %d-attempt budget with %zu "
-                            "image(s) unaccounted for\n", opt_.max_model_trials,
-                            unclaimedImages());
+                    slog::diag(slog::Tag::Map,
+                               "[map] sub-model search hit its %d-attempt budget with %zu "
+                               "image(s) unaccounted for", opt_.max_model_trials,
+                               unclaimedImages());
                 break;
             }
             resetModel();
@@ -983,7 +993,7 @@ public:
                 // would only starve later passes. Leave them for the next seed;
                 // `used_seeds_` stops this pair being tried again.
                 if (opt_.verbose)
-                    fprintf(stderr, "[map] sub-model discarded: %s\n", why.c_str());
+                    slog::diag(slog::Tag::Map, "[map] sub-model discarded: %s", why.c_str());
                 continue;
             }
             const uint32_t reg = sub.numRegistered();
@@ -991,8 +1001,10 @@ public:
             claimImages(models.back());
             recordCameras(models.back());
             if (opt_.verbose)
-                fprintf(stderr, "[map] sub-model %zu: %u images, %zu points (%zu images left)\n",
-                        models.size() - 1, reg, models.back().points3D.size(), unclaimedImages());
+                slog::diag(slog::Tag::Map,
+                           "[map] sub-model %zu: %u images, %zu points (%zu images left)",
+                           models.size() - 1, reg, models.back().points3D.size(),
+                           unclaimedImages());
         }
     }
 
@@ -1293,9 +1305,9 @@ public:
                     std::max(batches + 1, (int)std::ceil(e.need_mb / e.budget_mb * batches));
                 if (want > 64) throw;
                 if (opt_.verbose)
-                    fprintf(stderr,
-                            "[map] the joint solve needs %.0f MB against a %.0f MB budget: "
-                            "splitting it %d ways\n", e.need_mb, e.budget_mb, want);
+                    slog::diag(slog::Tag::Map,
+                               "[map] the joint solve needs %.0f MB against a %.0f MB budget: "
+                               "splitting it %d ways", e.need_mb, e.budget_mb, want);
                 batches = want;
             }
         }
@@ -1456,8 +1468,9 @@ public:
         // largest line in the finishing bill on every large capture.
         if (n <= (int)(opt_.audit_alternative_factor * cur) || n < opt_.audit_min_alternative) {
             if (audit_dump_)
-                fprintf(stderr, "[audit] %s: pool %d, current %d -> ok (no alternative can win)\n",
-                        db_.images[img].name.c_str(), n, cur);
+                slog::diag(slog::Tag::Map,
+                           "[audit] %s: pool %d, current %d -> ok (no alternative can win)",
+                           db_.images[img].name.c_str(), n, cur);
             return false;
         }
 
@@ -1488,11 +1501,11 @@ public:
             if (contradicted) alternative = r.pose;
         }
         if (audit_dump_)
-            fprintf(stderr,
-                    "[audit] %s: pool %d, current %d, alternative %d, rot %.1f deg, shift %.4f "
-                    "-> %s\n", db_.images[img].name.c_str(), n, cur,
-                    r.success ? r.num_inliers : 0, rot_deg, shift,
-                    contradicted ? "CONTRADICTED" : "ok");
+            slog::diag(slog::Tag::Map,
+                       "[audit] %s: pool %d, current %d, alternative %d, rot %.1f deg, shift %.4f "
+                       "-> %s", db_.images[img].name.c_str(), n, cur,
+                       r.success ? r.num_inliers : 0, rot_deg, shift,
+                       contradicted ? "CONTRADICTED" : "ok");
         return contradicted;
     }
 
@@ -1661,20 +1674,21 @@ private:
             }
         }
         if (name_mismatch)
-            fprintf(stderr,
-                    "[map] WARNING: %zu adopted image(s) have a different name than the database "
-                    "entry with the same id -- the model was probably built from other matches, "
-                    "and adopting it will produce nonsense\n", name_mismatch);
+            slog::diag(slog::Tag::Map,
+                       "[map] WARNING: %zu adopted image(s) have a different name than "
+                       "the database entry with the same id -- the model was probably "
+                       "built from other matches, "
+                       "and adopting it will produce nonsense", name_mismatch);
         if (count_mismatch)
-            fprintf(stderr,
-                    "[map] WARNING: %zu adopted image(s) hold a different keypoint count than "
-                    "this run's features -- their observations index other keypoints and were "
-                    "dropped, poses kept. Feature compaction on one side only does this; "
-                    "--compact-unused-features has to match the run that wrote the model\n",
-                    count_mismatch);
+            slog::diag(slog::Tag::Map,
+                       "[map] WARNING: %zu adopted image(s) hold a different keypoint count than "
+                       "this run's features -- their observations index other keypoints and were "
+                       "dropped, poses kept. Feature compaction on one side only does this; "
+                       "--compact-unused-features has to match the run that wrote the model",
+                       count_mismatch);
         if (missing && opt_.verbose)
-            fprintf(stderr,
-                    "[map] adopted model: %zu image(s) not in this database\n", missing);
+            slog::diag(slog::Tag::Map, "[map] adopted model: %zu image(s) not in this database",
+                       missing);
     }
 
     // Sort, report and return. Split out only because run() has two exits.
@@ -1706,15 +1720,15 @@ private:
             // problem, a low inlier *ratio* is usually the image being
             // genuinely somewhere else -- so they are worth separating.
             if (covered.size() < db_.images.size())
-                fprintf(stderr,
-                        "[map] registration attempts that failed: %u too few candidates, "
-                        "%u too few PnP inliers, %u inlier ratio below %.2f, %u lost on refit "
-                        "(%u came in on absolute support with the ratio failed, %u more were "
-                        "refused for a rival pose fitting the leftovers; %u correspondence(s) "
-                        "were left out of the ratio as unseeable)\n",
-                        reg_fail_.few_corr, reg_fail_.few_inliers, reg_fail_.low_ratio,
-                        opt_.min_pnp_inlier_ratio, reg_fail_.refined_out, reg_fail_.strong,
-                        reg_fail_.ambiguous, reg_fail_.occluded);
+                slog::diag(slog::Tag::Map,
+                           "[map] registration attempts that failed: %u too few candidates, "
+                           "%u too few PnP inliers, %u inlier ratio below %.2f, %u lost on refit "
+                           "(%u came in on absolute support with the ratio failed, %u more were "
+                           "refused for a rival pose fitting the leftovers; %u correspondence(s) "
+                           "were left out of the ratio as unseeable)",
+                           reg_fail_.few_corr, reg_fail_.few_inliers, reg_fail_.low_ratio,
+                           opt_.min_pnp_inlier_ratio, reg_fail_.refined_out, reg_fail_.strong,
+                           reg_fail_.ambiguous, reg_fail_.occluded);
         }
         g_map_prof.report(std::chrono::duration<double>(
                               std::chrono::steady_clock::now() - prof_start).count());
@@ -1874,6 +1888,7 @@ private:
         // would otherwise be over budget before it registered anything.
         const size_t shared_at_entry = sharedRegistered();
         while (true) {
+            cancel::check();
             if (max_reg && rec_.numRegistered() >= max_reg) break;
             // Both counts are of *this* pass, and both can be nudged by a
             // de-registration mid-pass, so neither subtraction may wrap.
@@ -1882,8 +1897,9 @@ private:
             const size_t fresh_here = registered_here > shared_here ? registered_here - shared_here : 0;
             if (shared_here > overlapBudget(fresh_here)) {
                 if (opt_.verbose)
-                    fprintf(stderr, "[map] growth took %zu image(s) an earlier model holds "
-                            "against %zu of its own; stopping it\n", shared_here, fresh_here);
+                    slog::diag(slog::Tag::Map,
+                               "[map] growth took %zu image(s) an earlier model holds "
+                               "against %zu of its own; stopping it", shared_here, fresh_here);
                 break;
             }
             // COLMAP's shape: rank all candidates, try them in order until one
@@ -1999,10 +2015,10 @@ private:
         bool collapsed = 2 * rec_.numRegistered() < reg_before;
         if (collapsed && !recent_regs_.empty()) {
             if (opt_.verbose)
-                fprintf(stderr,
-                        "[map] refinement collapsed the model (%u -> %u images); undoing %zu "
-                        "recent registration(s)\n", reg_before, rec_.numRegistered(),
-                        recent_regs_.size());
+                slog::diag(slog::Tag::Map,
+                           "[map] refinement collapsed the model (%u -> %u images); undoing %zu "
+                           "recent registration(s)", reg_before, rec_.numRegistered(),
+                           recent_regs_.size());
             restoreSnapshot(snap);
             for (uint32_t img : recent_regs_) deregisterImage(img);
             resetOrphanCameras();
@@ -2273,18 +2289,18 @@ private:
 
     void reportInitFailure() const {
         const InitTally& t = init_tally_;
-        fprintf(stderr, "[map] initialization failed: %zu candidate pair(s) tried; "
-                "rejected %zu no pose, %zu wrong config, %zu too few inliers, "
-                "%zu forward motion, %zu too few points, %zu low angle\n",
-                t.candidates, t.no_pose, t.config, t.few_inliers, t.forward, t.few_points,
-                t.low_angle);
+        slog::diag(slog::Tag::Map, "[map] initialization failed: %zu candidate pair(s) tried; "
+                   "rejected %zu no pose, %zu wrong config, %zu too few inliers, "
+                   "%zu forward motion, %zu too few points, %zu low angle",
+                   t.candidates, t.no_pose, t.config, t.few_inliers, t.forward, t.few_points,
+                   t.low_angle);
         if (t.candidates) {
-            fprintf(stderr, "[map]   best median triangulation angle %.2f deg, "
-                    "most sideways baseline %.3f (cap %.2f)\n",
-                    t.best_angle, t.best_forward, opt_.init_max_forward_motion);
+            slog::diag(slog::Tag::Map, "[map]   best median triangulation angle %.2f deg, "
+                       "most sideways baseline %.3f (cap %.2f)",
+                       t.best_angle, t.best_forward, opt_.init_max_forward_motion);
             if (t.best_angle < opt_.init_min_tri_angle_deg / 8)
-                fprintf(stderr, "[map]   no pair has enough parallax to triangulate on: "
-                        "the capture may be a pure rotation, or too small a sweep\n");
+                slog::diag(slog::Tag::Map, "[map]   no pair has enough parallax to triangulate on: "
+                           "the capture may be a pure rotation, or too small a sweep");
         }
     }
 
@@ -2429,11 +2445,12 @@ private:
         base.observations = countObservations();
         base.rot_spread = rotationSpreadDeg();
         if (opt_.verbose)
-            fprintf(stderr, "[map] focal probe at %.0f: %u image(s), %zu observation(s), "
-                    "orientations span %.1f deg%s\n", f0, base.registered, base.observations,
-                    base.rot_spread,
-                    base.rot_spread <= opt_.focal_max_rot_spread_deg
-                        ? " (too little to determine the focal)" : "");
+            slog::diag(slog::Tag::Map,
+                       "[map] focal probe at %.0f: %u image(s), %zu observation(s), "
+                       "orientations span %.1f deg%s", f0, base.registered, base.observations,
+                       base.rot_spread,
+                       base.rot_spread <= opt_.focal_max_rot_spread_deg
+                       ? " (too little to determine the focal)" : "");
 
         FocalTrial best = base;
         bool moved = false;
@@ -2444,8 +2461,9 @@ private:
         // more images.
         if (opt_.measured_focal_cameras.count(cams[0])) {
             if (opt_.verbose)
-                fprintf(stderr, "[map] focal %.0f -> %.0f (probe refinement of a measured "
-                        "focal)\n", f0, best.focal);
+                slog::diag(slog::Tag::Map,
+                           "[map] focal %.0f -> %.0f (probe refinement of a measured "
+                           "focal)", f0, best.focal);
             restoreAfterBootstrap(best.focal, cams, f0);
             return;
         }
@@ -2463,9 +2481,10 @@ private:
             const bool better = t.ok && (double)t.observations >
                                         (1.0 + opt_.focal_min_gain) * (double)best.observations;
             if (opt_.verbose)
-                fprintf(stderr, "[map]   focal %.0f -> %.0f: %u image(s), %zu observation(s)%s\n",
-                        f, t.focal, t.registered, t.observations,
-                        !t.ok ? " (failed)" : better ? " (better)" : " (no better, stopping)");
+                slog::diag(slog::Tag::Map,
+                           "[map]   focal %.0f -> %.0f: %u image(s), %zu observation(s)%s",
+                           f, t.focal, t.registered, t.observations,
+                           !t.ok ? " (failed)" : better ? " (better)" : " (no better, stopping)");
             if (!better) break;
             best = t;
             moved = true;
@@ -2477,9 +2496,10 @@ private:
             const bool better = t.ok && (double)t.observations >
                                         (1.0 + opt_.focal_min_gain) * (double)base.observations;
             if (opt_.verbose)
-                fprintf(stderr, "[map]   focal %.0f -> %.0f: %u image(s), %zu observation(s)%s\n",
-                        f0 * 1.6, t.focal, t.registered, t.observations,
-                        !t.ok ? " (failed)" : better ? " (better)" : " (no better)");
+                slog::diag(slog::Tag::Map,
+                           "[map]   focal %.0f -> %.0f: %u image(s), %zu observation(s)%s",
+                           f0 * 1.6, t.focal, t.registered, t.observations,
+                           !t.ok ? " (failed)" : better ? " (better)" : " (no better)");
             if (better) { best = t; moved = true; }
         }
         // Either way the probe's *refined* focal is what carries forward, not the
@@ -2487,10 +2507,11 @@ private:
         // bundle adjustment has already had a say. That matters where the guess
         // is far out but the descent finds no decisive gain.
         if (opt_.verbose)
-            fprintf(stderr, "[map] focal %.0f -> %.0f (%s; %zu observations vs %zu at the "
-                    "guess)\n", f0, best.focal,
-                    moved ? "trial reconstruction" : "probe refinement only",
-                    best.observations, base.observations);
+            slog::diag(slog::Tag::Map,
+                       "[map] focal %.0f -> %.0f (%s; %zu observations vs %zu at the "
+                       "guess)", f0, best.focal,
+                       moved ? "trial reconstruction" : "probe refinement only",
+                       best.observations, base.observations);
         restoreAfterBootstrap(best.focal, cams, f0);
     }
 
@@ -2782,6 +2803,10 @@ private:
         rec_.images[a].registered = true;
         rec_.images[b].pose = g.pose;
         rec_.images[b].registered = true;
+        if (opt_.report_progress) {
+            events::map_placed(a);   // the seed never reaches registerImage
+            events::map_placed(b);
+        }
 
         std::vector<double> angles;
         int created = 0;
@@ -2944,8 +2969,8 @@ private:
             if (reg_trials_[i] >= opt_.max_reg_trials || !allowed(i)) continue;
             int s = score_cache_[i];
             if (score_check && s != score(i)) {
-                fprintf(stderr, "[map] SCORE MISMATCH image %u: cache %d, reference %d\n",
-                        i, s, score(i));
+                slog::diag(slog::Tag::Map, "[map] SCORE MISMATCH image %u: cache %d, reference %d",
+                           i, s, score(i));
                 abort();
             }
             if (s < opt_.min_num_pnp_inliers) continue;
@@ -3107,10 +3132,22 @@ private:
         // one point at which the model visibly grows. The colouring runs only
         // over the points a snapshot writes, which is why it is a callback and
         // not an assignColors pass per registration.
-        progress::model(rec_, false,
-                        [this](const Point3D& p, uint8_t rgb[3]) {
-                            pointColor(p, rgb);
-                        });
+        if (opt_.report_progress) {
+            progress::model(rec_, false,
+                            [this](const Point3D& p, uint8_t rgb[3]) {
+                                pointColor(p, rgb);
+                            });
+            Event ev;
+            ev.kind = Event::Kind::ModelUpdated;
+            ev.stage = Stage::Map;
+            ev.registered = rec_.numRegistered();
+            ev.images = (int64_t)db_.images.size();
+            ev.points = (int64_t)rec_.points3D.size();
+            events::emit(ev);
+            // The bar, which counts the capture and not this attempt: a seed
+            // retry resets the model, so `numRegistered` falls back to nothing.
+            events::map_placed(img);
+        }
         return true;
     }
 
@@ -3301,8 +3338,9 @@ private:
             dropped = filterImages();
         }
         if (dropped && opt_.verbose)
-            fprintf(stderr, "[map] de-registered %d image(s) (few points or bogus camera), "
-                    "%u remain\n", dropped, rec_.numRegistered());
+            slog::diag(slog::Tag::Map,
+                       "[map] de-registered %d image(s) (few points or bogus camera), "
+                       "%u remain", dropped, rec_.numRegistered());
     }
 
     // Fuse two 3D points that a correspondence says are the same feature

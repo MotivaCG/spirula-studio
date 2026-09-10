@@ -163,13 +163,13 @@ Variant axes follow the CUDA instantiation structure
 
 ### The lens-distortion tier (`kDistortion`)
 
-`CameraDistortionType` (0 None / 1 OpenCV / 2 ThinPrism / 3 Rational, see
+`CameraDistortionType` (0 None / 1 OpenCV / 2 ThinPrism, see
 `core/CameraModel.h`) is a Slang generic `D : ICameraDistortion` in
 `shaders/projection_utils.slang`. `backend/vulkan/shaders/dist_spec.slang`
 carries the glue: `load_dist_coeffs<D>` (a camera's prefix of the 8-float
 storage row), `pixel_ray<D>`, and the `SS_DISPATCH_DIST` /
 `SS_DISPATCH_CAM_DIST` macros that fold the constant — the latter covering
-only the eleven compiled (model, tier) pairs, with the rest falling through
+only the ten compiled (model, tier) pairs, with the rest falling through
 to the nearest compiled tier. Launchers reject an uncompiled pair up front
 (`vkk::cam_dist_spec`), so the fallthrough is never reached.
 
@@ -827,7 +827,7 @@ the engine level.
 - **Real-dataset training via CLI/GUI (phase 5 wrap-up)**: the
   `SS_BACKEND=vulkan` CMake branch now builds `spirula train` (always —
   it is this build's primary artifact, as in the CUDA no-torch build) and
-  the GUI (with `SS_BUILD_GUI=ON`), linking `csrc_portable` +
+  the GUI (unless `SS_BUILD_GUI=OFF`), linking `csrc_portable` +
   `ss_backend_vulkan` through the shared app-target section
   (`SS_APP_LIBS` selects the per-backend libraries). `spirula mesh` builds
   here too since the phase-6 meshing port. The app layer

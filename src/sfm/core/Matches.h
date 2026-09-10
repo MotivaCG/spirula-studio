@@ -201,6 +201,10 @@ inline MatchesDatabase readMatches(const std::string& path) {
 // GUI's match map is the caller: it needs every pair's size to draw, and one
 // pair's contents only when the cursor is over it.
 
+// A pair count of this means "pairs until the end of the file": the writer was
+// still appending when the file was made (sfm/core/Progress.h, live_matches.bin).
+inline constexpr uint32_t kStreamingPairs = 0xFFFFFFFFu;
+
 struct MatchesIndex {
     struct Entry {
         uint32_t image1 = 0, image2 = 0, count = 0;
@@ -237,20 +241,28 @@ inline bool indexMatches(const std::string& path, MatchesIndex& out) {
     }
     uint32_t npairs = 0;
     f.read((char*)&npairs, 4);
-    if (!f || (uint64_t)npairs * 16 > bytes) return false;
-    idx.pairs.reserve(npairs);
-    for (uint32_t i = 0; i < npairs; i++) {
+    const bool streaming = npairs == kStreamingPairs;
+    if (!f || (!streaming && (uint64_t)npairs * 16 > bytes)) return false;
+    if (!streaming) idx.pairs.reserve(npairs);
+    for (uint32_t i = 0; streaming || i < npairs; i++) {
         MatchesIndex::Entry e;
         int32_t config = 0;
         f.read((char*)&e.image1, 4);
         f.read((char*)&e.image2, 4);
         f.read((char*)&config, 4);
         f.read((char*)&e.count, 4);
-        if (!f) return false;
+        // Streaming stops at the tail the writer has not finished; a fixed
+        // count that runs out is a truncated file and stays an error.
+        if (!f) return streaming ? (out = std::move(idx), true) : false;
         e.offset = (uint64_t)f.tellg();
+        // seekg past the end does not fail until something is read, so the
+        // bound is checked here for both shapes: a short streaming file is a
+        // tail the writer has not finished, a short fixed one is truncated.
+        if (e.offset + (uint64_t)e.count * 8 > bytes)
+            return streaming ? (out = std::move(idx), true) : false;
         idx.pairs.push_back(e);
         f.seekg((std::streamoff)e.count * 8, std::ios::cur);
-        if (!f) return false;
+        if (!f) return streaming ? (out = std::move(idx), true) : false;
     }
     out = std::move(idx);
     return true;

@@ -449,6 +449,25 @@ std::string SfmConfig::finalize(uint32_t cmd) {
                std::to_string(lomaDescriptorDim(matcher)) + "-D descriptors and "
                "--features " + features + " makes " +
                std::to_string(lomaDescriptorDim(features)) + "-D ones";
+    // Two metric references would each claim the gauge, and the fit would be
+    // whichever the code happened to try first.
+    const bool gps = metric_gps != "none";
+    if (!metric_positions.empty() && gps)
+        return "--metric-positions and --metric-gps are two references for one "
+               "gauge; pass one";
+    if (gps && image_dir.empty() && !(cmd & CMD_AUTO))
+        return "--metric-gps reads each image's EXIF, so it needs --images";
+    // GPS is metres-accurate and a positions file is usually centimetres, so
+    // one default cannot serve both; 0 means "the one for this source".
+    if (metric_max_error == 0)
+        metric_max_error = gps ? 5.0 : 0.5;
+    if (!telemetry.empty()) {
+        bool listed = false;
+        for (const TelemetryInput& t : telemetry_inputs)
+            if (t.prefix.empty() && t.path == telemetry) listed = true;
+        if (!listed) telemetry_inputs.push_back({"", telemetry, 0, 0});
+    }
+
     lightglue.device = device;
     loma.device = loma_match.device = device;
     if (max_image_size <= 0) max_image_size = defaultMaxImageSize(features);

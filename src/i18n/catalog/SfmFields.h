@@ -3200,6 +3200,191 @@ SS_MSG(quiet_help,
     RU("Печатать только строки результата, без прогресса по стадиям"),
     TR("Yalnızca sonuç satırlarını yazdır, aşama aşama ilerlemeyi değil"));
 
+SS_MSG(metric_positions_help,
+    EN("Write the model in the metric frame of these camera positions (one "
+       "`image_name X Y Z` per line, metres); a failed fit is reported and the model is "
+       "written un-scaled"),
+    JA("この camera 位置ファイル (1 行につき `image_name X Y Z`、メートル) のメートル座標系で"
+       "モデルを書き出します。当てはめに失敗した場合は報告し、縮尺なしで書き出します"),
+    ZH_HANS("按这些相机位置 (每行 `image_name X Y Z`，单位米) 的米制坐标系写出模型; 拟合失败会"
+            "报告，并按未缩放写出"),
+    ZH_HANT("按這些相機位置 (每行 `image_name X Y Z`，單位公尺) 的公尺座標系寫出模型; 擬合失敗"
+            "會回報，並按未縮放寫出"),
+    KO("이 카메라 위치 (한 줄에 `image_name X Y Z`, 미터) 의 미터 좌표계로 모델을 씁니다. "
+       "맞춤에 실패하면 보고하고 배율 없이 씁니다"),
+    DE("Das Modell im metrischen Rahmen dieser Kamerapositionen schreiben (je Zeile "
+       "`image_name X Y Z`, Meter); eine gescheiterte Anpassung wird gemeldet und das "
+       "Modell unskaliert geschrieben"),
+    FR("Écrire le modèle dans le repère métrique de ces positions de caméra (une ligne "
+       "`image_name X Y Z`, en mètres) ; un ajustement raté est signalé et le modèle est "
+       "écrit sans mise à l'échelle"),
+    ES("Escribir el modelo en el marco métrico de estas posiciones de cámara (una línea "
+       "`image_name X Y Z`, en metros); un ajuste fallido se informa y el modelo se "
+       "escribe sin escalar"),
+    PT("Escrever o modelo no referencial métrico destas posições de câmera (uma linha "
+       "`image_name X Y Z`, em metros); um ajuste falhado é relatado e o modelo é escrito "
+       "sem escala"),
+    IT("Scrivere il modello nel sistema metrico di queste posizioni di camera (una riga "
+       "`image_name X Y Z`, in metri); una stima fallita viene segnalata e il modello "
+       "scritto senza scala"),
+    NL("Het model schrijven in het metrische stelsel van deze cameraposities (per regel "
+       "`image_name X Y Z`, meters); een mislukte fit wordt gemeld en het model ongeschaald "
+       "geschreven"),
+    RU("Записать модель в метрической системе этих позиций камер (по строке "
+       "`image_name X Y Z`, метры); неудачная подгонка сообщается, и модель пишется "
+       "без масштабирования"),
+    TR("Modeli bu kamera konumlarının metrik çerçevesinde yaz (satır başına "
+       "`image_name X Y Z`, metre); başarısız uyum bildirilir ve model ölçeklenmeden yazılır"));
+
+SS_MSG(metric_gps_help,
+    EN("Fit a local east-north-up metre frame to the images' EXIF GPS: `horizontal` reads "
+       "latitude and longitude and leaves the tilt to the cameras' own up axis, `full` reads "
+       "altitude too; accuracy is a few metres, so the capture must be tens of metres across"),
+    JA("画像の EXIF GPS にローカルな東北上メートル座標系を当てはめます。`horizontal` は"
+       "緯度と経度だけを読み、傾きはカメラ自身の上方向に任せます。`full` は高度も読みます。"
+       "精度は数メートルなので、撮影範囲は数十メートル必要です"),
+    ZH_HANS("按图像 EXIF GPS 拟合本地东北天米制坐标系: `horizontal` 只读经纬度，倾斜交给相机"
+            "自身的上方向; `full` 连高度一起读。精度只有几米，所以采集范围要有几十米"),
+    ZH_HANT("按影像 EXIF GPS 擬合本地東北天公尺座標系: `horizontal` 只讀經緯度，傾斜交給相機"
+            "自身的上方向; `full` 連高度一起讀。精度只有幾公尺，所以拍攝範圍要有數十公尺"),
+    KO("이미지의 EXIF GPS 에 지역 동북상 미터 좌표계를 맞춥니다. `horizontal` 은 위도와 경도만 "
+       "읽고 기울기는 카메라 자신의 위 방향에 맡기며, `full` 은 고도까지 읽습니다. 정확도가 "
+       "수 미터라 촬영 범위가 수십 미터는 되어야 합니다"),
+    DE("Einen lokalen Ost-Nord-Oben-Meterrahmen an das EXIF-GPS der Bilder anpassen: "
+       "`horizontal` liest Breite und Länge und überlässt die Neigung der eigenen Hochachse "
+       "der Kameras, `full` liest auch die Höhe; die Genauigkeit liegt bei einigen Metern, "
+       "die Aufnahme muss also zehner Meter groß sein"),
+    FR("Ajuster un repère local est-nord-haut en mètres au GPS EXIF des images : `horizontal` "
+       "lit la latitude et la longitude et laisse l'inclinaison à l'axe vertical des caméras, "
+       "`full` lit aussi l'altitude ; la précision est de quelques mètres, la prise doit donc "
+       "faire des dizaines de mètres"),
+    ES("Ajustar un marco local este-norte-arriba en metros al GPS EXIF de las imágenes: "
+       "`horizontal` lee latitud y longitud y deja la inclinación al eje vertical de las "
+       "cámaras, `full` lee también la altitud; la precisión es de unos metros, así que la "
+       "toma debe medir decenas de metros"),
+    PT("Ajustar um referencial local este-norte-cima em metros ao GPS EXIF das imagens: "
+       "`horizontal` lê latitude e longitude e deixa a inclinação ao eixo vertical das "
+       "câmeras, `full` lê também a altitude; a precisão é de alguns metros, por isso a "
+       "captura tem de ter dezenas de metros"),
+    IT("Stimare un sistema locale est-nord-alto in metri dal GPS EXIF delle immagini: "
+       "`horizontal` legge latitudine e longitudine e lascia l'inclinazione all'asse "
+       "verticale delle camere, `full` legge anche la quota; la precisione è di alcuni metri, "
+       "quindi la ripresa deve misurare decine di metri"),
+    NL("Een lokaal oost-noord-omhoog meterstelsel op de EXIF-GPS van de beelden fitten: "
+       "`horizontal` leest breedte en lengte en laat de kanteling aan de eigen verticale as "
+       "van de camera's, `full` leest ook de hoogte; de nauwkeurigheid is enkele meters, dus "
+       "de opname moet tientallen meters groot zijn"),
+    RU("Подогнать локальную метровую систему восток-север-верх к GPS из EXIF снимков: "
+       "`horizontal` читает широту и долготу, а наклон оставляет собственной вертикали камер, "
+       "`full` читает и высоту; точность в несколько метров, поэтому съёмка должна быть "
+       "десятки метров"),
+    TR("Görüntülerin EXIF GPS'ine yerel bir doğu-kuzey-yukarı metre çerçevesi oturt: "
+       "`horizontal` enlem ve boylamı okur, eğimi kameraların kendi yukarı eksenine bırakır; "
+       "`full` yüksekliği de okur; doğruluk birkaç metre olduğundan çekim onlarca metre "
+       "olmalı"));
+
+SS_MSG(metric_max_error_help,
+    EN("Cameras farther than this many metres from the fitted position are outliers; 0 "
+       "chooses 5 for GPS and 0.5 for a positions file"),
+    JA("当てはめ位置からこのメートル数より離れたカメラを外れ値とします。0 なら GPS で 5、"
+       "位置ファイルで 0.5 を選びます"),
+    ZH_HANS("离拟合位置超过这么多米的相机算作外点; 0 表示 GPS 取 5、位置文件取 0.5"),
+    ZH_HANT("離擬合位置超過這麼多公尺的相機算作外點; 0 表示 GPS 取 5、位置檔取 0.5"),
+    KO("맞춘 위치에서 이 미터 수보다 먼 카메라는 이상치로 봅니다. 0 이면 GPS 는 5, 위치 파일은 "
+       "0.5 를 씁니다"),
+    DE("Kameras weiter als so viele Meter von der angepassten Position sind Ausreißer; 0 "
+       "wählt 5 für GPS und 0,5 für eine Positionsdatei"),
+    FR("Les caméras à plus de tant de mètres de la position ajustée sont aberrantes ; 0 "
+       "choisit 5 pour le GPS et 0,5 pour un fichier de positions"),
+    ES("Las cámaras a más de tantos metros de la posición ajustada son atípicas; 0 elige 5 "
+       "para GPS y 0,5 para un archivo de posiciones"),
+    PT("Câmeras a mais do que estes metros da posição ajustada são atípicas; 0 escolhe 5 "
+       "para GPS e 0,5 para um ficheiro de posições"),
+    IT("Le camere oltre questi metri dalla posizione stimata sono anomale; 0 sceglie 5 per "
+       "il GPS e 0,5 per un file di posizioni"),
+    NL("Camera's verder dan zoveel meter van de gefitte positie zijn uitschieters; 0 kiest 5 "
+       "voor GPS en 0,5 voor een positiebestand"),
+    RU("Камеры дальше такого числа метров от подогнанной позиции считаются выбросами; 0 "
+       "выбирает 5 для GPS и 0,5 для файла позиций"),
+    TR("Oturtulan konumdan bu kadar metreden uzak kameralar aykırıdır; 0, GPS için 5 ve "
+       "konum dosyası için 0,5 seçer"));
+
+SS_MSG(telemetry_help,
+    EN("A video whose IMU and GPS cover the images (Insta360 .insv, GoPro .360/.mp4, DJI .OSV, "
+       "CAMM): up comes from the accelerometer, scale from the accelerometer and the GPS log, "
+       "heading and place from the GPS. Frame names must carry the source frame index, as the "
+       "extractor writes them. A manifest lists one per camera group"),
+    JA("画像を記録した IMU と GPS 付きの動画 (Insta360 .insv、GoPro .360/.mp4、DJI .OSV、CAMM)。"
+       "上方向は加速度計から、縮尺は加速度計と GPS ログから、方位と位置は GPS から求めます。"
+       "フレーム名には抽出時に付く元のフレーム番号が必要です。マニフェストならカメラグループごとに指定できます"),
+    ZH_HANS("记录了这些图像的、带 IMU 和 GPS 的视频 (Insta360 .insv、GoPro .360/.mp4、DJI .OSV、CAMM): "
+            "上方向来自加速度计，缩放来自加速度计和 GPS 记录，朝向和位置来自 GPS。帧文件名须含"
+            "提取器写入的源帧序号。清单可以按相机分组各给一个"),
+    ZH_HANT("記錄了這些影像的、帶 IMU 和 GPS 的影片 (Insta360 .insv、GoPro .360/.mp4、DJI .OSV、CAMM): "
+            "上方向來自加速度計，縮放來自加速度計和 GPS 記錄，朝向和位置來自 GPS。幀檔名須含"
+            "擷取器寫入的來源幀序號。清單可以按相機分組各給一個"),
+    KO("이미지를 담은, IMU 와 GPS 가 있는 영상 (Insta360 .insv, GoPro .360/.mp4, DJI .OSV, CAMM). "
+       "위 방향은 가속도계에서, 축척은 가속도계와 GPS 로그에서, 방위와 위치는 GPS 에서 구합니다. "
+       "프레임 이름에는 추출기가 쓰는 원본 프레임 번호가 있어야 합니다. 매니페스트는 카메라 그룹마다 하나씩 적을 수 있습니다"),
+    DE("Ein Video, dessen IMU und GPS die Bilder abdecken (Insta360 .insv, GoPro .360/.mp4, DJI .OSV, "
+       "CAMM): oben aus dem Beschleunigungssensor, Maßstab aus Beschleunigungssensor und GPS-Log, "
+       "Richtung und Ort aus dem GPS. Frame-Namen müssen den Quell-Frameindex tragen, wie der "
+       "Extraktor sie schreibt. Ein Manifest nennt eines je Kameragruppe"),
+    FR("Une vidéo dont l'IMU et le GPS couvrent les images (Insta360 .insv, GoPro .360/.mp4, DJI .OSV, "
+       "CAMM) : la verticale vient de l'accéléromètre, l'échelle de l'accéléromètre et du journal GPS, "
+       "le cap et la position du GPS. Les noms d'images doivent porter l'index de la trame source, "
+       "tel que l'extracteur les écrit. Un manifeste en liste une par groupe de caméras"),
+    ES("Un vídeo cuya IMU y GPS cubren las imágenes (Insta360 .insv, GoPro .360/.mp4, DJI .OSV, CAMM): "
+       "la vertical sale del acelerómetro, la escala del acelerómetro y del registro GPS, el rumbo y "
+       "la posición del GPS. Los nombres de fotograma deben llevar el índice de origen, tal como los "
+       "escribe el extractor. Un manifiesto lista uno por grupo de cámaras"),
+    PT("Um vídeo cuja IMU e GPS cobrem as imagens (Insta360 .insv, GoPro .360/.mp4, DJI .OSV, CAMM): "
+       "a vertical vem do acelerómetro, a escala do acelerómetro e do registo GPS, o rumo e a posição "
+       "do GPS. Os nomes das imagens têm de trazer o índice de origem, tal como o extrator os escreve. "
+       "Um manifesto lista um por grupo de câmeras"),
+    IT("Un video la cui IMU e GPS coprono le immagini (Insta360 .insv, GoPro .360/.mp4, DJI .OSV, CAMM): "
+       "la verticale viene dall'accelerometro, la scala dall'accelerometro e dal log GPS, la rotta e la "
+       "posizione dal GPS. I nomi dei fotogrammi devono portare l'indice sorgente, come li scrive "
+       "l'estrattore. Un manifesto ne elenca uno per gruppo di camere"),
+    NL("Een video waarvan IMU en GPS de beelden dekken (Insta360 .insv, GoPro .360/.mp4, DJI .OSV, CAMM): "
+       "omhoog komt uit de versnellingsmeter, schaal uit versnellingsmeter en GPS-log, koers en plaats "
+       "uit de GPS. Framenamen moeten de bronframe-index dragen zoals de extractor ze schrijft. Een "
+       "manifest noemt er een per cameragroep"),
+    RU("Видео, чьи IMU и GPS покрывают снимки (Insta360 .insv, GoPro .360/.mp4, DJI .OSV, CAMM): верх "
+       "по акселерометру, масштаб по акселерометру и журналу GPS, курс и место по GPS. Имена кадров "
+       "должны нести индекс исходного кадра, как их пишет экстрактор. Манифест задаёт по одному на "
+       "группу камер"),
+    TR("IMU ve GPS'i görüntüleri kapsayan bir video (Insta360 .insv, GoPro .360/.mp4, DJI .OSV, CAMM): "
+       "yukarı ivmeölçerden, ölçek ivmeölçer ile GPS kaydından, yön ve konum GPS'ten gelir. Kare "
+       "adları çıkarıcının yazdığı kaynak kare indeksini taşımalı. Bir manifest kamera grubu başına "
+       "bir tane listeler"));
+
+SS_MSG(sensor_gauge_help,
+    EN("What the telemetry fixes: `auto` takes up, scale and place from whatever passes its checks, "
+       "`up` the orientation alone, `none` ignores the sensors"),
+    JA("テレメトリで決めるもの: `auto` は検査を通ったものから上方向・縮尺・位置を、`up` は向きだけを"
+       "決め、`none` はセンサーを無視します"),
+    ZH_HANS("遥测决定什么: `auto` 从通过检查的来源取上方向、缩放和位置，`up` 只取朝向，`none` 忽略传感器"),
+    ZH_HANT("遙測決定什麼: `auto` 從通過檢查的來源取上方向、縮放和位置，`up` 只取朝向，`none` 忽略感測器"),
+    KO("텔레메트리로 정하는 것: `auto` 는 검사를 통과한 것에서 위 방향·축척·위치를, `up` 은 방향만 "
+       "정하고, `none` 은 센서를 무시합니다"),
+    DE("Was die Telemetrie festlegt: `auto` nimmt oben, Maßstab und Ort aus allem, was seine "
+       "Prüfungen besteht, `up` nur die Ausrichtung, `none` ignoriert die Sensoren"),
+    FR("Ce que la télémétrie fixe : `auto` prend la verticale, l'échelle et la position de tout ce "
+       "qui passe ses contrôles, `up` l'orientation seule, `none` ignore les capteurs"),
+    ES("Qué fija la telemetría: `auto` toma vertical, escala y posición de lo que pase sus "
+       "comprobaciones, `up` solo la orientación, `none` ignora los sensores"),
+    PT("O que a telemetria fixa: `auto` toma vertical, escala e posição do que passar as suas "
+       "verificações, `up` só a orientação, `none` ignora os sensores"),
+    IT("Cosa fissa la telemetria: `auto` prende verticale, scala e posizione da ciò che supera i "
+       "suoi controlli, `up` solo l'orientamento, `none` ignora i sensori"),
+    NL("Wat de telemetrie vastlegt: `auto` neemt omhoog, schaal en plaats uit alles wat de controles "
+       "doorstaat, `up` alleen de oriëntatie, `none` negeert de sensoren"),
+    RU("Что задаёт телеметрия: `auto` берёт верх, масштаб и место из всего, что прошло проверки, "
+       "`up` только ориентацию, `none` игнорирует датчики"),
+    TR("Telemetrinin belirlediği: `auto` denetimlerini geçen her şeyden yukarı, ölçek ve konumu, "
+       "`up` yalnızca yönü alır, `none` sensörleri yok sayar"));
+
 }  // namespace sfmfield
 }  // namespace msg
 }  // namespace i18n

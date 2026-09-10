@@ -51,7 +51,6 @@ inline const char* camera_distortion_to_string(CameraDistortionType d) {
         case CameraDistortionType::None:      return "NONE";
         case CameraDistortionType::OpenCV:    return "OPENCV";
         case CameraDistortionType::ThinPrism: return "THIN_PRISM";
-        case CameraDistortionType::Rational:  return "RATIONAL";
         default:                              return "UNKNOWN";
     }
 }

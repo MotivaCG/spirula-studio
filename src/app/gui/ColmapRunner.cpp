@@ -4,6 +4,8 @@
 
 #include "app/gui/ColmapRunner.h"
 
+#include "app/gui/ReconStamp.h"
+
 #include "i18n/catalog/Log.h"
 #include "app/AppPaths.h"
 #include "app/gui/DatasetPrep.h"
@@ -83,26 +85,26 @@ bool is_fisheye_model(const std::string& m) {
 
 // The images one camera can cover: the folder --camera-mode asked for, split
 // by frame size, since a principal point is not shared across sizes.
-struct CameraGroup {
+struct SizeGroup {
     std::string folder;   // empty under one shared camera
     int w = 0, h = 0;
     std::vector<std::string> names;
 };
 
-std::vector<CameraGroup> camera_groups(
+std::vector<SizeGroup> size_groups(
         const std::vector<DatasetPrep::ImageSize>& images, bool per_folder) {
-    std::vector<CameraGroup> out;
+    std::vector<SizeGroup> out;
     for (const DatasetPrep::ImageSize& im : images) {
         std::string folder;
         if (per_folder) {
             const size_t slash = im.name.find_last_of('/');
             if (slash != std::string::npos) folder = im.name.substr(0, slash);
         }
-        CameraGroup* g = nullptr;
-        for (CameraGroup& c : out)
+        SizeGroup* g = nullptr;
+        for (SizeGroup& c : out)
             if (c.folder == folder && c.w == im.w && c.h == im.h) { g = &c; break; }
         if (!g) {
-            out.push_back(CameraGroup{folder, im.w, im.h, {}});
+            out.push_back(SizeGroup{folder, im.w, im.h, {}});
             g = &out.back();
         }
         g->names.push_back(im.name);
@@ -326,6 +328,47 @@ double ColmapRunner::model_reproj_error(const ColmapJob& job,
     return err;
 }
 
+// What the model is made of, in a stable order, for the stamp left beside it
+// (ReconStamp.h). Not COLMAP's own command line -- this path spends several of
+// them; what matters is that the same panel produces the same list.
+static std::vector<std::string> colmap_recon_args(const ColmapJob& job) {
+    auto num = [](double v) {
+        char b[32];
+        std::snprintf(b, sizeof b, "%g", v);
+        return std::string(b);
+    };
+    auto flag = [](bool v) { return std::string(v ? "1" : "0"); };
+    return {
+        "--camera-model", job.camera_model,
+        "--camera-mode", std::to_string(job.camera_mode),
+        "--camera-params", job.camera_params,
+        "--focal-factor", num(job.init_focal_factor),
+        "--features", job.feature_type == 1 ? "aliked" : "sift",
+        "--lightglue", flag(job.lightglue),
+        "--quality", std::to_string(job.quality),
+        "--matcher", std::to_string(job.matcher),
+        "--loop-closure", flag(job.seq_loop_closure),
+        "--overlap", std::to_string(job.seq_overlap),
+        "--quadratic-overlap", flag(job.seq_quadratic_overlap),
+        "--max-features", std::to_string(job.max_num_features),
+        "--max-image-size", std::to_string(job.max_image_size),
+        "--affine-shape", flag(job.estimate_affine_shape),
+        "--ba-gpu", flag(job.ba_use_gpu),
+        "--extra-params", std::to_string(job.mapper_extra_params),
+        "--min-matches", std::to_string(job.min_num_matches),
+        "--max-ratio", num(job.match_max_ratio),
+        "--min-inliers", std::to_string(job.min_inliers_per_pair),
+        "--abs-pose-inliers", std::to_string(job.abs_pose_min_num_inliers),
+        "--abs-pose-inlier-ratio", num(job.abs_pose_min_inlier_ratio),
+        "--abs-pose-error", num(job.abs_pose_max_error),
+        "--merge-models", flag(job.merge_models),
+        "--final-ba", flag(job.final_bundle_adjust),
+        "--vocab-tree", job.vocab_tree_path,
+        "--masks", flag(job.mask_enable),
+        "--mask-prompt", job.mask_enable ? job.mask_prompt : std::string(),
+    };
+}
+
 void ColmapRunner::run(ColmapJob job) {
     auto fail = [&](const std::string& why) {
         _prog.finish(_cancel.load() ? StageStatus::Skipped : StageStatus::Failed);
@@ -341,7 +384,18 @@ void ColmapRunner::run(ColmapJob job) {
         // insisted on; a model already there is reused whoever made it, and the
         // input's own images are not leftovers (see SfmRunner).
         const WorkspaceState prior = probe_workspace(ws.string(), job.inputs);
-        const bool reuse_model = prior.model && !job.redo_model;
+        // The model, as the settings that make it, against the ones the model
+        // already there was made with. A model with no stamp came from
+        // somewhere else and is reused whatever the panel says.
+        ReconStamp now;
+        now.present = true;
+        now.engine = "colmap";
+        now.args = colmap_recon_args(job);
+        const std::string changed =
+            recon_stamp_change(read_recon_stamp(ws.string()), now);
+        const bool reuse_model = prior.model && !job.redo_model && changed.empty();
+        if (prior.model && !job.redo_model && !changed.empty())
+            log(spirula::i18n::format(lmsg::sfm_settings_changed, {changed}));
         if (prior.resumable() && !job.resume)
             return fail("the workspace already contains an unfinished run "
                         "(database.db / extracted frames / masks); enable "
@@ -365,8 +419,10 @@ void ColmapRunner::run(ColmapJob job) {
             pj.resume = job.resume;
             pj.redo_frames = job.redo_frames;
             pj.redo_masks = job.redo_masks;
+            pj.photo_import = job.photo_import;
             pj.video_fps = job.video_fps;
             pj.sharp_window = job.sharp_window;
+            pj.pano = job.pano;
             pj.max_frames = job.max_frames;
             pj.ffmpeg_exe = job.ffmpeg_exe;
             pj.force_external_decode = job.force_external_decode;
@@ -448,14 +504,14 @@ void ColmapRunner::run(ColmapJob job) {
             // COLMAP's ImageReader drops every image whose frame size differs
             // from the first in its camera group -- one warning per image, exit
             // code 0, half a capture missing. Split by size here instead.
-            std::vector<CameraGroup> groups;
+            std::vector<SizeGroup> groups;
             size_t folders = 0;
             if (job.camera_mode == 0 || job.camera_mode == 1) {
-                groups = camera_groups(
+                groups = size_groups(
                     DatasetPrep::image_sizes(images, prep.mask_dir),
                     job.camera_mode == 1);
                 std::set<std::string> seen;
-                for (const CameraGroup& g : groups) seen.insert(g.folder);
+                for (const SizeGroup& g : groups) seen.insert(g.folder);
                 folders = seen.size();
             }
             const bool split_sizes = groups.size() > folders;
@@ -465,6 +521,9 @@ void ColmapRunner::run(ColmapJob job) {
 
             // ---- 3. feature extraction -----------------------------------------
             take_reconstruction(job);
+            // Live edits and the per-folder camera fix-up land after the reuse
+            // question was asked; the stamp has to record what actually ran.
+            now.args = colmap_recon_args(job);
             set_stage(Stage::Features,
                       aliked ? lmsg::stage_colmap_features_aliked.get()
                              : lmsg::stage_colmap_features.get());
@@ -683,7 +742,7 @@ void ColmapRunner::run(ColmapJob job) {
             // one is from a FINISHED run -- reuse it. An interrupted mapper
             // leaves nothing and simply reruns.
             std::vector<std::pair<int64_t, fs::path>> models;
-            if (job.resume && !job.redo_model &&
+            if (job.resume && !job.redo_model && changed.empty() &&
                 !(models = enumerate_models()).empty()) {
                 log("Resume: " + std::to_string(models.size()) +
                     " existing model(s) under sparse/; skipping the mapper "
@@ -799,6 +858,8 @@ void ColmapRunner::run(ColmapJob job) {
             }
         }
 
+        if (!reuse_model) write_recon_stamp(ws.string(), now);
+
         // ---- depth and normals ---------------------------------------------
         take_geometry(job);
         if (job.geometry.enable) {
@@ -812,10 +873,9 @@ void ColmapRunner::run(ColmapJob job) {
         // in-memory for the immediate open; on later re-opens the parser
         // default applies (video datasets use images/ anyway) and photo-in-
         // place datasets need data.image_dir set in the dataparser options.
-        if (reads_photos_in_place(job.inputs))
-            log("Note: images are referenced in place; when re-opening this "
-                "dataset later, set image_dir to " + image_dir_cfg +
-                " under the dataset-parsing options");
+        if (reads_photos_in_place(job.inputs, job.photo_import))
+            log(spirula::i18n::format(lmsg::photos_referenced_in_place,
+                                      {image_dir_cfg}));
 
         set_stage(Stage::Finishing, lmsg::stage_done.get());
         _prog.finish(StageStatus::Done);

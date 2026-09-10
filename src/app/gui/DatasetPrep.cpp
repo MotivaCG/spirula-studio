@@ -2,6 +2,8 @@
 
 #include "app/gui/DatasetPrep.h"
 
+#include "app/gui/ReconStamp.h"
+
 #include "i18n/catalog/Log.h"
 
 #include "app/gui/FrameSelect.h"
@@ -10,7 +12,8 @@
 #include "app_generated/mask_py.h"   // kMaskPy[], from reference/scripts/mask.py
 
 #include "core/ExrImage.h"
-#include "external/stb_image.h"      // stbi_info (image size probe)
+#include "external/stb_image.h"      // stbi_info (image size probe), stbi_load
+#include "external/stb_image_write.h"  // stbi_write_jpg (the photo re-encode)
 
 #ifdef SS_BUILD_SAM
 #include "app/WriterPool.h"
@@ -36,10 +39,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <thread>
 
 namespace fs = std::filesystem;
@@ -214,11 +219,16 @@ public:
     ImagePrefetch(const ImagePrefetch&) = delete;
     ImagePrefetch& operator=(const ImagePrefetch&) = delete;
 
-    // The next file in the order given; empty when it could not be read.
-    // Called at most once per file, so it cannot outrun the reader.
+    // The next file in the order given; empty when it could not be read or the
+    // reader stopped early. What the reader threw is rethrown here instead,
+    // this being the thread with somewhere to report it.
     nn::Image take() {
         std::unique_lock<std::mutex> lk(_mu);
-        _ready.wait(lk, [this] { return !_queue.empty(); });
+        _ready.wait(lk, [this] { return !_queue.empty() || _done; });
+        if (_queue.empty()) {
+            if (_err) std::rethrow_exception(_err);
+            return nn::Image();
+        }
         nn::Image img = std::move(_queue.front());
         _queue.pop_front();
         _space.notify_one();
@@ -231,15 +241,25 @@ private:
     static constexpr size_t kDepth = 2;
 
     void run() {
-        for (const fs::path& f : _files) {
-            if (_cancel.load()) break;
-            nn::Image img = nn::load_image(f.string(), _gamut, _is_linear);
-            std::unique_lock<std::mutex> lk(_mu);
-            _space.wait(lk, [this] { return _queue.size() < kDepth || _stop; });
-            if (_stop) return;
-            _queue.push_back(std::move(img));
-            _ready.notify_one();
+        try {
+            for (const fs::path& f : _files) {
+                if (_cancel.load()) break;
+                nn::Image img = nn::load_image(f.string(), _gamut, _is_linear);
+                std::unique_lock<std::mutex> lk(_mu);
+                _space.wait(lk, [this] { return _queue.size() < kDepth || _stop; });
+                if (_stop) break;
+                _queue.push_back(std::move(img));
+                _ready.notify_one();
+            }
+        } catch (...) {
+            std::lock_guard<std::mutex> lk(_mu);
+            _err = std::current_exception();
         }
+        {
+            std::lock_guard<std::mutex> lk(_mu);
+            _done = true;
+        }
+        _ready.notify_all();
     }
 
     std::vector<fs::path> _files;
@@ -250,6 +270,10 @@ private:
     std::mutex _mu;
     std::condition_variable _ready, _space;
     bool _stop = false;
+    // The reader is gone. Without it a take() the reader cancelled out from
+    // under waits on a queue nothing will ever fill again.
+    bool _done = false;
+    std::exception_ptr _err;
     std::thread _worker;
 };
 
@@ -472,6 +496,10 @@ bool is_dual_fisheye_path(const std::string& path) {
     return lower_ext(path) == ".insv" || lower_ext(path) == ".osv";
 }
 
+bool is_pano360_path(const std::string& path) {
+    return lower_ext(path) == ".360";
+}
+
 // ---------------------------------------------------------------------------
 // The ffmpeg fallback, on its own
 // ---------------------------------------------------------------------------
@@ -504,7 +532,8 @@ bool ffmpeg_probe_video(const std::string& ffmpeg_exe, const std::string& path,
                     // The frame size off the same line. The 16-pixel floor is
                     // what rejects the fourcc ("0x31637661"), which is also
                     // digits on both sides of an x.
-                    for (size_t i = 1; i + 1 < line.size() && !out.width; i++) {
+                    int lw = 0, lh = 0;
+                    for (size_t i = 1; i + 1 < line.size() && !lw; i++) {
                         if (line[i] != 'x') continue;
                         size_t b = i, e = i + 1;
                         while (b > 0 && std::isdigit((unsigned char)line[b - 1])) b--;
@@ -512,7 +541,11 @@ bool ffmpeg_probe_video(const std::string& ffmpeg_exe, const std::string& path,
                         if (b == i || e == i + 1) continue;
                         const int w = std::atoi(line.c_str() + b);
                         const int h = std::atoi(line.c_str() + i + 1);
-                        if (w >= 16 && h >= 16) { out.width = w; out.height = h; }
+                        if (w >= 16 && h >= 16) { lw = w; lh = h; }
+                    }
+                    if (lw > 0) {
+                        out.tracks.emplace_back(lw, lh);
+                        if (out.width == 0) { out.width = lw; out.height = lh; }
                     }
                     size_t b = f;
                     while (b > 0 && (std::isdigit((unsigned char)line[b - 1]) ||
@@ -551,6 +584,27 @@ bool ffmpeg_extract_frame(const std::string& ffmpeg_exe, const std::string& vide
     return fs::exists(out_path, ec) && fs::file_size(out_path, ec) > 0;
 }
 
+app::Eac360Layout probe_eac360(const std::string& ffmpeg_exe,
+                               const std::string& path,
+                               const std::atomic<bool>& cancel) {
+    app::Eac360Layout layout;
+    std::vector<std::pair<int, int>> tracks;
+#ifdef SS_HAVE_VIDEO
+    {
+        std::string err;
+        tracks = app::video_track_sizes(path, err);
+    }
+#endif
+    if (tracks.empty()) {
+        VideoFacts facts;
+        if (ffmpeg_probe_video(ffmpeg_exe, path, facts, cancel))
+            tracks = facts.tracks;
+    }
+    if (tracks.size() == 2 && tracks[0] == tracks[1])
+        app::eac360_detect(2, tracks[0].first, tracks[0].second, layout);
+    return layout;
+}
+
 namespace {
 
 // The last component, without a trailing separator ("a/b/" -> "b").
@@ -580,18 +634,71 @@ bool any_image(const fs::path& p) {
 
 bool folder_has_images(const std::string& dir) { return any_image(dir); }
 
-std::vector<std::string> camera_subfolders(const std::string& dir) {
-    std::vector<std::string> out;
+namespace {
+
+// Recursion for camera_subfolders. Collects the folder itself when it holds an
+// image directly, then descends -- one readdir per folder, which is what
+// answering both questions at once costs.
+void collect_image_folders(const fs::path& dir, const std::string& rel, int depth,
+                           std::vector<std::string>& out) {
+    if (out.size() >= kMaxCameraFolders) return;
+    std::vector<fs::path> sub;
+    bool here = false;
     std::error_code ec;
-    // One level only, and any_image stops at the first hit, so this stays cheap
-    // enough for the draw that asks it.
     for (fs::directory_iterator it(dir, kWalk, ec), end; !ec && it != end;
          it.increment(ec)) {
-        if (!it->is_directory(ec)) continue;
-        if (is_mask_folder(it->path().string())) continue;
-        if (any_image(it->path())) out.push_back(it->path().filename().string());
+        if (it->is_directory(ec)) {
+            if (!is_mask_folder(it->path().string())) sub.push_back(it->path());
+        } else if (!here && it->is_regular_file(ec) && is_image_file(it->path())) {
+            here = true;
+        }
     }
-    std::sort(out.begin(), out.end());
+    if (here) out.push_back(rel);
+    if (depth >= kMaxCameraFolderDepth) return;
+    std::sort(sub.begin(), sub.end());
+    for (const fs::path& s : sub)
+        collect_image_folders(s, rel.empty() ? s.filename().string()
+                                             : rel + "/" + s.filename().string(),
+                              depth + 1, out);
+}
+
+}  // namespace
+
+std::vector<std::string> camera_subfolders(const std::string& dir) {
+    std::vector<std::string> out;
+    collect_image_folders(dir, "", 0, out);
+    return out;
+}
+
+std::vector<CameraGroup> camera_groups(const std::vector<PrepInput>& inputs) {
+    std::vector<CameraGroup> out;
+    for (size_t i = 0; i < inputs.size(); i++) {
+        const PrepInput& in = inputs[i];
+        if (in.subcameras.empty()) {
+            out.push_back({i, -1, in.subdir});
+            continue;
+        }
+        for (size_t k = 0; k < in.subcameras.size(); k++) {
+            const std::string& rel = in.subcameras[k].rel;
+            std::string full = in.subdir;
+            if (!rel.empty()) full = full.empty() ? rel : full + "/" + rel;
+            out.push_back({i, (int)k, full});
+        }
+    }
+    return out;
+}
+
+std::vector<std::string> camera_group_models(const std::vector<PrepInput>& inputs,
+                                             const std::vector<CameraGroup>& groups,
+                                             const std::string& fallback) {
+    std::vector<std::string> out;
+    out.reserve(groups.size());
+    std::string above = fallback;
+    for (const CameraGroup& g : groups) {
+        const std::string& m = group_model(inputs, g);
+        if (!m.empty()) above = m;
+        out.push_back(above);
+    }
     return out;
 }
 
@@ -620,6 +727,18 @@ bool folder_looks_like_dataset(const std::string& dir) {
     return metashape_export_here(p);
 }
 
+// A folder is the run's leftover only if the run would write it. When images/
+// or masks/ under the output IS an input, it is the capture.
+static bool is_input_folder(const fs::path& dir,
+                            const std::vector<PrepInput>& inputs, bool masks) {
+    std::error_code ec;
+    for (const PrepInput& in : inputs) {
+        const std::string& p = masks ? in.mask_dir : in.path;
+        if (!p.empty() && fs::equivalent(dir, p, ec)) return true;
+    }
+    return false;
+}
+
 WorkspaceState probe_workspace(const std::string& workspace,
                                const std::vector<PrepInput>& inputs) {
     WorkspaceState st;
@@ -627,14 +746,8 @@ WorkspaceState probe_workspace(const std::string& workspace,
     const fs::path ws(workspace);
     if (workspace.empty() || !fs::is_directory(ws, ec)) return st;
 
-    // A folder is the run's leftover only if the run would write it. When
-    // images/ or masks/ under the output IS an input, it is the capture.
     auto is_input = [&](const fs::path& dir, bool masks) {
-        for (const PrepInput& in : inputs) {
-            const std::string& p = masks ? in.mask_dir : in.path;
-            if (!p.empty() && fs::equivalent(dir, p, ec)) return true;
-        }
-        return false;
+        return is_input_folder(dir, inputs, masks);
     };
     auto has_content = [&](const fs::path& p) {
         return fs::is_directory(p, ec) && !fs::is_empty(p, ec);
@@ -651,7 +764,29 @@ WorkspaceState probe_workspace(const std::string& workspace,
                fs::exists(ws / "transforms.json", ec) ||
                metashape_export_here(ws);
     st.geometry = has_content(ws / "normals") || has_content(ws / "depths");
+    st.recon_stamp = fs::exists(ws / kReconStampFile, ec);
     return st;
+}
+
+std::vector<std::string> workspace_artifacts(const std::string& workspace,
+                                             const std::vector<PrepInput>& inputs) {
+    std::vector<std::string> out;
+    std::error_code ec;
+    const fs::path ws(workspace);
+    if (workspace.empty() || !fs::is_directory(ws, ec)) return out;
+
+    auto add = [&](const char* name) {
+        const fs::path p = ws / name;
+        if (fs::is_directory(p, ec) ? !fs::is_empty(p, ec) : fs::exists(p, ec))
+            out.push_back(p.string());
+    };
+    if (!is_input_folder(ws / "images", inputs, false)) add("images");
+    if (!is_input_folder(ws / "masks", inputs, true)) add("masks");
+    for (const char* name : {"features", "sparse", "colmap", "normals", "depths",
+                             ".progress", "matches.bin", "database.db",
+                             kReconStampFile})
+        add(name);
+    return out;
 }
 
 bool is_mask_folder(const std::string& path) {
@@ -683,9 +818,9 @@ void resolve_photo_folder(const std::string& picked, std::string& images,
 }
 
 std::string planned_image_dir(const std::vector<PrepInput>& inputs,
-                              const std::string& workspace) {
+                              const std::string& workspace, PhotoImport mode) {
     std::error_code ec;
-    if (reads_photos_in_place(inputs))
+    if (reads_photos_in_place(inputs, mode))
         return fs::absolute(inputs[0].path, ec).string();
     return workspace.empty() ? std::string()
                              : (fs::path(workspace) / "images").string();
@@ -788,21 +923,28 @@ int64_t DatasetPrep::estimate_frames(const PrepJob& job, const PrepInput& in,
     // The probe has to match the path the extraction will take: the two count
     // tracks differently, and ffmpeg resamples the video rather than stepping
     // through the frames the container holds.
+
+    // A 360 capture writes one image per view; its two tracks are one frame.
+    const int per_frame =
+        in.eac360.valid()
+            ? (int)app::pano360_views(in.eac360, job.pano).size()
+            : 0;
 #ifdef SS_HAVE_VIDEO
     if (!job.force_external_decode && backends().builtin_video) {
         std::string err;
-        const int tracks = app::video_track_count(in.path, err);
-        video::VideoReader r;
-        if (tracks > 0 && r.open(in.path))
-            return expected_frames(job, r.info().fps > 1.0 ? r.info().fps : 30.0,
-                                   r.info().frame_count, tracks);
+        video::VideoProbe probe;
+        if (video::probe_video(in.path, probe, err) && probe.tracks > 0)
+            return expected_frames(job, probe.fps > 1.0 ? probe.fps : 30.0,
+                                   probe.frame_count,
+                                   per_frame > 0 ? per_frame : probe.tracks);
     }
 #endif
     VideoFacts facts;
     if (ffmpeg_probe_video(job.ffmpeg_exe, in.path, facts, _cancel) &&
         facts.fps > 1.0)
         return expected_frames(job, facts.fps, facts.frames,
-                               is_dual_fisheye_path(in.path) ? 2 : 1);
+                               per_frame > 0 ? per_frame
+                                             : (is_dual_fisheye_path(in.path) ? 2 : 1));
     return 0;
 }
 
@@ -839,8 +981,8 @@ bool DatasetPrep::run(const PrepJob& job_in, PrepResult& out, std::string& error
     struct Prepared {
         std::string images, masks;      // absolute
         std::string images_rel, masks_rel;  // relative to the workspace
-        // This input's masks already exist: brought along by the input, or
-        // kept by a resumed run.
+        // This input's masks already exist: brought along by the input, taken
+        // from its alpha channel, or kept by a resumed run.
         bool have_masks = false;
         // Segmentation already intersected this input's stencil into them.
         bool stencil_folded = false;
@@ -858,7 +1000,7 @@ bool DatasetPrep::run(const PrepJob& job_in, PrepResult& out, std::string& error
     // a run that turned it off -- that is what --no-masks exists to say.
     bool want_masks = job.mask_enable;
 
-    if (reads_photos_in_place(job.inputs)) {
+    if (reads_photos_in_place(job.inputs, job.photo_import)) {
         // Photos are referenced where they are, not copied: a 40 GB folder of
         // raw captures does not want a second copy, and the parsers accept an
         // absolute image_dir.
@@ -941,10 +1083,16 @@ bool DatasetPrep::run(const PrepJob& job_in, PrepResult& out, std::string& error
             if (!in.is_video && !in.mask_dir.empty())
                 produced += count_images(p.masks);
             _frames_tally.settle(produced, planned[i]);
-            // Masks an input brought with it are in the dataset now, so they
-            // count even when nothing asked for masking.
-            if (p.have_masks && !in.mask_dir.empty()) want_masks = true;
+            // Masks an input brought with it -- or carried in its alpha --
+            // are in the dataset now, so they count even when nothing asked
+            // for masking.
+            if (p.have_masks) want_masks = true;
         }
+        // A capture that arrived split into cam/, cam0/, cam1/ keeps those
+        // folders on the way in, and they are what make it several cameras --
+        // not only a job whose inputs each got one.
+        if (camera_subfolders(out.image_dir).size() > 1)
+            out.per_folder_cameras = true;
     }
 
     out.n_images = count_images(out.image_dir, skip_dir);
@@ -1003,9 +1151,9 @@ bool DatasetPrep::run(const PrepJob& job_in, PrepResult& out, std::string& error
             // masks an input brought with it are safe.
             if (job.redo_masks && job.inputs[i].mask_dir.empty())
                 clear_generated(per[i].masks, ws);
-            // Already masked by whoever made the masks this input arrived
-            // with. Segmenting over those would replace an answer the user
-            // already has.
+            // Already masked by whoever drew the masks -- or the alpha -- this
+            // input arrived with. Segmenting over those would replace an
+            // answer the user already has.
             if (per[i].have_masks) continue;
             if (!generate_masks(job, job.inputs[i], per[i].images,
                                 per[i].images_rel, per[i].masks, per[i].masks_rel,
@@ -1060,6 +1208,10 @@ bool DatasetPrep::extract_video(const PrepJob& job, const PrepInput& in,
             std::error_code ec;
             if (fs::is_directory(fs::path(images) / "cam1", ec))
                 out.per_folder_cameras = true;
+            // Kept frames of unknown provenance: the file's own rate is the
+            // built-in extractor's convention, and a wrong one is refused
+            // downstream by the gyro-against-poses check, not misused.
+            out.captures.push_back({in.subdir, in.path, 0.0});
             // Masks a previous run left. Not when this one is re-doing them:
             // `masked` is what makes run() skip the masking pass entirely.
             if (job.mask_enable && !job.redo_masks) {
@@ -1075,20 +1227,25 @@ bool DatasetPrep::extract_video(const PrepJob& job, const PrepInput& in,
 
     const bool want_builtin = !job.force_external_decode && backends().builtin_video;
     if (want_builtin) {
-        if (extract_video_builtin(job, in, images, out, error)) return true;
+        if (extract_video_builtin(job, in, images, out, error)) {
+            out.captures.push_back({in.subdir, in.path, 0.0});
+            return true;
+        }
         if (_cancel.load()) return false;
         // A container or profile the driver cannot decode is exactly what the
         // fallback is for, and the user should not have to know which is which.
         log(fmt(lmsg::decode_fallback_ffmpeg, {error}), /*detail=*/false);
     }
-    return extract_video_ffmpeg(job, in, images, out, error);
+    const bool ok = in.eac360.valid() && job.pano.mode != app::Pano360Mode::Off
+                        ? extract_360_ffmpeg(job, in, images, out, error)
+                        : extract_video_ffmpeg(job, in, images, out, error);
+    if (ok) out.captures.push_back({in.subdir, in.path, (double)job.video_fps});
+    return ok;
 }
 
-// Extraction writes frames and nothing else. Masking used to ride along on the
-// decode, which was cheaper by one JPEG decode per frame and cost the user the
-// ability to see the frames before deciding what to mask, to re-mask without
-// re-extracting, and to have photos and video take the same path. The decode it
-// saved is hidden behind the model anyway (generate_masks_builtin reads ahead).
+// Extraction writes frames and nothing else: masking is a separate pass
+// (generate_masks_builtin), so frames are visible before the user chooses
+// masks and re-masking costs no re-extraction.
 bool DatasetPrep::extract_video_builtin(const PrepJob& job, const PrepInput& in,
                                         const std::string& images,
                                         PrepResult& out, std::string& error) {
@@ -1103,18 +1260,18 @@ bool DatasetPrep::extract_video_builtin(const PrepJob& job, const PrepInput& in,
     // fps -> "one frame every N source frames". The source rate is what the
     // container states; a variable-rate file is close enough for this.
     std::string probe_err;
-    const int tracks = app::video_track_count(in.path, probe_err);
-    if (tracks <= 0) {
+    video::VideoProbe probe;
+    if (!video::probe_video(in.path, probe, probe_err) || probe.tracks <= 0) {
         error = probe_err.empty() ? "no video track" : probe_err;
         return false;
     }
-    if (tracks > 1) out.per_folder_cameras = true;
+    const std::vector<app::Pano360View> views =
+        in.eac360.valid() ? app::pano360_views(in.eac360, job.pano)
+                          : std::vector<app::Pano360View>();
+    if (!views.empty()) out.per_folder_cameras = views.size() > 1;
+    else if (probe.tracks > 1) out.per_folder_cameras = true;
 
-    double src_fps = 30.0;
-    {
-        video::VideoReader r;
-        if (r.open(in.path) && r.info().fps > 1.0) src_fps = r.info().fps;
-    }
+    const double src_fps = probe.fps > 1.0 ? probe.fps : 30.0;
     const int window = std::max(job.sharp_window, 1);
     const int skip = frame_skip(job, src_fps);
 
@@ -1125,6 +1282,12 @@ bool DatasetPrep::extract_video_builtin(const PrepJob& job, const PrepInput& in,
     fx.keep = window > 1 ? window : 0;
     fx.max_frames = job.max_frames;
     fx.quality = 95;
+    if (!views.empty()) {
+        fx.eac = in.eac360;
+        fx.views = views;
+        log(fmt(lmsg::pano360_plan, {(long long)views.size(), views[0].width,
+                                     views[0].height}), /*detail=*/false);
+    }
 
     app::FrameExtractSinks sinks;
     sinks.log = [this](const std::string& l) { log(l); };
@@ -1247,17 +1410,258 @@ bool DatasetPrep::extract_video_ffmpeg(const PrepJob& job, const PrepInput& in,
 }
 
 // ---------------------------------------------------------------------------
+// 360 -> views
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The canvas frames selection kept, resampled into the plan's views. One
+// thread per view, each with a share of the cores: the resampler threads and
+// the JPEG encode does not, so overlapping them is what fills the machine.
+bool warp_canvases(const fs::path& from, const fs::path& to,
+                   const app::Eac360Layout& layout,
+                   const std::vector<app::Pano360View>& views,
+                   const std::atomic<bool>& cancel,
+                   const std::function<void(int64_t)>& progress,
+                   std::string& error) {
+    std::error_code ec;
+    std::vector<app::Pano360Remap> maps(views.size());
+    for (size_t i = 0; i < views.size(); i++) {
+        app::pano360_remap(layout, views[i], maps[i]);
+        fs::create_directories(to / views[i].dir, ec);
+    }
+    std::vector<fs::path> files;
+    for (const auto& e : fs::directory_iterator(from, ec))
+        if (e.is_regular_file(ec)) files.push_back(e.path());
+    std::sort(files.begin(), files.end());
+
+    const int cores = std::max(1, (int)std::thread::hardware_concurrency());
+    const int per_view = std::max(1, cores / (int)views.size());
+    int64_t done = 0;
+    for (const fs::path& f : files) {
+        if (cancel.load()) { error = lmsg::err_cancelled.get(); return false; }
+        int w = 0, h = 0, ch = 0;
+        stbi_uc* px = stbi_load(f.string().c_str(), &w, &h, &ch, 3);
+        if (!px || w != layout.canvasW() || h != layout.canvasH()) {
+            if (px) stbi_image_free(px);
+            error = fmt(lmsg::err_360_frame_read, {f.string()});
+            return false;
+        }
+        std::atomic<bool> ok{true};
+        std::vector<std::thread> pool;
+        pool.reserve(views.size());
+        for (size_t i = 0; i < views.size(); i++) {
+            pool.emplace_back([&, i] {
+                std::vector<uint8_t> out((size_t)maps[i].width * maps[i].height * 3);
+                app::pano360_apply(maps[i], px, w, h, per_view, out.data());
+                const std::string path =
+                    (to / views[i].dir / (f.stem().string() + ".jpg")).string();
+                if (!stbi_write_jpg(path.c_str(), maps[i].width, maps[i].height, 3,
+                                    out.data(), kPhotoJpegQuality))
+                    ok = false;
+            });
+        }
+        for (std::thread& t : pool) t.join();
+        stbi_image_free(px);
+        if (!ok) {
+            error = fmt(lmsg::err_360_frame_write, {(to / f.stem()).string()});
+            return false;
+        }
+        if (progress) progress(++done);
+    }
+    return true;
+}
+
+}  // namespace
+
+bool DatasetPrep::extract_360_ffmpeg(const PrepJob& job, const PrepInput& in,
+                                     const std::string& images, PrepResult& out,
+                                     std::string& error) {
+    if (!command_exists(job.ffmpeg_exe)) {
+        error = fmt(lmsg::err_ffmpeg_missing, {job.ffmpeg_exe});
+        return false;
+    }
+    const std::vector<app::Pano360View> views =
+        app::pano360_views(in.eac360, job.pano);
+    if (views.empty()) {
+        error = lmsg::err_ffmpeg_extract_failed.get();
+        return false;
+    }
+    if (views.size() > 1) out.per_folder_cameras = true;
+    log(fmt(lmsg::video_input, {in.path}), /*detail=*/false);
+    log(fmt(lmsg::pano360_plan, {(long long)views.size(), views[0].width,
+                                 views[0].height}), /*detail=*/false);
+
+    const fs::path ws = job.workspace;
+    const int window = std::max(job.sharp_window, 1);
+    std::error_code ec;
+
+    // ffmpeg decodes both tracks and cuts the overlap strips out; the warp is
+    // ours, in both decode paths, because ffmpeg's own EAC sampler insets every
+    // face (app/Pano360.h).
+    enter(Stage::Frames, window > 1 ? lmsg::stage_extract_candidates.get()
+                                    : lmsg::stage_extract_ffmpeg.get());
+    const fs::path cand = ws / "frames_tmp";
+    remove_tree(cand);
+    fs::create_directories(cand, ec);
+    char pre[64];
+    std::snprintf(pre, sizeof pre, "fps=%g", (double)job.video_fps * window);
+    const std::string graph = app::pano360_graph(in.eac360, pre);
+    int rc = exec({job.ffmpeg_exe, "-nostdin", "-y", "-i", in.path,
+                   "-filter_complex", graph,
+                   "-map", std::string("[") + app::pano360_canvas_pad() + "]",
+                   "-qscale:v", "2", (cand / "c_%06d.jpg").string()});
+    if (rc == kCancelled) { error = lmsg::err_cancelled.get(); return false; }
+    if (rc != 0) {
+        error = lmsg::err_ffmpeg_extract_failed.get();
+        return false;
+    }
+
+    // Selection scores the canvas, so a frame is ranked on the whole sphere
+    // rather than on whichever view happens to be pointing at texture.
+    if (window > 1) enter(Stage::Frames, lmsg::stage_select_sharpest.get());
+    const fs::path kept = ws / "canvas_tmp";
+    remove_tree(kept);
+    fs::create_directories(kept, ec);
+    const int n = select_sharpest_frames(
+        cand.string(), kept.string(), "", window, job.max_frames,
+        [this](const std::string& l) { log(l); }, _cancel);
+    remove_tree(cand);
+    if (n < 0) {
+        remove_tree(kept);
+        error = _cancel.load() ? lmsg::err_cancelled.get()
+                               : lmsg::err_ffmpeg_extract_failed.get();
+        return false;
+    }
+
+    enter(Stage::Frames, lmsg::stage_warp_360.get());
+    RateLimitedProgress progress(_prog, Stage::Frames, lmsg::noun_frames_written,
+                                 _frames_tally);
+    const bool ok = warp_canvases(
+        kept, fs::path(images), in.eac360, views, _cancel,
+        [&](int64_t done) { progress.update(done * (int64_t)views.size()); },
+        error);
+    remove_tree(kept);
+    if (!ok) return false;
+    log(fmt(lmsg::kept_frames, {(long long)n * (long long)views.size(), images}),
+        /*detail=*/false);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Photos -> the dataset's own images/
 // ---------------------------------------------------------------------------
 
-// Only when the photos cannot be read where they are: a job with more than one
-// input reconstructs from ONE image tree, and the folders under it are what
-// make its inputs separate cameras.
-//
-// Hard links where the filesystem gives one, a copy otherwise. A link costs a
-// directory entry, which matters when the alternative is a second copy of a
-// folder of raw captures; falling back is what makes it work across devices
-// (and on a filesystem that has no links at all).
+namespace {
+
+// Extensions worth handing to the re-encoder. JPEG is already JPEG, EXR is HDR,
+// and the two stb cannot decode (TIFF, WebP) would only reach the fallback.
+bool jpeg_candidate_ext(const fs::path& f) {
+    std::string e = f.extension().string();
+    for (auto& c : e) c = (char)std::tolower((unsigned char)c);
+    return e == ".png" || e == ".bmp";
+}
+
+// Decode, then JPEG. Alpha is a cut-out, not decoration, so it becomes
+// `mask_to` gated at 128 (opaque = keep). The mask is written FIRST: a resumed
+// run reads the photo's existence as proof the pair is complete.
+bool convert_to_jpeg(const fs::path& from, const fs::path& to,
+                     const fs::path& mask_to, bool& wrote_mask) {
+    wrote_mask = false;
+    const std::string src = from.string();
+    int w = 0, h = 0, ch = 0;
+    if (!stbi_info(src.c_str(), &w, &h, &ch)) return false;
+    if (ch < 1 || ch > 4 || stbi_is_16_bit(src.c_str())) return false;
+    const bool alpha = ch == 2 || ch == 4;
+    // Nowhere to put the cut-out: copying keeps it, re-encoding would lose it.
+    if (alpha && mask_to.empty()) return false;
+    stbi_uc* px = stbi_load(src.c_str(), &w, &h, &ch, 0);
+    if (!px) return false;
+
+    const int color = alpha ? ch - 1 : ch;
+    const size_t n = (size_t)w * (size_t)h;
+    std::vector<stbi_uc> opaque, mask;
+    std::error_code ec;
+    bool ok = true;
+    if (alpha) {
+        opaque.resize(n * (size_t)color);
+        mask.resize(n);
+        for (size_t i = 0; i < n; i++) {
+            for (int c = 0; c < color; c++)
+                opaque[i * (size_t)color + (size_t)c] = px[i * (size_t)ch + (size_t)c];
+            mask[i] = px[i * (size_t)ch + (size_t)color] >= 128 ? 255 : 0;
+        }
+        fs::create_directories(mask_to.parent_path(), ec);
+        ok = stbi_write_png(mask_to.string().c_str(), w, h, 1, mask.data(), w) != 0;
+    }
+    if (ok)
+        ok = stbi_write_jpg(to.string().c_str(), w, h, color,
+                            alpha ? opaque.data() : px, kPhotoJpegQuality) != 0;
+    stbi_image_free(px);
+    // A half-written pair is worse than none: the next run would keep it.
+    if (!ok) {
+        fs::remove(to, ec);
+        if (alpha) fs::remove(mask_to, ec);
+        return false;
+    }
+    wrote_mask = alpha;
+    return true;
+}
+
+// One photo's journey. `fallback` is where it goes when the re-encode cannot
+// happen after all -- its own name, which nothing else can have claimed.
+// `mask_to` is empty for a photo that gets no mask of its own.
+struct PhotoMove {
+    fs::path from, to, fallback, mask_to;
+    bool convert = false;
+};
+
+// A re-encoded photo takes the .jpg its bytes now are; the parsers match a
+// mask by stem (find_aux_file), so that is free. A name already spoken for --
+// a.jpg beside a.png, or two stems meeting in `mask_root` -- is not taken twice.
+std::vector<PhotoMove> plan_photo_moves(const std::vector<fs::path>& files,
+                                        const fs::path& from, const fs::path& to,
+                                        const fs::path& mask_root, bool convert) {
+    std::vector<PhotoMove> plan;
+    plan.reserve(files.size());
+    std::set<fs::path> taken, mask_taken;
+    for (const fs::path& f : files)
+        taken.insert(to / under_root(f, from));
+    for (const fs::path& f : files) {
+        PhotoMove m;
+        m.from = f;
+        const fs::path rel = under_root(f, from);
+        m.to = m.fallback = to / rel;
+        if (convert && jpeg_candidate_ext(f)) {
+            const fs::path cand =
+                m.to.parent_path() / (m.to.stem().string() + ".jpg");
+            if (taken.insert(cand).second) {
+                m.to = cand;
+                m.convert = true;
+            }
+        }
+        if (m.convert && !mask_root.empty()) {
+            const fs::path cand =
+                mask_root / rel.parent_path() / (rel.stem().string() + ".png");
+            if (mask_taken.insert(cand).second) m.mask_to = cand;
+        }
+        plan.push_back(std::move(m));
+    }
+    return plan;
+}
+
+// What a run did with one tree, for the line it logs afterwards.
+struct GatherTally {
+    std::atomic<int> converted{0}, linked{0}, copied{0}, moved{0}, kept{0};
+    std::atomic<int> masked{0};
+    std::atomic<int64_t> done{0};
+};
+
+}  // namespace
+
+// Copying hard-links where the filesystem gives one, which costs a directory
+// entry rather than a second copy of a folder of raw captures; falling back to
+// a real copy is what makes it work across devices and where links do not.
 bool DatasetPrep::gather_photos(const PrepJob& job, const PrepInput& in,
                                 const std::string& images,
                                 const std::string& masks, bool& have_masks,
@@ -1279,55 +1683,189 @@ bool DatasetPrep::gather_photos(const PrepJob& job, const PrepInput& in,
     // pasted into an English sentence.
     struct Tree {
         fs::path from, to;
+        bool photos;
         const spirula::i18n::Msg* moving;   // "<kind>: <from> -> <to>"
         const spirula::i18n::Msg* empty;    // "there are no <kind> in <from>"
         const spirula::i18n::Msg* counted;  // what the progress line counts
     };
-    std::vector<Tree> trees{{src, fs::path(images), &lmsg::copying_photos,
+    std::vector<Tree> trees{{src, fs::path(images), true, &lmsg::copying_photos,
                              &lmsg::err_no_photos_in,
                              &lmsg::noun_photos_collected}};
     if (with_masks)
-        trees.push_back({fs::absolute(in.mask_dir, ec), fs::path(masks),
+        trees.push_back({fs::absolute(in.mask_dir, ec), fs::path(masks), false,
                          &lmsg::copying_masks, &lmsg::err_no_masks_in,
                          &lmsg::noun_masks_collected});
 
+    // Masks this pass made out of the photos' alpha, which is what tells the
+    // run there are masks in the dataset even though nothing asked for any.
+    bool derived_any_masks = false;
     for (const Tree& t : trees) {
+        // The output folder is often the input folder -- the point of the
+        // images/ + masks/ layout -- and then there is nothing to do. A
+        // re-encode there would be rewriting the capture.
+        std::error_code same_ec;
+        if (fs::exists(t.to, same_ec) &&
+            fs::equivalent(t.from, t.to, same_ec) && !same_ec) {
+            log(fmt(lmsg::photos_already_in_dataset, {t.to.string()}),
+                /*detail=*/false);
+            continue;
+        }
         log(fmt(*t.moving, {t.from.string(), t.to.string()}), /*detail=*/false);
-        const std::vector<fs::path> files = walk_images(t.from);
+        // A destination nested inside the source would otherwise be walked as
+        // input, so a resumed run would gather its own output.
+        const std::vector<fs::path> files =
+            walk_images(t.from, inside(t.to, t.from) ? t.to : fs::path());
         if (files.empty()) {
             error = fmt(*t.empty, {t.from.string()});
             return false;
         }
-        int linked = 0, copied = 0, kept = 0;
+        // Masks are never re-encoded: they are binary, and JPEG's ringing
+        // around every edge is exactly what a mask cannot survive.
+        const bool convert =
+            t.photos && job.photo_import == PhotoImport::ConvertJpeg;
+        const bool move = job.photo_import == PhotoImport::Move;
+        // An alpha channel becomes a mask -- but not over a masks/ the input
+        // brought, which is the answer its owner already gave and which this
+        // loop fills after the photos.
+        const fs::path derived_masks =
+            convert && !with_masks ? fs::path(masks) : fs::path();
+        const std::vector<PhotoMove> plan =
+            plan_photo_moves(files, t.from, t.to, derived_masks, convert);
+
+        GatherTally tally;
+        std::mutex notes_mu;
+        std::vector<std::string> notes;   // capped in step()
+        std::atomic<size_t> next{0};
+        std::atomic<bool> stop{false};
+        std::string failure;              // guarded by notes_mu
+
+        auto step = [&](const PhotoMove& m) {
+            std::error_code probe_ec;
+            if (fs::exists(m.to, probe_ec)) { tally.kept++; return true; }
+            std::error_code dir_ec;
+            fs::create_directories(m.to.parent_path(), dir_ec);
+            if (dir_ec && !fs::is_directory(m.to.parent_path(), dir_ec)) {
+                std::lock_guard<std::mutex> lk(notes_mu);
+                if (failure.empty())
+                    failure = fmt(lmsg::err_copy_failed,
+                                  {m.from.string(), t.to.string(),
+                                   dir_ec.message()});
+                return false;
+            }
+            if (m.convert) {
+                bool wrote_mask = false;
+                if (convert_to_jpeg(m.from, m.to, m.mask_to, wrote_mask)) {
+                    tally.converted++;
+                    if (wrote_mask) tally.masked++;
+                    return true;
+                }
+                // 16-bit, or a format stb cannot read. Its own name is free --
+                // plan_photo_moves reserved it.
+                std::lock_guard<std::mutex> lk(notes_mu);
+                if (notes.size() < 20)
+                    notes.push_back(fmt(lmsg::photo_kept_unconverted,
+                                        {m.from.string()}));
+            }
+            const fs::path& dst = m.convert ? m.fallback : m.to;
+            if (m.convert && fs::exists(dst, probe_ec)) { tally.kept++; return true; }
+            std::error_code op_ec;
+            if (move) {
+                fs::rename(m.from, dst, op_ec);
+                if (!op_ec) { tally.moved++; return true; }
+                // Another filesystem: copy, then drop the original only once
+                // the copy is on disk.
+                op_ec.clear();
+                fs::copy_file(m.from, dst, op_ec);
+                if (!op_ec) {
+                    std::error_code rm_ec;
+                    fs::remove(m.from, rm_ec);
+                    tally.moved++;
+                    return true;
+                }
+            } else {
+                fs::create_hard_link(m.from, dst, op_ec);
+                if (!op_ec) { tally.linked++; return true; }
+                op_ec.clear();
+                fs::copy_file(m.from, dst, op_ec);
+                if (!op_ec) { tally.copied++; return true; }
+            }
+            std::lock_guard<std::mutex> lk(notes_mu);
+            if (failure.empty())
+                failure = fmt(lmsg::err_copy_failed,
+                              {m.from.string(), t.to.string(), op_ec.message()});
+            return false;
+        };
+
+        // Copying and moving are the disk's work, so one thread; the re-encode
+        // is the CPU's, ~60 ms a photo. Capped at 8 because each worker holds a
+        // decoded frame (24 MB at 4K) that glibc faults in on every call.
+        const unsigned cores = std::thread::hardware_concurrency();
+        const int threads =
+            convert ? (int)std::clamp<unsigned>(cores ? cores : 1u, 1u, 8u) : 1;
+        std::atomic<int> live{0};
+        auto worker = [&] {
+            for (;;) {
+                const size_t i = next.fetch_add(1);
+                if (i >= plan.size() || stop.load() || _cancel.load()) break;
+                if (!step(plan[i])) { stop.store(true); break; }
+                tally.done.fetch_add(1);
+            }
+            live.fetch_sub(1);
+        };
         RateLimitedProgress progress(_prog, Stage::Frames, *t.counted,
                                      _frames_tally);
-        for (const fs::path& f : files) {
-            if (_cancel.load()) { error = lmsg::err_cancelled.get(); return false; }
-            fs::path rel = f.lexically_relative(t.from);
-            if (rel.empty() || *rel.begin() == "..") rel = f.filename();
-            const fs::path out_path = t.to / rel;
-            if (fs::exists(out_path, ec)) { kept++; continue; }
-            fs::create_directories(out_path.parent_path(), ec);
-            std::error_code link_ec;
-            fs::create_hard_link(f, out_path, link_ec);
-            if (!link_ec) {
-                linked++;
-            } else {
-                std::error_code copy_ec;
-                fs::copy_file(f, out_path, copy_ec);
-                if (copy_ec) {
-                    error = fmt(lmsg::err_copy_failed,
-                                {f.string(), t.to.string(), copy_ec.message()});
-                    return false;
-                }
-                copied++;
+        std::vector<std::thread> pool;
+        pool.reserve((size_t)threads);
+        for (int i = 0; i < threads; i++) {
+            live.fetch_add(1);
+            try {
+                pool.emplace_back(worker);
+            } catch (const std::system_error&) {
+                live.fetch_sub(1);
+                break;
             }
-            progress.update(linked + copied + kept);
         }
-        log(fmt(lmsg::linked_copied_kept,
-                 {(long long)linked, (long long)copied, (long long)kept}));
+        if (pool.empty()) {
+            // No thread could be started, so this one does the plan itself.
+            for (size_t i = 0; i < plan.size(); i++) {
+                if (_cancel.load()) break;
+                if (!step(plan[i])) { stop.store(true); break; }
+                tally.done.fetch_add(1);
+                progress.update(tally.done.load());
+            }
+        } else {
+            while (live.load() > 0) {
+                progress.update(tally.done.load());
+                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            }
+            for (std::thread& th : pool) th.join();
+        }
+        progress.update(tally.done.load());
+
+        if (!failure.empty()) { error = failure; return false; }
+        if (_cancel.load()) { error = lmsg::err_cancelled.get(); return false; }
+        for (const std::string& n : notes) log(n);
+        if (move)
+            log(fmt(lmsg::moved_kept,
+                    {(long long)tally.moved.load(), (long long)tally.kept.load()}));
+        else if (convert)
+            log(fmt(lmsg::converted_copied_kept,
+                    {(long long)tally.converted.load(),
+                     (long long)(tally.linked.load() + tally.copied.load()),
+                     (long long)tally.kept.load()}));
+        else
+            log(fmt(lmsg::linked_copied_kept,
+                    {(long long)tally.linked.load(),
+                     (long long)tally.copied.load(),
+                     (long long)tally.kept.load()}));
+        if (tally.masked.load() > 0) {
+            log(fmt(lmsg::masks_from_alpha,
+                    {(long long)tally.masked.load(), masks}),
+                /*detail=*/false);
+            derived_any_masks = true;
+        }
     }
-    if (with_masks) have_masks = true;
+    if (with_masks || derived_any_masks) have_masks = true;
     return true;
 }
 

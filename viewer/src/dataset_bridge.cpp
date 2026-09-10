@@ -13,6 +13,7 @@
 // a transforms.json, only a pointcloud.ply, ...) still shows what is available.
 
 #include "data/DatasetParser.h"
+#include "data/FrustumSize.h"
 #include "data/Json.h"
 #include "data/Xml.h"
 
@@ -488,6 +489,12 @@ KEEP float* ssv_ds_fit_sphere() {
     g_fit[3] = std::max(rp, rc);
     if (!(g_fit[3] > 0.f)) g_fit[3] = 1.f;
     return g_fit;
+}
+
+// Base frustum size in the dataset's frame (js/main.js multiplies in the slider).
+KEEP float ssv_ds_frustum_size() {
+    int64_t n = std::min<int64_t>(g_ds.num_cameras, (int64_t)g_ds.c2w.size() / 12);
+    return (float)camhost::frustum_display_size(g_ds.c2w.data(), n);
 }
 
 // Nearest point to a ray (model-native frame): returns (index, t, perp) so JS

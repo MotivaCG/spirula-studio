@@ -101,6 +101,11 @@ public:
     // the CAMERA, not the geometry, so moving a model costs nothing.
     void set_model_transform(const float a[12]);
 
+    // What the dataset says about its own frame, so the panel can offer to
+    // skip the parsers' up->+Z guess (DatasetParser.h). `first` picks the
+    // checkbox's default; a refresh of the same scene must not.
+    void adopt_gauge(const ParsedDataset& ds, bool first);
+
     // Side-by-side: adopt `src`'s navigation pose, camera model and FOV, so
     // two panels showing the same scene stay locked to one view. `moved()`
     // says whether this panel's own pose changed on the last draw, which is
@@ -132,7 +137,7 @@ private:
     // Frame the scene only when a different dataset arrives; a preview ->
     // engine transition on the same dataset keeps the navigated pose and
     // intrinsics (no jump when training starts).
-    void maybe_frame(const spirula::TrainerSession& session);
+    bool maybe_frame(const spirula::TrainerSession& session);
     void reset_view();
     // Update _moving / _last_move from the camera pose. Runs every frame in
     // every scale mode: what it feeds is no longer only the adaptive scale.
@@ -195,10 +200,27 @@ private:
     bool _has_cameras = true;
 
     // Model frame -> shared navigation frame (see set_model_transform), and
-    // its scale, cached because every render divides by it.
+    // its scale, cached because every render divides by it. `_m2s` is the
+    // owner's placement composed with the levelling correction below.
+    float _m2s_owner[12] = {1,0,0,0, 0,1,0,0, 0,0,1,0};
     float _m2s[12] = {1,0,0,0, 0,1,0,0, 0,0,1,0};
     float _m2s_scale = 1.0f;
     bool _m2s_identity = true;
+    void rebuild_m2s();
+
+    // The parsers rotate every dataset so the mean camera up axis becomes +Z,
+    // a guess, and a bad one on a tilted 360 capture. `_align` is that
+    // rotation; unchecking `_level_cameras` undoes it and nothing else.
+    float _align[9] = {1,0,0, 0,1,0, 0,0,1};
+    bool _align_identity = true;
+    bool _level_cameras = true;
+    bool _gauge_metric = false;
+    // Model units per unit of the navigated frame: what turns the grid's cell
+    // size into a length (ParsedDataset::train_frame_scale).
+    float _scene_scale = 1.0f;
+    // The grid's cell in model units, from the same rule both backends use.
+    float grid_cell() const;
+    void draw_grid_overlay(float x, float y, int line) const;
     bool _nav_controls = true;
     float _controls_h = 0.0f;
     float _controls_pad = 0.0f;

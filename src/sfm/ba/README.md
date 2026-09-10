@@ -47,7 +47,7 @@ regenerates the minimax transcendental coefficients in `df.slang` /
 ## Build & run
 
 ```bash
-bash build_develop.bash -DSS_BACKEND=vulkan -DSS_BUILD_CLI=ON
+bash build_develop.bash -DSS_BACKEND=vulkan
 ./build/spirula sfm ba /path/to/bal/problem-16-22106-pre.txt --real double
 ./build/spirula sfm ba problem.txt --real df --loss huber --loss-param 1.0 --ply out
 ./build/spirula sfm ba /path/to/sparse/0 -o refined/       # a COLMAP model

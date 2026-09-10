@@ -559,7 +559,8 @@ void fpbo(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
             if (kColorTrust != 0) {
                 float c_ch = (ch == 0) ? c_dc.x : (ch == 1) ? c_dc.y
                                                             : c_dc.z;
-                v_sh_coeff /= linear_rgb_to_srgb_grad(c_ch);
+                // v_sh_coeff /= linear_rgb_to_srgb_grad(c_ch);
+                v_sh_coeff *= exp(c_ch);
             }
             float g1 = kFpboBeta1 * sh_g1[i] +
                        (1.0f - kFpboBeta1) * v_sh_coeff;

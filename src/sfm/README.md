@@ -18,7 +18,10 @@ of this file and in the port plan.
   device. Built by default only for `SS_BACKEND=vulkan`.
 - **No heavy dependencies.** Vulkan, Slang, C++17, and the repository's
   vendored `stb_image`. No Ceres, no Eigen on the hot path, no OpenCV, no
-  SQLite, no PyTorch.
+  SQLite, no PyTorch. `core/Manifest.cpp` reads its file through the
+  repository's header-only `data/Json.h` + `data/Yaml.h` rather than growing a
+  second parser; that is the one thing here that reaches outside `sfm/` and
+  `core/`, and it costs nothing at link time.
 - **Compute on the GPU, control flow on the host.** Slang kernels do the
   per-pixel / per-feature / per-observation work; the host owns graph
   structure, RANSAC bookkeeping and the mapper's decisions. RANSAC in
@@ -189,6 +192,9 @@ core/        types shared by every stage, no Vulkan:
                Pose                   Rigid3, Sim3, angle-axis conversions
                Image / ImageLoader    decode, grayscale, the batch decode pool
                Exif                   focal prior + camera identity from headers
+               Telemetry              the IMU / GPS a video carries (GPMF, Insta360,
+                                        DJI, CAMM), read by content; unconsumed --
+                                        docs/notes/imu-gps-for-sfm.md
                Features / Matches     the on-disk feature and match formats
                Mask                   keypoint masking, sampled in uv
                Model                  Reconstruction + COLMAP binary IO
@@ -222,7 +228,7 @@ apart.
 ## Building
 
 ```bash
-bash build_develop.bash -DSS_BACKEND=vulkan -DSS_BUILD_CLI=ON
+bash build_develop.bash -DSS_BACKEND=vulkan
 ```
 
 `SS_BUILD_SFM` defaults ON for the Vulkan backend and OFF for CUDA (where
@@ -388,6 +394,103 @@ model is written, so the trainer's own normalization comes out as the identity
 tilted with no way left to recover the transform. `map/Orient.h` has the
 algebra and the caveats; `--no-orient` keeps the mapper's raw gauge.
 
+`--metric-positions FILE` and `--metric-gps` fix that same gauge from an
+outside measurement instead, so the model is written **in metres**. The first
+reads per-image camera positions in COLMAP's `model_aligner --ref_images_path`
+format (`image_name X Y Z` per line, any right-handed metric frame — a LiDAR
+trajectory, ARKit, RTK); the second reads each registered image's own EXIF GPS
+and converts it to a local east-north-up frame. Either way a similarity is
+fitted from the camera centres with LO-RANSAC over the same `estimateSim3` that
+model merging uses, and `--metric-max-error` is its inlier radius in metres (0
+picks 5 for GPS, 0.5 for a positions file).
+
+`--metric-gps` takes `none` (the CLI default; the GUI asks for `horizontal`),
+`horizontal` or `full`, and the difference is the altitude.
+`full` fits all seven parameters, so the reference's
+vertical sets the model's tilt; `horizontal` fits only scale, heading and place,
+against latitude and longitude, and leaves which way is up to the cameras' own
+mean up axis — the same claim `--orient` makes. A phone's altitude is the worst
+component it reports, and over a capture wider than it is tall the fit converts
+that error into tilt: on an 850-image walk around a city square (150 m across,
+level ground) `full` came out **5.05 degrees off vertical**, spreading the
+cameras over 12.9 m of fake height, where `horizontal` leaves them within 2.5 m
+and recovers a scale 0.2 % away. The east and north residuals were the same to
+2 % either way, so the vertical is what was paid for. `horizontal` also has no
+collinearity gate: a turn about the vertical is resisted by the whole in-plane
+radius, so a street walked end to end — which `full` refuses — fits.
+
+The fit is refused rather than approximated, and **what refuses it is geometry,
+not a noise model**. Fewer than three positioned cameras, reference positions
+that do not spread wider than the inlier radius, under half the cameras inlying,
+or (full only) cameras lying so close to a line that the reference amplifies
+orientation error more than 20x — each reports its own reason with the numbers
+behind it; the model is then still written, in the ordinary orient gauge, and
+the exit status is 4.
+
+`merge` accepts a single model when a metric reference is given: there is
+nothing to merge, and it re-gauges the model in place. That is the way to put
+metres on a finished reconstruction without rebuilding it —
+`spirula sfm merge ws/sparse --in-place --metric-gps horizontal --images ws/images`.
+
+The scale and orientation uncertainties are **reported and never gated on**.
+They come from the inlier residuals assuming uncorrelated noise, and measured
+against a reference whose error is correlated — GPS drift — they under-state
+the real error by 3.9-4.5x: on one flight a 2 % gate on them passed a 3.6 %
+scale error. A gate that passes what it exists to catch is worse than no gate,
+so they are printed as the lower bounds they are. `map/MetricGauge.h` has the
+algebra (D74).
+
+`--telemetry VIDEO` fixes the same gauge from the **video's own sensors**,
+which is the default whenever the GUI extracted the frames from a file that
+carries them (Insta360 `.insv`, GoPro `.360`/`.mp4`, DJI `.OSV`, CAMM): its
+manifest lists one `captures:` entry per video, and the frame stems carry the
+source frame index, which is how a frame gets its time on the sensor clock.
+`map/SensorGauge.h` treats every reading as a factor on one small state (a
+Sim(3), the IMU biases, and per-lens nuisances), initialises each block in
+closed form and refines them together in one robust Levenberg-Marquardt solve:
+
+- **up** from the accelerometer, once the IMU-to-lens rotation is calibrated
+  from the reconstruction itself (`map/ImuExtrinsic.h`: the gyro's relative
+  rotations must match the poses' and every frame's gravity must land on one
+  world vector, both linear in the rotation's nine entries). A left-handed
+  sensor frame and the sign of the gyro integration are tested as hypotheses,
+  and the IMU clock offset against the video is searched for first;
+- **scale** from the accelerometer through pre-integration between
+  consecutive frames (`core/Preintegration.h`), in the velocity-free form of
+  Mur-Artal and Tardós, solved jointly with both biases because on a gentle
+  walk the bias error is as large as the signal. The gravity vector solved
+  alongside is the check: 9.82 m/s² within 0.3° of up on a 118 s X5 walk;
+- **scale, heading and place** from the GPS log, interpolated at each frame
+  and fitted exactly as `--metric-gps horizontal` fits EXIF.
+
+What is missing or degenerate is refused by its own uncertainty rather than
+by a rule: a camera that only pans gets up and no scale, a stale phone fix
+gets no GPS, a file with an attitude stream but no raw gyro (the Osmo 360)
+pre-integrates from the attitude instead, and a per-frame accelerometer has
+the attenuation its own aliasing noise causes taken back out. Two scale
+sources are combined by information and reported separately, and an
+IMU-versus-GPS disagreement beyond three sigma keeps the more certain one
+and says so. `--sensor-gauge up` takes the orientation alone; `none` ignores
+the sensors. On the X5 walk the whole fit
+takes 0.3 s; a metric reference the user passes still outranks an upright-only
+sensor frame. `docs/notes/imu-gps-for-sfm.md` records what the files carry
+and what was measured.
+
+The sources run in that order and read each other: `gauge.txt`'s two bits are
+the state as well as the record, so a reference is not fitted over a model the
+sensors already made metric, `horizontal` skips its own upright pre-transform
+where the sensors already levelled the model, and the mean-camera-up fallback
+runs in exactly one place, over models nothing measured. A gauge a sensor
+settled is never overwritten by the guess it was consulted to replace.
+
+Whatever settled a model's gauge, `sparse/N/gauge.txt` records it beside the
+model — `oriented` (is +Z up because something measured it, rather than the
+mean camera up axis guessing), `metric` (is a unit a metre), and which source
+each came from. Plain text, and read by the viewer: a model that says
+`oriented 1` is shown in its own frame with the up guess switched off, and its
+grid legend is in metres. Nothing else depends on the file, so a reconstruction
+COLMAP wrote is simply one that says nothing.
+
 ### The finishing passes
 
 Reconstruction ends with up to two more global bundle adjustments, on models
@@ -462,6 +565,7 @@ PASS/FAIL and returns 0/1 — the same convention as `src/backend/tests/`.
 | `sfm_geometry_test` | F, H, E, P3P, triangulation, RANSAC, SVD/eigen kernels | no |
 | `sfm_merge_test` | Sim(3) algebra, model alignment, track splicing, fold detection | no |
 | `sfm_mask_test` | mask uv sampling, decode, file discovery | no |
+| `sfm_telemetry_test` | the four telemetry carriers on synthetic files, and the sanity checks; `sfm_telemetry_test FILE` prints what a video carries | no |
 
 End to end, the check that matters is a reconstruction on a public dataset
 scored against the reference that ships with it: `tools/sfm/eval_poses.py` reads
@@ -542,9 +646,12 @@ port. Ordered by what blocks the most.
 
 10. **Undistortion stage.** Never written. The dataset parser takes distortion
     parameters, so confirm this is wanted before building it.
-11. **Equirectangular end to end.** The mapper writes `EQUIRECTANGULAR`
-    (model 17); `ColmapParser` stops at model 10 and the renderer has no
-    spherical camera, so such a model cannot currently be trained on.
+11. **Equirectangular end to end.** Done: the mapper writes `EQUIRECTANGULAR`
+    (model 17), `ColmapParser` reads it, and the trainer splits it into cube
+    faces (`warp_spherical_to_pinhole`). What is untested is how well the
+    learned front ends match on a panorama's polar distortion, which is one
+    reason a 360 capture is unwrapped into perspective views by default
+    (`docs/datasets.md`, "360 cameras").
 12. **Faster decode.** A scaled JPEG decode straight to the working resolution
     would cut the CPU time. (The *peak* half of this is done: the decoder
     resamples out of stb's RGB buffer instead of building a full-resolution
@@ -587,5 +694,6 @@ port. Ordered by what blocks the most.
 
 **Deliberately out of scope**, so they are not silently skipped: rig
 constraints in the mapper (a rig is used as a ground-truth-free *diagnostic*,
-not a constraint), GPS / geo-registration, MVS / dense reconstruction,
+not a constraint -- `docs/notes/sfm-rig-constraints.md` surveys what changing
+that would cost, and what a 360 capture would get for it), GPS / geo-registration, MVS / dense reconstruction,
 incremental database updates, and relating two models that share no images.

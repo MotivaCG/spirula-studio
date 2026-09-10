@@ -24,6 +24,7 @@
 #include "app/gui/ModelCache.h"
 #include "app/gui/SegmentPanel.h"
 #include "app/gui/SfmRunner.h"
+#include "app/gui/TelemetryProbe.h"
 #include "app/gui/TrainPreset.h"
 #include "app/gui/TrainRunner.h"
 #include "app/gui/ViewportPanel.h"
@@ -182,6 +183,12 @@ private:
     bool builtin_sfm_available() const;
     bool colmap_available() const;
     Engine effective_engine() const;
+    // Does any input carry the 360 packing, and what the plan does to the lens.
+    bool any_pano360() const;
+    void apply_pano_lens();
+    void reset_pano_size();
+    void draw_pano360_options();
+    void draw_pano360_size();
     bool dataset_busy() const;
     // Which step a running job is on, or nullptr when none is. Both runners
     // report through the same object, so the screen reads one thing.
@@ -211,6 +218,7 @@ private:
     void draw_home_banner(float avail, float indent);
     void draw_new_dataset();
     void draw_dataset_source();       // input list / output / resume
+    void draw_sensor_badge(const PrepInput& s);
     void draw_dataset_basics();       // the four or five knobs a beginner needs
     void draw_source_cameras();       // one lens per input, when there are several
     // The line under a lens picker when the input contradicts the model --
@@ -256,6 +264,25 @@ private:
     // "Re-run masking only" and friends: what probe_workspace already knows,
     // as the actions it implies.
     void draw_dataset_rerun(const WorkspaceState& prior);
+    // Throwing the whole project away rather than one step of it: the run's
+    // own files, and the options, each on its own button.
+    void draw_dataset_reset();
+    void draw_clear_project_modal();
+    // Every option back to what a freshly picked input would have given it.
+    // The inputs, the output folder and the mask prompt are not options.
+    void reset_recon_options();
+    // The settings an input implies -- what a video wants, what a dual-lens
+    // 360 file wants. Asked when the list changes, and again by the reset.
+    void apply_source_presets();
+    // The single "Camera / lens" control speaks for the whole capture, so it
+    // writes to every input rather than only the first.
+    void apply_lens_to_sources(const std::string& model);
+    // Put the per-input lens list back in its canonical shape: a real model on
+    // the first row, "same as above" (an empty model) on every row that only
+    // repeats the row before it.
+    void normalize_source_lenses();
+    // What one input's images are fitted with, resolved down the row list.
+    void source_lens(size_t input, std::string& model, float& focal) const;
     // What the output folder holds, at 1 Hz rather than per frame: the answer
     // now costs a directory scan (a Metashape export is found by extension).
     const WorkspaceState& workspace_state();
@@ -467,6 +494,9 @@ private:
     // that runs instead of a parallel copy of it: a video file or photo folder
     // each, plus the sub-folder and the lens that belong to it.
     std::vector<PrepInput> _sources;
+    // What each input's IMU / GPS holds, read on its own thread and keyed by
+    // path, so re-choosing a file already read costs nothing.
+    TelemetryProbe _telemetry;
     std::string _workspace;
     // The output folder this screen derived from the inputs. Kept so a folder
     // the user typed is never overwritten when the input list changes.
@@ -600,10 +630,20 @@ private:
     // Those masks are white where the image is REMOVED, the other convention
     // in the wild. Declared once here; the run normalizes what it writes.
     bool _flip_found_masks = false;
+    // What a folder of photos does on its way into the dataset. The default
+    // gives the dataset an images/ of its own, which is what makes it open
+    // again without image_dir being named by hand.
+    PhotoImport _photo_import = PhotoImport::ConvertJpeg;
+
+    // "Clear this project's data": what the modal is about to delete, listed
+    // when it opens so the user reads the same paths that go.
+    bool _clear_open = false, _clear_shown = false;
+    std::vector<std::string> _clear_targets;
 
     // workspace_state()'s cache: what it was asked about and when.
     WorkspaceState _ws_state;
     std::string _ws_state_key;
+    std::vector<std::string> _ws_artifacts;
     double _ws_state_at = -1.0;
 
     // VRAM readout on the status strip, polled from the backend at ~2 Hz.

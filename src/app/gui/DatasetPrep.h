@@ -25,6 +25,7 @@
 // do, so the GUI can say so instead of failing at run time.
 
 #include "app/FrameMask.h"
+#include "app/Pano360.h"
 #include "app/gui/FilmReel.h"
 #include "app/gui/PrepProgress.h"
 
@@ -101,12 +102,70 @@ struct PrepInput {
     // The camera folders found under this input, when it arrived with more
     // than one. Empty means the lens above describes all of it.
     std::vector<SubCamera> subcameras;
+    // The 360 packing this file was found to carry, when it carries one: two
+    // EAC tracks that the job's `pano` plan turns into ordinary views. Detected
+    // rather than asked for, so a capture that is not one cannot be warped.
+    app::Eac360Layout eac360;
     // Areas of the frame that are never scene -- the fisheye border, a
     // watermark, the rig in shot. Per input because it describes a lens, and
     // resolved per camera folder when it asks for the border to be fitted
     // (app::FrameStencil), which is what gives a dual-fisheye file two circles.
     app::FrameStencil stencil;
 };
+
+// One row of the "Camera / lens per input" list. `rel` is the prefix
+// `--camera-model PREFIX=MODEL` matches on, so the panel's rows and the
+// reconstruction's overrides are one list (SfmRunner::append_camera_overrides).
+struct CameraGroup {
+    size_t input = 0;   // index into the job's inputs
+    int sub = -1;       // index into that input's subcameras; -1 = the input
+    std::string rel;    // under images/; "" is the whole capture
+};
+
+// The rows, in the order they are drawn and applied.
+std::vector<CameraGroup> camera_groups(const std::vector<PrepInput>& inputs);
+
+// Where a row's settings are stored.
+inline std::string& group_model(std::vector<PrepInput>& in, const CameraGroup& g) {
+    return g.sub < 0 ? in[g.input].camera_model
+                     : in[g.input].subcameras[(size_t)g.sub].camera_model;
+}
+inline const std::string& group_model(const std::vector<PrepInput>& in,
+                                      const CameraGroup& g) {
+    return g.sub < 0 ? in[g.input].camera_model
+                     : in[g.input].subcameras[(size_t)g.sub].camera_model;
+}
+inline float& group_focal(std::vector<PrepInput>& in, const CameraGroup& g) {
+    return g.sub < 0 ? in[g.input].focal_factor
+                     : in[g.input].subcameras[(size_t)g.sub].focal_factor;
+}
+inline float group_focal(const std::vector<PrepInput>& in, const CameraGroup& g) {
+    const float f = g.sub < 0 ? in[g.input].focal_factor
+                              : in[g.input].subcameras[(size_t)g.sub].focal_factor;
+    return f > 0 ? f : in[g.input].focal_factor;
+}
+
+// The model each row is actually fitted with. An EMPTY model means "the same
+// as the row above" -- a dozen clips off one camera are one decision -- and the
+// first row, having none above it, falls back to `fallback`.
+std::vector<std::string> camera_group_models(const std::vector<PrepInput>& inputs,
+                                             const std::vector<CameraGroup>& groups,
+                                             const std::string& fallback);
+
+// What a folder of photos does on its way into the dataset. Only `InPlace`
+// leaves it pointing at a folder outside itself, and such a dataset opens
+// again only if `image_dir` is set by hand -- which is why it is not default.
+enum class PhotoImport {
+    ConvertJpeg,   // into images/, re-encoded as JPEG where that loses nothing
+    Copy,          // into images/, unchanged
+    Move,          // into images/, leaving nothing behind
+    InPlace,       // read where they are; only a lone folder can
+};
+inline constexpr int kNumPhotoImports = 4;
+
+// Quality of the re-encode. High enough that the artefacts are below what the
+// photometric loss can tell from sensor noise.
+inline constexpr int kPhotoJpegQuality = 95;
 
 struct PrepJob {
     std::vector<PrepInput> inputs;   // in the order the user added them
@@ -122,8 +181,15 @@ struct PrepJob {
     // keep. Applied where those files are read, so everything this run writes
     // is in the one convention every reader uses (sfm/core/Mask.h).
     bool flip_found_masks = false;
+    // How a photo input reaches images/. Videos ignore it -- their frames are
+    // written into the dataset whatever this says.
+    PhotoImport photo_import = PhotoImport::ConvertJpeg;
 
     // ---- video extraction ----
+    // What a 360 capture (PrepInput::eac360) becomes. Dataset-wide: mixing
+    // panoramas and pinhole faces in one image tree describes no camera rig.
+    app::Pano360Options pano;
+
     float video_fps = 2.0f;          // kept frames per second
     int   sharp_window = 3;          // keep the sharpest of N (1 = off)
     int   max_frames = 100000;
@@ -169,18 +235,31 @@ struct PrepJob {
     std::string python_exe = "python3";
 };
 
-// The one case where images are read where they are instead of being gathered
-// into the dataset's own images/ (see DatasetPrep::run): one folder of photos.
-inline bool reads_photos_in_place(const std::vector<PrepInput>& inputs) {
-    return inputs.size() == 1 && !inputs[0].is_video;
+// Images read where they are instead of gathered into the dataset's own
+// images/ (see DatasetPrep::run). Several inputs reconstruct from ONE image
+// tree, so there is nowhere for a second one to be read in place from.
+inline bool reads_photos_in_place(const std::vector<PrepInput>& inputs,
+                                  PhotoImport mode) {
+    return mode == PhotoImport::InPlace && inputs.size() == 1 &&
+           !inputs[0].is_video;
 }
 
 // Where a job's images will be, before it has run: what PrepResult::image_dir
 // comes out as, for the panels that must read a dataset a previous run wrote.
 std::string planned_image_dir(const std::vector<PrepInput>& inputs,
-                              const std::string& workspace);
+                              const std::string& workspace, PhotoImport mode);
+
+// A video the run extracted frames from, for the manifest's `captures`:
+// the stems carry the source frame index (fps 0, the file's own rate) or,
+// after the ffmpeg fallback, the kept-frame count at `fps`.
+struct PrepCapture {
+    std::string subdir;
+    std::string path;
+    double fps = 0;
+};
 
 struct PrepResult {
+    std::vector<PrepCapture> captures;
     std::string image_dir;           // absolute; what SfM should index
     std::string image_dir_cfg;       // what the trainer's image_dir should be
     std::string mask_dir;            // "" when there are no masks
@@ -226,6 +305,9 @@ bool is_video_path(const std::string& path);
 // A dual-fisheye Insta360 file: two video tracks, one per lens, and a lens the
 // default camera model does not fit.
 bool is_dual_fisheye_path(const std::string& path);
+// A GoPro MAX .360 by its name. The packing itself is what probe_eac360
+// confirms; this only decides whether it is worth asking.
+bool is_pano360_path(const std::string& path);
 
 // ---- the ffmpeg fallback, for callers that are not a preparation run -------
 //
@@ -243,6 +325,9 @@ struct VideoFacts {
     long long frames = 0;     // duration * fps; the container's own count is
                               // not printed by `ffmpeg -i`
     int width = 0, height = 0;   // one frame, before any scaling
+    // One entry per video stream, in the order ffmpeg lists them, which is the
+    // order `[0:v:N]` and the built-in demuxer both number them by.
+    std::vector<std::pair<int, int>> tracks;
 };
 bool ffmpeg_probe_video(const std::string& ffmpeg_exe, const std::string& path,
                         VideoFacts& out, const std::atomic<bool>& cancel);
@@ -252,6 +337,13 @@ bool ffmpeg_probe_video(const std::string& ffmpeg_exe, const std::string& path,
 bool ffmpeg_extract_frame(const std::string& ffmpeg_exe, const std::string& video,
                           double seconds, const std::string& out_path,
                           const std::atomic<bool>& cancel);
+
+// The 360 packing a video carries, or a layout that is not valid(). Asks the
+// built-in demuxer where there is one and ffmpeg otherwise, so the answer does
+// not depend on which decode path the run will take.
+app::Eac360Layout probe_eac360(const std::string& ffmpeg_exe,
+                               const std::string& path,
+                               const std::atomic<bool>& cancel);
 
 // What a picked folder of photos actually means, by the layout conventions the
 // rest of the project already uses -- `spirula sfm auto`'s own probing and the
@@ -270,10 +362,16 @@ bool ffmpeg_extract_frame(const std::string& ffmpeg_exe, const std::string& vide
 void resolve_photo_folder(const std::string& picked, std::string& images,
                           std::string& masks);
 
-// The immediate sub-folders of `dir` that hold images, sorted -- the camera
-// folders of a capture that was handed over already split. Empty when the
-// images sit in `dir` itself, which is the ordinary case.
+// Every folder under `dir` holding images DIRECTLY, '/'-separated, parents
+// before children, "" being `dir` itself -- exactly the groups `--camera-mode
+// folder` will make, grouping an image on its parent path (core/CameraSetup.h).
 std::vector<std::string> camera_subfolders(const std::string& dir);
+
+// Bounds on that walk: it runs on the UI thread and each entry becomes a panel
+// row. Past them a folder still reconstructs, sharing the nearest listed
+// folder's lens by the overrides' longest-prefix rule.
+inline constexpr int kMaxCameraFolderDepth = 4;
+inline constexpr size_t kMaxCameraFolders = 64;
 
 // Does this folder hold any image at all, at any depth? Follows directory
 // symlinks (a prepared capture's images/ is often a link into the raw one) and
@@ -306,11 +404,21 @@ struct WorkspaceState {
     // finished. A run pointed at one ADDS to it rather than rebuilding it.
     bool model = false;
     bool geometry = false;  // normals/ or depths/, which a run adds to
+    // Were the flags that built that model written down beside it
+    // (ReconStamp.h)? Without them a run cannot tell whether reusing it still
+    // answers what the panel is asking for, and reuses it regardless.
+    bool recon_stamp = false;
     // Something a resumed run can pick up instead of redoing.
     bool resumable() const { return frames || features || masks; }
 };
 WorkspaceState probe_workspace(const std::string& workspace,
                                const std::vector<PrepInput>& inputs);
+
+// Everything a run WROTE into the output folder, absolute, existing ones only:
+// what "clear this project" deletes. Never an input -- the images and masks the
+// user picked are not leftovers, which is probe_workspace's rule reused.
+std::vector<std::string> workspace_artifacts(const std::string& workspace,
+                                             const std::vector<PrepInput>& inputs);
 
 // Is this the mask half of one of those layouts, rather than an input of its
 // own? By name, which is what makes it a convention: `--mask-dir masks` is the
@@ -390,8 +498,14 @@ private:
     bool extract_video_ffmpeg(const PrepJob& job, const PrepInput& in,
                               const std::string& images, PrepResult& out,
                               std::string& error);
-    // Photos into the dataset's own images/<subdir>, when they cannot simply be
-    // read where they are (see run()) -- and the masks they came with into the
+    // A 360 capture through ffmpeg: one decode writing the EAC canvas, frame
+    // selection over those, then our own resampler into the views. ffmpeg is
+    // never asked to warp -- see app/Pano360.h.
+    bool extract_360_ffmpeg(const PrepJob& job, const PrepInput& in,
+                            const std::string& images, PrepResult& out,
+                            std::string& error);
+    // Photos into the dataset's own images/<subdir>, by whichever of
+    // PhotoImport the job asked for -- and the masks they came with into the
     // matching masks/<subdir>, so the two trees still mirror each other.
     bool gather_photos(const PrepJob& job, const PrepInput& in,
                        const std::string& images, const std::string& masks,

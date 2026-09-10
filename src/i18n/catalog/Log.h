@@ -603,6 +603,66 @@ SS_MSG(kept_frames,
     RU("Оставлено кадров: {0} -> {1}"),
     TR("{0} kare tutuldu -> {1}"));
 
+SS_MSG(stage_warp_360,
+    EN("Warping 360 frames into views"),
+    JA("360 フレームを各ビューに変換しています"),
+    ZH_HANS("正在把 360 帧展开为各视角"),
+    ZH_HANT("正在把 360 影格展開為各視角"),
+    KO("360 프레임을 각 뷰로 변환하는 중"),
+    DE("360-Einzelbilder werden in Ansichten entzerrt"),
+    FR("Transformation des images 360 en vues"),
+    ES("Transformando los fotogramas 360 en vistas"),
+    PT("Transformando os quadros 360 em vistas"),
+    IT("Trasformazione dei fotogrammi 360 in viste"),
+    NL("360-beelden worden omgezet naar aanzichten"),
+    RU("Преобразование кадров 360 в виды"),
+    TR("360 kareler görünümlere dönüştürülüyor"));
+
+SS_MSG(pano360_plan,
+    EN("360 capture: {0} view(s) of {1}x{2}"),
+    JA("360 撮影: {1}x{2} のビュー {0} 個"),
+    ZH_HANS("360 拍摄：{0} 个 {1}x{2} 的视角"),
+    ZH_HANT("360 拍攝：{0} 個 {1}x{2} 的視角"),
+    KO("360 촬영: {1}x{2} 뷰 {0}개"),
+    DE("360-Aufnahme: {0} Ansicht(en) zu {1}x{2}"),
+    FR("Prise de vue 360 : {0} vue(s) de {1}x{2}"),
+    ES("Captura 360: {0} vista(s) de {1}x{2}"),
+    PT("Captura 360: {0} vista(s) de {1}x{2}"),
+    IT("Ripresa 360: {0} vista/e da {1}x{2}"),
+    NL("360-opname: {0} aanzicht(en) van {1}x{2}"),
+    RU("Съёмка 360: видов — {0}, размер {1}x{2}"),
+    TR("360 çekim: {1}x{2} boyutunda {0} görünüm"));
+
+SS_MSG(err_360_frame_read,
+    EN("Could not read the extracted 360 frame {0}"),
+    JA("抽出した 360 フレーム {0} を読み込めませんでした"),
+    ZH_HANS("无法读取已提取的 360 帧 {0}"),
+    ZH_HANT("無法讀取已擷取的 360 影格 {0}"),
+    KO("추출된 360 프레임 {0}을(를) 읽을 수 없습니다"),
+    DE("Das extrahierte 360-Einzelbild {0} konnte nicht gelesen werden"),
+    FR("Impossible de lire l'image 360 extraite {0}"),
+    ES("No se pudo leer el fotograma 360 extraído {0}"),
+    PT("Não foi possível ler o quadro 360 extraído {0}"),
+    IT("Impossibile leggere il fotogramma 360 estratto {0}"),
+    NL("Het uitgepakte 360-beeld {0} kon niet worden gelezen"),
+    RU("Не удалось прочитать извлечённый кадр 360 {0}"),
+    TR("Çıkarılan 360 karesi {0} okunamadı"));
+
+SS_MSG(err_360_frame_write,
+    EN("Could not write the warped frame {0}"),
+    JA("変換したフレーム {0} を書き出せませんでした"),
+    ZH_HANS("无法写出展开后的帧 {0}"),
+    ZH_HANT("無法寫出展開後的影格 {0}"),
+    KO("변환한 프레임 {0}을(를) 쓸 수 없습니다"),
+    DE("Das entzerrte Einzelbild {0} konnte nicht geschrieben werden"),
+    FR("Impossible d'écrire l'image transformée {0}"),
+    ES("No se pudo escribir el fotograma transformado {0}"),
+    PT("Não foi possível gravar o quadro transformado {0}"),
+    IT("Impossibile scrivere il fotogramma trasformato {0}"),
+    NL("Het omgezette beeld {0} kon niet worden weggeschreven"),
+    RU("Не удалось записать преобразованный кадр {0}"),
+    TR("Dönüştürülen kare {0} yazılamadı"));
+
 SS_MSG(linked_copied_kept,
     EN("  {0} linked, {1} copied, {2} already there"),
     JA("  リンク {0} 件、コピー {1} 件、既存 {2} 件"),
@@ -617,6 +677,88 @@ SS_MSG(linked_copied_kept,
     NL("  {0} gekoppeld, {1} gekopieerd, {2} stonden er al"),
     RU("  связано: {0}, скопировано: {1}, уже было: {2}"),
     TR("  {0} bağlandı, {1} kopyalandı, {2} zaten vardı"));
+
+SS_MSG(converted_copied_kept,
+    EN("  {0} re-encoded, {1} copied, {2} already there"),
+    JA("  再エンコード {0} 件、コピー {1} 件、既存 {2} 件"),
+    ZH_HANS("  重新编码 {0} 个，复制 {1} 个，已有 {2} 个"),
+    ZH_HANT("  重新編碼 {0} 個，複製 {1} 個，已有 {2} 個"),
+    KO("  다시 인코딩 {0}개, 복사 {1}개, 이미 있던 것 {2}개"),
+    DE("  {0} neu kodiert, {1} kopiert, {2} schon vorhanden"),
+    FR("  {0} réencodées, {1} copiées, {2} déjà présentes"),
+    ES("  {0} recodificadas, {1} copiadas, {2} ya estaban"),
+    PT("  {0} recodificadas, {1} copiadas, {2} já estavam lá"),
+    IT("  {0} ricodificate, {1} copiate, {2} già presenti"),
+    NL("  {0} opnieuw gecodeerd, {1} gekopieerd, {2} stonden er al"),
+    RU("  перекодировано: {0}, скопировано: {1}, уже было: {2}"),
+    TR("  {0} yeniden kodlandı, {1} kopyalandı, {2} zaten vardı"));
+
+SS_MSG(moved_kept,
+    EN("  {0} moved, {1} already there"),
+    JA("  移動 {0} 件、既存 {1} 件"),
+    ZH_HANS("  移动 {0} 个，已有 {1} 个"),
+    ZH_HANT("  移動 {0} 個，已有 {1} 個"),
+    KO("  옮김 {0}개, 이미 있던 것 {1}개"),
+    DE("  {0} verschoben, {1} schon vorhanden"),
+    FR("  {0} déplacées, {1} déjà présentes"),
+    ES("  {0} movidas, {1} ya estaban"),
+    PT("  {0} movidas, {1} já estavam lá"),
+    IT("  {0} spostate, {1} già presenti"),
+    NL("  {0} verplaatst, {1} stonden er al"),
+    RU("  перемещено: {0}, уже было: {1}"),
+    TR("  {0} taşındı, {1} zaten vardı"));
+
+SS_MSG(masks_from_alpha,
+    EN("  {0} masks taken from the photos' alpha channel -> {1}"),
+    JA("  写真のアルファチャンネルから取ったマスク {0} 件 -> {1}"),
+    ZH_HANS("  从照片的 alpha 通道取得掩码 {0} 个 -> {1}"),
+    ZH_HANT("  從照片的 alpha 通道取得遮罩 {0} 個 -> {1}"),
+    KO("  사진의 알파 채널에서 얻은 마스크 {0}개 -> {1}"),
+    DE("  {0} Masken aus dem Alphakanal der Fotos -> {1}"),
+    FR("  {0} masques tirés du canal alpha des photos -> {1}"),
+    ES("  {0} máscaras tomadas del canal alfa de las fotos -> {1}"),
+    PT("  {0} máscaras tiradas do canal alfa das fotos -> {1}"),
+    IT("  {0} maschere ricavate dal canale alfa delle foto -> {1}"),
+    NL("  {0} maskers uit het alfakanaal van de foto's -> {1}"),
+    RU("  масок из альфа-канала фотографий: {0} -> {1}"),
+    TR("  fotoğrafların alfa kanalından alınan {0} maske -> {1}"));
+
+SS_MSG(photos_already_in_dataset,
+    EN("{0} is already the dataset's own folder; its files stay as they are."),
+    JA("{0} はすでにこのデータセット自身のフォルダーで、中のファイルはそのままです。"),
+    ZH_HANS("{0} 已经是这个数据集自己的文件夹，里面的文件保持原样。"),
+    ZH_HANT("{0} 已經是這個資料集自己的資料夾，裡面的檔案保持原樣。"),
+    KO("{0} 은(는) 이미 이 데이터셋 자신의 폴더이고, 안의 파일은 그대로 둡니다."),
+    DE("{0} ist bereits der eigene Ordner des Datensatzes; seine Dateien "
+       "bleiben, wie sie sind."),
+    FR("{0} est déjà le dossier propre au jeu de données : ses fichiers restent "
+       "tels quels."),
+    ES("{0} ya es la carpeta propia del conjunto de datos; sus archivos se "
+       "quedan como están."),
+    PT("{0} já é a pasta do próprio conjunto de dados; os seus ficheiros ficam "
+       "como estão."),
+    IT("{0} è già la cartella del set di dati; i suoi file restano come sono."),
+    NL("{0} is al de eigen map van de dataset; de bestanden erin blijven zoals "
+       "ze zijn."),
+    RU("{0} — уже собственная папка набора данных; файлы в ней остаются как "
+       "есть."),
+    TR("{0} zaten veri kümesinin kendi klasörü; içindeki dosyalar olduğu gibi "
+       "kalıyor."));
+
+SS_MSG(photo_kept_unconverted,
+    EN("{0} was copied unchanged rather than re-encoded."),
+    JA("{0} は再エンコードせず、そのままコピーしました。"),
+    ZH_HANS("{0} 未重新编码，原样复制。"),
+    ZH_HANT("{0} 未重新編碼，原樣複製。"),
+    KO("{0} 은(는) 다시 인코딩하지 않고 그대로 복사했습니다."),
+    DE("{0} wurde unverändert kopiert statt neu kodiert."),
+    FR("{0} a été copiée telle quelle plutôt que réencodée."),
+    ES("{0} se copió sin cambios en vez de recodificarse."),
+    PT("{0} foi copiada sem mudanças em vez de recodificada."),
+    IT("{0} è stata copiata invariata invece che ricodificata."),
+    NL("{0} is onveranderd gekopieerd in plaats van opnieuw gecodeerd."),
+    RU("{0} скопирован без изменений, а не перекодирован."),
+    TR("{0} yeniden kodlanmak yerine olduğu gibi kopyalandı."));
 
 SS_MSG(err_inputs_without_prompt,
     EN("Nothing to mask by for {0}. A clicked object prompts only the input it "
@@ -801,6 +943,32 @@ SS_MSG(colmap_split_frame_sizes,
     TR("Aynı kamera grubunda birden çok görüntü boyutu var; COLMAP bunu yapamaz, "
        "bu yüzden her boyut için ayrı kamera ile çıkarım yapılıyor. "
        "Kamera grubu sayısı: {0}"));
+
+SS_MSG(sfm_not_metric,
+    EN("Note: the GPS scale could not be fitted. The model is written in its "
+       "own units, not metres."),
+    JA("メモ: GPS による寸法を当てはめられませんでした。モデルはメートルではなく"
+       "独自の単位で書き出されます。"),
+    ZH_HANS("提示：没能拟合出 GPS 尺度。模型按自身单位写出，而不是米。"),
+    ZH_HANT("提示：沒能擬合出 GPS 尺度。模型按自身單位寫出，而不是公尺。"),
+    KO("참고: GPS 로 크기를 맞추지 못했습니다. 모델은 미터가 아니라 자체 단위로 "
+       "기록됩니다."),
+    DE("Hinweis: Der GPS-Maßstab ließ sich nicht anpassen. Das Modell wird in "
+       "eigenen Einheiten geschrieben, nicht in Metern."),
+    FR("Note : l'échelle GPS n'a pas pu être ajustée. Le modèle est écrit dans "
+       "ses propres unités, pas en mètres."),
+    ES("Nota: no se pudo ajustar la escala por GPS. El modelo se escribe en sus "
+       "propias unidades, no en metros."),
+    PT("Nota: não foi possível ajustar a escala por GPS. O modelo é escrito nas "
+       "suas próprias unidades, não em metros."),
+    IT("Nota: la scala da GPS non si è potuta stimare. Il modello viene scritto "
+       "nelle sue unità, non in metri."),
+    NL("Let op: de GPS-schaal kon niet worden gefit. Het model wordt in eigen "
+       "eenheden geschreven, niet in meters."),
+    RU("Примечание: масштаб по GPS подобрать не удалось. Модель записывается в "
+       "своих единицах, а не в метрах."),
+    TR("Not: GPS ölçeği oturtulamadı. Model metre yerine kendi biriminde "
+       "yazılıyor."));
 
 SS_MSG(sfm_partial,
     EN("Note: only part of the capture reconstructed. It will still train, but "
@@ -3058,6 +3226,32 @@ SS_MSG(stage_geometry,
     NL("Diepte en normalen worden geschat"),
     RU("Оценка глубины и нормалей"),
     TR("Derinlik ve normaller kestiriliyor"));
+
+SS_MSG(sfm_settings_changed,
+    EN("the settings have moved since the reconstruction in the output folder "
+       "was built ({0}); building it again"),
+    JA("出力フォルダの再構成結果を作ったときから設定が変わっています（{0}）。"
+       "作り直します"),
+    ZH_HANS("自输出文件夹里的重建结果做好之后，设置已经变了（{0}），将重新重建"),
+    ZH_HANT("自輸出資料夾裡的重建結果做好之後，設定已經變了（{0}），將重新重建"),
+    KO("출력 폴더의 재구성 결과를 만든 뒤로 설정이 바뀌었습니다({0}). 다시 "
+       "만듭니다"),
+    DE("die Einstellungen haben sich geändert, seit die Rekonstruktion im "
+       "Ausgabeordner gebaut wurde ({0}); sie wird neu gebaut"),
+    FR("les réglages ont changé depuis la construction de la reconstruction du "
+       "dossier de sortie ({0}) ; elle est refaite"),
+    ES("los ajustes han cambiado desde que se construyó la reconstrucción de "
+       "la carpeta de salida ({0}); se rehace"),
+    PT("as definições mudaram desde que a reconstrução da pasta de saída foi "
+       "construída ({0}); vai ser refeita"),
+    IT("le impostazioni sono cambiate da quando è stata costruita la "
+       "ricostruzione nella cartella di uscita ({0}); viene rifatta"),
+    NL("de instellingen zijn veranderd sinds de reconstructie in de uitvoermap "
+       "is gebouwd ({0}); die wordt opnieuw gemaakt"),
+    RU("настройки изменились с тех пор, как была построена реконструкция в "
+       "папке вывода ({0}); она строится заново"),
+    TR("çıktı klasöründeki yeniden kurma yapıldığından beri ayarlar değişti "
+       "({0}); yeniden kuruluyor"));
 
 SS_MSG(sfm_reusing_model,
     EN("{0} already holds a reconstruction; keeping it and only adding to it "

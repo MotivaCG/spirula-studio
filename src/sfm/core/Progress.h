@@ -12,6 +12,8 @@
 // registers an image every few milliseconds on a small capture and every few
 // seconds on a large one, and a screen wants the same cadence from both.
 
+#include "sfm/core/Events.h"
+
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -35,11 +37,14 @@ inline constexpr uint32_t kMaxPoints = 50000;
 void set_dir(const std::string& dir);
 bool enabled();
 
-// model.bin: "VKPM", u32 version=2, u32 images, u32 registered, u64 points,
-// then per registered image { f32 c2w[12] (OpenGL camera-to-world), u32 w, u32
-// h, u32 colmap_model_id, u32 num_params, f64 params[num_params] }, then u32
-// count and that many { f32 xyz[3], u8 rgb[3] }.
-//
+// What the model's frame is worth, carried into the next model.bin so a front
+// end drawing it can say whether a unit is a metre (sfm/Pipeline.h ModelGauge).
+void gauge(bool oriented, bool metric);
+
+// model.bin: "VKPM", u32 version=3, flags (1 oriented, 2 metric), images,
+// registered, u64 points; per registered image { f32 c2w[12] OpenGL, u32 w, h,
+// colmap_model_id, nparams, f64 params[] }; u32 count, { f32 xyz, u8 rgb }.
+
 // The model as it stands, subsampled to kMaxPoints. Call it as often as is
 // convenient; it returns immediately until the interval has passed, unless
 // `force` says this is the last word on a stage.
@@ -62,6 +67,33 @@ void begin_matching(uint32_t n_images,
 // One verified pair, `inliers` of 0 meaning it did not survive verification.
 // Safe to call from the verification workers.
 void pair(uint32_t image1, uint32_t image2, uint32_t inliers);
+
+// status.bin: "VKPS", u32 version=1, u32 stage, u32 flags (1 finished,
+// 2 partial, 4 metric), i64 done, total, registered, images, points, models,
+// f64 mean_reproj.
+//
+// Where the run is and how it ended, so a front end watching a child reads the
+// same facts an in-process one gets from the event stream instead of parsing
+// the log. Rate-limited like the rest; a stage change or a result forces it.
+void status(const Event& e);
+
+// thumbs/<rel_stem>.jpg: the working copy the extractor has already decoded and
+// downscaled, at kThumbLong on its long side.
+//
+// Without it a screen showing the frames as they are extracted has to decode
+// the source file a second time -- a 24 MP JPEG per frame, on its own thread,
+// which is what made the reel lag the stage it was drawing.
+void thumbnail(const std::string& rel_stem, const uint8_t* rgb, int w, int h);
+inline constexpr int kThumbLong = 640;
+
+// live_matches.bin: a matches.bin whose pair count is `kStreamingPairs`,
+// appended as verification produces each pair, so hovering the match map draws
+// a verified pair instead of nothing until the stage ends.
+void live_matches_begin(const std::vector<std::string>& names,
+                        const std::vector<uint32_t>& num_features);
+void live_pair(uint32_t a, uint32_t b, int32_t config,
+               const uint32_t* idx1, const uint32_t* idx2, size_t stride,
+               uint32_t count);
 
 // Write whatever is buffered, whatever the clock says. Call at the end of a
 // stage so the last state on screen is the final one.

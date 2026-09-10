@@ -88,7 +88,8 @@ __device__ inline float4 _optim_block_reduce_minmax_f4(float4 mm) {
 }
 
 
-template<bool use_scale_agnostic_mean, bool zero_grad, bool non_sh_quant>
+template<bool use_scale_agnostic_mean, bool zero_grad, bool non_sh_quant,
+         bool color_trust_linear>
 __global__ void fused_optim_3dgs_geometry_kernel(
     float3* __restrict__ means,
     float3* __restrict__ v_means,
@@ -132,6 +133,8 @@ __global__ void fused_optim_3dgs_geometry_kernel(
     const float max_screen_size,
     const float max_screen_size_penalty,
     const float grad_scale,
+    // Colour trust region; read only by the features_dc update.
+    [[maybe_unused]] const float eps_tr,
     // Non-SH Adam-state quantization bundle. Only read when non_sh_quant is on.
     const NonShQuantState non_sh,
     // Block-wise QUANTIZED gradient input (non-FPBO grad-quant path). For each
@@ -357,12 +360,37 @@ __global__ void fused_optim_3dgs_geometry_kernel(
             v_dc.y += dc_reg_weight * fmaxf(fdc.y - dc_off, 0.f) + under_reg_weight * fminf(fdc.y + dc_off, 0.f);
             v_dc.z += dc_reg_weight * fmaxf(fdc.z - dc_off, 0.f) + under_reg_weight * fminf(fdc.z + dc_off, 0.f);
 
+            // Adam runs on x = splat_dc_encode(dc); carry the gradient there.
+            if constexpr (color_trust_linear) {
+                v_dc.x /= SlangPixelWise::linear_rgb_to_srgb_grad(kSh0 * fdc.x + 0.5f);
+                v_dc.y /= SlangPixelWise::linear_rgb_to_srgb_grad(kSh0 * fdc.y + 0.5f);
+                v_dc.z /= SlangPixelWise::linear_rgb_to_srgb_grad(kSh0 * fdc.z + 0.5f);
+            }
+
             float3 g1_dc, g2_dc;
             _OptimNonShQ<3>::decode(non_sh.features_dc_packed, non_sh.features_dc_bounds, idx,
                                     (float*)&g1_dc, (float*)&g2_dc);
             g1_dc = beta1 * g1_dc + (1.f - beta1) * v_dc;
             g2_dc = beta2 * g2_dc + (1.f - beta2) * v_dc*v_dc;
-            features_dc[idx] = fdc - lr_features_dc * g1_dc / (sqrtf(g2_dc * inv_bias_correction2) + eps);
+            float3 delta_dc = -lr_features_dc * g1_dc / (sqrtf(g2_dc * inv_bias_correction2) + eps);
+            if constexpr (color_trust_linear) {
+                // The encode supplies the brightness scaling, so the rail is a
+                // bare radius; the 2 matches the colour-proportional clip.
+                float clip = kSh0 * sqrtf(2.0f * eps_tr /
+                                          fmaxf(opac_post_sigmoid, 1e-12f));
+                delta_dc.x = fminf(fmaxf(delta_dc.x, -clip), clip);
+                delta_dc.y = fminf(fmaxf(delta_dc.y, -clip), clip);
+                delta_dc.z = fminf(fmaxf(delta_dc.z, -clip), clip);
+                delta_dc.x = isfinite(delta_dc.x) ? delta_dc.x : 0.0f;
+                delta_dc.y = isfinite(delta_dc.y) ? delta_dc.y : 0.0f;
+                delta_dc.z = isfinite(delta_dc.z) ? delta_dc.z : 0.0f;
+                features_dc[idx] = make_float3(
+                    SlangPixelWise::splat_dc_decode(SlangPixelWise::splat_dc_encode(fdc.x) + delta_dc.x),
+                    SlangPixelWise::splat_dc_decode(SlangPixelWise::splat_dc_encode(fdc.y) + delta_dc.y),
+                    SlangPixelWise::splat_dc_decode(SlangPixelWise::splat_dc_encode(fdc.z) + delta_dc.z));
+            } else {
+                features_dc[idx] = fdc + delta_dc;
+            }
             nq_g1_dc = g1_dc;
             nq_g2_dc = g2_dc;
             _OptimNonShQ<3>::accumulate((float*)&g1_dc, (float*)&g2_dc, nq_mm_dc);
@@ -416,6 +444,7 @@ void fused_optim_3dgs_geometry(
     const float dc_reg_weight, const float sh_reg_weight,
     const float max_screen_size, const float max_screen_size_penalty,
     bool use_scale_agnostic_mean,
+    ColorTrustState color_trust,
     NonShQuantState non_sh,
     GradQuantBuffers gq,
     int32_t step, DeviceVector<int32_t> per_splat_steps,
@@ -424,7 +453,9 @@ void fused_optim_3dgs_geometry(
     if (num_splats == 0)
         return;
 
-    // Dispatch over (use_scale_agnostic_mean, zero_grad, non_sh_quant) -> 8 instantiations.
+    // Dispatch over (use_scale_agnostic_mean, zero_grad, non_sh_quant,
+    // color_trust_linear). Colour trust only reaches the features_dc update,
+    // which only runs under non-SH quant, so 12 kernels rather than 16.
     using KFn = void(*)(
         float3*, float3*, float3*, float3*,
         float4*, float4*, float4*, float4*,
@@ -437,28 +468,25 @@ void fused_optim_3dgs_geometry(
         const float, const float, const float, const float,
         const float, const float, const float, const float,
         const float, const float, const float, const float,
+        const float,
         const NonShQuantState,
         const GradQuantBuffers,
         const int32_t, const int32_t*, const int64_t);
     KFn kfn = nullptr;
     const bool nq = non_sh.enabled;
+    const bool ct = nq && color_trust.enabled;
+    #define _PICK_GEO(SAM, ZG) \
+        kfn = ct ? fused_optim_3dgs_geometry_kernel<SAM, ZG, true,  true> \
+             : nq ? fused_optim_3dgs_geometry_kernel<SAM, ZG, true,  false> \
+                  : fused_optim_3dgs_geometry_kernel<SAM, ZG, false, false>
     if (use_scale_agnostic_mean) {
-        if (zero_grad) {
-            kfn = nq ? fused_optim_3dgs_geometry_kernel<true,  true,  true>
-                     : fused_optim_3dgs_geometry_kernel<true,  true,  false>;
-        } else {
-            kfn = nq ? fused_optim_3dgs_geometry_kernel<true,  false, true>
-                     : fused_optim_3dgs_geometry_kernel<true,  false, false>;
-        }
+        if (zero_grad) _PICK_GEO(true,  true);
+        else           _PICK_GEO(true,  false);
     } else {
-        if (zero_grad) {
-            kfn = nq ? fused_optim_3dgs_geometry_kernel<false, true,  true>
-                     : fused_optim_3dgs_geometry_kernel<false, true,  false>;
-        } else {
-            kfn = nq ? fused_optim_3dgs_geometry_kernel<false, false, true>
-                     : fused_optim_3dgs_geometry_kernel<false, false, false>;
-        }
+        if (zero_grad) _PICK_GEO(false, true);
+        else           _PICK_GEO(false, false);
     }
+    #undef _PICK_GEO
     kfn<<<_LAUNCH_ARGS_1D(num_splats, 256)>>>(
         means.data_ptr(), v_means.data_ptr(), g1_means.data_ptr(), g2_means.data_ptr(),
         quats.data_ptr(), v_quats.data_ptr(), g1_quats.data_ptr(), g2_quats.data_ptr(),
@@ -475,9 +503,11 @@ void fused_optim_3dgs_geometry(
         erank_reg_weight / (float)num_splats,
         erank_reg_weight_s3 / (float)num_splats,
         quat_norm_reg_weight / (float)num_splats,
-        dc_reg_weight, sh_reg_weight,
+        2.0f * dc_reg_weight / 3.0f,
+        2.0f * sh_reg_weight / (float)(3 * num_splats),
         max_screen_size, max_screen_size_penalty,
         grad_scale,
+        color_trust.eps_tr,
         non_sh,
         gq,
         step, per_splat_steps.data_ptr(), num_splats

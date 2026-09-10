@@ -17,6 +17,7 @@
 // Only compiled when SS_ENABLE_PATENTED is ON; every caller has an ffmpeg
 // fallback for when it is not.
 
+#include "app/Pano360.h"
 #include "sam/Masking.h"
 
 #include <atomic>
@@ -40,6 +41,12 @@ struct FrameExtractJob {
     float scale = 1.0f;
     int   track = -1;              // -1 = every track
     int   threads = 0;             // encoder threads; 0 = cores - 1
+
+    // A 360 capture: both tracks are decoded together, stitched into the EAC
+    // canvas and resampled into `views` (app/Pano360.h) instead of being split
+    // one folder per track. `track`, `scale` and `rotate` do not apply.
+    Eac360Layout eac;
+    std::vector<Pano360View> views;
 
     // Masking. Empty model = no masks.
     sam::MaskOptions mask;
@@ -78,6 +85,10 @@ std::string video_decode_availability();
 // Number of video tracks in the file, or 0 with `error` set. Cheap: the
 // demuxer alone, no decode session.
 int video_track_count(const std::string& path, std::string& error);
+
+// Each of those tracks' pixel size, in the same order.
+std::vector<std::pair<int, int>> video_track_sizes(const std::string& path,
+                                                   std::string& error);
 
 // Runs the whole thing. False with `error` set on failure; a cancellation
 // returns false with error == "cancelled".

@@ -254,9 +254,9 @@ int main(int argc, char** argv) {
     // --- packed projection: nnz-compacted outputs (ids exact via float) ---
     for (int prim = 0; prim < 3; prim++)
         for (int ci = 0; ci < 4; ci += 3) {  // PINHOLE + EQUIRECTANGULAR
-            // PINHOLE walks the three distorted tiers across the primitives;
-            // EQUIRECTANGULAR has no lens distortion.
-            const int tier = ci == 0 ? 1 + prim : 0;
+            // PINHOLE alternates its two distorted tiers across the
+            // primitives; EQUIRECTANGULAR has no lens distortion.
+            const int tier = ci == 0 ? 1 + prim % 2 : 0;
             backend::memset_sync(d_radii, 0, N * sizeof(float));
             auto fn = prim == 0   ? projection_3dgs_packed_forward
                       : prim == 1 ? projection_mip_packed_forward
@@ -299,8 +299,8 @@ int main(int argc, char** argv) {
         const int prim = k == 0 ? 0 : 2;
         const int bits = k == 0 ? 8 : 16;
         const int fpbo = k;
-        // PINHOLE rational, then FISHEYE thin-prism.
-        const int tier = k == 0 ? 3 : 2;
+        // PINHOLE opencv, then FISHEYE thin-prism.
+        const int tier = k == 0 ? 1 : 2;
         backend::memset_sync(d_radii, 0, N * sizeof(float));
         auto fn = prim == 0 ? projection_3dgs_packed_forward
                             : projection_3dgut_packed_forward;

@@ -99,6 +99,7 @@ struct PplParams {
     int W_ref_normal, H_ref_normal;
     int W_ref_alpha, H_ref_alpha;
     int has_mask;
+    float saturation_threshold;
     uint in_flags;
     uint out_flags;
     uint wgs_per_row;     // pixel axis folds across (wg.x, wg.z); wg.y = batch
@@ -326,6 +327,24 @@ void _ms_load_pixel(PplParams p, int batch_idx, gindex_t idx, int x_dst,
 
 groupshared float _ms_red[256];
 
+// Workgroup sum of `v`, valid on thread 0. Two barriers, against the
+// groupshared tree's one per level -- ppl_fwd reduces once per raw loss, so
+// the tree cost ~200 workgroup barriers a launch and this costs 40.
+float _ms_block_sum(float v, uint tid) {
+    uint wsize = WaveGetLaneCount();
+    float wsum = WaveActiveSum(v);
+    GroupMemoryBarrierWithGroupSync();  // previous call done reading _ms_red
+    if (WaveIsFirstLane()) _ms_red[tid / wsize] = wsum;
+    GroupMemoryBarrierWithGroupSync();
+    float total = 0.0f;
+    if (tid < wsize) {  // wave 0, whole-wave uniform
+        float part = 0.0f;
+        for (uint k = tid; k < 256 / wsize; k += wsize) part += _ms_red[k];
+        total = WaveActiveSum(part);
+    }
+    return total;
+}
+
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void ppl_fwd(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
@@ -358,7 +377,7 @@ void ppl_fwd(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
             render_rgb, ref_rgb, render_depth, ref_depth_v, render_normal,
             depth_normal, ref_normal_v, render_Ts, rgb_dist, depth_dist,
             normal_dist, median_depth, median_normal, ref_alpha_v,
-            p.has_mask != 0, p.weights);
+            p.has_mask != 0, p.saturation_threshold, p.weights);
 
         if ((p.in_flags & kInLossMap) != 0) {
             p.loss_map[idx] = abs(
@@ -386,14 +405,8 @@ void ppl_fwd(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
     for (int i = 0; i < kNRaw; i++) {
         float loss = inside ? losses[i] : 0.0f;
         loss = _ms_finite(loss) ? loss : 0.0f;
-        _ms_red[tid] = loss;
-        GroupMemoryBarrierWithGroupSync();
-        for (uint s = 128; s > 0; s >>= 1) {
-            if (tid < s) _ms_red[tid] += _ms_red[tid + s];
-            GroupMemoryBarrierWithGroupSync();
-        }
+        float sum = _ms_block_sum(loss, tid);
         if (tid == 0) {
-            float sum = _ms_red[0];
             if (sum != 0.0f && _ms_finite(sum)) {
                 int which = _ms_add_which(i);
                 if (which == 0 || which == 2)
@@ -403,7 +416,6 @@ void ppl_fwd(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
                                    sum);
             }
         }
-        GroupMemoryBarrierWithGroupSync();
     }
 }
 
@@ -451,7 +463,8 @@ void ppl_bwd(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
         render_rgb, ref_rgb, render_depth, ref_depth_v, render_normal,
         depth_normal, ref_normal_v, render_Ts, rgb_dist, depth_dist,
         normal_dist, median_depth, median_normal, ref_alpha_v,
-        p.has_mask != 0, p.weights, v_losses, v_render_rgb, v_ref_rgb,
+        p.has_mask != 0, p.saturation_threshold, p.weights, v_losses,
+        v_render_rgb, v_ref_rgb,
         v_render_depth, v_ref_depth, v_render_normal, v_depth_normal,
         v_ref_normal, v_render_Ts, v_rgb_dist, v_depth_dist, v_normal_dist,
         v_median_depth, v_median_normal);

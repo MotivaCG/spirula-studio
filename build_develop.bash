@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Development build for Linux. Extra arguments are passed to CMake, e.g.
-#   ./build_develop.bash -DSS_BUILD_CLI=ON -DSS_BUILD_GUI=ON
+#   ./build_develop.bash -DSS_BACKEND=vulkan -DSS_BUILD_GUI=OFF
 # SS_BUILD_DIR picks the tree (default "build"), so a second backend does
 # not have to reconfigure the first one away. See build_presets/.
 : "${SS_BUILD_DIR:=build}"

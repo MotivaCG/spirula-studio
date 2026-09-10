@@ -33,8 +33,7 @@ struct ColmapCamera {
 
 // What a COLMAP camera record means to the renderer: which model, which
 // distortion tier, and its coefficients. Exposed for a caller that only wants
-// to DRAW the camera -- the live SfM preview, whose model is not on disk yet --
-// so it needs neither the images nor the re-distort fit the parser runs.
+// to DRAW the camera -- the live SfM preview, whose model is not on disk yet.
 struct PreviewIntrins {
     float fx = 0, fy = 0, cx = 0, cy = 0;
     int32_t model = 0;         // CameraModelType
@@ -45,10 +44,9 @@ struct PreviewIntrins {
     std::array<float, 8> dist{};
 };
 
-// False for a model id this reader does not know, a parameter count that does
-// not match it, or a source model no tier represents exactly -- the last of
-// which the parser answers by fitting and resampling, which is more than a
-// frustum needs.
+// False for a model id this reader does not know or a parameter count that
+// does not match it. A lens no tier represents is FITTED here, exactly as the
+// loader fits it, which costs ~25 ms -- cache on the camera record.
 bool colmap_preview_intrins(int model_id, int width, int height,
                             const std::vector<double>& params,
                             PreviewIntrins& out);
@@ -217,6 +215,17 @@ struct ParsedDataset {
     // through this before rendering (RenderWorker.cpp). Row-major 4x4;
     // identity when train_frame_scale == 1.
     std::array<float, 16>    train_to_normalized{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+
+    // The up->+Z rotation inside train_to_normalized, row-major 3x3, so a
+    // viewer can undo just that and leave any axis convention the file came
+    // with (applied_transform) alone. Identity when none was applied.
+    std::array<float, 9>     normalized_rotation{1,0,0, 0,1,0, 0,0,1};
+
+    // What the model's own frame is worth, from the gauge.txt a reconstruction
+    // leaves beside it (sfm/Pipeline.h ModelGauge). Both false when there is no
+    // such file, which is every dataset that did not come from this tool.
+    bool                     gauge_oriented = false;   // +Z is up, measured
+    bool                     gauge_metric = false;     // one unit is one metre
 };
 
 ParsedDataset parse_colmap_dataset(const std::string& dataset_dir,
@@ -313,12 +322,11 @@ namespace dsparse {
 // train_frame="points". Returns 1/max_abs.
 double compute_normalized_scale_factor(const std::vector<float>& c2w, int64_t n);
 
-// Full normalized-frame similarity: writes the row-major 4x4
-// T_n_from_camera = scale * [R_align | -R_align @ center], and returns
-// scale_factor. The viewer remap transform is
-// inv(T_n_from_camera @ applied_transform).
+// Writes T_n_from_camera = scale * [R_align | -R_align @ center] (row-major
+// 4x4) and returns scale_factor; the viewer remap is inv(that @ applied).
+// `R_out` takes R_align alone, the one part of it a viewer can offer to skip.
 double compute_normalized_transform(const std::vector<float>& c2w, int64_t n,
-                                    double T_out[16]);
+                                    double T_out[16], double R_out[9] = nullptr);
 
 // inv([A|b; 0 1]) for a general invertible 3x3 A (row-major 4x4 in/out).
 void invert_affine4x4(const double in[16], double out[16]);

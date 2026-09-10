@@ -531,6 +531,7 @@ export function dsLastError() {
   return Module.ccall('ssv_ds_last_error', 'string', [], []);
 }
 export function dsFitSphere() { return f32(call('ssv_ds_fit_sphere') >>> 0, 4).slice(); }
+export function dsFrustumSize() { return call('ssv_ds_frustum_size'); }
 export function dsPickPoint(ox, oy, oz, dx, dy, dz) {
   const ptr = Module.ccall('ssv_ds_pick_point', 'number',
     ['number','number','number','number','number','number'], [ox,oy,oz,dx,dy,dz]) >>> 0;

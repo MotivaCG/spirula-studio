@@ -34,6 +34,8 @@
 #include "sfm/core/Camera.h"
 #include "sfm/core/Features.h"
 #include "sfm/core/Matches.h"
+#include "sfm/core/Cancel.h"
+#include "sfm/core/Events.h"
 #include "sfm/core/Log.h"
 #include "sfm/geometry/TwoView.h"
 #include "i18n/catalog/Sfm.h"
@@ -227,10 +229,14 @@ inline double bootstrapFocal(const std::vector<FeatureSet>& feats,
                   (long long)((0.5 * diag / best_f) * 180.0 / M_PI)});
         // The search curve itself is a debug histogram -- whoever reads it is
         // calibrating the focal search, not waiting on a reconstruction.
-        fprintf(stderr, "[focal] curve (f:peripheral/total):");
-        for (size_t i = 0; i < curve.size(); i++)
-            fprintf(stderr, " %.0f:%d/%d", curve[i].first, curve[i].second, totals[i]);
-        fprintf(stderr, "\n");
+        std::string line = "[focal] curve (f:peripheral/total):";
+        for (size_t i = 0; i < curve.size(); i++) {
+            char buf[64];
+            snprintf(buf, sizeof buf, " %.0f:%d/%d", curve[i].first,
+                     curve[i].second, totals[i]);
+            line += buf;
+        }
+        slog::diag(slog::Tag::Match, "%s", line.c_str());
     }
     return best_f;
 }
@@ -275,10 +281,10 @@ inline void bootstrapGroupFocals(const std::vector<FeatureSet>& feats,
         auto g = by_group.find(id);
         if (g == by_group.end() || g->second.size() < 8) {
             if (verbose)
-                fprintf(stderr,
-                        "[focal] camera %u: %zu in-group pair(s), too few to search; "
-                        "keeping f=%.1f\n",
-                        id, g == by_group.end() ? 0 : g->second.size(), kv.second.focal());
+                slog::diag(slog::Tag::Match,
+                           "[focal] camera %u: %zu in-group pair(s), too few to search; "
+                           "keeping f=%.1f",
+                           id, g == by_group.end() ? 0 : g->second.size(), kv.second.focal());
             continue;
         }
         // Spread the sample over the group's pairs; a prefix would sample one
@@ -290,7 +296,7 @@ inline void bootstrapGroupFocals(const std::vector<FeatureSet>& feats,
             sp.push_back(pairs[g->second[k]]);
             sm.push_back(matches[g->second[k]]);
         }
-        if (verbose) fprintf(stderr, "[focal] camera %u:\n", id);
+        if (verbose) slog::diag(slog::Tag::Match, "[focal] camera %u:", id);
         double f = bootstrapFocal(feats, sp, sm, percam, tvopt, threads, verbose);
         if (f > 0) {
             kv.second.setFocal(f);
@@ -501,17 +507,17 @@ inline void bootstrapRectilinearFocals(const std::vector<FeatureSet>& feats,
             focalFromEpipolar(feats, sp, sm, kv.second, tvopt, fo, threads);
         if (r.focal > 0) {
             if (verbose)
-                fprintf(stderr,
-                        "[focal] camera %u: %.0f -> %.0f px from %d/%d epipolar vote(s), "
-                        "spread %.0f%%\n",
-                        id, kv.second.focal(), r.focal, r.votes, r.pairs, 100.0 * r.spread);
+                slog::diag(slog::Tag::Match,
+                           "[focal] camera %u: %.0f -> %.0f px from %d/%d epipolar vote(s), "
+                           "spread %.0f%%",
+                           id, kv.second.focal(), r.focal, r.votes, r.pairs, 100.0 * r.spread);
             kv.second.setFocal(r.focal);
             measured.insert(id);
         } else if (verbose) {
-            fprintf(stderr,
-                    "[focal] camera %u: %d/%d epipolar vote(s)%s; keeping the f=%.0f guess\n",
-                    id, r.votes, r.pairs,
-                    r.votes >= fo.min_votes ? " disagree" : " -- too few", kv.second.focal());
+            slog::diag(slog::Tag::Match,
+                       "[focal] camera %u: %d/%d epipolar vote(s)%s; keeping the f=%.0f guess",
+                       id, r.votes, r.pairs,
+                       r.votes >= fo.min_votes ? " disagree" : " -- too few", kv.second.focal());
         }
     }
 }
@@ -619,13 +625,36 @@ inline std::vector<TwoViewMatches> verifyPairs(
         // pair that failed from one nothing has reached yet unless both are
         // reported. A no-op without --progress-dir, and called from the
         // workers, which is what the lock inside it is for.
-        progress::pair(i, j, verifyBody(p, m, i, j));
+        const uint32_t inl = verifyBody(p, m, i, j);
+        progress::pair(i, j, inl);
+        if (inl) {
+            const std::vector<FeatureMatch>& kept = results[p].matches;
+            progress::live_pair(i, j, results[p].config,
+                                &kept[0].idx1, &kept[0].idx2,
+                                sizeof(FeatureMatch), (uint32_t)kept.size());
+        }
+        Event e;
+        e.kind = Event::Kind::PairVerified;
+        e.stage = Stage::Match;
+        e.image_a = i;
+        e.image_b = j;
+        e.inliers = inl;
+        events::emit(e);
     };
 
     // How many pairs to ask the matcher for at once. Independent of the worker
     // count: it only bounds how far the GPU may run ahead of the verifiers.
     const size_t batch = std::max<size_t>(1, (size_t)opt.match_batch_pairs);
     std::vector<std::vector<FeatureMatch>> batch_out;
+
+    // The stage's fraction, at most a few hundred steps over the whole of it.
+    // Per pair it is a global lock the workers are already contending for, and
+    // a screen cannot show 700k of anything.
+    const size_t step = std::max<size_t>(1, pairs.size() / 400);
+    auto tick = [&](size_t p) {
+        if ((p + 1) % step == 0 || p + 1 == pairs.size())
+            events::progress(Stage::Match, (int64_t)p + 1, (int64_t)pairs.size());
+    };
 
     if (nthreads <= 1) {
         for (size_t b = 0; b < pairs.size(); b += batch) {
@@ -636,6 +665,8 @@ inline std::vector<TwoViewMatches> verifyPairs(
                 putative += m.size();
                 verifyOne(p, m);
                 if (progress) progress(p + 1, pairs.size());
+                tick(p);
+                cancel::check();
             }
         }
     } else {
@@ -668,7 +699,11 @@ inline std::vector<TwoViewMatches> verifyPairs(
             });
         }
 
-        for (size_t b = 0; b < pairs.size(); b += batch) {
+        // A cancel stops the producer and lets the queue drain; it must not
+        // throw from here, because the workers are still waiting on `cv_job`
+        // and an unwind past their join() would terminate the process.
+        bool stop = false;
+        for (size_t b = 0; b < pairs.size() && !stop; b += batch) {
             size_t e = std::min(b + batch, pairs.size());
             matchFn(b, e, batch_out);
             for (size_t p = b; p < e; p++) {
@@ -681,6 +716,8 @@ inline std::vector<TwoViewMatches> verifyPairs(
                 }
                 cv_job.notify_one();
                 if (progress) progress(p + 1, pairs.size());
+                tick(p);
+                if (cancel::requested()) { stop = true; break; }
             }
         }
         {
@@ -690,6 +727,7 @@ inline std::vector<TwoViewMatches> verifyPairs(
         cv_job.notify_all();
         for (std::thread& w : workers) w.join();
     }
+    cancel::check();   // safe now: every worker has been joined
 
     if (putative_out) *putative_out = putative;
 

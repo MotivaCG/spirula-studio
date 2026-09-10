@@ -15,6 +15,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <optional>
 
 namespace fs = std::filesystem;
 
@@ -57,13 +59,45 @@ struct Reader {
 
 }  // namespace
 
+bool read_status(const std::string& dir, int64_t& mtime, RunStatus& out) {
+    if (dir.empty()) return false;
+    const std::string b = slurp_if_newer(fs::path(dir) / "status.bin", mtime);
+    if (b.size() < 72 || std::memcmp(b.data(), "VKPS", 4) != 0) return false;
+    Reader r{b.data() + 4, b.data() + b.size()};
+    if (r.u32() != 1) return false;
+    RunStatus st;
+    st.stage = r.u32();
+    const uint32_t flags = r.u32();
+    st.finished = (flags & 1u) != 0;
+    st.partial = (flags & 2u) != 0;
+    st.metric = (flags & 4u) != 0;
+    st.done = (int64_t)r.u64();
+    st.total = (int64_t)r.u64();
+    st.registered = (int64_t)r.u64();
+    st.images = (int64_t)r.u64();
+    st.points = (int64_t)r.u64();
+    st.models = (int64_t)r.u64();
+    double mean = 0;
+    r.take(&mean, 8);
+    st.mean_reproj = mean;
+    if (!r.ok) return false;
+    out = st;
+    return true;
+}
+
 bool read_live_model(const std::string& dir, int64_t& mtime, LiveModel& out) {
     const std::string b = slurp_if_newer(fs::path(dir) / "model.bin", mtime);
     if (b.size() < 24 || std::memcmp(b.data(), "VKPM", 4) != 0) return false;
 
     Reader r{b.data() + 4, b.data() + b.size()};
-    if (r.u32() != 2) return false;
+    const uint32_t version = r.u32();
+    if (version != 2 && version != 3) return false;
     LiveModel m;
+    if (version >= 3) {
+        const uint32_t flags = r.u32();
+        m.ds.gauge_oriented = (flags & 1u) != 0;
+        m.ds.gauge_metric = (flags & 2u) != 0;
+    }
     m.n_images = r.u32();
     m.n_registered = r.u32();
     m.n_points = r.u64();
@@ -79,6 +113,10 @@ bool read_live_model(const std::string& dir, int64_t& mtime, LiveModel& out) {
                                  (int32_t)CameraDistortionType::None);
     ds.dist_coeffs.assign((size_t)m.n_registered * kCameraDistortionParams, 0.0f);
     std::vector<double> params;
+    // One camera record per image in the snapshot, and a capture usually
+    // repeats one: colmap_preview_intrins solves a least-squares fit for a
+    // lens no tier represents, which is ~25 ms each.
+    std::map<std::string, std::optional<PreviewIntrins>> cams;
     for (uint32_t i = 0; i < m.n_registered; i++) {
         for (int k = 0; k < 12; k++) ds.c2w[(size_t)i * 12 + k] = r.f32();
         const int w = (int)r.u32(), h = (int)r.u32();
@@ -91,8 +129,17 @@ bool read_live_model(const std::string& dir, int64_t& mtime, LiveModel& out) {
         for (uint32_t k = 0; k < np; k++) r.take(&params[k], 8);
         // The parser's own mapping, so a fisheye draws as a fisheye rather
         // than as the pinhole a bare focal length would suggest.
-        PreviewIntrins pi;
-        if (colmap_preview_intrins(model_id, w, h, params, pi)) {
+        std::string key((const char*)&model_id, sizeof model_id);
+        key.append((const char*)&w, sizeof w).append((const char*)&h, sizeof h);
+        key.append((const char*)params.data(), params.size() * sizeof(double));
+        auto [ent, fresh] = cams.try_emplace(key);
+        if (fresh) {
+            PreviewIntrins pi;
+            if (colmap_preview_intrins(model_id, w, h, params, pi))
+                ent->second = pi;
+        }
+        if (ent->second) {
+            const PreviewIntrins& pi = *ent->second;
             ds.camera_models[i] = pi.model;
             ds.camera_distortions[i] = pi.distortion;
             ds.intrins[(size_t)i * 4 + 0] = pi.fx;
@@ -102,7 +149,7 @@ bool read_live_model(const std::string& dir, int64_t& mtime, LiveModel& out) {
             for (int k = 0; k < kCameraDistortionParams; k++)
                 ds.dist_coeffs[(size_t)i * kCameraDistortionParams + k] = pi.dist[k];
         } else if (params.size() >= 4) {
-            // A model the parser will not map without a fit; a plain frustum
+            // A record this reader cannot interpret at all; a plain frustum
             // from whatever the first four parameters are is still the right
             // place in space.
             for (int k = 0; k < 4; k++)

@@ -5,14 +5,17 @@ describe is gone -- see §3 for what it covered and what now does not.
 
 ## 1. Native cross-backend parity tests (the important ones)
 
-`src/backend/tests/*.cpp` — currently 19 tools covering projection (fwd, bwd,
+`src/backend/tests/*.cpp` — currently 20 tools covering projection (fwd, bwd,
 quant-grad), rasterization bwd, tile intersect, warp, FPBO, optimizer (general
 + geometry), densify, per-pixel train, PPISP, bilagrid, multi-scale loss
-(`mask_loss_semantics` and `reg_loss_underflow` are self-checking rather than
-dump-then-compare: the first pins what an image mask means in the loss, in
-both mask modes and with none; the second sweeps log scales past every
-exp(scales) underflow threshold, down to -inf, and fails if the per-splat
-regularizers hand the optimizer a NaN or push a splat below kMinLogScale),
+(`mask_loss_semantics`, `reg_loss_underflow` and `fpbo_split_parity` are
+self-checking rather than dump-then-compare: the first pins what an image mask
+means in the loss, in both mask modes and with none; the second sweeps log
+scales past every exp(scales) underflow threshold, down to -inf, and fails if
+the per-splat regularizers hand the optimizer a NaN or push a splat below
+kMinLogScale; the third steps FPBO and the non-fused optimizer path from the
+same state and fails if they disagree, which is how the two update laws for
+linear splat colour are held together),
 meshing (activation, LBVH, occupancy/bisection/color, moment raster, the
 per-camera samplers and the visibility cull), plus
 `backend/tests/engine/` which drives the *real* engine end to end
@@ -192,6 +195,28 @@ expectation, one executable. Neither exists yet.
 (H2D / D2H / D2D / memset / device / host). Header-only, works on both
 backends — the right first tool when a backend is unexpectedly slow rather
 than wrong.
+
+Above that table both backends print **GPU time by kernel**, so the two are
+directly comparable without a profiler. Vulkan brackets each dispatch with
+timestamp queries; CUDA does the same with a CUDA event pair, injected by
+`-Wl,--wrap=cudaLaunchKernel` (`backend/cuda/KernelProfilerCuda.cu`) so no
+launch site is instrumented by hand and CUB's kernels are covered too. Rows
+aggregate over template arguments / specialization constants, which is what
+makes a CUDA row and a Vulkan row the same thing.
+
+Two caveats on reading those numbers against each other. The intervals
+include the gap before each kernel starts, so their sum runs a little over
+the device-wait total. And a training run is **not** reproducible: atomic
+order moves the trajectory, and the rasterization and sort kernels then see a
+different scene — `rasterize_fwd` has been seen to move 70% between two runs
+of the same binary. The image-sized kernels (losses, bilagrid, PPISP, FPBO)
+hold to ~1%, so they can be A/B'd from a training run directly; for the rest
+use the benchmark tools, which fix the workload:
+
+```bash
+./build/raster_bench [num_splats] [iters] [macro_log2]   # raster fwd/bwd, binning
+./build/fpbo_bench   [num_splats] [iters]                # fused projection bwd + optimizer
+```
 
 A run that trains also prints a VRAM breakdown after the timing table: pool
 capacity per `VramCategory` (`src/core/PoolSlots.h`), the scratch buffer, the

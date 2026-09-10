@@ -1067,6 +1067,31 @@ SS_MSG(opt_primitive_help,
        "izdüşümü, bozulmalı kameralar (balıkgözü / eşdikdörtgen) için tam "
        "doğrudur."));
 
+SS_MSG(opt_primitive_3dgut_warn,
+    EN("3dgut generally trains slower than 3dgs, and few existing viewers can "
+       "open what it produces."),
+    JA("3dgut は 3dgs より学習が遅く、その結果を開けるビューアも限られます。"),
+    ZH_HANS("3dgut 的训练通常比 3dgs 慢，能打开它的结果的现有查看器也很少。"),
+    ZH_HANT("3dgut 的訓練通常比 3dgs 慢，能開啟它的結果的現有檢視器也很少。"),
+    KO("3dgut은 3dgs보다 학습이 대체로 느리고, 그 결과를 열 수 있는 기존 "
+       "뷰어도 적습니다."),
+    DE("3dgut trainiert meist langsamer als 3dgs, und nur wenige vorhandene "
+       "Betrachter können das Ergebnis öffnen."),
+    FR("3dgut s'entraîne généralement plus lentement que 3dgs, et peu de "
+       "visionneuses existantes savent ouvrir ce qu'il produit."),
+    ES("3dgut suele entrenar más lento que 3dgs y pocos visores existentes "
+       "abren lo que produce."),
+    PT("3dgut costuma treinar mais devagar que 3dgs e poucos visualizadores "
+       "existentes abrem o que ele produz."),
+    IT("3dgut di solito si addestra più lentamente di 3dgs e pochi "
+       "visualizzatori esistenti aprono ciò che produce."),
+    NL("3dgut traint doorgaans langzamer dan 3dgs en weinig bestaande viewers "
+       "kunnen openen wat het oplevert."),
+    RU("3dgut обычно обучается медленнее, чем 3dgs, и мало какие существующие "
+       "просмотрщики открывают его результат."),
+    TR("3dgut genellikle 3dgs'den daha yavaş eğitilir ve ürettiğini açabilen "
+       "görüntüleyici azdır."));
+
 SS_MSG(opt_resolution,
     EN("Image resolution"), JA("画像の解像度"), ZH_HANS("图像分辨率"),
     ZH_HANT("影像解析度"),  KO("이미지 해상도"), DE("Bildauflösung"),
@@ -2017,45 +2042,45 @@ SS_MSG(keep_training_help,
     TR("Bunu kapatır ve çalışmanın duraklatıldığı yerden devam eder."));
 
 SS_MSG(data_error_title,
-    EN("Dataset file unreadable"),
-    JA("データセットのファイルを読めません"),
-    ZH_HANS("无法读取数据集文件"),
-    ZH_HANT("無法讀取資料集檔案"),
-    KO("데이터셋 파일을 읽을 수 없음"),
-    DE("Datensatzdatei nicht lesbar"),
-    FR("Fichier du jeu de données illisible"),
-    ES("Archivo del conjunto de datos ilegible"),
-    PT("Ficheiro do conjunto de dados ilegível"),
-    IT("File del set di dati illeggibile"),
-    NL("Datasetbestand onleesbaar"),
-    RU("Файл набора данных не читается"),
-    TR("Veri kümesi dosyası okunamıyor"));
+    EN("Training paused"),
+    JA("学習を一時停止しました"),
+    ZH_HANS("训练已暂停"),
+    ZH_HANT("訓練已暫停"),
+    KO("학습이 일시정지됨"),
+    DE("Training pausiert"),
+    FR("Entraînement en pause"),
+    ES("Entrenamiento en pausa"),
+    PT("Treinamento pausado"),
+    IT("Addestramento in pausa"),
+    NL("Training gepauzeerd"),
+    RU("Обучение приостановлено"),
+    TR("Eğitim duraklatıldı"));
 
 SS_MSG(data_error_intro,
-    EN("Training is paused here and nothing is lost. Put the file back, then "
-       "retry."),
-    JA("ここで学習は一時停止していて、失われたものはありません。ファイルを"
-       "戻してから、やり直してください。"),
-    ZH_HANS("训练已在此暂停，没有任何损失。把文件放回去，然后重试。"),
-    ZH_HANT("訓練已在此暫停，沒有任何損失。把檔案放回去，然後重試。"),
-    KO("여기서 학습이 멈춰 있고 잃은 것은 없습니다. 파일을 되돌려 놓고 다시 "
+    EN("Training is paused here and nothing is lost. Clear the problem above, "
+       "then retry."),
+    JA("ここで学習は一時停止していて、失われたものはありません。上の問題を"
+       "解消してから、やり直してください。"),
+    ZH_HANS("训练已在此暂停，没有任何损失。解决上面的问题，然后重试。"),
+    ZH_HANT("訓練已在此暫停，沒有任何損失。解決上面的問題，然後重試。"),
+    KO("여기서 학습이 멈춰 있고 잃은 것은 없습니다. 위의 문제를 해결한 뒤 다시 "
        "시도하세요."),
-    DE("Das Training pausiert hier, nichts geht verloren. Legen Sie die Datei "
-       "zurück und versuchen Sie es erneut."),
-    FR("L'entraînement est en pause ici et rien n'est perdu. Remettez le "
-       "fichier en place, puis réessayez."),
-    ES("El entrenamiento está en pausa aquí y no se pierde nada. Vuelve a "
-       "poner el archivo y reinténtalo."),
-    PT("O treinamento está pausado aqui e nada se perde. Coloque o ficheiro de "
-       "volta e tente novamente."),
-    IT("L'addestramento è in pausa qui e non si perde nulla. Rimetti a posto "
-       "il file, poi riprova."),
-    NL("De training staat hier stil en er gaat niets verloren. Zet het bestand "
-       "terug en probeer het opnieuw."),
-    RU("Обучение приостановлено здесь, ничего не потеряно. Верните файл на "
-       "место и повторите."),
-    TR("Eğitim burada duraklatıldı ve hiçbir şey kaybolmadı. Dosyayı geri "
-       "koyup yeniden deneyin."));
+    DE("Das Training pausiert hier, nichts geht verloren. Beheben Sie das "
+       "Problem oben und versuchen Sie es erneut."),
+    FR("L'entraînement est en pause ici et rien n'est perdu. Corrigez le "
+       "problème ci-dessus, puis réessayez."),
+    ES("El entrenamiento está en pausa aquí y no se pierde nada. Resuelve el "
+       "problema de arriba y reinténtalo."),
+    PT("O treinamento está pausado aqui e nada se perde. Resolva o problema "
+       "acima e tente novamente."),
+    IT("L'addestramento è in pausa qui e non si perde nulla. Risolvi il "
+       "problema qui sopra, poi riprova."),
+    NL("De training staat hier stil en er gaat niets verloren. Los het "
+       "probleem hierboven op en probeer het opnieuw."),
+    RU("Обучение приостановлено здесь, ничего не потеряно. Устраните проблему "
+       "выше и повторите."),
+    TR("Eğitim burada duraklatıldı ve hiçbir şey kaybolmadı. Yukarıdaki "
+       "sorunu giderip yeniden deneyin."));
 
 SS_MSG(data_error_retry,
     EN("Retry"), JA("やり直す"), ZH_HANS("重试"), ZH_HANT("重試"),
@@ -2207,6 +2232,60 @@ SS_MSG(viewport_grid,
     KO("격자"),           DE("Raster"),       FR("grille"),       ES("rejilla"),
     PT("grade"),         IT("griglia"),      NL("raster"),       RU("сетка"),
     TR("ızgara"));
+
+SS_MSG(viewport_level_cameras,
+    EN("auto-level"),    JA("自動水平"),      ZH_HANS("自动摆正"),  ZH_HANT("自動擺正"),
+    KO("자동 수평"),      DE("autom. Ausrichtung"), FR("mise à niveau"),
+    ES("nivelado autom."),
+    PT("nivelamento autom."), IT("livellamento autom."), NL("autom. waterpas"),
+    RU("автовыравнивание"), TR("otom. tesviye"));
+
+SS_MSG(viewport_level_cameras_help,
+    EN("Turn the view so the cameras' average up axis points up. That is a "
+       "guess, and a poor one for a tilted or upside-down 360 capture; off "
+       "uses the model's own axes, which a measured orientation has levelled."),
+    JA("カメラの平均的な上方向が上を向くように視点を回転します。これは推定であり、"
+       "傾いた、または上下が逆の360度撮影では外れます。オフにするとモデル自身の"
+       "座標軸を使います。向きが実測されていれば、それはすでに水平です。"),
+    ZH_HANS("旋转视图，使各相机的平均朝上方向指向上方。这只是推测，对倾斜或倒置的"
+            "360 度拍摄往往不准；关闭后使用模型自身的坐标轴，若方向已实测则本就是"
+            "水平的。"),
+    ZH_HANT("旋轉檢視，使各相機的平均朝上方向指向上方。這只是推測，對傾斜或倒置的"
+            "360 度拍攝往往不準；關閉後使用模型自身的座標軸，若方向已實測則本就是"
+            "水平的。"),
+    KO("카메라들의 평균 위쪽 축이 위를 향하도록 시점을 돌립니다. 이는 추정이며 "
+       "기울거나 뒤집힌 360도 촬영에서는 잘 맞지 않습니다. 끄면 모델 자체의 축을 "
+       "쓰며, 방향이 측정된 모델은 이미 수평입니다."),
+    DE("Dreht die Ansicht so, dass die mittlere Oben-Achse der Kameras nach "
+       "oben zeigt. Das ist geraten und bei einer geneigten oder "
+       "kopfstehenden 360-Aufnahme schlecht; aus nutzt die Achsen des Modells."),
+    FR("Oriente la vue pour que l'axe haut moyen des caméras pointe vers le "
+       "haut. C'est une supposition, mauvaise pour une capture 360 inclinée ou "
+       "retournée ; désactivé, la vue suit les axes propres du modèle."),
+    ES("Gira la vista para que el eje superior medio de las cámaras apunte "
+       "hacia arriba. Es una suposición, mala en una captura 360 inclinada o "
+       "invertida; al desactivarla se usan los ejes propios del modelo."),
+    PT("Roda a vista para que o eixo superior médio das câmaras aponte para "
+       "cima. É uma suposição, má numa captura 360 inclinada ou invertida; "
+       "desligada, usa os eixos do próprio modelo."),
+    IT("Ruota la vista perché l'asse alto medio delle fotocamere punti verso "
+       "l'alto. È una supposizione, sbagliata in una ripresa 360 inclinata o "
+       "capovolta; disattivata, usa gli assi propri del modello."),
+    NL("Draait het beeld zodat de gemiddelde omhoog-as van de camera's omhoog "
+       "wijst. Dat is een gok, en een slechte bij een gekantelde of "
+       "omgekeerde 360-opname; uit gebruikt de assen van het model zelf."),
+    RU("Поворачивает вид так, чтобы средняя ось «вверх» камер смотрела вверх. "
+       "Это догадка, плохая для наклонной или перевёрнутой 360-съёмки; "
+       "выключено — используются собственные оси модели."),
+    TR("Görünümü, kameraların ortalama yukarı ekseni yukarı bakacak biçimde "
+       "döndürür. Bu bir tahmindir ve eğik ya da ters 360 çekimlerde kötüdür; "
+       "kapalıyken modelin kendi eksenleri kullanılır."));
+
+SS_MSG(viewport_scale,
+    EN("resolution"),    JA("解像度"),       ZH_HANS("分辨率"),   ZH_HANT("解析度"),
+    KO("해상도"),        DE("Auflösung"),   FR("résolution"),  ES("resolución"),
+    PT("resolução"),     IT("risoluzione"),  NL("resolutie"),    RU("разрешение"),
+    TR("çözünürlük"));
 
 SS_MSG(viewport_scale_auto,
     EN("Auto"),         JA("自動"),          ZH_HANS("自动"),    ZH_HANT("自動"),
@@ -6194,6 +6273,36 @@ SS_MSG(overlay_points,
     NL("Punten: {0}"),
     RU("Точки: {0}"),
     TR("Nokta: {0}"));
+
+SS_MSG(overlay_grid_metric,
+    EN("Grid: {0}"),
+    JA("グリッド: {0}"),
+    ZH_HANS("网格：{0}"),
+    ZH_HANT("格線：{0}"),
+    KO("격자: {0}"),
+    DE("Raster: {0}"),
+    FR("Grille : {0}"),
+    ES("Cuadrícula: {0}"),
+    PT("Grelha: {0}"),
+    IT("Griglia: {0}"),
+    NL("Raster: {0}"),
+    RU("Сетка: {0}"),
+    TR("Izgara: {0}"));
+
+SS_MSG(overlay_grid_relative,
+    EN("Grid: {0} (no metric scale)"),
+    JA("グリッド: {0}（実寸不明）"),
+    ZH_HANS("网格：{0}（无实际尺度）"),
+    ZH_HANT("格線：{0}（無實際尺度）"),
+    KO("격자: {0} (실척 없음)"),
+    DE("Raster: {0} (kein metrischer Maßstab)"),
+    FR("Grille : {0} (pas d'échelle métrique)"),
+    ES("Cuadrícula: {0} (sin escala métrica)"),
+    PT("Grelha: {0} (sem escala métrica)"),
+    IT("Griglia: {0} (nessuna scala metrica)"),
+    NL("Raster: {0} (geen metrische schaal)"),
+    RU("Сетка: {0} (масштаб не в метрах)"),
+    TR("Izgara: {0} (metrik ölçek yok)"));
 
 
 // ===========================================================================

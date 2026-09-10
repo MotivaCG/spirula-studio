@@ -515,8 +515,7 @@ int main(int argc, char** argv) {
 
         for (int c = 0; c < NCAM; ++c) {
             const int cm = 0;   // PINHOLE
-            // Thin prism is covered by the projection and the cull.
-            const int td = c == 0 ? 0 : c == 1 ? 1 : 3;
+            const int td = c == 0 ? 0 : c == 1 ? 1 : 2;
             const float* d_dc =
                 d_dist + dist_fixture::row_offset(td, NCAM, c);
             meshing::launch_sample_occ(d_q, NQ, d_vm + 16 * c, d_intr + 4 * c,

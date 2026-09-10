@@ -12,6 +12,7 @@ namespace srccam {
 // Model ids. 0..17 are COLMAP's own CameraModelId values (models.h), and their
 // parameters are COLMAP's array verbatim. Ours are numbered from 1000, leaving
 // COLMAP room to keep appending to its enum.
+constexpr int kColmapFullOpenCV             = 6;
 constexpr int kColmapFOV                    = 7;
 constexpr int kColmapRadTanThinPrismFisheye = 11;
 constexpr int kColmapSimpleDivision         = 12;
@@ -19,7 +20,7 @@ constexpr int kColmapDivision               = 13;
 constexpr int kColmapEUCM                   = 16;
 
 // Any supported camera plus a sensor skew, which no tier carries: Agisoft
-// Metashape's b2. Parameter layout in camera_source.slang.
+// Metashape's b2. Parameter layout: docs/datasets.md.
 constexpr int kSkewed = 1000;
 
 // kSkewed's base camera, params[13].
@@ -29,7 +30,7 @@ constexpr float kSkewBaseEquisolid   = 2.0f;
 
 // kSkewed's radial form, params[14].
 constexpr float kSkewRadialPolynomial = 0.0f;   // DistThinPrism slot order
-constexpr float kSkewRadialRational   = 1.0f;   // DistRational slot order
+constexpr float kSkewRadialRational   = 1.0f;   // k1..k6 p1 p2, k4..k6 divide
 
 constexpr int kMaxParams = 16;
 

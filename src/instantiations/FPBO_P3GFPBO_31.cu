@@ -6,7 +6,7 @@
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     MipSplatting<1>,
-    CameraModelType::PINHOLE,
+    CameraModelType::FISHEYE,
     CameraDistortionType::OpenCV,
     false,
     false,
@@ -66,7 +66,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     MipSplatting<1>,
-    CameraModelType::PINHOLE,
+    CameraModelType::FISHEYE,
     CameraDistortionType::ThinPrism,
     true,
     true,
@@ -126,7 +126,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     MipSplatting<1>,
-    CameraModelType::PINHOLE,
+    CameraModelType::FISHEYE,
     CameraDistortionType::ThinPrism,
     true,
     true,
@@ -186,7 +186,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     MipSplatting<1>,
-    CameraModelType::PINHOLE,
+    CameraModelType::FISHEYE,
     CameraDistortionType::ThinPrism,
     true,
     false,
@@ -246,7 +246,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     MipSplatting<1>,
-    CameraModelType::PINHOLE,
+    CameraModelType::FISHEYE,
     CameraDistortionType::ThinPrism,
     true,
     false,
@@ -306,7 +306,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     MipSplatting<1>,
-    CameraModelType::PINHOLE,
+    CameraModelType::FISHEYE,
     CameraDistortionType::ThinPrism,
     false,
     true,
@@ -366,7 +366,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     MipSplatting<1>,
-    CameraModelType::PINHOLE,
+    CameraModelType::FISHEYE,
     CameraDistortionType::ThinPrism,
     false,
     true,
@@ -426,7 +426,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     MipSplatting<1>,
-    CameraModelType::PINHOLE,
+    CameraModelType::FISHEYE,
     CameraDistortionType::ThinPrism,
     false,
     false,
@@ -486,7 +486,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     MipSplatting<1>,
-    CameraModelType::PINHOLE,
+    CameraModelType::FISHEYE,
     CameraDistortionType::ThinPrism,
     false,
     false,

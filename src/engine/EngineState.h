@@ -56,6 +56,7 @@ inline DistortionType engine_distortion_type(
 #include "kernels/tile/SplatTileIntersector.cuh"
 #include "kernels/visualize/Visualizer.cuh"
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <map>
@@ -368,11 +369,11 @@ struct BilagridNormal {
     bool quantize_value() const { return value_bits != 32; }
 };
 
-// Background blending. Applied BEFORE bilagrid/PPISP. Two modes:
-//   - Noise: random per-pixel color (warmup-weighted). No persistent state.
-//   - Sh:    skybox = SH(world ray dir) + DC color. DC + L1+ coeffs trained.
+// Background blending. Applied BEFORE bilagrid/PPISP. Noise and Pseudorandom
+// are the same stateless blend over a different draw; Sh is a trained skybox,
+// SH(world ray dir) + DC color, and carries the only persistent state here.
 struct EngineBackground {
-    enum class Mode { None = 0, Noise = 1, Sh = 2 };
+    enum class Mode { None = 0, Noise = 1, Sh = 2, Pseudorandom = 3 };
     Mode mode    = Mode::None;
     bool enabled = false;
 
@@ -422,6 +423,9 @@ struct ColorSpaceState {
     int                    image_transfer   = 0;
     bool                   image_is_linear  = false;
     DeviceTensor2D<float3> image_color_matrix;   // [3, 3], stored as 3 float3 rows
+    // The same matrix on the host: the mean-luma weight scale
+    // (EngineDataManager.cpp) converts reference pixels on the CPU.
+    std::array<float, 9>   image_color_matrix_host{};
 
     // Per-iter scratch: pre-conversion render kept for the backward vjp
     // (working_to_display_backward consumes the working-space input).
@@ -483,7 +487,7 @@ struct EngineViewerState {
     DeviceVector<float>   d_dist_coeffs;      // [N_post, 8]
     DeviceVector<int32_t> d_distortions;      // [N_post] CameraDistortionType
     DeviceVector<float>   d_camera_to_worlds; // [N_post, 3, 4] (y/z-flipped form)
-    float  camera_size = 0.0f;                // frustum render scale, from knn-dist
+    float  camera_size = 0.0f;                // frustum render scale, world units
 
     // Thumbnail cache: [N_post, S, S, 4] uint8, S = VIEWER_THUMBNAIL_SIZE.
     // done_mask[i] = 1 once cam i's thumbnail has been written. Host fast-path
@@ -596,6 +600,11 @@ struct EngineState {
     // batching). Set by engine_setup_data_manager(); when present, the new
     // engine_train_step_managed() entrypoint pulls per-step inputs from it.
     std::unique_ptr<DataManager> dm;
+
+    // Mean sRGB luma per input camera, filled lazily by the photometric weight
+    // normalization (EngineDataManager.cpp) and NaN until measured. An image's
+    // pixels do not change between epochs, so one measurement stands for a run.
+    std::vector<float> gt_mean_luma;
 
     // Out-of-line ctor/dtor (defined in EngineState.cpp) so the
     // std::unique_ptr<DataManager> deleter only needs the complete type at

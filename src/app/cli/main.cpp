@@ -3,16 +3,14 @@
 //     spirula train [<preset>] --data <dir> [--flag value ...]
 //
 // where <preset> is one of 3dgs (the default), 360-camera, in-the-wild,
-// linear-color, synthetic, meshing, academic-baseline. Flags are the
-// FLATTENED training config fields
-// (--sh-degree, not --model.sh-degree); '-' and '_' are interchangeable;
-// booleans take a value (--warp-to-pinhole 1). The config struct, flag
-// table, and preset appliers all come from config/TrainConfig.h.
+// centered-object, hdr, synthetic, meshing, academic-baseline. Flags are the
+// FLATTENED config fields (--sh-degree, not --model.sh-degree); '-' and '_'
+// are interchangeable; booleans take a value (--warp-to-pinhole 1). Struct,
+// flag table and preset appliers all come from config/TrainConfig.h.
 //
-// The engine plumbing (dataset -> seeding -> per-step configs -> train loop)
-// lives in TrainerCore.{h,cpp}, shared with the native GUI (gui/). This file
-// adds only CLI parsing, --help, stdout progress printing, and the web
-// viewer wiring.
+// The engine plumbing lives in TrainerCore.{h,cpp}, shared with the native
+// GUI (gui/); this file adds CLI parsing, --help, progress printing and the
+// web viewer wiring.
 
 #include "app/Tools.h"
 #include "app/TrainerCore.h"
@@ -179,12 +177,9 @@ int char_columns(unsigned cp) {
            ? 2 : 1;
 }
 
-// The first sentence of a help string, cut to one terminal line.
-//
-// Two things stop this from being substr(0, s.find(". ")): a Japanese or
-// Chinese sentence ends in "。" with no space after it, and a width limit in
-// bytes would both slice a multi-byte character in half and still overflow
-// the line, since those characters are twice as wide as they are numerous.
+// The first sentence of a help string, cut to one terminal line. Not
+// substr(0, s.find(". ")): a CJK sentence ends in "。" with no space after
+// it, and a byte limit would both split a character and overflow the line.
 std::string help_summary(const char* text, size_t max_columns = 110) {
     std::string s = text;
 

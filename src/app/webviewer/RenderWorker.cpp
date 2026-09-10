@@ -5,6 +5,7 @@
 #include "engine/Engine.h"    // engine render + viewer entry points
 #include "core/Camera.h"    // camera_model_from_name
 #include "app/DepthColor.h"  // error_scale -- shared with the error pane
+#include "data/FrustumSize.h"
 
 #include <algorithm>
 #include <atomic>
@@ -15,7 +16,6 @@
 #include <cstring>
 #include <stdexcept>
 #include <thread>
-#include <unordered_set>
 
 namespace {
 
@@ -51,44 +51,6 @@ struct DevBuf {
     }
     ~DevBuf() { if (ptr) backend::device_free(ptr); }
 };
-
-// Median distance to the 4th-nearest unique camera position, for the frustum
-// scale. O(N^2) is fine at realistic camera counts.
-double camera_knn_dist(const std::vector<float>& c2w_flip, int64_t n, int k = 4) {
-    if (n <= 1) return 1.0;
-    std::vector<std::array<double, 3>> pos;
-    pos.reserve(n);
-    double scale = 1e-9;
-    for (int64_t i = 0; i < n; i++)
-        for (int r = 0; r < 3; r++)
-            scale = std::max(scale, (double)std::abs(c2w_flip[i*12 + r*4 + 3]));
-    std::unordered_set<uint64_t> seen;   // hash of quantized position
-    for (int64_t i = 0; i < n; i++) {
-        std::array<double, 3> p;
-        uint64_t h = 1469598103934665603ull;
-        for (int r = 0; r < 3; r++) {
-            p[r] = c2w_flip[i*12 + r*4 + 3];
-            int64_t q = (int64_t)std::llround(p[r] / scale * 1e6);
-            h = (h ^ (uint64_t)q) * 1099511628211ull;
-        }
-        if (seen.insert(h).second) pos.push_back(p);
-    }
-    int64_t m = (int64_t)pos.size();
-    if (m <= 1) return 1.0;
-    std::vector<double> kth;
-    std::vector<double> d2(m);
-    for (int64_t i = 0; i < m; i++) {
-        for (int64_t j = 0; j < m; j++) {
-            double dx = pos[j][0]-pos[i][0], dy = pos[j][1]-pos[i][1], dz = pos[j][2]-pos[i][2];
-            d2[j] = dx*dx + dy*dy + dz*dz;
-        }
-        int kk = (int)std::min<int64_t>(k, m - 1);
-        std::nth_element(d2.begin(), d2.begin() + kk, d2.end());
-        kth.push_back(std::sqrt(d2[kk]));   // max over the k nearest (self = 0)
-    }
-    std::nth_element(kth.begin(), kth.begin() + kth.size()/2, kth.end());
-    return kth[kth.size()/2];
-}
 
 struct PendingReq {
     uint64_t id = 0;
@@ -531,7 +493,7 @@ std::vector<std::string> RenderWorker::buffer_keys() const {
 }
 
 float viewer_camera_size_heuristic(const PostSplitCameras& post) {
-    return 0.2f * (float)camera_knn_dist(post.c2w_flip, post.n_post);
+    return (float)camhost::frustum_display_size(post.c2w_flip.data(), post.n_post);
 }
 
 float viewer_upload_cameras(const PostSplitCameras& post) {

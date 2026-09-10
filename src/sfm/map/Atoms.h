@@ -39,11 +39,13 @@
 #include <thread>
 #include <vector>
 
+#include "sfm/core/Events.h"
 #include "sfm/core/Features.h"
 #include "sfm/core/Matches.h"
 #include "sfm/core/Model.h"
 #include "sfm/map/Mapper.h"
 #include "sfm/vk/VkContext.h"
+#include "sfm/core/Log.h"
 
 namespace sfm {
 
@@ -208,6 +210,10 @@ inline std::vector<Reconstruction> reconstructAtoms(
     MapperOptions mo = base;
     mo.verbose = false;
     mo.threads = 1;  // the parallelism is over atoms; nesting only oversubscribes
+    // An atom is not the capture: it numbers its images within itself and its
+    // model is one of hundreds. The loop below reports it in database ids once
+    // it is done, and a snapshot from here would show one atom as "the model".
+    mo.report_progress = false;
     mo.ba_growth_ratio = std::max(1.0 + 1e-9, opt.ba_growth);
     mo.ba_final_tight = opt.tight_final_ba;
     // Every solve an atom runs is a coarse one (nothing here is the final
@@ -263,14 +269,16 @@ inline std::vector<Reconstruction> reconstructAtoms(
                     if (r.numRegistered() < 2) continue;
                     detail::toGlobalIds(r, sub.to_global);
                     reg += r.numRegistered();
+                    for (const auto& kv : r.images)
+                        if (kv.second.registered) events::map_placed(kv.first);
                     per_atom[i].push_back(std::move(r));
                 }
                 if (opt.verbose) {
                     const size_t n = ++done;
                     std::lock_guard<std::mutex> lk(log_mu);
-                    fprintf(stderr,
-                            "[bup] atom %zu/%zu: %zu images -> %zu model(s), %u registered\n",
-                            n, atoms.size(), atoms[i].size(), per_atom[i].size(), reg);
+                    slog::diag(slog::Tag::Map,
+                               "[bup] atom %zu/%zu: %zu images -> %zu model(s), %u registered",
+                               n, atoms.size(), atoms[i].size(), per_atom[i].size(), reg);
                 }
             }
         } catch (...) {

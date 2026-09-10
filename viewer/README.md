@@ -7,6 +7,10 @@ GitHub Pages). Performance-critical parsing, depth sorting, and statistics run
 in **C++ compiled to WebAssembly** (built with CMake + Emscripten); rendering
 is WebGL2.
 
+The directory holds two independent pages: `index.html`, the model viewer
+described below, and [`telemetry.html`](#telemetry-viewer--telemetryhtml), an
+**IMU/GPS viewer** for captures. Each has its own WASM module.
+
 The viewer's own runtime code is **independent** from the rest of
 the trainer — nothing here imports from the training code at runtime. The
 one deliberate exception is at build time: the WASM module compiles the
@@ -107,17 +111,67 @@ plain C++17 with no CUDA dependency (see `csrc/CameraModel.h`).
   buffers. Replacing keeps the current viewpoint (the camera is only fitted for
   the first model; refresh the page to start over).
 
+## Telemetry viewer — `telemetry.html`
+
+A second, independent page in the same directory: drop videos, photos or whole
+folders and see the **IMU and GPS** they carry. It reuses the trainer's reader
+(`src/sfm/core/Telemetry.cpp`, compiled in place into its own WASM module) so
+the browser sees exactly what the reconstruction pipeline sees —
+`docs/notes/imu-gps-for-sfm.md` is what that is for.
+
+- **Detection is by content, not extension.** A GoPro `gpmd` track (GPMF), the
+  Insta360 trailer that follows the MP4, a DJI `djmd` protobuf track, a Google
+  **CAMM** track, or **EXIF GPS** in a JPEG. Anything else is skipped silently,
+  so a folder of a few thousand mixed files is a reasonable thing to drop.
+- **Files stay on the machine and are never buffered whole.** The scan worker
+  answers the parser's reads with `FileReaderSync` over a `File` slice behind a
+  1 MB block cache, so a 4 GB capture is read in place — tested end to end on
+  4 GB `.360` and `.insv` files, which no `ArrayBuffer` would hold. Up to three
+  workers scan in parallel, each with its own module instance.
+- **3D viewport** in a local metric frame (east / north / up, metres at the
+  scene origin) with a **raster basemap** on the ground plane —
+  OpenStreetMap, Esri satellite, CARTO dark, OpenTopoMap, or a custom
+  `{z}/{x}/{y}` template for a keyed provider. Tiles load lazily by view and
+  zoom, and a tile that has not arrived is drawn from its nearest loaded
+  ancestor, so panning never shows holes. Altitude is real (with an
+  exaggeration slider and optional drop lines to the ground), and the frame is
+  Web Mercator scaled by cos(lat₀), which is the one frame where imagery and
+  track agree without warping either.
+- **The IMU is drawn where it was measured**: an attitude triad at the
+  playhead, optional acceleration and gravity vectors, and an attitude trail
+  every *n* seconds along the track. The track itself can be coloured by time,
+  speed, altitude, DOP, or gyro/accel magnitude.
+- **Stacked plots** under the viewport share a time axis with the viewport's
+  playhead (drag to scrub, shift-drag to pan, wheel to zoom, space to play).
+  Each channel keeps a min/max pyramid, each level 8× coarser than the one
+  below, so a 400 000-sample gyro redraws in the cost of the canvas width
+  rather than the capture length.
+- **Screenshot-safe mode** (one toggle, also in the header) hides the basemap,
+  latitude/longitude, absolute altitude, wall-clock times and file names, and
+  redacts the fix line from the report — shapes, distances and every IMU
+  stream stay, so a plot can be shared without publishing where it was taken.
+- Per-file verdicts come from the same checks the trainer runs: sample-rate
+  regularity, the gravity norm, cross-stream gravity agreement, and whether the
+  GPS moves rather than repeating one stale fix. The full text report is in the
+  panel.
+
+English only, by design — this is a diagnostic, and the model viewer's i18n
+would be overkill.
+
 ## Build
 
 Requires the Emscripten SDK on `PATH` (`emcc`, `emcmake`) and CMake ≥ 3.16.
 
 ```bash
 source ~/emsdk/emsdk_env.sh      # activate emsdk
-./build.sh                       # emcmake cmake + cmake --build
+./build.sh                       # both modules
+./build.sh ssv_telemetry         # just the telemetry one
 ```
 
-This produces `js/ssv_wasm.js` and `js/ssv_wasm.wasm` (committed so the site is
-directly hostable without a build step).
+The two modules are separate CMake targets, so editing one page's sources
+rebuilds only that page. This produces `js/ssv_wasm.{js,wasm}` and
+`js/ssv_telemetry.{js,wasm}` (committed so the site is directly hostable
+without a build step).
 
 ## Run
 
@@ -133,6 +187,13 @@ picker takes multiple files; folder drops walk the directory tree). You can
 also deep-link a hosted model: `index.html?model=<url>` (external
 `.bin`/`.mtl`/image siblings are fetched automatically).
 
+`telemetry.html` is the IMU/GPS page. Its basemap fetches tiles from a public
+provider at view time, so that page needs network access and the provider's
+usage policy applies (the built-ins are fine for interactive use; for anything
+heavier, pick **Custom URL…** and paste your own `{z}/{x}/{y}` template with a
+key). Choosing **None** — which screenshot-safe mode does anyway — leaves the
+page fully offline.
+
 ## Test
 
 `test/run.sh` generates synthetic COLMAP / Nerfstudio / Metashape datasets and
@@ -144,11 +205,24 @@ test/run.sh            # all cases
 test/run.sh metashape  # one case; see test/test_ds.html for the list
 ```
 
+The telemetry page's parser is covered by the trainer's `sfm_telemetry_test`
+(synthetic GPMF / Insta360 / DJI / CAMM fixtures). `test/telemetry_probe.mjs`
+checks the page itself — WASM boot, the worker's `File` reads, the clip
+model — against captures of your own, which is the only way to exercise the
+multi-GB path:
+
+```bash
+python3 -m http.server 8098 &
+node test/telemetry_probe.mjs http://localhost:8098/telemetry.html VIDEO.360 PHOTO.jpg
+```
+
 ## Layout
 
 ```
-index.html          UI + panel
+index.html          model viewer: UI + panel
+telemetry.html      IMU/GPS viewer: UI + panel
 css/style.css        theme (adapted from the training viewer)
+css/telemetry.css    the telemetry page's own layout and overlays
 js/
   main.js            app wiring, input, render loop, sorting
   renderer.js        WebGL2 renderer (splat HDR pass, mesh, dataset, grid lines, tonemap)
@@ -161,8 +235,17 @@ js/
   linalg.js          vec/quat/mat helpers
   histogram.js       canvas bar chart
   ssv_wasm.{js,wasm} built WASM module
+  telemetry/
+    main.js          telemetry app wiring, options, viewport render loop
+    scanworker.js    per-file scan worker (own WASM instance, FileReaderSync)
+    scene.js         WebGL2 viewport (instanced polylines, tiles, points)
+    tiles.js         basemap tile cache with ancestor fallback
+    charts.js        stacked plots with min/max decimation pyramids
+    geo.js           Mercator frame, per-clip model, derived series
+  ssv_telemetry.{js,wasm}  built telemetry WASM module
 src/viewer.cpp       parsers (PLY/OBJ), depth sort, histograms
 src/dataset_bridge.cpp  dataset C ABI over MEMFS (drives the trainer's parsers)
+src/telemetry_bridge.cpp  telemetry C ABI (drives the trainer's Telemetry.cpp)
 test/                end-to-end harness (headless Chrome) + data generators
 CMakeLists.txt       Emscripten build (also compiles ../src/data/ parsers)
 ```

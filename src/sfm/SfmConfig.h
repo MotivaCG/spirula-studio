@@ -61,6 +61,14 @@ enum CmdMask : uint32_t {
 // already listed (parsed, but not printed twice or offered to the GUI).
 enum class Tier { Basic, Advanced, Alias };
 
+// One video whose IMU and GPS cover the images under `prefix` ("" = all).
+struct TelemetryInput {
+    std::string prefix;
+    std::string path;
+    double fps = 0;           // stem index -> seconds; 0 = the file's own rate
+    double time_offset = 0;   // seconds added to every frame time
+};
+
 // The aggregate. Sub-option structs are held unchanged so that library callers
 // -- the tests, the mapper's own defaults -- are unaffected by anything here.
 struct SfmConfig {
@@ -133,6 +141,19 @@ struct SfmConfig {
     // Write the finished model in an upright, centred, unit-sized frame rather
     // than in whatever gauge the seed pair left it in (map/Orient.h).
     bool orient = true;
+    // Instead: fix the gauge from an outside measurement in metres, so the
+    // model is written metric (map/MetricGauge.h, D74).
+    std::string metric_positions;       // one `image_name X Y Z` per line
+    // Each image's own EXIF GPS: "none", "horizontal" (latitude and longitude,
+    // tilt left to the cameras) or "full" (altitude as well).
+    std::string metric_gps = "none";
+    double metric_max_error = 0;        // metres; 0 resolves per source
+    // The video's own IMU and GPS (map/SensorGauge.h). `telemetry` names one
+    // file covering every image; the manifest lists several. "auto" takes
+    // up, scale and place from whatever passes, "up" the orientation alone.
+    std::string telemetry;
+    std::string sensor_gauge = "auto";
+    std::vector<TelemetryInput> telemetry_inputs;   // manifest entries + --telemetry
     bool merge_ba = true;               // merge: bundle-adjust across the seams
     bool in_place = false;              // merge: write back over the input
 
@@ -342,6 +363,16 @@ struct SfmConfig {
       Tier::Advanced, "mapper", 0, 0, "", final_per_image_intrinsics)                              \
     F(orient, "orient", CMD_AUTO | CMD_MAP | CMD_MERGE, Tier::Advanced, "mapper", 0, 0, "",        \
       orient)                                                                                      \
+    F(metric_positions, "metric-positions", CMD_AUTO | CMD_MAP | CMD_MERGE, Tier::Advanced,        \
+      "mapper", 0, 0, "", metric_positions)                                                        \
+    F(metric_gps, "metric-gps", CMD_AUTO | CMD_MAP | CMD_MERGE, Tier::Advanced, "mapper", 0, 0,    \
+      "none|horizontal|full", metric_gps)                                                          \
+    F(metric_max_error, "metric-max-error", CMD_AUTO | CMD_MAP | CMD_MERGE, Tier::Advanced,        \
+      "mapper", 0, 1000000, "", metric_max_error)                                                  \
+    F(telemetry, "telemetry", CMD_AUTO | CMD_MAP | CMD_MERGE, Tier::Advanced, "mapper", 0, 0, "",  \
+      telemetry)                                                                                   \
+    F(sensor_gauge, "sensor-gauge", CMD_AUTO | CMD_MAP | CMD_MERGE, Tier::Advanced, "mapper", 0,   \
+      0, "auto|up|none", sensor_gauge)                                                             \
     F(mapper.min_tri_angle_deg, "min-tri-angle", CMD_AUTO | CMD_MAP, Tier::Advanced, "mapper", 0,  \
       90, "", min_tri_angle)                                                                       \
     F(mapper.init_min_tri_angle_deg, "init-min-tri-angle", CMD_AUTO | CMD_MAP, Tier::Advanced,     \
@@ -470,7 +501,7 @@ struct SfmConfig {
     F(merge_ba, "ba", CMD_MERGE, Tier::Advanced, "merge", 0, 0, "", ba)                            \
     F(in_place, "in-place", CMD_MERGE, Tier::Advanced, "merge", 0, 0, "", in_place)                \
     /* ---- inputs ---- */                                                                         \
-    F(image_dir, "images", CMD_MAP, Tier::Advanced, "input", 0, 0, "", images)                     \
+    F(image_dir, "images", CMD_MAP | CMD_MERGE, Tier::Advanced, "input", 0, 0, "", images)         \
     F(feature_dir, "features", CMD_MAP, Tier::Advanced, "input", 0, 0, "", feature_dir)            \
     F(resume, "resume", CMD_MAP, Tier::Advanced, "input", 0, 0, "", resume)                        \
     F(check, "check", CMD_MAP, Tier::Advanced, "input", 0, 0, "", check)                           \

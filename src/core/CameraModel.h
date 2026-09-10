@@ -34,12 +34,10 @@ enum class CameraModelType {
 // thing across tiers:
 //   OpenCV      k1 k2 p1 p2                 (COLMAP OPENCV)
 //   ThinPrism   k1 k2 k3 k4 p1 p2 sx1 sy1   (COLMAP THIN_PRISM_FISHEYE)
-//   Rational    k1 k2 k3 k4 k5 k6 p1 p2     (COLMAP FULL_OPENCV; k4..k6 divide)
 enum class CameraDistortionType {
     None = 0,
     OpenCV = 1,
     ThinPrism = 2,
-    Rational = 3,
 };
 
 // Storage width of the per-camera coefficient row. Every tier reads a prefix of
@@ -56,7 +54,6 @@ inline const char* camera_distortion_to_string(CameraDistortionType d) {
         case CameraDistortionType::None:      return "NONE";
         case CameraDistortionType::OpenCV:    return "OPENCV";
         case CameraDistortionType::ThinPrism: return "THIN_PRISM";
-        case CameraDistortionType::Rational:  return "RATIONAL";
         default:                              return "UNKNOWN";
     }
 }
@@ -65,34 +62,17 @@ inline CameraDistortionType camera_distortion_from_name(const std::string& name)
     if (name == "NONE")       return CameraDistortionType::None;
     if (name == "OPENCV")     return CameraDistortionType::OpenCV;
     if (name == "THIN_PRISM") return CameraDistortionType::ThinPrism;
-    if (name == "RATIONAL")   return CameraDistortionType::Rational;
     return (CameraDistortionType)-1;
 }
 
 // Cheapest tier that still represents `coeffs` exactly, given the tier it was
 // written in. Zero-extension OpenCV -> ThinPrism is exact, so a ThinPrism
-// camera whose k3/k4/sx1/sy1 vanish demotes; a Rational camera whose
-// denominator vanishes is a plain polynomial and demotes as well.
+// camera whose k3/k4/sx1/sy1 vanish demotes.
 inline CameraDistortionType camera_distortion_demote(
     CameraDistortionType tier, const float* coeffs, float* out)
 {
     auto zero = [](float v) { return v == 0.0f; };
-    if (tier == CameraDistortionType::Rational) {
-        // 1/(1 + 0) == 1, so an all-zero denominator is the polynomial form
-        // with k1..k3 and no k4 term.
-        if (zero(coeffs[3]) && zero(coeffs[4]) && zero(coeffs[5])) {
-            float k1 = coeffs[0], k2 = coeffs[1], k3 = coeffs[2];
-            float p1 = coeffs[6], p2 = coeffs[7];
-            if (zero(k3)) {
-                out[0] = k1; out[1] = k2; out[2] = p1; out[3] = p2;
-                for (int i = 4; i < kCameraDistortionParams; i++) out[i] = 0.0f;
-                return CameraDistortionType::OpenCV;
-            }
-            out[0] = k1; out[1] = k2; out[2] = k3; out[3] = 0.0f;
-            out[4] = p1; out[5] = p2; out[6] = 0.0f; out[7] = 0.0f;
-            return CameraDistortionType::ThinPrism;
-        }
-    } else if (tier == CameraDistortionType::ThinPrism) {
+    if (tier == CameraDistortionType::ThinPrism) {
         if (zero(coeffs[2]) && zero(coeffs[3]) && zero(coeffs[6]) && zero(coeffs[7])) {
             float k1 = coeffs[0], k2 = coeffs[1], p1 = coeffs[4], p2 = coeffs[5];
             out[0] = k1; out[1] = k2; out[2] = p1; out[3] = p2;
@@ -133,13 +113,6 @@ inline bool camera_distortion_promote(CameraDistortionType from,
         out[4] = in[2]; out[5] = in[3];          // p1 p2
         return true;
     }
-    if (from == CameraDistortionType::OpenCV && to == CameraDistortionType::Rational) {
-        out[0] = in[0]; out[1] = in[1];          // k1 k2 (numerator)
-        out[6] = in[2]; out[7] = in[3];          // p1 p2
-        return true;
-    }
-    // ThinPrism -> Rational would need a 4th numerator term and drop sx1/sy1;
-    // Rational -> ThinPrism cannot express the denominator at all.
     return false;
 }
 
@@ -148,14 +121,11 @@ inline bool camera_distortion_promote(CameraDistortionType from,
 // SPIR-V), so this bounds the CUDA binary only, and it must match
 // kCameraVariants in tools/codegen/generate_kernel_instantiation.py and the
 // export lists in shaders/primitive_3dgs.slang.
-//
-// The gaps are not arbitrary: no COLMAP fisheye model is rational, and
-// EQUIRECTANGULAR has no lens distortion.
 inline bool camera_distortion_is_compiled(CameraModelType m, CameraDistortionType d) {
     switch (m) {
-        case CameraModelType::PINHOLE:         return true;
+        case CameraModelType::PINHOLE:
         case CameraModelType::FISHEYE:
-        case CameraModelType::EQUISOLID:       return d != CameraDistortionType::Rational;
+        case CameraModelType::EQUISOLID:       return true;
         case CameraModelType::EQUIRECTANGULAR: return d == CameraDistortionType::None;
         default:                               return false;
     }

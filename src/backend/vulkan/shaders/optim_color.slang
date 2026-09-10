@@ -1,14 +1,16 @@
 // Trust-region Adam color kernels (Vulkan backend), mirroring the
 // fused_adamtr_rgb_optim / fused_adamtr_rgb_sh_optim kernels in
 // kernels/optim/ColorOptim.cu (the non-FPBO DC/SH update path when
-// use_color_trust_region is on and no quantization is active). The
-// is_linear (sRGB-Jacobian gradient conversion) and zero_grad template
-// axes become runtime flags — the kernels are branch-light and have no
-// barriers.
+// use_color_trust_region is on and no quantization is active). The linear
+// colour space is the kIsLinear specialization constant, matching the
+// template axis there; zero_grad stays a runtime flag.
 
 #define CudaDeviceExport ForceInline
 #include "shaders/pixel_wise.slang"
 #undef CudaDeviceExport
+
+[SpecializationConstant]
+const int kIsLinear = 0;    // linear splat colour space
 
 static const float kTrBeta1 = 0.9f;
 static const float kTrBeta2 = 0.999f;
@@ -28,11 +30,13 @@ struct AdamTrRgbParams {  // 88 bytes: pushed directly
     float bias_correction2;  // 1 - beta2^step
     float eps;
     float eps_tr;
+    float dc_reg_weight;
+    float sh_reg_weight;
     float grad_scale;
-    uint is_linear;
     uint zero_grad;
     uint num_gs;
     uint wgs_per_row;
+    uint _pad0;
 };
 
 [shader("compute")]
@@ -54,9 +58,18 @@ void fused_adamtr_rgb(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
     float3 v_val = float3(p.exp_avg_sq[3 * idx], p.exp_avg_sq[3 * idx + 1],
                           p.exp_avg_sq[3 * idx + 2]);
 
+    const float dc_off = 0.5f / kTrSh0;
+    float under_reg_weight = p.dc_reg_weight + p.sh_reg_weight;
+    v.x += p.dc_reg_weight * max(x.x - dc_off, 0.0f) +
+        under_reg_weight * min(x.x + dc_off, 0.0f);
+    v.y += p.dc_reg_weight * max(x.y - dc_off, 0.0f) +
+        under_reg_weight * min(x.y + dc_off, 0.0f);
+    v.z += p.dc_reg_weight * max(x.z - dc_off, 0.0f) +
+        under_reg_weight * min(x.z + dc_off, 0.0f);
+
     // Carry the gradient to x = splat_dc_encode(dc), the space Adam and its
     // moments live in when the working colour space is linear.
-    if (p.is_linear != 0) {
+    if (kIsLinear != 0) {
         v.x /= linear_rgb_to_srgb_grad(kTrSh0 * x.x + 0.5f);
         v.y /= linear_rgb_to_srgb_grad(kTrSh0 * x.y + 0.5f);
         v.z /= linear_rgb_to_srgb_grad(kTrSh0 * x.z + 0.5f);
@@ -78,7 +91,7 @@ void fused_adamtr_rgb(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
     float opac = _tr_sigmoid(p.opacities[idx]);
     float inv_opac = 1.0f / max(opac, 1e-12f);
     float3 clipv;
-    if (p.is_linear != 0) {
+    if (kIsLinear != 0) {
         clipv = float3(kTrSh0 * sqrt(max(2.0f * p.eps_tr * inv_opac, 0.0f)));
     } else {
         float3 rgb = max(kTrSh0 * x + float3(0.5f),
@@ -95,7 +108,7 @@ void fused_adamtr_rgb(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
     delta.z = isfinite(delta.z) ? delta.z : 0.0f;
 
     float3 new_dc = x + delta;
-    if (p.is_linear != 0) {
+    if (kIsLinear != 0) {
         new_dc = float3(splat_dc_decode(splat_dc_encode(x.x) + delta.x),
                         splat_dc_decode(splat_dc_encode(x.y) + delta.y),
                         splat_dc_decode(splat_dc_encode(x.z) + delta.z));
@@ -130,12 +143,13 @@ struct AdamTrRgbShParams {  // 96 bytes: pushed directly
     float bias_correction2;
     float eps;
     float eps_tr;
+    float sh_reg_weight;
     float grad_scale;
-    uint is_linear;
     uint zero_grad;
     uint num_params;  // num_gs * num_sh * 3, scalar-indexed
     uint num_sh;
     uint wgs_per_row;
+    uint _pad0;
 };
 
 [shader("compute")]
@@ -147,8 +161,9 @@ void fused_adamtr_rgb_sh(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
 
     float step_size = p.lr / p.bias_correction1;
 
+    float x = p.param[idx];
     float v = p.grad[idx];
-    v *= p.grad_scale;
+    v = v * p.grad_scale + p.sh_reg_weight * x;
     float m_val = p.exp_avg[idx];
     float v_val = p.exp_avg_sq[idx];
 
@@ -156,7 +171,7 @@ void fused_adamtr_rgb_sh(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
     // extend here, because linearizing it about the DC colour needs
     // |sh| << c, which 3DGS does not satisfy.
     float c = p.rgbs[(idx / (3 * p.num_sh)) * 3 + (idx % 3)] * kTrSh0 + 0.5f;
-    if (p.is_linear != 0) v /= linear_rgb_to_srgb_grad(c);
+    if (kIsLinear != 0) v /= linear_rgb_to_srgb_grad(c);
 
     m_val = kTrBeta1 * m_val + (1.0f - kTrBeta1) * v;
     v_val = kTrBeta2 * v_val + (1.0f - kTrBeta2) * v * v;
@@ -171,7 +186,7 @@ void fused_adamtr_rgb_sh(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
                                    0.0f));
 
     delta = clamp(delta, -clip, clip);
-    p.param[idx] += delta;
+    p.param[idx] = x + (isfinite(delta) ? delta : 0.0f);
     p.exp_avg[idx] = m_val;
     p.exp_avg_sq[idx] = v_val;
 

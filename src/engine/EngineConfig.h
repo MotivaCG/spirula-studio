@@ -53,6 +53,14 @@ struct LossConfig {
     // backward reduces the map to one score per splat. Ignored when the map
     // is off.
     int   loss_map_accum_mode    = (int)DensifyAccumMode::Max;
+    // Positive: a pixel above this in every channel of BOTH the render and the
+    // reference leaves the photometric loss (value, map, gradient, SSIM), the
+    // way a masked pixel does. Negative (default) keeps every pixel.
+    float saturation_threshold   = -1.0f;
+    // Divide the photometric weights (RGB / YUV supervision and SSIM) by
+    // 0.5 / max(mean sRGB luma of this step's reference pixels, 1/255), so a
+    // dark capture pulls on the splats as hard as a bright one.
+    bool  normalize_by_luminance = false;
     // Image-space overexposure regularization weight. When non-zero, a
     // dedicated kernel adds dL/dx of L = w * mean(max(-x, x-1, 0)^2) directly
     // into v_render_rgb (in the pre-bilagrid / pre-PPISP / pre-color-space

@@ -13,6 +13,7 @@
 
 #include "kernels/pixelwise/PixelWise.cuh"
 
+#include <algorithm>
 #include <stdexcept>
 #include <vector>
 
@@ -57,6 +58,8 @@ void engine_init_color_space(
             throw std::runtime_error("engine_init_color_space: image_color_matrix must have 9 elements");
         _alloc_and_upload_matrix(cs.image_color_matrix, image_color_matrix.data(),
                                  PoolSlot::ColorSpaceImageMatrix);
+        std::copy_n(image_color_matrix.begin(), 9,
+                    cs.image_color_matrix_host.begin());
     }
 }
 

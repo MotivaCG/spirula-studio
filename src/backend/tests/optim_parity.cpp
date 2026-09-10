@@ -163,6 +163,19 @@ int main(int argc, char** argv) {
 
     // ---- fused_adam_step_quantized (bits 4, 8) ----
     const int64_t n_blocks = (NUMEL + 255) / 256;
+
+    // Linear working colour space: the SH cells get the sRGB-Jacobian carry
+    // and the per-splat trust-region clip. stride S == 3, so one coefficient.
+    ColorTrustState ct{};
+    {
+        std::vector<float> dc(3 * N), opacs(N);
+        for (auto& v : dc) v = uf(-1.5f, 1.5f);
+        for (auto& v : opacs) v = uf(-4.f, 4.f);
+        ct.enabled = true;
+        ct.eps_tr = 1e-4f;
+        ct.features_dc = upload(dc);
+        ct.opacities = upload(opacs);
+    }
     for (int bits : {4, 8}) {
         const int64_t packed_bytes = NUMEL * (bits == 8 ? 2 : 1);
         std::vector<uint8_t> packed(packed_bytes);
@@ -185,6 +198,7 @@ int main(int argc, char** argv) {
                                   ttv(d_grad, {N, S, 1}), d_packed,
                                   (float4*)d_bounds, 1e-2f, 12,
                                   DeviceVector<int32_t>{}, 0.f, 0.f, bits,
+                                  bits == 8 ? ct : ColorTrustState{},
                                   1.f, false);
         backend::device_synchronize();
         readback_f(acc, d_param, NUMEL);
@@ -233,7 +247,8 @@ int main(int argc, char** argv) {
         fused_adam_step_quantized_value(
             N, NUMEL, ttv(d_grad, {N, S, 1}), d_gq, (const float2*)d_gb, d_opt,
             (float4*)d_ob, d_val, (float2*)d_vb, 1e-2f, 9,
-            DeviceVector<int32_t>{}, 0.f, 0.f, obits, vbits, 1.f, !gq);
+            DeviceVector<int32_t>{}, 0.f, 0.f, obits, vbits,
+            vbits == 16 ? ct : ColorTrustState{}, 1.f, !gq);
         backend::device_synchronize();
         readback_f(acc, d_ob, n_blocks * 4);
         readback_f(acc, d_vb, n_blocks * 2);

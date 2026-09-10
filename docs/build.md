@@ -22,7 +22,7 @@ Always build through the dev scripts.
 
 | file | what it does |
 |---|---|
-| `SsOptions.cmake` | options (`SS_BUILD_CLI/GUI`, `SS_DEBUG_SYMBOLS`, …), backend selection, tree paths (`SS_ROOT`, `SS_CSRC`, …) |
+| `SsOptions.cmake` | options (`SS_BUILD_GUI`, `SS_DEBUG_SYMBOLS`, …), backend selection, tree paths (`SS_ROOT`, `SS_CSRC`, …) |
 | `SsSources.cmake` | `ss_collect_sources()` — expands `sources.txt` with `CONFIGURE_DEPENDS` |
 | `SsBackendCuda.cmake` | Torch probe, CUDA arch detection, flags, the `csrc` library, CUDA-side parity tools |
 | `SsBackendVulkan.cmake` | portable engine object lib, slangc + SPIR-V embed, `ss_backend_vulkan`, the Vulkan-side tests |
@@ -54,10 +54,11 @@ available RAM (~750 MB/job).
 
 | goal | command |
 |---|---|
-| CUDA CLI + GUI | `bash build_develop.bash -DSS_BUILD_CLI=ON -DSS_BUILD_GUI=ON -DSS_BACKEND=cuda` |
-| Vulkan CLI + GUI | `bash build_develop.bash -DSS_BUILD_CLI=ON -DSS_BUILD_GUI=ON -DSS_BACKEND=vulkan` |
+| CUDA CLI + GUI | `bash build_develop.bash -DSS_BACKEND=cuda` |
+| Vulkan CLI + GUI | `bash build_develop.bash -DSS_BACKEND=vulkan` |
+| Vulkan, no window | `bash build_develop.bash -DSS_BACKEND=vulkan -DSS_BUILD_GUI=OFF` |
 | parity tests | add `-DSS_BUILD_BACKEND_TESTS=ON` (Vulkan builds them unconditionally) |
-| Vulkan GUI, everything on | `bash build_develop.bash -DSS_BUILD_CLI=ON -DSS_BUILD_GUI=ON -DSS_BACKEND=vulkan -DSS_ENABLE_PATENTED=ON` |
+| Vulkan GUI, everything on | `bash build_develop.bash -DSS_BACKEND=vulkan -DSS_ENABLE_PATENTED=ON` |
 
 Keep the two backends in **separate build directories** so you can test both
 without reconfiguring, e.g. `-B build_cuda` and `-B build`.
@@ -66,9 +67,8 @@ without reconfiguring, e.g. `-B build_cuda` and `-B build`.
 
 | option | default | effect |
 |---|---|---|
-| `SS_BACKEND` | `cuda` | `cuda` \| `vulkan`. `vulkan` builds the portable engine layer + `backend/vulkan/` **without the CUDA toolkit**, and forces `SS_BUILD_CLI=ON`. |
-| `SS_BUILD_CLI` | `OFF` | the command-line tools (`spirula train`, `spirula mesh`) |
-| `SS_BUILD_GUI` | `OFF` | the graphical application (`spirula` with no arguments); FetchContent's GLFW 3.4 + Dear ImGui v1.92.8 (needs network once) |
+| `SS_BACKEND` | `cuda` | `cuda` \| `vulkan`. `vulkan` builds the portable engine layer + `backend/vulkan/` **without the CUDA toolkit**. |
+| `SS_BUILD_GUI` | `ON` | the graphical application (`spirula` with no arguments); FetchContent's GLFW 3.4 + Dear ImGui v1.92.8 (needs network once). `OFF` builds only the command-line tools, which need neither a display nor GL and fetch nothing. |
 | `SS_SEPARATE_TOOLS` | `OFF` | *also* build `spirula-sfm` and `spirula-sam` standalone — same code, but neither links the engine (24 MB vs the combined 61 MB) |
 | `SS_BUILD_BACKEND_TESTS` | `OFF` | build `backend/tests/*` (CUDA branch; Vulkan always builds them) |
 | `SS_DEBUG_SYMBOLS` | `OFF` | host `-g`, CUDA cubin lineinfo, `slangc -g2`. Bloats binaries substantially — profiling/debugging only. |

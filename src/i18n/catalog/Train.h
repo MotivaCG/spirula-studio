@@ -168,43 +168,89 @@ SS_MSG(preset_in_the_wild_help,
        "değişken, maskelenmemiş yabancı nesneler içeren ve/veya uzun odaklı "
        "çekilmiş veri kümeleri için hazır ayar."));
 
-SS_MSG(preset_linear_color,
-    EN("Linear colour space"),
-    JA("リニア色空間"),
-    ZH_HANS("线性色彩空间"),
-    ZH_HANT("線性色彩空間"),
-    KO("선형 색공간"),
-    DE("Linearer Farbraum"),
-    FR("Espace colorimétrique linéaire"),
-    ES("Espacio de color lineal"),
-    PT("Espaço de cor linear"),
-    IT("Spazio colore lineare"),
-    NL("Lineaire kleurruimte"),
-    RU("Линейное цветовое пространство"),
-    TR("Doğrusal renk uzayı"));
+SS_MSG(preset_centered_object,
+    EN("Centered object"),
+    JA("中心の被写体"),
+    ZH_HANS("居中物体"),
+    ZH_HANT("置中物體"),
+    KO("가운데 놓인 물체"),
+    DE("Zentriertes Objekt"),
+    FR("Objet centré"),
+    ES("Objeto centrado"),
+    PT("Objeto centrado"),
+    IT("Oggetto centrato"),
+    NL("Gecentreerd object"),
+    RU("Объект в центре"),
+    TR("Merkezdeki nesne"));
 
-SS_MSG(preset_linear_color_help,
-    EN("Preset for training splats in linear color spaces (e.g. ACEScg)."),
-    JA("リニア色空間（ACEScg など）でスプラットを学習するためのプリセットです。"),
-    ZH_HANS("用于在线性色彩空间（如 ACEScg）中训练泼溅的预设。"),
-    ZH_HANT("用於在線性色彩空間（如 ACEScg）中訓練潑濺的預設。"),
-    KO("선형 색공간(ACEScg 등)에서 스플랫을 학습하기 위한 프리셋입니다."),
-    DE("Voreinstellung für das Training von Splats in linearen Farbräumen "
-       "(z. B. ACEScg)."),
-    FR("Préréglage pour entraîner des splats dans des espaces colorimétriques "
-       "linéaires (ACEScg, par exemple)."),
-    ES("Preajuste para entrenar splats en espacios de color lineales (por "
-       "ejemplo ACEScg)."),
-    PT("Predefinição para treinar splats em espaços de cor lineares (por "
-       "exemplo ACEScg)."),
-    IT("Preimpostazione per addestrare splat in spazi colore lineari (per "
-       "esempio ACEScg)."),
-    NL("Voorinstelling om splats te trainen in lineaire kleurruimten "
-       "(bijvoorbeeld ACEScg)."),
-    RU("Пресет для обучения сплатов в линейных цветовых пространствах "
-       "(например, ACEScg)."),
-    TR("Splat'ları doğrusal renk uzaylarında (örneğin ACEScg) eğitmek için "
-       "hazır ayar."));
+SS_MSG(preset_centered_object_help,
+    EN("Preset for captures that orbit a single masked object, whose "
+       "background is not meant to be reconstructed."),
+    JA("マスクした単一の被写体を取り囲むように撮影したデータのための"
+       "プリセットです。背景は復元の対象にしません。"),
+    ZH_HANS("用于环绕单个已遮罩物体拍摄的数据的预设，"
+            "背景不作为重建对象。"),
+    ZH_HANT("用於環繞單個已遮罩物體拍攝的資料的預設，"
+            "背景不作為重建對象。"),
+    KO("마스크한 하나의 물체를 둘러싸며 촬영한 데이터를 위한 "
+       "프리셋입니다. 배경은 복원 대상이 아닙니다."),
+    DE("Voreinstellung für Aufnahmen, die ein einzelnes maskiertes Objekt "
+       "umkreisen und deren Hintergrund nicht rekonstruiert werden soll."),
+    FR("Préréglage pour des prises de vue tournant autour d'un seul objet "
+       "masqué, dont l'arrière-plan n'a pas vocation à être reconstruit."),
+    ES("Preajuste para capturas que giran alrededor de un único objeto "
+       "enmascarado, cuyo fondo no se pretende reconstruir."),
+    PT("Predefinição para capturas que giram em torno de um único objeto "
+       "mascarado, cujo fundo não se pretende reconstruir."),
+    IT("Preimpostazione per riprese che ruotano attorno a un singolo oggetto "
+       "mascherato, il cui sfondo non va ricostruito."),
+    NL("Voorinstelling voor opnamen die om één gemaskeerd object heen draaien, "
+       "waarvan de achtergrond niet gereconstrueerd hoeft te worden."),
+    RU("Пресет для съёмок, обходящих один замаскированный "
+       "объект, фон которых восстанавливать не требуется."),
+    TR("Maskelenmiş tek bir nesnenin çevresinde dönerek yapılan çekimler "
+       "için hazır ayar; arka planın yeniden oluşturulması amaçlanmaz."));
+
+SS_MSG(preset_hdr,
+    EN("High dynamic range"),
+    JA("ハイダイナミックレンジ"),
+    ZH_HANS("高动态范围"),
+    ZH_HANT("高動態範圍"),
+    KO("하이 다이내믹 레인지"),
+    DE("Hoher Dynamikumfang"),
+    FR("Grande plage dynamique"),
+    ES("Alto rango dinámico"),
+    PT("Alta faixa dinâmica"),
+    IT("Ampia gamma dinamica"),
+    NL("Hoog dynamisch bereik"),
+    RU("Высокий динамический диапазон"),
+    TR("Yüksek dinamik aralık"));
+
+SS_MSG(preset_hdr_help,
+    EN("Preserves the dynamic range of the splats; trains linear ACEScg "
+       "splats by default."),
+    JA("スプラットのダイナミックレンジを保ちます。既定ではリニアの ACEScg で"
+       "スプラットを学習します。"),
+    ZH_HANS("保留泼溅的动态范围；默认训练线性 ACEScg 泼溅。"),
+    ZH_HANT("保留潑濺的動態範圍；預設訓練線性 ACEScg 潑濺。"),
+    KO("스플랫의 다이내믹 레인지를 보존합니다. 기본적으로 선형 ACEScg 스플랫을 "
+       "학습합니다."),
+    DE("Erhält den Dynamikumfang der Splats; trainiert standardmäßig lineare "
+       "ACEScg-Splats."),
+    FR("Préserve la plage dynamique des splats ; entraîne par défaut des "
+       "splats ACEScg linéaires."),
+    ES("Conserva el rango dinámico de los splats; entrena por defecto splats "
+       "ACEScg lineales."),
+    PT("Preserva a faixa dinâmica dos splats; treina por padrão splats ACEScg "
+       "lineares."),
+    IT("Conserva la gamma dinamica degli splat; addestra splat ACEScg lineari "
+       "in modo predefinito."),
+    NL("Behoudt het dynamisch bereik van de splats; traint standaard lineaire "
+       "ACEScg-splats."),
+    RU("Сохраняет динамический диапазон сплатов; по умолчанию обучает линейные "
+       "сплаты в ACEScg."),
+    TR("Splat'ların dinamik aralığını korur; varsayılan olarak doğrusal "
+       "ACEScg splat'ları eğitir."));
 
 SS_MSG(preset_synthetic,
     EN("Synthetic renders"),
@@ -340,7 +386,8 @@ inline constexpr PresetText kPresetText[] = {
     {"3dgs",              &preset_3dgs,              &preset_3dgs_help},
     {"360-camera",        &preset_360_camera,        &preset_360_camera_help},
     {"in-the-wild",       &preset_in_the_wild,       &preset_in_the_wild_help},
-    {"linear-color",      &preset_linear_color,      &preset_linear_color_help},
+    {"centered-object",   &preset_centered_object,   &preset_centered_object_help},
+    {"hdr",               &preset_hdr,               &preset_hdr_help},
     {"synthetic",         &preset_synthetic,         &preset_synthetic_help},
     {"meshing",           &preset_meshing,           &preset_meshing_help},
     // hidden by default, uncomment to enable

@@ -181,6 +181,10 @@ LossValues compute_multi_scale_per_pixel_losses(
     bool has_mask,
     const std::array<float, (int)LossWeightIndex::length> loss_weights_0,
     const float w_ssim,
+    // Positive: a pixel whose render and reference are both above it in every
+    // channel leaves the loss entirely -- value, map and gradient. Both are
+    // clipped there, so no colour error at that pixel is recoverable.
+    const float saturation_threshold,
     TorchTensorView v_losses,
     std::vector<bool> needs_input_grad,
     long num_train_images,

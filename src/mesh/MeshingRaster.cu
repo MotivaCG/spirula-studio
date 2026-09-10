@@ -36,7 +36,6 @@ namespace SlangProjectionUtils {
         case CameraDistortionType::None:      BODY(CameraDistortionType::None);      break; \
         case CameraDistortionType::OpenCV:    BODY(CameraDistortionType::OpenCV);    break; \
         case CameraDistortionType::ThinPrism: BODY(CameraDistortionType::ThinPrism); break; \
-        case CameraDistortionType::Rational:  BODY(CameraDistortionType::Rational);  break; \
         default: throw std::runtime_error("Unknown camera distortion tier");        \
     } } while (0)
 

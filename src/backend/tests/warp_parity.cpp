@@ -190,7 +190,7 @@ int main(int argc, char** argv) {
             {"FISHEYE", 20.0f, 20.5f, 2, 0},
             {"EQUISOLID", 24.0f, 24.0f, 1, 0},
             {"PINHOLE", 30.0f, 31.0f, 0, 0},
-            {"PINHOLE", 30.0f, 31.0f, 3, 0},
+            {"PINHOLE", 30.0f, 31.0f, 2, 0},
             // EUCM source: the warp projects through it instead of the fitted
             // camera, which is the fused re-distort + warp-to-pinhole path.
             {"FISHEYE", 20.0f, 20.5f, 2, 16},
@@ -420,8 +420,35 @@ int main(int argc, char** argv) {
             auto img = r.bytes(n_in * 3);
             float* out = alloc_out<float>(n_out * 3);
             launch_redistort_byte_to_float(
-                "PINHOLE", "RATIONAL", d_intr,
-                upload(dist_rows) + dist_fixture::row_offset(3, B),
+                "PINHOLE", "THIN_PRISM", d_intr,
+                upload(dist_rows) + dist_fixture::row_offset(2, B),
+                (const int*)upload(sm), upload(sp),
+                upload(img), false, B, refH, refW, 3,
+                out, refH, refW, refH, refW, 0.5f);
+            readback_f(out, n_out * 3);
+        }
+
+        // COLMAP FULL_OPENCV (model 6). No tier carries its rational radial,
+        // so this path is the only place that lens is evaluated at all.
+        {
+            std::vector<int32_t> sm(B, 6);
+            std::vector<float> sp((size_t)B * 16, 0.0f);
+            for (int b = 0; b < B; b++) {
+                float* p = &sp[(size_t)b * 16];
+                p[0] = intr[b*4 + 0]; p[1] = intr[b*4 + 1];
+                p[2] = intr[b*4 + 2]; p[3] = intr[b*4 + 3];
+                p[4] = -0.31f; p[5] = 0.12f;                     // k1 k2
+                p[6] = 7e-4f;  p[7] = -4e-4f;                    // p1 p2
+                p[8] = -0.02f;                                   // k3
+                p[9] = 0.65f;  p[10] = 0.08f; p[11] = -0.006f;   // k4 k5 k6
+            }
+            const int64_t n_in  = (int64_t)B * refH * refW;
+            const int64_t n_out = n_in;
+            auto img = r.bytes(n_in * 3);
+            float* out = alloc_out<float>(n_out * 3);
+            launch_redistort_byte_to_float(
+                "PINHOLE", "THIN_PRISM", d_intr,
+                upload(dist_rows) + dist_fixture::row_offset(2, B),
                 (const int*)upload(sm), upload(sp),
                 upload(img), false, B, refH, refW, 3,
                 out, refH, refW, refH, refW, 0.5f);

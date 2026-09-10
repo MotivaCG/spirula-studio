@@ -1105,10 +1105,9 @@ void GuiApp::refresh_sources() {
         _mask.current_object = 0;
     }
 
-    // Camera folders inside each input. A capture that arrives already split
-    // into cam/, cam0/, cam1/ needs one lens each -- one of them being a
-    // fisheye does not make the others one -- and the folders are the only
-    // place that shows.
+    // Camera folders inside each input. A capture that arrives split into
+    // cam0/, cam1/ -- or into 1/cam0, 1/cam1, 2/cam0 ... -- needs one lens
+    // each: one of them being a fisheye does not make the others one.
     for (PrepInput& s : _sources) {
         std::vector<std::string> found;
         if (!s.is_video && !s.path.empty()) {
@@ -1125,12 +1124,17 @@ void GuiApp::refresh_sources() {
         for (const std::string& rel : found) {
             SubCamera sc;
             sc.rel = rel;
+            // Empty means "same as the row above", so a folder nobody has
+            // seen starts on the lens its input's kind suggests -- inheriting
+            // a 360 file's fisheye is what ordinary photos must not do.
+            sc.camera_model = s.camera_model;
             for (const SubCamera& old : s.subcameras)
                 if (old.rel == rel) sc = old;
             next.push_back(std::move(sc));
         }
         s.subcameras.swap(next);
     }
+    normalize_source_lenses();
 
     // The output folder follows the input until the user takes it over.
     if (_workspace.empty() || _workspace == _workspace_auto) {
@@ -1167,6 +1171,13 @@ void GuiApp::refresh_sources() {
     }
 }
 
+// Every input carries a concrete lens, so a list holding a 360 camera and a
+// phone cannot end up applying one of them to the other. An Insta360 .insv
+// splits into one folder per fisheye track, which the thin-prism model fits.
+static std::string default_lens(const std::string& path) {
+    return is_dual_fisheye_path(path) ? "thin-prism-fisheye" : "opencv";
+}
+
 // One picked path -> the input it describes, with the defaults its kind wants.
 static PrepInput make_source(const std::string& path,
                              bool use_found_masks) {
@@ -1182,18 +1193,7 @@ static PrepInput make_source(const std::string& path,
         resolve_photo_folder(path, s.path, s.mask_dir);
         if (!use_found_masks) s.mask_dir.clear();
     }
-    // Every input carries a concrete lens, so a list holding a 360 camera and a
-    // phone cannot end up applying one of them to the other.
-    //
-    // 360-camera preset for Insta360 .insv files: the two fisheye tracks land
-    // in one folder per lens (one camera each), the thin-prism fisheye model
-    // fits them, and the known focal length above starts them off.
-    s.camera_model = "opencv";
-    if (is_dual_fisheye_path(path)) {
-        s.camera_model = "thin-prism-fisheye";
-        // Commented - We don't assume every camera is Insta360 X5
-        // s.focal_factor = kInsta360FocalFactor;
-    }
+    s.camera_model = default_lens(path);
     return s;
 }
 
@@ -1264,6 +1264,13 @@ void GuiApp::add_sources(const std::vector<std::string>& paths, bool replace) {
         _color_space_touched = false;
     }
     for (const std::string& path : inputs) _sources.push_back(make_source(path, _use_found_masks));
+    // What a .360 actually holds, asked once per input: the plan below and the
+    // lens both follow from the packing, not from the extension.
+    for (PrepInput& s : _sources) {
+        if (!s.is_video || s.eac360.valid() || !is_pano360_path(s.path)) continue;
+        static const std::atomic<bool> never{false};
+        s.eac360 = probe_eac360(_ffmpeg_exe, s.path, never);
+    }
     for (const std::string& masks : mask_folders) {
         if (attach_mask_folder(_sources, masks))
             log(i18n::format(dmsg::log_masks_attached, {masks}));
@@ -1271,9 +1278,16 @@ void GuiApp::add_sources(const std::vector<std::string>& paths, bool replace) {
             log(i18n::format(dmsg::log_masks_orphaned, {masks}));
     }
     if (_sources.empty()) return;
+    apply_source_presets();
+    if (_mask_preview_input >= (int)_sources.size()) _mask_preview_input = 0;
+    adopt_exr_color_space();
+    refresh_sources();
+}
 
-    // The engine-wide settings follow whatever the list is now. A video is a
-    // capture in order; a folder of photos is not.
+// The engine-wide settings the list itself decides. A video is a capture in
+// order; a folder of photos is not.
+void GuiApp::apply_source_presets() {
+    if (_sources.empty()) return;
     const bool video = _sources[0].is_video;
     const bool fisheye = is_dual_fisheye_path(_sources[0].path);
     _sfm_job.data_type = video ? 1 : 0;
@@ -1297,9 +1311,71 @@ void GuiApp::add_sources(const std::vector<std::string>& paths, bool replace) {
         _sfm_job.camera_mode = 1;
         _colmap_job.camera_mode = 1;
     }
-    if (_mask_preview_input >= (int)_sources.size()) _mask_preview_input = 0;
-    adopt_exr_color_space();
-    refresh_sources();
+    if (any_pano360()) {
+        // Views of one frame share no features, so temporal neighbours are not
+        // the pairs that hold a 360 dataset together; the same reasoning as the
+        // dual-lens case above, and content-based selection is the answer.
+        _sfm_job.pairs = 0;
+        _colmap_job.matcher = 2;
+        // Every view of every 360 input is the same camera by construction --
+        // one focal, one centre, no distortion -- so folder grouping would hand
+        // bundle adjustment six copies of it to drift apart.
+        bool all = true;
+        for (const PrepInput& s : _sources) all = all && s.eac360.valid();
+        _sfm_job.camera_mode = all ? 0 : 1;
+        _colmap_job.camera_mode = all ? 0 : 1;
+        if (_sfm_job.prep.pano.mode == app::Pano360Mode::Off)
+            _sfm_job.prep.pano.mode = app::Pano360Mode::Faces;
+        reset_pano_size();
+        apply_pano_lens();
+    }
+}
+
+// The size box shows what the run will actually use, not a zero standing for
+// "work it out later": it is the one number here a user might want to change.
+void GuiApp::reset_pano_size() {
+    for (const PrepInput& s : _sources)
+        if (s.eac360.valid()) {
+            _sfm_job.prep.pano.size =
+                app::pano360_default_size(s.eac360, _sfm_job.prep.pano);
+            return;
+        }
+}
+
+bool GuiApp::any_pano360() const {
+    for (const PrepInput& s : _sources)
+        if (s.eac360.valid()) return true;
+    return false;
+}
+
+// The warp decides the lens exactly: a face is a pinhole camera of the field
+// of view it was cut at, and a panorama is the spherical model. Neither is a
+// guess, so both the focal prior and the model are set rather than offered.
+void GuiApp::apply_pano_lens() {
+    const app::Pano360Options& p = _sfm_job.prep.pano;
+    if (p.mode == app::Pano360Mode::Off) return;
+    const bool faces = p.mode == app::Pano360Mode::Faces;
+    // All ten views share one focal length in PIXELS, and the factor is
+    // resolved against the first image in the tree -- cam0, the view on the
+    // lens axis, which is the 90-degree one this halves (build_manifest).
+    const float focal = faces ? 0.5f : 0.0f;
+    for (PrepInput& s : _sources) {
+        if (!s.eac360.valid()) continue;
+        s.camera_model = faces ? "pinhole" : "equirectangular";
+        s.focal_factor = focal;
+        for (SubCamera& sc : s.subcameras) {
+            sc.camera_model.clear();
+            sc.focal_factor = 0.0f;
+        }
+    }
+    if (!_sources.empty() && _sources[0].eac360.valid())
+        _sfm_job.camera_model = _sources[0].camera_model;
+    // COLMAP has no spherical model; only the faces can reach that engine.
+    if (faces) {
+        _colmap_job.camera_model = "PINHOLE";
+        _colmap_job.init_focal_factor = focal;
+    }
+    normalize_source_lenses();
 }
 
 // A folder of EXRs declares its own colour space, and the picker for it is
@@ -1764,9 +1840,17 @@ void GuiApp::draw_home_banner(float avail, float indent) {
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
     const ImVec2 p1(p0.x + avail, p0.y + h);
 
+    // Full bleed: the artwork is painted out over the host window's padding on
+    // the three sides it touches, so the band meets the menu bar and both
+    // edges. Only the drawing grows -- p1 stays where the layout below it is.
+    const ImVec2 pad = ImGui::GetStyle().WindowPadding;
+    const ImVec2 q0(p0.x - pad.x, p0.y - pad.y);
+    const ImVec2 q1(p1.x + pad.x, p1.y);
+    const float band_w = q1.x - q0.x, band_h = q1.y - q0.y;
+
     // Cover, not fit: crop to the band's aspect so the artwork fills the width
     // whatever the window is doing.
-    const float want = avail / h, have = (float)bw / (float)bh;
+    const float want = band_w / band_h, have = (float)bw / (float)bh;
     ImVec2 uv0(0.0f, 0.0f), uv1(1.0f, 1.0f);
     const float f = have > want ? want / have : have / want;
     if (have > want) {
@@ -1778,10 +1862,10 @@ void GuiApp::draw_home_banner(float avail, float indent) {
     }
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddImage((ImTextureID)(intptr_t)tex, p0, p1, uv0, uv1);
+    dl->AddImage((ImTextureID)(intptr_t)tex, q0, q1, uv0, uv1);
     // The artwork is bright everywhere, so the text needs its own ground.
     const ImU32 clear = IM_COL32(14, 15, 18, 0), dark = IM_COL32(14, 15, 18, 232);
-    dl->AddRectFilledMultiColor(ImVec2(p0.x, p0.y + h * 0.30f), p1,
+    dl->AddRectFilledMultiColor(ImVec2(q0.x, q0.y + band_h * 0.30f), q1,
                                 clear, clear, dark, dark);
 
     ImGui::SetCursorScreenPos(ImVec2(p0.x + indent, p1.y - px(76.0f)));
@@ -1963,6 +2047,7 @@ const WorkspaceState& GuiApp::workspace_state() {
         _ws_state_key = std::move(key);
         _ws_state_at = now;
         _ws_state = probe_workspace(_workspace, _sources);
+        _ws_artifacts = workspace_artifacts(_workspace, _sources);
     }
     return _ws_state;
 }
@@ -1981,12 +2066,14 @@ void GuiApp::sync_dataset_jobs() {
     prep.resume = _resume;
     prep.video_fps = _sfm_job.prep.video_fps;
     prep.sharp_window = _sfm_job.prep.sharp_window;
+    prep.pano = _sfm_job.prep.pano;
     prep.max_frames = _sfm_job.prep.max_frames;
     prep.force_external_decode = _sfm_job.prep.force_external_decode;
     prep.ffmpeg_exe = _ffmpeg_exe;
     prep.python_exe = _python_exe;
     prep.mask_enable = _mask_enable;
     prep.flip_found_masks = _use_found_masks && _flip_found_masks;
+    prep.photo_import = _photo_import;
     prep.mask_prompt = _mask.prompt;
     prep.mask_negative_prompt = _mask.negative_prompt;
     prep.mask_keep_subject = _mask.keep_subject;
@@ -2002,17 +2089,16 @@ void GuiApp::sync_dataset_jobs() {
     if (const ModelEntry* e = find_model(_model_id))
         prep.mask_model_name = e->legacy_name;
     _sfm_job.prep = prep;
-    // The dataset-wide lens is the lone input's; with several, each input names
-    // its own and this is only what an image no override covers would get.
-    if (!_sources.empty()) _sfm_job.camera_model = _sources[0].camera_model;
 
     _colmap_job.inputs = prep.inputs;
     _colmap_job.workspace = prep.workspace;
     _colmap_job.resume = prep.resume;
     _colmap_job.video_fps = prep.video_fps;
     _colmap_job.sharp_window = prep.sharp_window;
+    _colmap_job.pano = prep.pano;
     _colmap_job.max_frames = prep.max_frames;
     _colmap_job.force_external_decode = prep.force_external_decode;
+    _colmap_job.photo_import = prep.photo_import;
     _colmap_job.force_external_masking = prep.force_external_masking;
     _colmap_job.colmap_exe = _colmap_exe;
     _colmap_job.ffmpeg_exe = _ffmpeg_exe;
@@ -2081,6 +2167,68 @@ void GuiApp::start_dataset_job() {
 // Source, destination, resume
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// Built by hand rather than with ui::Combo for the same reason as the lens
+// pickers: what each row costs is the whole of the question, and one tooltip
+// on the closed combo cannot answer it row by row.
+void photo_import_combo(PhotoImport* mode, bool several_inputs) {
+    const std::vector<const Msg*> labels{
+        &dmsg::photo_import_convert, &dmsg::photo_import_copy,
+        &dmsg::photo_import_move, &dmsg::photo_import_inplace};
+    const std::vector<const Msg*> helps{
+        &dmsg::photo_import_convert_help, &dmsg::photo_import_copy_help,
+        &dmsg::photo_import_move_help, &dmsg::photo_import_inplace_help};
+    int idx = (int)*mode;
+    ImGui::SetNextItemWidth(px(260.0f));
+    if (ui::BeginCombo(dmsg::photo_import, labels[(size_t)idx]->get())) {
+        for (int i = 0; i < kNumPhotoImports; i++) {
+            const bool blocked =
+                several_inputs && (PhotoImport)i == PhotoImport::InPlace;
+            ImGui::BeginDisabled(blocked);
+            if (ui::Selectable(*labels[(size_t)i], i == idx))
+                *mode = (PhotoImport)i;
+            ImGui::EndDisabled();
+            ui::help_on_hover(*helps[(size_t)i]);
+        }
+        ImGui::EndCombo();
+    }
+    ui::help_on_hover(dmsg::photo_import_help);
+}
+
+}  // namespace
+
+// What the IMU and GPS of this input hold, beside the row that chose it. The
+// reconstruction uses them without being asked (SfM's sensor gauge), so what
+// is worth seeing here is whether there is anything for it to use.
+void GuiApp::draw_sensor_badge(const PrepInput& s) {
+    std::error_code ec;
+    if (s.path.empty() ||
+        (s.is_video ? !fs::is_regular_file(s.path, ec)
+                    : !fs::is_directory(s.path, ec)))
+        return;
+    const TelemetryInfo t = _telemetry.get(s.path, s.is_video);
+    ImGui::SameLine();
+    if (!t.done) {
+        ui::TextDisabled(dmsg::sensors_reading);
+        return;
+    }
+    if (!s.is_video) {
+        if (t.photos == 0) return;
+        if (t.with_gps == 0) { ui::TextDisabled(dmsg::sensors_none); return; }
+        ui::TextDisabled(dmsg::sensors_photo_gps,
+                         {(long long)t.with_gps, (long long)t.photos});
+        return;
+    }
+    const bool imu = t.gyro || t.accel || t.attitude;
+    if (!imu && !t.gps) { ui::TextDisabled(dmsg::sensors_none); return; }
+    ui::TextDisabled(imu && t.gps ? dmsg::sensors_imu_gps
+                     : imu        ? dmsg::sensors_imu
+                                  : dmsg::sensors_gps);
+    if (!t.carrier.empty() && ImGui::IsItemHovered())
+        ui::SetTooltip(dmsg::sensors_carrier_tooltip, {t.carrier});
+}
+
 void GuiApp::draw_dataset_source() {
     // One row per input. Several videos reconstruct as one scene -- each gets
     // its own folder of frames under images/, and so its own camera.
@@ -2089,9 +2237,9 @@ void GuiApp::draw_dataset_source() {
     for (size_t i = 0; i < _sources.size(); i++) {
         PrepInput& s = _sources[i];
         ImGui::PushID((int)i);
-        // Room for Browse + Remove + where the frames go, which is longer than
-        // any other row on the screen.
-        ImGui::SetNextItemWidth(px(-380.0f));
+        // Room for Browse + Remove + where the frames go + what sensors it
+        // carries, which is longer than any other row on the screen.
+        ImGui::SetNextItemWidth(px(-500.0f));
         if (ui::InputTextRaw("##in", &s.path)) {
             std::error_code ec;
             s.is_video = !fs::is_directory(s.path, ec) && is_video_path(s.path);
@@ -2137,6 +2285,7 @@ void GuiApp::draw_dataset_source() {
         }
         if (masked && ImGui::IsItemHovered())
             ui::SetTooltip(dmsg::existing_masks_tooltip, {s.mask_dir});
+        draw_sensor_badge(s);
         ImGui::PopID();
     }
     if (remove >= 0) {
@@ -2181,6 +2330,7 @@ void GuiApp::draw_dataset_source() {
             ui::help_on_hover(dmsg::flip_found_masks_help);
             ImGui::Unindent();
         }
+        photo_import_combo(&_photo_import, _sources.size() > 1);
     }
 
     ImGui::SetNextItemWidth(px(-220.0f));
@@ -2226,30 +2376,40 @@ void GuiApp::draw_dataset_source() {
 
 namespace {
 
-// The closed picker's tooltip: what the control decides, then what the model
-// standing in it is for. Two paragraphs rather than one message, because only
-// the second one changes with the selection.
-void lens_tooltip(const Msg& model_help) {
+// Two paragraphs rather than one message, because only the second one changes
+// with the selection. `inherited` names the model too, for a row reading "same
+// as above" -- the picker is no longer showing which lens that is.
+void lens_tooltip(const Msg& model_help, const Msg* inherited = nullptr) {
     if (!ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort) ||
         !ImGui::BeginTooltip())
         return;
     ImGui::PushTextWrapPos(px(420.0f));
     ui::Text(dmsg::camera_lens_help);
     ImGui::Separator();
+    if (inherited) ui::Text(*inherited);
     ui::Text(model_help);
     ImGui::PopTextWrapPos();
     ImGui::EndTooltip();
 }
 
-// The lens pickers. ImGui's Combo takes a flat list of strings and has
-// nowhere to hang a description on a row, so the popup is built by hand:
-// which physical camera each model is for is the whole of the question, and
-// one tooltip on the closed combo cannot answer it row by row.
-bool sfm_lens_combo(const char* id, int* idx) {
+// ImGui's Combo has nowhere to hang a description on a row, so the popup is
+// built by hand: which physical camera each model is for is the whole of the
+// question. `inherit` adds "(same as above)" and makes -1 a selection.
+bool sfm_lens_combo(const char* id, int* idx, bool inherit = false) {
     const auto labels = sfm_camera_model_labels();
     const auto helps = sfm_camera_model_helps();
-    if (!ui::BeginComboRaw(id, labels[(size_t)*idx]->get())) return false;
+    const char* shown = *idx < 0 ? dmsg::lens_same_as_above.get()
+                                 : labels[(size_t)*idx]->get();
+    if (!ui::BeginComboRaw(id, shown)) return false;
     bool changed = false;
+    if (inherit) {
+        if (ui::Selectable(dmsg::lens_same_as_above, *idx < 0)) {
+            *idx = -1;
+            changed = true;
+        }
+        ui::help_on_hover(dmsg::lens_same_as_above_help);
+        ImGui::Separator();
+    }
     for (int i = 0; i < (int)labels.size(); i++) {
         if (ui::Selectable(*labels[(size_t)i], i == *idx)) {
             *idx = i;
@@ -2284,10 +2444,21 @@ bool colmap_lens_combo(const char* id, int* idx) {
 void GuiApp::draw_dataset_basics() {
     const bool builtin = effective_engine() == Engine::BuiltIn;
 
+    // A model already in the output folder is reused, so these settings reach
+    // it only through a rebuild -- which a stamp mismatch forces
+    // (ReconStamp.h), and which a model that arrived without one never gets.
+    const WorkspaceState& prior = workspace_state();
+    const bool reusing = !dataset_busy() && prior.model && !_redo_model;
+    const bool inert = reusing && !prior.recon_stamp;
+    if (reusing)
+        ui::TextColoredWrapped(inert ? kWarn : kDim,
+                               inert ? dmsg::recon_reuse_locked
+                                     : dmsg::recon_reuse_rebuild);
+
     // Everything down to the frame-rate control is read by feature extraction
     // and after; the frame settings below it were read the moment the run
     // began. Hence two guards rather than one round the lot.
-    ImGui::BeginDisabled(dataset_locked(Stage::Features));
+    ImGui::BeginDisabled(inert || dataset_locked(Stage::Features));
 
     // Quality means the same thing to both engines even though it moves
     // different knobs, so it is one control.
@@ -2326,13 +2497,14 @@ void GuiApp::draw_dataset_basics() {
     if (!per_input_lens) {
         ImGui::SetNextItemWidth(px(220.0f));
         if (builtin) {
-            std::string& model =
-                _sources.empty() ? _sfm_job.camera_model : _sources[0].camera_model;
+            // Kept equal to the first row's by normalize_source_lenses, so
+            // this reads the same lens whichever control last wrote it.
+            const std::string& model = _sfm_job.camera_model;
             int idx = 0;
             for (int i = 0; i < kNumSfmCameraModels; i++)
                 if (model == kSfmCameraModels[i]) idx = i;
             if (sfm_lens_combo(ui::detail::label(dmsg::camera_lens), &idx))
-                model = kSfmCameraModels[idx];
+                apply_lens_to_sources(kSfmCameraModels[idx]);
             lens_tooltip(*sfm_camera_model_helps()[idx]);
         } else {
             int idx = 0;
@@ -2344,7 +2516,7 @@ void GuiApp::draw_dataset_basics() {
         }
         if (!_sources.empty())
             draw_lens_warning(_sources[0].path, _sources[0].is_video,
-                              builtin ? _sources[0].camera_model
+                              builtin ? _sfm_job.camera_model
                                       : _colmap_job.camera_model,
                               builtin);
         if (!builtin && _sources.size() > 1)
@@ -2397,6 +2569,7 @@ void GuiApp::draw_dataset_basics() {
         ImGui::SetNextItemWidth(px(220.0f));
         ui::SliderInt(dmsg::sharpness_window, &_sfm_job.prep.sharp_window, 1, 8);
         ui::help_on_hover(dmsg::sharpness_window_help);
+        if (any_pano360()) draw_pano360_options();
         if (!backends().builtin_video) {
             // What the note says is a build-configuration diagnostic and
             // stays English; the sentence around it does not.
@@ -2410,64 +2583,157 @@ void GuiApp::draw_dataset_basics() {
     if (dataset_busy()) ui::help_on_hover_disabled(dmsg::step_locked);
 }
 
-// One lens per input, in place of the single "Camera / lens" control, once
-// there is more than one input to tell apart. The reconstruction takes these as
-// per-folder overrides (SfmRunner::append_camera_overrides), which is what lets
-// a 360 clip and a phone clip reconstruct as one scene without either being
-// fitted with the other's model.
+// What a 360 capture is unwrapped into, drawn among the video settings only
+// when one was detected. The lens follows the choice exactly (apply_pano_lens),
+// so there is no camera model to pick here.
+void GuiApp::draw_pano360_options() {
+    app::Pano360Options& p = _sfm_job.prep.pano;
+    int mode = p.mode == app::Pano360Mode::Equirect ? 1 : 0;
+    ImGui::SetNextItemWidth(px(220.0f));
+    if (ui::Combo(dmsg::pano360_output, &mode,
+                  {&dmsg::pano360_output_faces, &dmsg::pano360_output_equirect})) {
+        p.mode = mode == 1 ? app::Pano360Mode::Equirect : app::Pano360Mode::Faces;
+        // A face side and a panorama width are not the same number, so the one
+        // in the box is meaningless the moment the other is chosen.
+        reset_pano_size();
+        apply_pano_lens();
+    }
+    ui::help_on_hover(dmsg::pano360_output_help);
+    if (mode == 1 && effective_engine() != Engine::BuiltIn)
+        ui::TextColoredWrapped(kWarn, dmsg::pano360_colmap_warning);
+}
+
+// The size of those views, which is under Advanced because the default is
+// derived from the source and is what almost everyone should use.
+void GuiApp::draw_pano360_size() {
+    ImGui::SetNextItemWidth(px(260.0f));
+    ui::InputInt(dmsg::pano360_size, &_sfm_job.prep.pano.size, 32, 128);
+    if (_sfm_job.prep.pano.size < 0) _sfm_job.prep.pano.size = 0;
+    ui::help_on_hover(dmsg::pano360_size_help);
+}
+
+
+// One lens control for the whole capture has to reach every input:
+// append_camera_overrides emits a --camera-model per input folder, and one
+// still holding the model its file type suggested wins on longest prefix.
+void GuiApp::apply_lens_to_sources(const std::string& model) {
+    _sfm_job.camera_model = model;
+    for (PrepInput& s : _sources) {
+        s.camera_model = model;
+        for (SubCamera& sc : s.subcameras) sc.camera_model.clear();
+    }
+    normalize_source_lenses();
+}
+
+// What keeps "same as above" (an empty model) honest: the first row always
+// holds a real model, and a row that merely repeats the row above is emptied,
+// so a later change to that row reaches it too. Runs after every edit.
+void GuiApp::normalize_source_lenses() {
+    const std::vector<CameraGroup> groups = camera_groups(_sources);
+    if (groups.empty()) return;
+    std::string above;
+    for (size_t i = 0; i < groups.size(); i++) {
+        std::string& m = group_model(_sources, groups[i]);
+        if (i == 0) {
+            // Nothing above to inherit from, so a row the removal of the one
+            // above just promoted keeps what it was resolving to.
+            if (m.empty()) m = _sfm_job.camera_model;
+            if (m.empty()) m = default_lens(_sources[groups[i].input].path);
+            above = m;
+            continue;
+        }
+        if (m == above) m.clear();
+        else if (!m.empty()) above = m;
+    }
+    // A group whose images are the whole capture carries no prefix, so nothing
+    // names it on the command line -- the dataset-wide --camera-model is what
+    // it gets. Keep that equal to the first row, which is the row it is.
+    _sfm_job.camera_model = group_model(_sources, groups[0]);
+}
+
+// The lens and starting focal an input's images are fitted with: its first
+// camera group's, once "same as above" has been followed down the list.
+void GuiApp::source_lens(size_t input, std::string& model, float& focal) const {
+    const std::vector<CameraGroup> groups = camera_groups(_sources);
+    const std::vector<std::string> models =
+        camera_group_models(_sources, groups, _sfm_job.camera_model);
+    for (size_t i = 0; i < groups.size(); i++) {
+        if (groups[i].input != input) continue;
+        model = models[i];
+        focal = group_focal(_sources, groups[i]);
+        return;
+    }
+}
+
+// One lens per camera group, in place of the single "Camera / lens" control,
+// once there is more than one camera to tell apart -- which lets a 360 clip and
+// a phone clip reconstruct as one scene, neither fitted with the other's model.
 void GuiApp::draw_source_cameras() {
     ui::Text(dmsg::camera_lens_per_input);
     ui::help_on_hover(dmsg::camera_lens_per_input_help);
     ImGui::Indent();
-    // `label` names the row, `dir` is the folder it measures, and model/focal
-    // are what the row edits -- an input with no camera folders under it is
-    // one row, an input with three is three.
-    auto row = [&](const char* id, const std::string& label,
-                   const std::string& dir, std::string& model, float& focal) {
-        ImGui::PushID(id);
-        ui::TextRaw(label);
+    const std::vector<CameraGroup> groups = camera_groups(_sources);
+    const std::vector<std::string> models =
+        camera_group_models(_sources, groups, _sfm_job.camera_model);
+    const auto labels = sfm_camera_model_labels();
+    const auto helps = sfm_camera_model_helps();
+
+    // A row names the folder it measures, which is also the prefix the
+    // override matches on -- so an input with several camera folders repeats
+    // its own name, and that is what says which rows belong together.
+    std::vector<std::string> names(groups.size());
+    float col = px(200.0f);
+    for (size_t i = 0; i < groups.size(); i++) {
+        fs::path p(_sources[groups[i].input].path);
+        if (p.filename().empty()) p = p.parent_path();   // trailing separator
+        names[i] = groups[i].rel.empty() ? p.filename().string() : groups[i].rel;
+        col = std::max(col, ImGui::CalcTextSize(names[i].c_str()).x + px(24.0f));
+    }
+    col = std::min(col, px(420.0f));
+
+    bool edited = false;
+    for (size_t i = 0; i < groups.size(); i++) {
+        const CameraGroup& g = groups[i];
+        const PrepInput& in = _sources[g.input];
+        const std::string dir =
+            g.sub < 0 ? in.path
+                      : (fs::path(in.path) /
+                         in.subcameras[(size_t)g.sub].rel).string();
+        // The row's own prefix as its ID, so adding or dropping an input does
+        // not carry an open picker or a half-typed focal onto another row.
+        ImGui::PushID(g.rel.c_str());
+        ui::TextRaw(names[i]);
         if (ImGui::IsItemHovered()) ui::SetTooltipRaw(dir);
-        ImGui::SameLine(px(200.0f));
+        // A name too long for the column takes the row and leaves the controls
+        // on the next one, rather than being drawn through them.
+        if (ImGui::CalcTextSize(names[i].c_str()).x + px(8.0f) < col)
+            ImGui::SameLine(col);
         ImGui::SetNextItemWidth(px(220.0f));
-        int idx = 0;
+        std::string& stored = group_model(_sources, g);
+        int idx = stored.empty() ? -1 : 0;
         for (int m = 0; m < kNumSfmCameraModels; m++)
-            if (model == kSfmCameraModels[m]) idx = m;
-        if (sfm_lens_combo("##lens", &idx)) model = kSfmCameraModels[idx];
-        lens_tooltip(*sfm_camera_model_helps()[(size_t)idx]);
+            if (stored == kSfmCameraModels[m]) idx = m;
+        if (sfm_lens_combo("##lens", &idx, /*inherit=*/i > 0)) {
+            stored = idx < 0 ? std::string() : kSfmCameraModels[idx];
+            edited = true;
+        }
+        int shown = 0;
+        for (int m = 0; m < kNumSfmCameraModels; m++)
+            if (models[i] == kSfmCameraModels[m]) shown = m;
+        lens_tooltip(*helps[(size_t)shown],
+                     idx < 0 ? labels[(size_t)shown] : nullptr);
         ImGui::SameLine();
         ImGui::SetNextItemWidth(px(90.0f));
-        ui::InputFloat(dmsg::focal_x_width, &focal, 0, 0, "%.4g");
+        ui::InputFloat(dmsg::focal_x_width, &group_focal(_sources, g), 0, 0,
+                       "%.4g");
         ui::help_on_hover(dmsg::focal_x_width_help);
-        draw_lens_warning(dir, /*is_video=*/false, model, /*builtin=*/true);
-        ImGui::PopID();
-    };
-
-    for (size_t i = 0; i < _sources.size(); i++) {
-        PrepInput& s = _sources[i];
-        ImGui::PushID((int)i);
-        if (s.subcameras.empty()) {
-            const std::string label =
-                s.subdir.empty() ? fs::path(s.path).filename().string() : s.subdir;
-            row("input", label, s.path, s.camera_model, s.focal_factor);
-        } else {
-            // The input itself is a heading here: every image under it is in
-            // one of the camera folders, so the input's own lens covers none.
-            if (_sources.size() > 1) {
-                ui::TextDisabledRaw(s.subdir.empty() ? s.path : s.subdir);
-                ImGui::Indent();
-            }
-            for (size_t k = 0; k < s.subcameras.size(); k++) {
-                SubCamera& sc = s.subcameras[k];
-                if (sc.camera_model.empty()) sc.camera_model = s.camera_model;
-                row(sc.rel.c_str(), sc.rel,
-                    (fs::path(s.path) / sc.rel).string(), sc.camera_model,
-                    sc.focal_factor);
-            }
-            if (_sources.size() > 1) ImGui::Unindent();
-        }
+        draw_lens_warning(dir, in.is_video, models[i], /*builtin=*/true);
         ImGui::PopID();
     }
     ImGui::Unindent();
+    // Only now: the edit is the row's own, and collapsing it into the row above
+    // rewrites what the loop was holding references into.
+    if (edited) normalize_source_lenses();
 }
 
 bool GuiApp::input_pixel_size(const std::string& path, bool is_video,
@@ -2506,6 +2772,10 @@ void GuiApp::draw_lens_warning(const std::string& path, bool is_video,
     // COLMAP has no panorama model, so the question only arises for the
     // built-in engine.
     const bool pano = builtin && model == "equirectangular";
+    // A 360 capture's lens describes the WARPED views, which are 2:1 (or square
+    // faces) by construction; the frame this would measure is the packing.
+    for (const PrepInput& s : _sources)
+        if (s.eac360.valid() && s.path == path) return;
     // A dual-lens file is two fisheye circles per frame whatever its pixel
     // dimensions are, so this one needs no measurement.
     if (is_dual_fisheye_path(path)) {
@@ -2616,6 +2886,8 @@ void GuiApp::draw_masking_options() {
             ui::TextColoredWrappedRaw(kErr, _download.status());
         if (entry && !entry->text_prompts && _mask.clicks.empty())
             ui::TextColored(kWarn, dmsg::mask_no_text_prompts);
+        if (any_pano360())
+            ui::TextColoredWrapped(kWarn, dmsg::pano360_clicks_warning);
         if (!_mask.clicks.empty()) {
             int objects = 0;
             for (const MaskClick& c : _mask.clicks)
@@ -2769,14 +3041,18 @@ void GuiApp::open_geometry_preview() {
     // One multi-gigabyte backbone at a time: the mask preview holds SAM and
     // this one holds Metric3D, and the inference layer's pool is process-wide.
     _segment.close();
-    const PrepInput* in =
-        _sources.empty() ? nullptr
-                         : &_sources[(size_t)std::min((size_t)_mask_preview_input,
-                                                      _sources.size() - 1)];
+    const size_t idx =
+        _sources.empty() ? 0
+                         : std::min((size_t)_mask_preview_input,
+                                    _sources.size() - 1);
+    const PrepInput* in = _sources.empty() ? nullptr : &_sources[idx];
+    std::string lens = _sfm_job.camera_model;
+    float focal = 0.0f;
+    if (in) source_lens(idx, lens, focal);
     _geometry_panel.open(in ? in->path : std::string(), in && in->is_video,
-                         _workspace, planned_image_dir(_sources, _workspace),
-                         in ? in->camera_model : std::string("opencv"),
-                         in ? in->focal_factor : 0.0f, _ffmpeg_exe,
+                         _workspace,
+                         planned_image_dir(_sources, _workspace, _photo_import),
+                         lens, focal, _ffmpeg_exe,
                          _sfm_job.prep.force_external_decode);
 }
 
@@ -3005,9 +3281,11 @@ void GuiApp::poll_sfm_progress() {
     // features are read off disk, which is what this watcher is for.
     if (dataset_busy() && dataset_steps()->current() == Stage::Features)
         _features.start(_sfm.sfm_image_dir(), _sfm.sfm_mask_dir(),
-                        _sfm.features_dir(), &_film_features);
+                        _sfm.features_dir(), &_film_features,
+                        _sfm.thumbs_dir());
     _pairs_view.configure(_sfm.sfm_image_dir(), _sfm.sfm_mask_dir(),
-                          _sfm.features_dir(), _sfm.matches_path());
+                          _sfm.features_dir(), _sfm.matches_path(),
+                          _sfm.live_matches_path());
 
     const std::string dir = _sfm.progress_dir();
     if (dir.empty()) return;
@@ -3024,13 +3302,10 @@ void GuiApp::poll_sfm_progress() {
     if (read_live_model(dir, _model_mtime, lm)) {
         _live_model = std::move(lm);
         // The mapper's own output is a wall of per-registration detail, so the
-        // default log used to go quiet for the whole of the longest step. The
-        // snapshot has the exact counts and needs no line parsed out of a
-        // translated sentence, so say it here instead -- and give the step a
-        // real bar rather than a spinner.
+        // default log used to go quiet for the longest step. These are the
+        // model in hand, not the bar -- a seed retry starts one over.
         if (dataset_busy() && _live_model.n_images) {
             RunProgress& p = _sfm.steps();
-            p.count(Stage::Mapping, _live_model.n_registered, _live_model.n_images);
             p.note(Stage::Mapping,
                    i18n::format(dmsg::model_live_counts,
                                 {(long long)_live_model.n_registered,
@@ -3254,6 +3529,102 @@ void GuiApp::draw_dataset_rerun(const WorkspaceState& prior) {
 }
 
 // ---------------------------------------------------------------------------
+// Starting over
+// ---------------------------------------------------------------------------
+
+void GuiApp::reset_recon_options() {
+    // The photographs' colour space was read off the files, not chosen, so it
+    // is not one of the options this puts back.
+    const std::string gamut = _sfm_job.image_gamut;
+    const std::optional<bool> linear = _sfm_job.image_is_linear;
+    _sfm_job = SfmJob{};
+    _colmap_job = ColmapJob{};
+    _geometry = GeometryJob{};
+    _sfm_job.image_gamut = gamut;
+    _sfm_job.image_is_linear = linear;
+    for (PrepInput& s : _sources) {
+        s.camera_model = default_lens(s.path);
+        s.focal_factor = 0.0f;
+        for (SubCamera& sc : s.subcameras) {
+            sc.camera_model = s.camera_model;
+            sc.focal_factor = 0.0f;
+        }
+    }
+    apply_source_presets();
+    normalize_source_lenses();
+    _redo_frames = _redo_masks = _redo_model = _redo_geometry = false;
+    _resume = true;
+    log(dmsg::reset_options_done.get());
+}
+
+void GuiApp::draw_dataset_reset() {
+    if (!ui::CollapsingHeader(dmsg::reset_section)) return;
+    ImGui::Indent();
+    ui::TextDisabledWrapped(dmsg::reset_section_help);
+    ImGui::BeginDisabled(dataset_busy());
+    // A transforms.json or a Metashape export is not on the list -- it is the
+    // dataset somebody handed over, not something a run here wrote -- so a
+    // folder can hold a model and still have nothing to delete.
+    ImGui::BeginDisabled(_ws_artifacts.empty());
+    if (ui::Button(dmsg::clear_project)) {
+        _clear_targets = _ws_artifacts;
+        _clear_open = true;
+    }
+    ImGui::EndDisabled();
+    ui::help_on_hover(dmsg::clear_project_help);
+    ImGui::SameLine();
+    if (ui::Button(dmsg::reset_options)) reset_recon_options();
+    ui::help_on_hover(dmsg::reset_options_help);
+    ImGui::EndDisabled();
+    ImGui::NewLine();
+    ImGui::Unindent();
+}
+
+// Deleting is the one thing here that cannot be undone, so the modal lists the
+// paths themselves rather than describing them.
+void GuiApp::draw_clear_project_modal() {
+    if (_clear_open) {
+        ui::OpenPopup(dmsg::clear_project_title);
+        _clear_open = false;
+        _clear_shown = true;
+    }
+    if (!_clear_shown) return;
+    if (!ui::BeginPopupModal(dmsg::clear_project_title, nullptr,
+                             ImGuiWindowFlags_AlwaysAutoResize)) {
+        _clear_shown = false;
+        return;
+    }
+    ImGui::PushTextWrapPos(px(460.0f));
+    ui::Text(dmsg::clear_project_confirm, {_workspace});
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+    for (const std::string& path : _clear_targets) ui::TextDisabledRaw(path);
+    ImGui::Spacing();
+
+    if (ui::Button(dmsg::clear_project_button, ImVec2(px(150.0f), 0))) {
+        // The screen is reading several of these; it has to let go first.
+        reset_dataset_preview();
+        for (const std::string& path : _clear_targets) {
+            std::error_code ec;
+            fs::remove_all(path, ec);
+            if (ec) log(i18n::format(dmsg::clear_project_failed,
+                                     {path, ec.message()}));
+        }
+        log(i18n::format(dmsg::clear_project_done, {_workspace}));
+        _clear_targets.clear();
+        _ws_state_at = -1.0;      // the answer changed; do not wait a second
+        _clear_shown = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ui::Button(dmsg::cancel, ImVec2(px(150.0f), 0))) {
+        _clear_shown = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+// ---------------------------------------------------------------------------
 // Advanced: the photographs' colour space
 // ---------------------------------------------------------------------------
 
@@ -3351,6 +3722,7 @@ void GuiApp::draw_sfm_advanced() {
               {&dmsg::capture_photos, &dmsg::capture_video,
                &dmsg::capture_internet});
     ui::help_on_hover(dmsg::capture_type_help);
+    if (any_pano360()) draw_pano360_size();
 
     ImGui::SetNextItemWidth(px(260.0f));
     ui::Combo(dmsg::features, &_sfm_job.features,
@@ -3426,6 +3798,24 @@ void GuiApp::draw_sfm_advanced() {
     ui::InputInt(dmsg::max_image_size_auto, &_sfm_job.max_image_size);
     ui::help_on_hover(dmsg::max_image_size_auto_help);
 
+    // ---- what the sensors are allowed to settle ----
+    // Two sources, two controls: a video's own IMU and GPS track, and the
+    // per-photograph EXIF position. Either can be the only one an input has.
+    ImGui::Spacing();
+    ui::SeparatorText(dmsg::section_sensors);
+    ImGui::SetNextItemWidth(px(260.0f));
+    ui::Combo(dmsg::sfm_sensor_gauge, &_sfm_job.sensor_gauge,
+              {&dmsg::sfm_sensor_gauge_off, &dmsg::sfm_sensor_gauge_up,
+               &dmsg::sfm_sensor_gauge_auto});
+    ui::help_on_hover(dmsg::sfm_sensor_gauge_help);
+
+    ImGui::SetNextItemWidth(px(260.0f));
+    ui::Combo(dmsg::sfm_metric_gps, &_sfm_job.metric_gps,
+              {&dmsg::sfm_metric_gps_off, &dmsg::sfm_metric_gps_horizontal,
+               &dmsg::sfm_metric_gps_full});
+    ui::help_on_hover(dmsg::sfm_metric_gps_help);
+    ImGui::Spacing();
+
     ui::Checkbox(dmsg::keep_intermediate, &_sfm_job.keep_intermediate);
     ui::help_on_hover(dmsg::keep_intermediate_help);
 
@@ -3449,6 +3839,9 @@ void GuiApp::draw_sfm_advanced() {
 
     ui::Checkbox(dmsg::sfm_ba_cpu, &_sfm_job.ba_cpu);
     ui::help_on_hover(dmsg::sfm_ba_cpu_help);
+
+    ui::Checkbox(dmsg::sfm_subprocess, &_sfm_job.subprocess);
+    ui::help_on_hover(dmsg::sfm_subprocess_help);
 }
 
 // ---------------------------------------------------------------------------
@@ -3713,7 +4106,10 @@ void GuiApp::draw_dataset_form(float height, bool running) {
                 else                      request_geometry_download();
             }
         }
-        if (ready) draw_dataset_rerun(workspace_state());
+        if (ready) {
+            draw_dataset_rerun(workspace_state());
+            draw_dataset_reset();
+        }
     } else if (ui::Button(dmsg::cancel, ImVec2(px(200.0f), px(34.0f)))) {
         cancel_dataset_job();
     }
@@ -3746,6 +4142,8 @@ void GuiApp::draw_dataset_form(float height, bool running) {
     if (st.done) {
         if (effective_engine() == Engine::BuiltIn && _sfm.partial())
             ui::TextColoredWrapped(kWarn, dmsg::partial_reconstruction);
+        if (effective_engine() == Engine::BuiltIn && _sfm.not_metric())
+            ui::TextColoredWrapped(kWarn, dmsg::not_metric_reconstruction);
         ui::TextColoredWrapped(kOk, dmsg::done_at, {st.dir});
         if (ui::Button(dmsg::open_in_trainer)) {
             if (training_busy()) {
@@ -3790,8 +4188,6 @@ void GuiApp::draw_new_dataset() {
     // panel that is read across everything, and it is what a run used to be
     // watched entirely through.
     const float log_h = log_height(ImGui::GetContentRegionAvail().y);
-    const float body_h = ImGui::GetContentRegionAvail().y - log_h -
-                         (log_h > 0 ? splitter_extent() : 0);
 
     // Side by side only when there is a preview AND room for both. On a narrow
     // window the preview goes under the form instead, which is worth less but
@@ -3799,7 +4195,7 @@ void GuiApp::draw_new_dataset() {
     const bool wide = ImGui::GetContentRegionAvail().x >= px(1000.0f);
     const bool two_col = preview_has_content() && wide;
 
-    ImGui::BeginChild("##dsbody", ImVec2(0, body_h));
+    ImGui::BeginChild("##dsbody", ImVec2(0, body_height(log_h)));
     if (two_col) {
         const float w = std::clamp(_ds_panel_w * ui_scale(), px(320.0f),
                                    std::max(px(320.0f),
@@ -3843,6 +4239,7 @@ void GuiApp::draw_new_dataset() {
         }
     }
     if (_geometry_panel.is_open()) _geometry_panel.draw(_geometry);
+    draw_clear_project_modal();
     draw_license_modal();
 }
 
@@ -5092,6 +5489,8 @@ void GuiApp::draw_basic_options() {
             _cfg_ui.touched.insert("primitive");
         }
         ui::help_on_hover(msg::opt_primitive_help);
+        if (_cfg.primitive == "3dgut")
+            ui::TextColoredWrapped(kWarn, msg::opt_primitive_3dgut_warn);
     }
 
     int ds_idx = _cfg.train_resolution_divisor == 2.0f ? 1
@@ -5228,17 +5627,24 @@ void GuiApp::draw_metrics() {
     ui::SeparatorText(msg::section_metrics);
     // Downsample to <= 240 plot points.
     int stride = std::max<size_t>(1, pts.size() / 240);
-    static std::vector<float> psnr, splats;
+    static std::vector<float> steps, psnr, splats;
+    steps.clear();
     psnr.clear();
     splats.clear();
-    for (size_t i = 0; i < pts.size(); i += stride) {
+    auto take = [&](size_t i) {
+        steps.push_back((float)pts[i].step);
         psnr.push_back(pts[i].psnr);
         splats.push_back(pts[i].num_splats);
-    }
+    };
+    size_t last_i = 0;
+    for (size_t i = 0; i < pts.size(); i += stride) { take(i); last_i = i; }
+    // The stride can stop short of the newest point, which on a step axis
+    // leaves the curve ending before the score printed beside it.
+    if (last_i != pts.size() - 1) take(pts.size() - 1);
     const auto& last = pts.back();
     // PSNR / SSIM / loss are the metric names the literature and the logs use;
     // they are not translated, only the numbers change.
-    ui::PlotLinesRaw("##psnr", psnr.data(), (int)psnr.size(), nullptr,
+    ui::PlotLinesRaw(steps.data(), psnr.data(), (int)psnr.size(),
                      ImVec2(-8, px(64.0f)));
     // The score, placed in the plot's own rectangle rather than handed to
     // PlotLines as its overlay: that one is drawn against the TOP of the
@@ -5402,7 +5808,11 @@ float GuiApp::log_height(float avail) const {
 }
 
 float GuiApp::body_height(float log_h) {
-    return log_h > 0.0f ? -(log_h + splitter_extent()) : 0.0f;
+    // ItemSpacing twice: once above the splitter's grab and once below it.
+    // Counting it once left the body a spacing too tall, which the host window
+    // answered by becoming scrollable by exactly that much.
+    if (log_h <= 0.0f) return 0.0f;
+    return -(log_h + splitter_extent() + ImGui::GetStyle().ItemSpacing.y);
 }
 
 void GuiApp::draw_log_panel(float height) {

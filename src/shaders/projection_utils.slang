@@ -221,7 +221,6 @@ enum CameraDistortionType {
     DIST_NONE = 0,
     DIST_OPENCV = 1,
     DIST_THIN_PRISM = 2,
-    DIST_RATIONAL = 3,
 };
 
 interface ICameraDistortion {
@@ -270,27 +269,6 @@ struct DistThinPrism : ICameraDistortion {
         return uv * radial + float2(
             2.0*p1*u*v + p2*(r2 + 2.0*u*u) + sx1*r2,
             2.0*p2*u*v + p1*(r2 + 2.0*v*v) + sy1*r2);
-    }
-};
-
-// k1 k2 k3 k4 k5 k6 p1 p2 -- COLMAP FULL_OPENCV, i.e. OpenCV's 8-coefficient
-// rational model. k4..k6 are DENOMINATOR terms, which is why they cannot be
-// folded into the DistThinPrism slots of the same index.
-struct DistRational : ICameraDistortion {
-    static const int kNumParams = 8;
-    static const bool kIsIdentity = false;
-    [Differentiable]
-    static float2 distort(float2 uv, no_diff float coeffs[8]) {
-        float k1 = coeffs[0], k2 = coeffs[1], k3 = coeffs[2],
-              k4 = coeffs[3], k5 = coeffs[4], k6 = coeffs[5],
-              p1 = coeffs[6], p2 = coeffs[7];
-        float u = uv.x, v = uv.y;
-        float r2 = u*u + v*v;
-        float radial = (1.0 + r2*(k1 + r2*(k2 + r2*k3)))
-                     / (1.0 + r2*(k4 + r2*(k5 + r2*k6)));
-        return uv * radial + float2(
-            2.0*p1*u*v + p2*(r2 + 2.0*u*u),
-            2.0*p2*u*v + p1*(r2 + 2.0*v*v));
     }
 };
 
@@ -846,7 +824,6 @@ bool generate_ray<D : ICameraDistortion>(
 _DEF_DIST_ENTRIES(_none, DistNone, 1)
 _DEF_DIST_ENTRIES(_opencv, DistOpenCV, 4)
 _DEF_DIST_ENTRIES(_prism, DistThinPrism, 8)
-_DEF_DIST_ENTRIES(_rational, DistRational, 8)
 
 #undef _DEF_DIST_ENTRIES
 

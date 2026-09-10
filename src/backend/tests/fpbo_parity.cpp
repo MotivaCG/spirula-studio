@@ -172,7 +172,7 @@ int main(int argc, char** argv) {
         {0, false, 0, 0, 3, 0, false, false, false, 31, false, true},
         {0, false, 0, 1, 3, 0, false, false, false, 31, false, true},
         {1, false, 1, 2, 2, 0, false, true, false, 0, true, false},
-        {2, false, 0, 3, 3, 0, false, false, true, 7, false, true},
+        {2, false, 0, 2, 3, 0, false, false, true, 7, false, true},
         // NOTE: scale-agnostic means x non-SH quant is excluded: the mixed
         // g1/g2 units make u = g1/sqrt(g2) unbounded for edge splats
         // (radii 0 with nonzero grad), so +-1 quantum decode differences
