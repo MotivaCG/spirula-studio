@@ -502,11 +502,13 @@ std::vector<std::string> SfmRunner::recon_args(const SfmJob& job,
     // Not flags any more: the groups go in the manifest. Its text joins the
     // stamp so that changing a lens still counts as a different model
     // (recon_stamp_change), which is the whole point of this list.
+#ifdef SS_TOOL_SFM
     const std::string manifest = sfm::manifest_write(build_manifest(job, prep));
     if (!manifest.empty()) {
         argv.push_back("--manifest");
         argv.push_back(manifest);
     }
+#endif
     if (job.max_features > 0) {
         // Each frontend has its own count flag: the budgets are not comparable,
         // a learned detector emitting a few thousand better-localized points
