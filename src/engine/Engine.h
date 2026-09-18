@@ -687,10 +687,12 @@ void engine_profile_capture_vram();
 //   full_dump=true  -> Always+Resume (world raw params + all optimizer state,
 //                                      i.e. sufficient to resume training)
 // The device->host copy is chunked, using no extra device memory.
+// keep_all: no PLY filtering, so its indices match the live buffers.
 void engine_save_checkpoint(
     std::string output_dir,
     bool full_dump,
-    int step
+    int step,
+    bool keep_all = false
 );
 
 // Restore engine state from `input_dir`/state.tar (resume training). The engine
@@ -699,3 +701,7 @@ void engine_save_checkpoint(
 // optimizer layout from state.json, force-allocates optimizer/appearance-optim
 // buffers, and restores every saved buffer by slot name. Returns the saved step.
 int engine_load_checkpoint(std::string input_dir);
+
+// Restores only eng.ppisp.params from another run's checkpoint, leaving the
+// rest of the engine alone. False when the checkpoint has no such slot.
+bool engine_load_ppisp(std::string input_dir);

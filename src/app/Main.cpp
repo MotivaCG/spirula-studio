@@ -132,6 +132,22 @@ void print_usage() {
 
 }  // namespace
 
+// Leave without running static destructors. On the CUDA backend one of them
+// touches the driver after it is gone and faults, so a finished run reaches
+// the parent as a crash. Everything is already written and flushed by here.
+static int ss_leave(int rc) {
+    std::fflush(nullptr);
+#ifdef SS_BACKEND_VULKAN
+    return rc;
+#else
+#ifdef _WIN32
+    // _exit skips the atexit use_utf8_console() registered for this.
+    if (g_console_cp) SetConsoleOutputCP(g_console_cp);
+#endif
+    _exit(rc);
+#endif
+}
+
 int main(int argc, char** argv) {
     // Stop FULL buffering of stdout whenever it is NOT a terminal. Every tool
     // here is routinely run as a CHILD PROCESS with its output piped to a live
@@ -188,7 +204,7 @@ int main(int argc, char** argv) {
             sub.push_back(prog.data());
             for (int i = 2; i < argc; i++) sub.push_back(argv[i]);
             sub.push_back(nullptr);
-            return t->run((int)sub.size() - 1, sub.data());
+            return ss_leave(t->run((int)sub.size() - 1, sub.data()));
         }
     }
 
@@ -196,7 +212,7 @@ int main(int argc, char** argv) {
     // spirula-sfm symlink behaves exactly as the separate executable did.
     if (const Tool* t = tool_from_argv0(argc > 0 ? argv[0] : nullptr)) {
         app::set_crash_note(t->name);
-        return t->run(argc, argv);
+        return ss_leave(t->run(argc, argv));
     }
 
     if (argc > 1) {

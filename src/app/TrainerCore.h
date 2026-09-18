@@ -126,6 +126,8 @@ struct RunState {
     bool  bilagrid_depth_init  = false;
     bool  bilagrid_normal_init = false;
     bool  ppisp_init           = false;
+    // PPISP came from another run's checkpoint: held fixed, see ppisp_from.
+    bool  ppisp_frozen         = false;
 };
 
 std::array<float, (int)LossWeightIndex::length>

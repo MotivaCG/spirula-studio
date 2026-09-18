@@ -601,10 +601,11 @@ EngineStepConfig build_step_config(const TrainConfig& c, const RunState& st, int
 
     // ---- PPISP ---------------------------------------------------------
     if (st.ppisp_init) {
-        cfg.ppisp.lr = c.use_adagrad_ppisp_optim
-            ? c.ppisp_adagrad_lr
-            : scheduled_lr(step, max_steps_lr, c.ppisp_lr, c.ppisp_lr_final,
-                           c.ppisp_lr_warmup);
+        cfg.ppisp.lr = st.ppisp_frozen ? 0.0f
+            : (c.use_adagrad_ppisp_optim
+                ? c.ppisp_adagrad_lr
+                : scheduled_lr(step, max_steps_lr, c.ppisp_lr, c.ppisp_lr_final,
+                               c.ppisp_lr_warmup));
         // PPISPRegLossIndex order
         cfg.ppisp.reg_weights = {
             c.ppisp_reg_exposure_mean, c.ppisp_reg_vig_center,
@@ -1083,6 +1084,12 @@ void TrainerSession::setup_engine() {
     // appearance channel the checkpoint carries must already exist as a
     // restore target, which is what everything above establishes.
     if (!cfg.resume.empty()) restore_checkpoint();
+    // A take's photometric fit, loaded once and then held: see ppisp_from.
+    if (!cfg.ppisp_from.empty() && cfg.resume.empty()) {
+        st.ppisp_frozen = engine_load_ppisp(cfg.ppisp_from);
+        log(st.ppisp_frozen ? ("PPISP reused from " + cfg.ppisp_from)
+                         : ("no PPISP in " + cfg.ppisp_from + "; fitting one"));
+    }
 }
 
 // Where the run's first splats come from: the dataset's point cloud, an
@@ -1153,7 +1160,8 @@ void TrainerSession::save_checkpoint(int step) {
     std::snprintf(name, sizeof name, "step-%09d.ckpt", step);
     fs::path ckpt = out_dir / name;
     fs::create_directories(ckpt);
-    engine_save_checkpoint(ckpt.string(), cfg.save_full_checkpoint, step);
+    engine_save_checkpoint(ckpt.string(), cfg.save_full_checkpoint, step,
+                           cfg.export_keep_all_splats);
     if (cfg.save_only_latest_checkpoint) {
         std::vector<fs::path> stale;
         for (const auto& e : fs::directory_iterator(out_dir)) {

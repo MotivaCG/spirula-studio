@@ -158,7 +158,8 @@ static std::string _json_str(const std::string& s, const std::string& key) {
 void engine_save_checkpoint(
     std::string output_dir,
     bool full_dump,
-    int step
+    int step,
+    bool keep_all
 ) {
     EngineState& s = engine();
 
@@ -287,10 +288,13 @@ void engine_save_checkpoint(
             }
         }
         if (!ok) { keep[i] = 0; nan_dropped++; continue; }
-        if (h_opacities[i] < OPA_MIN) { keep[i] = 0; lowopa_dropped++; continue; }
-        const float3& sc = h_scales[i];
-        if (std::max(std::max(sc.x, sc.y), sc.z) <= SCALE_MIN) {
-            keep[i] = 0; deadscale_dropped++; continue;
+        // Non-finite splats are dropped either way: they would poison the PLY.
+        if (!keep_all) {
+            if (h_opacities[i] < OPA_MIN) { keep[i] = 0; lowopa_dropped++; continue; }
+            const float3& sc = h_scales[i];
+            if (std::max(std::max(sc.x, sc.y), sc.z) <= SCALE_MIN) {
+                keep[i] = 0; deadscale_dropped++; continue;
+            }
         }
         kept++;
     }
@@ -392,6 +396,32 @@ void engine_save_checkpoint(
 //      H->D, no extra device memory), validating byte sizes,
 //   4. leaves *_initialized flags set so the lazy guards won't re-zero data.
 // Returns the saved training `step`.
+// Restore ONLY the per-camera photometric fit from another run's checkpoint.
+// A take wants one of those, not one per frame: relearned each time, the
+// disagreement lands on whatever part of the subject each camera sees.
+bool engine_load_ppisp(std::string input_dir) {
+    fs::path tarpath = fs::path(input_dir) / "state.tar";
+    std::ifstream in(tarpath.string(), std::ios::binary);
+    if (!in) return false;
+
+    _ensure_ppisp_optim_state();
+    const std::string want = "eng.ppisp.params";
+    for (auto& m : ckpt::tar_index(in)) {
+        if (m.name != want + ".npy") continue;
+        PoolSlot slot; uint32_t sub;
+        if (!parse_saved_name(want, slot, sub)) return false;
+        void* ptr = nullptr; size_t nbytes = 0;
+        if (!DevicePool::global().lookup(slot, sub, ptr, nbytes)) return false;
+        auto info = ckpt::npy_locate(in, m.data_offset, m.size);
+        if (info.data_bytes != nbytes) return false;
+        std::vector<char> host_stage;
+        ckpt::read_into_device(in, info.data_offset, ptr, nbytes, host_stage);
+        backend::device_synchronize();
+        return true;
+    }
+    return false;
+}
+
 int engine_load_checkpoint(std::string input_dir) {
     EngineState& s = engine();
 

@@ -3013,6 +3013,18 @@ SS_MSG(init_ply_add_points_help,
        "ekler: önce PLY girer, kalan yeri splat sınırına kadar noktalar "
        "doldurur. O model eğitildikten sonra büyümüş bir veri kümesi için; PLY "
        "yoksa hiçbir şey yapmaz."));
+SS_MSG_EN(ppisp_from, "Reuse a photometric fit");
+SS_MSG_EN(ppisp_from_help,
+    "Load the per-camera photometric fit from another run's checkpoint and "
+    "hold it fixed, instead of fitting one for this run. For a sequence: fitted "
+    "per frame, the cameras disagree slightly each time and that disagreement "
+    "lands on whichever part of the subject each camera sees, as flicker.");
+SS_MSG_EN(export_keep_all_splats, "Keep every splat on export");
+SS_MSG_EN(export_keep_all_splats_help,
+    "Write faint and dead-scale splats to the PLY instead of dropping them, "
+    "so its index order matches the live buffers. For a sequence trained "
+    "frame by frame: a dropped splat shifts every later index and breaks "
+    "frame-to-frame correspondence.");
 
 SS_MSG(scale_init,
     EN("Initial splat size"), JA("スプラットの初期サイズ"),

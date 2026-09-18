@@ -159,6 +159,7 @@ inline int train_tier_rank(const char* tier) {
     X(float, background_noise_pre_warmup, 0.25f, "splats", "expert", "")     \
     X(std::string, init_ply, "", "splats", "advanced", "none")               \
     X(bool, init_ply_add_points, false, "splats", "advanced", "")            \
+    X(bool, export_keep_all_splats, false, "splats", "advanced", "")         \
     X(std::optional<float>, scale_init, std::nullopt, "splats", "advanced", "") \
     X(std::optional<float>, opacity_init, std::nullopt, "splats", "advanced", "") \
     X(bool, suppress_initial_scales, false, "splats", "expert", "")          \
@@ -290,6 +291,7 @@ inline int train_tier_rank(const char* tier) {
     X(float, ppisp_lr, 0.002f, "correction", "advanced", "")                 \
     X(std::optional<float>, ppisp_lr_final, 2e-05f, "correction", "advanced", "") \
     X(int, ppisp_lr_warmup, 500, "correction", "advanced", "")               \
+    X(std::string, ppisp_from, "", "correction", "advanced", "none")        \
                                                                              \
     /* ==== colorspace -- linear vs display encoding, and which gamut ==== */\
     X(std::optional<bool>, image_color_is_linear, std::nullopt, "colorspace", "basic", "") \
