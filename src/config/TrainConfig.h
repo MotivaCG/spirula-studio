@@ -121,6 +121,8 @@ inline int train_tier_rank(const char* tier) {
     X(std::string, metashape_xml, "", "dataset", "advanced", "none")         \
     X(std::string, metashape_ply, "", "dataset", "advanced", "none")         \
     X(std::string, metashape_psx, "", "dataset", "advanced", "none")         \
+    X(std::string, init_ply, "", "dataset", "basic", "none")                 \
+    X(bool, init_ply_add_points, false, "dataset", "advanced", "")           \
     X(float, train_resolution_divisor, 0.0f, "dataset", "basic", "")         \
     X(std::string, downscale_rounding_mode, "floor", "dataset", "advanced", "floor|ceil|round") \
     X(std::string, eval_mode, "all", "dataset", "advanced", "fraction|filename|interval|all") \
@@ -153,8 +155,6 @@ inline int train_tier_rank(const char* tier) {
     X(int, background_noise_warmup, 2000, "splats", "expert", "")            \
     X(float, background_noise_pre_warmup, 0.25f, "splats", "expert", "")     \
     X(bool, background_match_luminance, false, "splats", "advanced", "")     \
-    X(std::string, init_ply, "", "splats", "advanced", "none")               \
-    X(bool, init_ply_add_points, false, "splats", "advanced", "")            \
     X(std::optional<float>, scale_init, std::nullopt, "splats", "advanced", "") \
     X(std::optional<float>, opacity_init, std::nullopt, "splats", "advanced", "") \
     X(bool, suppress_initial_scales, false, "splats", "expert", "")          \
