@@ -56,8 +56,10 @@ inline DistortionType engine_distortion_type(
 #include "kernels/tile/SplatTileIntersector.cuh"
 #include "kernels/visualize/Visualizer.cuh"
 
+#include <array>
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -127,11 +129,14 @@ struct CameraTable {
 struct ForwardCache {
     DeviceVector<int32_t>             camera_ids;
     DeviceVector<int32_t>             gaussian_ids;
-    DeviceTensor2D<float4>            aabb;         // [nnz,1] packed or [C,N] non-packed
+    DeviceTensor2D<uint2>             aabb;         // [nnz,1] or [C,N]; core/AabbQuant.cuh
     std::vector<DeviceTensorFloatND>  splats_w;
     std::vector<DeviceTensorFloatND>  splats_s;
     DeviceTensor3D<int32_t>           tile_offsets;
     DeviceVector<int32_t>             flatten_ids;
+    // Binning granularity the forward chose (core/Common.cuh). The backward
+    // must bin the same way, so it reads this rather than assuming a default.
+    int                               macro_log2 = kMacroLog2Default;
     // [C, tile_h, tile_w] of 0/1: tiles no pixel of the loss reads are left
     // out of the intersections, so the raster gets an empty range for them.
     // Empty unless a training step asked for it (engine_set_tile_skip_mask).
@@ -249,6 +254,10 @@ struct SplatOptim {
     // accum_buffer with DensifyConfig::final_score_power applied to lane 0.
     // Empty when that power is 1, which is when accum_buffer IS the score.
     DeviceVector<float2>   densify_sample_score;   // [cur_N], or empty
+    // Summed log2(radii / max_screen_size) over the steps since the last
+    // refine, zeroed with accum_buffer. Empty when the oversize split
+    // channel is off.
+    DeviceVector<float>    densify_oversize;       // [max_N], or empty
 
     // Set per-step from cfg.optim.use_fused_proj_bwd_optim before forward/loss
     // so engine_compute_loss_backward knows to skip projection_*_backward and
@@ -360,16 +369,24 @@ struct BilagridNormal {
     bool quantize_value() const { return value_bits != 32; }
 };
 
-// Background blending. Applied BEFORE bilagrid/PPISP. Two modes:
-//   - Noise: random per-pixel color (warmup-weighted). No persistent state.
-//   - Sh:    skybox = SH(world ray dir) + DC color. DC + L1+ coeffs trained.
+// Background blending. Applied BEFORE bilagrid/PPISP. Noise and Pseudorandom
+// are the same stateless blend over a different draw; Sh is a trained skybox,
+// SH(world ray dir) + DC color, and carries the only persistent state here.
 struct EngineBackground {
-    enum class Mode { None = 0, Noise = 1, Sh = 2 };
+    enum class Mode { None = 0, Noise = 1, Sh = 2, Pseudorandom = 3,
+                      Color = 4, Random = 5 };
     Mode mode    = Mode::None;
     bool enabled = false;
 
     // Common config (set at init time)
-    bool splat_color_is_linear = false;  // noise mode: sRGB->linear conversion
+    int  splat_transfer = 0;             // noise mode: display -> working space
+    bool splat_is_linear = false;
+
+    // Color mode: the user's colour. `color` is what the blend wants (working
+    // space); `color_display` is what the viewer wants back, kept rather than
+    // round-tripped so a clamping transfer cannot move it.
+    float3 color         = {0.0f, 0.0f, 0.0f};
+    float3 color_display = {0.0f, 0.0f, 0.0f};
 
     // SH mode config
     int  sh_degree       = 0;            // 0..4
@@ -382,9 +399,8 @@ struct EngineBackground {
     DeviceVector<float3> sh_g1, sh_g2;
     bool sh_optim_initialized = false;
 
-    // Per-iter, resized each forward. fwd_pre_blend_rgb is kept in BOTH modes:
-    // the blend clamps its output, so backward cannot recover the composite.
-    // fwd_background is the skybox image (Sh mode).
+    // Per-iter, resized each forward. fwd_pre_blend_rgb is kept in BOTH modes
+    // (the backward reads it); fwd_background is the skybox image (Sh mode).
     DeviceTensor3D<float3> fwd_pre_blend_rgb;
     DeviceTensor3D<float3> fwd_background;
 
@@ -392,6 +408,24 @@ struct EngineBackground {
     // (Noise mode) and so the optim step can run after backward (both modes).
     uint32_t cur_seed             = 0;
     float    cur_randomize_weight = 0.0f;
+
+    // The loss pyramid this step, as passed to engine_compute_loss_backward:
+    // the randomized backgrounds draw a cell size uniformly over its levels,
+    // so noise a level of the pyramid would average away still costs something.
+    int      cur_num_loss_scales      = 1;
+    int      cur_loss_scale_min_pixels = 0;
+    // Resolved by the forward (it knows this batch's H/W) and read again by
+    // the backward, which must reconstruct the same background.
+    unsigned cur_block_px         = 0;
+
+    // Per post-split camera slot: the reference image's mean display luma and
+    // the power the randomized draw is raised to. Armed per training forward
+    // (never for a viewer render), consumed into cur_match_luma for the bwd.
+    std::vector<float>  luma_by_cam_host;
+    std::vector<float>  exponent_by_cam_host;
+    DeviceVector<float> exponent_by_cam;
+    bool match_luma_pending = false;
+    bool cur_match_luma     = false;
 };
 
 // Linear / wide-gamut color space conversion.
@@ -401,16 +435,21 @@ struct EngineBackground {
 struct ColorSpaceState {
     // Splat (per-frame fwd + bwd)
     bool                   splat_enabled    = false;
+    int                    splat_transfer   = 0;   // colorspace::Transfer
     bool                   splat_is_linear  = false;
     DeviceTensor2D<float3> splat_color_matrix;   // [3, 3], stored as 3 float3 rows
 
     // Image (one-shot at upload)
     bool                   image_enabled    = false;
+    int                    image_transfer   = 0;
     bool                   image_is_linear  = false;
     DeviceTensor2D<float3> image_color_matrix;   // [3, 3], stored as 3 float3 rows
+    // The same matrix on the host: the mean-luma weight scale
+    // (EngineDataManager.cpp) converts reference pixels on the CPU.
+    std::array<float, 9>   image_color_matrix_host{};
 
     // Per-iter scratch: pre-conversion render kept for the backward vjp
-    // (rgb_to_srgb_backward consumes the linear / wide-gamut input).
+    // (working_to_display_backward consumes the working-space input).
     DeviceTensor3D<float3> fwd_pre;
 };
 
@@ -431,11 +470,16 @@ struct PpispState {
     bool enabled            = false;
     bool optim_initialized  = false;
     bool use_adagrad        = false;
-    // Per-iteration: mirrors PpispStepConfig::run_before_bilagrid for the
-    // current step. The forward path stashes this before launching bilagrid /
-    // PPISP forwards; the backward hooks in EngineLoss.cpp read it back to
-    // invert the order. Reset each step.
+    bool exposure_arithmetic_mean = false;
+    // Per-iteration mirror of the PpispStepConfig order flags, stashed by the
+    // forward path so the backward hooks in EngineLoss.cpp can invert the
+    // order they picked. Reset each step.
     bool cur_run_before_bilagrid = false;
+    bool cur_run_before_color_space = false;
+    // Armed by the step that wants PPISP inside forward_3dgs (before the
+    // working->display conversion) and cleared there, so an eval or viewer
+    // render never picks the transform up off stale cam indices.
+    bool forward_pending = false;
 };
 
 
@@ -465,7 +509,7 @@ struct EngineViewerState {
     DeviceVector<float>   d_dist_coeffs;      // [N_post, 8]
     DeviceVector<int32_t> d_distortions;      // [N_post] CameraDistortionType
     DeviceVector<float>   d_camera_to_worlds; // [N_post, 3, 4] (y/z-flipped form)
-    float  camera_size = 0.0f;                // frustum render scale, from knn-dist
+    float  camera_size = 0.0f;                // frustum render scale, world units
 
     // Thumbnail cache: [N_post, S, S, 4] uint8, S = VIEWER_THUMBNAIL_SIZE.
     // done_mask[i] = 1 once cam i's thumbnail has been written. Host fast-path
@@ -524,6 +568,29 @@ struct EngineState {
     int     num_sh         = 0;
     int     sh_degree      = 0;
     bool    packed         = false;
+    // Binning tile edge in pixels the caller asked for, or 0 to let the
+    // forward choose from the measured splat footprint (engine_set_bin_tile_size).
+    int     bin_tile_request = 0;
+    // Keyed by (width << 32 | height): a viewport render at another
+    // resolution measures another footprint and must not retune training's.
+    // Search: docs/notes/binning-tile-size.md.
+    struct BinTileChoice {
+        int macro_log2 = kMacroLog2Start;
+        int floor      = kMacroLog2Min;  // coarsest the intersect fell back to
+        int from       = kMacroLog2Start;  // setting a running probe came from
+        int probing    = 0;                // 0 base, 1 trial, 2 base again
+        int dir        = -1;               // -1 finer, +1 coarser
+        // Steps discarded before the first baseline: image decode and
+        // first-touch allocation make the opening steps unrepresentative,
+        // and they would otherwise inflate the cost of the starting size.
+        int warmup     = 8;
+        int have       = 0;
+        int wait       = 1;                // windows before the next probe
+        double sum     = 0.0;
+        double base    = 0.0;              // bracketing cost at `from`
+        double trial   = 0.0;              // cost measured at `from + dir`
+    };
+    std::map<uint64_t, BinTileChoice> bin_tile_auto;
     // PoolSlot::EngVLosses (the per-pixel loss cotangent seed) is uploaded
     // once. Not a function-local static: engine_reset() frees the pool, and a
     // flag outliving it leaves the next scene reading the reallocated buffer.
@@ -555,6 +622,11 @@ struct EngineState {
     // batching). Set by engine_setup_data_manager(); when present, the new
     // engine_train_step_managed() entrypoint pulls per-step inputs from it.
     std::unique_ptr<DataManager> dm;
+
+    // Mean sRGB luma per input camera, filled lazily by the photometric weight
+    // normalization (EngineDataManager.cpp) and NaN until measured. An image's
+    // pixels do not change between epochs, so one measurement stands for a run.
+    std::vector<float> gt_mean_luma;
 
     // Out-of-line ctor/dtor (defined in EngineState.cpp) so the
     // std::unique_ptr<DataManager> deleter only needs the complete type at

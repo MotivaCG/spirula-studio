@@ -18,7 +18,10 @@ of this file and in the port plan.
   device. Built by default only for `SS_BACKEND=vulkan`.
 - **No heavy dependencies.** Vulkan, Slang, C++17, and the repository's
   vendored `stb_image`. No Ceres, no Eigen on the hot path, no OpenCV, no
-  SQLite, no PyTorch.
+  SQLite, no PyTorch. `core/Manifest.cpp` reads its file through the
+  repository's header-only `data/Json.h` + `data/Yaml.h` rather than growing a
+  second parser; that is the one thing here that reaches outside `sfm/` and
+  `core/`, and it costs nothing at link time.
 - **Compute on the GPU, control flow on the host.** Slang kernels do the
   per-pixel / per-feature / per-observation work; the host owns graph
   structure, RANSAC bookkeeping and the mapper's decisions. RANSAC in
@@ -149,6 +152,17 @@ not for the two deliberately ill-conditioned convergence checks in
 part here has an fp64 buffer atomic add, so all of them take the host path
 unless `--ba-real df` says otherwise.
 
+A device that *had* the feature and then failed anyway — `VK_ERROR_DEVICE_LOST`
+(what a Windows TDR reset looks like from here: the watchdog kills a driver
+whose kernel runs past two seconds, and a thousand-image dense factorization
+is one long kernel), or an allocation the driver refused — does not end the
+run. `runGlobalBA` re-runs that solve on the host and sends every later solve
+at least that big straight there, because the mapper's problems only grow;
+`VkContext`'s `VK_CHECK` throws rather than exits so it can. The run says so
+once, and `--ba-real cpu --ba-real-coarse cpu` (Spirula Studio: "Bundle
+adjustment on the CPU", under Advanced) skips the failed GPU attempt next time
+— worth setting on a card that resets once, since it resets again.
+
 Two devices deserve naming:
 
 - **Intel UHD 750 (Gen12, RPL-S desktop)** has *none* of the three: no fp64, no
@@ -178,11 +192,18 @@ core/        types shared by every stage, no Vulkan:
                Pose                   Rigid3, Sim3, angle-axis conversions
                Image / ImageLoader    decode, grayscale, the batch decode pool
                Exif                   focal prior + camera identity from headers
+               Attitude               the gimbal yaw / pitch / roll a drone writes
+                                        into each photo's XMP
+               Telemetry              the IMU / GPS a video carries (GPMF, Insta360,
+                                        DJI, CAMM), read by content; unconsumed --
+                                        docs/notes/imu-gps-for-sfm.md
                Features / Matches     the on-disk feature and match formats
                Mask                   keypoint masking, sampled in uv
                Model                  Reconstruction + COLMAP binary IO
 feature/     Sift (GPU), Matcher (GPU), Pairing, PairSelection (GPU),
-               Verification (host worker pool)
+               Verification (host worker pool), and the two seams the learned
+               frontends plug into: Extractor.h and LearnedMatcher.h, neither
+               of which includes an aliked/ or loma/ header
 geometry/    Essential, Fundamental, Homography, P3P, AbsolutePose,
                Triangulation, TwoView, LinAlg
 optim/       Ransac   LO-RANSAC with MSAC scoring
@@ -206,10 +227,28 @@ tests/       one executable per file
 `core/Camera.h` are different types with different jobs; the paths keep them
 apart.
 
+### `features.bin`
+
+Little-endian throughout. The header is `char[4] "VKFT"`, `u32 version`,
+`i32 width, height`, `u32 count, dim, dtype`; then `count` keypoints of
+`{ f32 x, y, scale, orientation }`, then the descriptor blob
+(`count * dim * dtypeSize` bytes).
+
+Every version since appends a section at the end, and the reader takes all of
+them — a stale cache is reused, never rejected:
+
+| version | appends | an older file reads back as |
+|---|---|---|
+| v2 | `u8 has_colors`, then `count*3` bytes of per-keypoint RGB | no colors |
+| v3 | `f64 exif_focal`, `u32 len`, `len` bytes of `exif_camera` | no EXIF |
+| v4 | `i32 extract_width, extract_height` | 0, so `pixelScale() == 1` — thresholds in source pixels, which is what those files were produced under |
+| v5 | `u8 has_scores`, then (if 1) `count` f32 detection scores | every response 0, which is what SIFT persisted |
+| v6 | `u8 exif_orientation` | 1, the orientation of a file carrying no tag |
+
 ## Building
 
 ```bash
-bash build_develop.bash -DSS_BACKEND=vulkan -DSS_BUILD_CLI=ON
+bash build_develop.bash -DSS_BACKEND=vulkan
 ```
 
 `SS_BUILD_SFM` defaults ON for the Vulkan backend and OFF for CUDA (where
@@ -317,6 +356,20 @@ and nowhere else, so the CLI and the GUI cannot disagree about what
 `--max-error` (one tolerance, two struct fields — D47), `--device`, `--quiet`
 or the camera settings mean.
 
+The brute-force matcher takes 128-**or** 256-byte descriptors -- SIFT's and
+ALIKED's, and DeDoDe-G's. The kernel is built at both widths
+(`-DDESC_WORDS=64` halves the groupshared tile so it stays 8 KiB), and float
+descriptors are L2-normalized on upload, which ALIKED's already were and
+DeDoDe's are not. One matcher cannot mix widths, and says so.
+
+`--features` picks the frontend: `sift`, `aliked-n16rot`, `aliked-n32`,
+`loma-b128` or `loma-b`. The learned ones need the inference layer
+(`SS_BUILD_SAM=ON`) and fetch a checkpoint on first use; `--matcher` then takes
+`lightglue` for the ALIKED ones and `loma-b128` / `loma-b` / `loma-r` /
+`loma-l` / `loma-g` for the LoMa ones. The families do not mix -- a learned
+matcher only reads the descriptors it was trained on, and `auto` says so rather
+than running.
+
 `--quality low|medium|high|extreme` sets the working resolution, the feature cap
 and the pair-selection breadth; `--data-type individual|video|internet` sets the
 pairing mode, the seed angle and how cameras are grouped. Both are applied
@@ -360,6 +413,247 @@ model is written, so the trainer's own normalization comes out as the identity
 `splat.ply`, a mesh, a bare model in a viewer — is upright too rather than
 tilted with no way left to recover the transform. `map/Orient.h` has the
 algebra and the caveats; `--no-orient` keeps the mapper's raw gauge.
+
+Which up that is, is `--exif-orientation`'s business. A phone held upright
+writes a landscape file plus a tag saying to turn it, so the frame's own up
+is 90 degrees from the photographer's; `orient` (the default) reads the tag
+for the gauge and leaves the pixels alone, `apply` turns the pixels instead
+and fits cameras to the turned frame, `none` ignores it. A training run over
+the model must be given the SAME value — `docs/datasets.md`, "EXIF
+orientation", has the table and the mirrored-tag compromise.
+
+`--exif-attitude` (`auto` by default) replaces the cameras' mean up axis with
+a measurement wherever the images carry one: a drone writes its gimbal's yaw, pitch and roll
+into every photo (DJI's `drone-dji:Gimbal*Degree` XMP, `core/Attitude.h`).
+Each registered image votes for up with its pitch and roll and, under `auto`,
+for north with its yaw (`map/AttitudeGauge.h`). A vote more than 10 degrees
+from the consensus counts against the set, and a set with more of those than
+agreeing votes is refused with a warning, so a wrong convention or a stale
+tag cannot tilt a model; scattered headings alone leave the model level and
+north unset. `up` takes the tilt alone, `none` ignores the tags, and
+`--no-orient` turns it off with the rest.
+
+It matters where the mean camera up axis is no answer at all: a camera looking
+down, or a gimbal pitched past the nadir so that every other frame is upside
+down. Measured against the vertical and heading of a full similarity fitted to
+RTK camera positions (centimetre altitude), on three flights of one DJI M4E:
+
+| capture | cameras' mean up | attitude: votes agree to | attitude: tilt | heading |
+|---|---|---|---|---|
+| 200 frames of a five-direction oblique survey (pitch -45, -55 rolled 180, -90) | 40.8 deg | 1.05 deg | 0.32 deg | 0.57 deg |
+| the whole survey, 1271 frames | 2.0 deg | 1.04 deg | 0.04 deg | 0.45 deg |
+| 136 frames flown by hand, pitch +7 to -88 | 7.4 deg | 0.28 deg | 0.17 deg | 0.55 deg |
+| 100 frames at pitch 0 | 0.13 deg | 0.34 deg | 0.13 deg | 1.11 deg |
+
+Over a whole survey the four oblique directions nearly cancel in the mean; a
+part of one -- a flight cut short, a subset, a model the mapper split off --
+is where the guess fails. On the 200 frames that is also the difference
+between `--metric-gps horizontal` fitting (200/200 cameras within 5 m, 0.04 m
+RMS) and being refused (64/200), since the horizontal fit takes its tilt from
+whatever levelled the model; on the hand-flown flight, 0.05 m RMS against
+2.0 m.
+
+`--metric-positions FILE` and `--metric-gps` fix that same gauge from an
+outside measurement instead, so the model is written **in metres**. The first
+reads per-image camera positions in COLMAP's `model_aligner --ref_images_path`
+format (`image_name X Y Z` per line, any right-handed metric frame — a LiDAR
+trajectory, ARKit, RTK); the second reads each registered image's own EXIF GPS
+and converts it to a local east-north-up frame. Either way a similarity is
+fitted from the camera centres with LO-RANSAC over the same `estimateSim3` that
+model merging uses, and `--metric-max-error` is its inlier radius in metres (0
+picks 5 for GPS, 0.5 for a positions file).
+
+`--metric-gps` takes `none` (the CLI default; the GUI asks for `horizontal`),
+`horizontal` or `full`, and the difference is the altitude.
+`full` fits all seven parameters, so the reference's
+vertical sets the model's tilt; `horizontal` fits only scale, heading and place,
+against latitude and longitude, and leaves which way is up to the recorded
+attitude where the images carry one and to the cameras' own mean up axis where
+they do not — the same claims `--orient` makes. A phone's altitude is the worst
+component it reports, and over a capture wider than it is tall the fit converts
+that error into tilt: on an 850-image walk around a city square (150 m across,
+level ground) `full` came out **5.05 degrees off vertical**, spreading the
+cameras over 12.9 m of fake height, where `horizontal` leaves them within 2.5 m
+and recovers a scale 0.2 % away. The east and north residuals were the same to
+2 % either way, so the vertical is what was paid for. `horizontal` also has no
+collinearity gate: a turn about the vertical is resisted by the whole in-plane
+radius, so a street walked end to end — which `full` refuses — fits.
+
+The fit is refused rather than approximated, and **what refuses it is geometry,
+not a noise model**. Fewer than three positioned cameras, reference positions
+that do not spread wider than the inlier radius, under half the cameras inlying,
+or (full only) cameras lying so close to a line that the reference amplifies
+orientation error more than 20x — each reports its own reason with the numbers
+behind it; the model is then still written, in the ordinary orient gauge, and
+the exit status is 4.
+
+`merge` accepts a single model when a metric reference is given: there is
+nothing to merge, and it re-gauges the model in place. That is the way to put
+metres on a finished reconstruction without rebuilding it —
+`spirula sfm merge ws/sparse --in-place --metric-gps horizontal --images ws/images`.
+
+The scale and orientation uncertainties are **reported and never gated on**.
+They come from the inlier residuals assuming uncorrelated noise, and measured
+against a reference whose error is correlated — GPS drift — they under-state
+the real error by 3.9-4.5x: on one flight a 2 % gate on them passed a 3.6 %
+scale error. A gate that passes what it exists to catch is worse than no gate,
+so they are printed as the lower bounds they are. `map/MetricGauge.h` has the
+algebra (D74).
+
+`--telemetry VIDEO` fixes the same gauge from the **video's own sensors**,
+which is the default whenever the GUI extracted the frames from a file that
+carries them (Insta360 `.insv`, GoPro `.360`/`.mp4`, DJI `.OSV`, CAMM): its
+manifest lists one `captures:` entry per video, and the frame stems carry the
+source frame index, which is how a frame gets its time on the sensor clock.
+`map/SensorGauge.h` treats every reading as a factor on one small state (a
+Sim(3), the IMU biases, and per-lens nuisances), initialises each block in
+closed form and refines them together in one robust Levenberg-Marquardt solve:
+
+- **up** from the accelerometer, once the IMU-to-lens rotation is calibrated
+  from the reconstruction itself (`map/ImuExtrinsic.h`: the gyro's relative
+  rotations must match the poses' and every frame's gravity must land on one
+  world vector, both linear in the rotation's nine entries). A left-handed
+  sensor frame and the sign of the gyro integration are tested as hypotheses,
+  and the IMU clock offset against the video is searched for first;
+- **scale** from the accelerometer through pre-integration between
+  consecutive frames (`core/Preintegration.h`), in the velocity-free form of
+  Mur-Artal and Tardós, solved jointly with both biases because on a gentle
+  walk the bias error is as large as the signal. The gravity vector solved
+  alongside is the check: 9.82 m/s² within 0.3° of up on a 118 s X5 walk;
+- **scale, heading and place** from the GPS log, interpolated at each frame
+  and fitted exactly as `--metric-gps horizontal` fits EXIF.
+
+What is missing or degenerate is refused by its own uncertainty rather than
+by a rule: a camera that only pans gets up and no scale, a stale phone fix
+gets no GPS, a file with an attitude stream but no raw gyro (the Osmo 360)
+pre-integrates from the attitude instead, and a per-frame accelerometer has
+the attenuation its own aliasing noise causes taken back out. Two scale
+sources are combined by information and reported separately, and an
+IMU-versus-GPS disagreement beyond three sigma keeps the more certain one
+and says so. `--sensor-gauge up` takes the orientation alone; `none` ignores
+the sensors. On the X5 walk the whole fit
+takes 0.3 s; a metric reference the user passes still outranks an upright-only
+sensor frame. `docs/notes/imu-gps-for-sfm.md` records what the files carry
+and what was measured.
+
+The sources run in order -- the video's sensors, the recorded attitude, a
+metric reference, the fallback -- and read each other: `gauge.txt`'s two bits
+are the state as well as the record, so a reference is not fitted over a model
+the sensors already made metric, the attitude does not re-level a model the
+sensors levelled, `horizontal` skips its own upright pre-transform where either
+already levelled the model, and the mean-camera-up fallback runs in exactly one
+place, over models nothing measured. A gauge a sensor
+settled is never overwritten by the guess it was consulted to replace.
+
+Whatever settled a model's gauge, `sparse/N/gauge.txt` records it beside the
+model — `oriented` (is +Z up because something measured it, rather than the
+mean camera up axis guessing), `metric` (is a unit a metre), and which source
+each came from. Plain text, and read by the viewer: a model that says
+`oriented 1` is shown in its own frame with the up guess switched off, and its
+grid legend is in metres. Nothing else depends on the file, so a reconstruction
+COLMAP wrote is simply one that says nothing.
+
+## Rigs
+
+A rig is a set of lenses with a fixed relative pose -- the two sides of a
+dual-fisheye camera, the ten faces a `.360` unwraps into, two cameras on one
+mount -- and the reconstruction can be told so (`src/sfm/core/Rig.h`,
+docs/notes/sfm-rig-constraints.md). A definition names its **members** as path
+prefixes; the images under them with the same path form a **frame**:
+
+```bash
+spirula sfm auto IMAGES/ -o ws/ --rig cam0,cam1            # cam0/x.jpg + cam1/x.jpg
+spirula sfm auto IMAGES/ -o ws/ --rig 'clip1,clip2:cam0,cam1'   # one rig behind two videos
+spirula sfm auto IMAGES/ -o ws/ --rig '*:cam0,cam1'        # ... behind every top-level folder
+spirula sfm auto IMAGES/ -o ws/ --rig cam0,cam1 --rig cam2,cam3   # two rigs
+```
+
+The form with captures keeps frames apart per capture (a stem repeats across
+clips) while the calibration is one. The manifest's `rigs:` list spells the same
+thing, and may carry a member's known `cam_from_rig` (quaternion and
+translation; a zero translation is honoured as such, a nonzero one is used for
+its rotation until the model has a scale). `spirula sfm map` takes `--rig` too.
+An image claimed by two rigs, or a member no image matches, is an error.
+
+What the run does with it, in the order it happens:
+
+- **Calibration** (`Mapper::calibrateRigs`). Frames whose lenses registered on
+  their own give the relative pose of each member to the rig's reference lens
+  (the member registered alongside another most often); a robust average over
+  at least `--rig-min-frames` (3) frames establishes it, and the median angular
+  deviation is reported. A member is declined with a line saying so when its
+  median deviation exceeds `--rig-max-spread` (1 deg) or fewer than 90% of its
+  frames agree within three times that -- the two `.insv` tracks extracted
+  frame by frame do this, since each track kept its own sharpest frame, and
+  agree on only 55-80% of frames -- and its images register as they always did.
+- **Frames register as one thing** (`Mapper::registerFrame`). Once a member is
+  calibrated, a candidate whose frame has no lens placed yet brings the whole
+  frame, and the frame -- not a lens -- is what the PnP estimates: every
+  calibrated member's 2D-3D correspondences go into one pool, and one LO-RANSAC
+  over that pool solves for the frame's pose (`ransacRigPnP`,
+  `geometry/AbsolutePose.h`). A minimal sample is three correspondences drawn
+  from the pool, scored against **all** the members, so a hypothesis that
+  explains one lens and contradicts the other nine loses to one that explains
+  the frame. Three rays that meet at a lens's optical centre solve as P3P;
+  three that do not -- because the lens that supplied one of them was too small
+  to fill the sample -- solve as a generalized camera (`geometry/GP3P.h`,
+  gp3p), so a frame can be posed that no single lens could pose. The local
+  optimization refines the frame pose over every member's inliers
+  (`refineFramePose`), and the inlier and ratio gates judge the frame's total.
+  Every member is then placed, a lens with nothing of its own to offer on the
+  rig's word alone (`--no-rig-blind` turns that off), which is how ten lenses
+  that barely overlap -- each too weak to register alone -- or a lens on the
+  sky get a pose at all. The ranking that picks the next candidate counts a
+  frame's correspondences together for the same reason.
+
+  The sample is drawn from one lens whenever the lens the first draw landed on
+  can fill it. Three rays of one lens are exact whatever the calibration is
+  worth, while a sample spanning lenses carries the calibration's own error --
+  and a rig estimated from the reconstruction is good to a fraction of a
+  degree, not to a pixel. Measured on a `.360` capture and on a dual-fisheye
+  one, drawing across lenses regardless cost coverage; drawing within one and
+  scoring across all of them is what the numbers in
+  `docs/notes/sfm-rig-constraints.md` were taken on.
+- **Frames stay whole.** A frame with a lens already placed places the others,
+  always, and places them together (`Mapper::completeFrame`). The lens that is
+  there predicts the frame's pose; that one pose is then refined on **all** the
+  waiting lenses' correspondences at once (`refineFramePose`) and kept when it
+  explains enough of them and stays within the calibration's spread (floor 1
+  deg), and stands as predicted otherwise. A lens with a workable set of its own
+  may then take a correction on top of the frame's pose, under the same bound
+  and only when it explains more than the frame's pose did -- because the
+  extrinsics are estimated rather than exact, and a lens that sees better than
+  they know should say so. So the frame pose carries the lenses that have little
+  to say, and the ones that have plenty are not held back by it. The summary line
+  counts the images placed with no inlier of their own. Every de-registration
+  pass judges a frame by its members' points together and drops it whole, and
+  every refinement ends by placing the mates of whatever is registered, so no
+  lens of a placed frame is ever left out.
+- **Bundle adjustment** (`map/Bundle.h`, `ba/README.md` "Rigs"). A frame is one
+  6-DOF block and each member one shared `cam_from_rig`, refined unless
+  `--no-refine-rigs` or the definition fixed it. A refined member costs every
+  one of its observations six more Jacobian columns (measured 1.7x on the
+  Schur assembly), so the growth refines hold the extrinsics and let them move
+  each time the model has doubled; a final pass refines them in its first round. With
+  the extrinsics held a rigged frame has half the pose columns of its images,
+  which is where a rigged run gains its time. Images with no observations ride
+  along on their frame. The joint solve over several models keeps one
+  calibration per model, since each is in its own scale.
+- **Merging.** Two models holding different lenses of the same frames align
+  through the calibration exactly as if they shared those images, so a 360
+  capture that reconstructs as one component per direction is merged rather
+  than written as pieces (`map/Merge.h` `poseCorrespondences`).
+
+`--final-free-rig` (off) runs one last bundle adjustment with the rig set
+aside, for a mount that flexed or lenses that did not fire together. With no
+`--rig` and no `rigs:` nothing above runs and the mapper is byte-for-byte the
+one before rigs existed.
+
+Extraction is where a video's lenses become a rig or not. `spirula sam extract
+--sync` (Spirula Studio: "Synchronize lenses") decodes a multi-track file in
+lockstep under one sharpness window, so every frame is a rig frame; without it
+each track keeps its own sharpest frame and only the coincidences are. A
+`.360` is always extracted in lockstep, and its ten views share a stem.
 
 ### The finishing passes
 
@@ -431,10 +725,14 @@ PASS/FAIL and returns 0/1 — the same convention as `src/backend/tests/`.
 |---|---|---|
 | `sfm_sift_test` | GPU SIFT, matcher, batch decode, camera-model and format round trips | yes |
 | `sfm_map_test` | synthetic reconstruction end to end, incl. assembly/audit/split | yes |
+| `sfm_rig_test` | rig bundle adjustment, GPU against host; a synthetic two-lens rig through the mapper and the merger | yes |
+| `sfm_ba_cpu_test` | host bundle adjustment against the written-out normal equations, rigs included | no |
 | `sfm_cholesky_test` | dense GPU Cholesky vs a CPU reference | yes |
 | `sfm_geometry_test` | F, H, E, P3P, triangulation, RANSAC, SVD/eigen kernels | no |
 | `sfm_merge_test` | Sim(3) algebra, model alignment, track splicing, fold detection | no |
+| `sfm_attitude_test` | the XMP attitude, its angle convention, the gauge's vote and refusals | no |
 | `sfm_mask_test` | mask uv sampling, decode, file discovery | no |
+| `sfm_telemetry_test` | the four telemetry carriers on synthetic files, and the sanity checks; `sfm_telemetry_test FILE` prints what a video carries | no |
 
 End to end, the check that matters is a reconstruction on a public dataset
 scored against the reference that ships with it: `tools/sfm/eval_poses.py` reads
@@ -515,9 +813,12 @@ port. Ordered by what blocks the most.
 
 10. **Undistortion stage.** Never written. The dataset parser takes distortion
     parameters, so confirm this is wanted before building it.
-11. **Equirectangular end to end.** The mapper writes `EQUIRECTANGULAR`
-    (model 17); `ColmapParser` stops at model 10 and the renderer has no
-    spherical camera, so such a model cannot currently be trained on.
+11. **Equirectangular end to end.** Done: the mapper writes `EQUIRECTANGULAR`
+    (model 17), `ColmapParser` reads it, and the trainer splits it into cube
+    faces (`warp_spherical_to_pinhole`). What is untested is how well the
+    learned front ends match on a panorama's polar distortion, which is one
+    reason a 360 capture is unwrapped into perspective views by default
+    (`docs/datasets.md`, "360 cameras").
 12. **Faster decode.** A scaled JPEG decode straight to the working resolution
     would cut the CPU time. (The *peak* half of this is done: the decoder
     resamples out of stb's RGB buffer instead of building a full-resolution
@@ -544,15 +845,21 @@ port. Ordered by what blocks the most.
 
 **Unstarted**
 
-15. Learned frontend (ALIKED / SuperPoint + LightGlue) behind the existing
-    extractor and matcher interfaces.
+15. ~~Learned frontend~~ -- done twice, behind the existing extractor and
+    matcher interfaces: ALIKED + LightGlue (`src/aliked/`) and LoMa
+    (`src/loma/`, DaD keypoints + DeDoDe descriptors, five matcher variants).
+    `--features loma-b128 --matcher loma-b128` is the compact one and
+    `--features loma-b --matcher loma-b` the accurate one. Both match
+    onnxruntime on the same checkpoints; both are matchers for a SHORTLIST.
+    What is left is a scored comparison of the three frontends on a public
+    dataset -- nothing here says which to reach for.
 16. A **global** (GLOMAP-style) mapper. The **bottom-up** one exists
     (`--mapper bottom-up`, `map/Partition.h` + `map/Bottomup.h`); what it has
     not got is parallel atom reconstruction, which needs a second `rec_` per
     worker and one shared `VkContext`.
 17. Parity benchmarking on ETH3D / IMC.
 
-**Deliberately out of scope**, so they are not silently skipped: rig
-constraints in the mapper (a rig is used as a ground-truth-free *diagnostic*,
-not a constraint), GPS / geo-registration, MVS / dense reconstruction,
-incremental database updates, and relating two models that share no images.
+**Deliberately out of scope**, so they are not silently skipped: GPS /
+geo-registration beyond the metric gauge, MVS / dense reconstruction,
+incremental database updates, and relating two models that share neither an
+image nor a rig frame.

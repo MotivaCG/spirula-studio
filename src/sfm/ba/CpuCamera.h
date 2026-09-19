@@ -139,6 +139,7 @@ template <int N> inline Jet<N> atan2(const Jet<N>& y, const Jet<N>& x) {
 
 struct SnavelyModel {
     static constexpr int kNumIntr = 3;
+    static constexpr bool kPeriodicX = false;
     template <class T> static void project(const T* c, const T p[3], T out[2]) {
         const T& f_log = c[0];
         const T& k1 = c[1];
@@ -155,6 +156,7 @@ struct SnavelyModel {
 
 struct SnavelyFModel {
     static constexpr int kNumIntr = 3;
+    static constexpr bool kPeriodicX = false;
     template <class T> static void project(const T* c, const T p[3], T out[2]) {
         const T& f = c[0];
         const T& k1 = c[1];
@@ -170,6 +172,7 @@ struct SnavelyFModel {
 
 struct PinholeRadialModel {
     static constexpr int kNumIntr = 5;
+    static constexpr bool kPeriodicX = false;
     template <class T> static void project(const T* c, const T p[3], T out[2]) {
         const T& f = c[0];
         const T& k1 = c[1];
@@ -187,6 +190,7 @@ struct PinholeRadialModel {
 
 struct SimplePinholeModel {
     static constexpr int kNumIntr = 3;
+    static constexpr bool kPeriodicX = false;
     template <class T> static void project(const T* c, const T p[3], T out[2]) {
         out[0] = c[0] * (p[0] / p[2]) + c[1];
         out[1] = c[0] * (p[1] / p[2]) + c[2];
@@ -195,6 +199,7 @@ struct SimplePinholeModel {
 
 struct PinholeModel {
     static constexpr int kNumIntr = 4;
+    static constexpr bool kPeriodicX = false;
     template <class T> static void project(const T* c, const T p[3], T out[2]) {
         out[0] = c[0] * (p[0] / p[2]) + c[2];
         out[1] = c[1] * (p[1] / p[2]) + c[3];
@@ -203,6 +208,7 @@ struct PinholeModel {
 
 struct OpenCVModel {
     static constexpr int kNumIntr = 8;
+    static constexpr bool kPeriodicX = false;
     template <class T> static void project(const T* c, const T p[3], T out[2]) {
         const T& fx = c[0];
         const T& fy = c[1];
@@ -225,6 +231,7 @@ struct OpenCVModel {
 
 struct FisheyeModel {
     static constexpr int kNumIntr = 8;
+    static constexpr bool kPeriodicX = false;
     template <class T> static void project(const T* c, const T p[3], T out[2]) {
         const T& fx = c[0];
         const T& fy = c[1];
@@ -246,6 +253,7 @@ struct FisheyeModel {
 
 struct FullOpenCVModel {
     static constexpr int kNumIntr = 12;
+    static constexpr bool kPeriodicX = false;
     template <class T> static void project(const T* c, const T p[3], T out[2]) {
         const T& fx = c[0];
         const T& fy = c[1];
@@ -273,6 +281,7 @@ struct FullOpenCVModel {
 
 struct ThinPrismFisheyeModel {
     static constexpr int kNumIntr = 12;
+    static constexpr bool kPeriodicX = false;
     template <class T> static void project(const T* c, const T p[3], T out[2]) {
         const T& fx = c[0];
         const T& fy = c[1];
@@ -302,6 +311,7 @@ struct ThinPrismFisheyeModel {
 
 struct EquirectModel {
     static constexpr int kNumIntr = 2;
+    static constexpr bool kPeriodicX = true;
     template <class T> static void project(const T* c, const T p[3], T out[2]) {
         const T& w = c[0];
         const T& h = c[1];
@@ -382,14 +392,38 @@ template <class T> inline void angleAxisRotate(const T axis[3], const T p[3], T 
 }
 
 template <class M>
-inline void residual(const double pose[6], const double* intr, const double X[3],
-                     const double obs[2], double r[2]) {
-    double p[3], px[2];
-    angleAxisRotate<double>(pose, X, p);
-    for (int i = 0; i < 3; i++) p[i] += pose[3 + i];
+inline void residualAt(const double* intr, const double p[3], const double obs[2], double r[2]) {
+    double px[2];
     M::template project<double>(intr, p, px);
     r[0] = px[0] - obs[0];
+    if constexpr (M::kPeriodicX) {
+        const double half = 0.5 * intr[0];
+        if (r[0] > half) r[0] -= intr[0];
+        else if (r[0] < -half) r[0] += intr[0];
+    }
     r[1] = px[1] - obs[1];
+}
+
+template <class M>
+inline void residual(const double pose[6], const double* intr, const double X[3],
+                     const double obs[2], double r[2]) {
+    double p[3];
+    angleAxisRotate<double>(pose, X, p);
+    for (int i = 0; i < 3; i++) p[i] += pose[3 + i];
+    residualAt<M>(intr, p, obs, r);
+}
+
+// Through a rig: `pose` is the frame's rig_from_world, `ext` the member's
+// cam_from_rig (camera.slang reprojectRig).
+template <class M>
+inline void residualRig(const double pose[6], const double ext[6], const double* intr,
+                        const double X[3], const double obs[2], double r[2]) {
+    double q[3], p[3];
+    angleAxisRotate<double>(pose, X, q);
+    for (int i = 0; i < 3; i++) q[i] += pose[3 + i];
+    angleAxisRotate<double>(ext, q, p);
+    for (int i = 0; i < 3; i++) p[i] += ext[3 + i];
+    residualAt<M>(intr, p, obs, r);
 }
 
 // ct I + st [a]_x + (1-ct) a a^T: what angleAxisRotate applies, and its
@@ -410,45 +444,121 @@ inline void angleAxisMatrix(const double axis[3], double R[9]) {
     R[8] = ct + w * a2 * a2;
 }
 
-// Jc is [row][6 pose | kNumIntr intrinsics], Jp is [row][3]. The angle-axis
-// block takes a dual pass of its own and the point block comes from the
-// rotation matrix: the axis norm has no derivative at a zero rotation (every
-// seed pair's first image), and one pass over both would spread that 0/0 out
-// of the axis columns the assembly's isfinite guards drop it in.
+// d(R(aa) p)/d aa as a 3x3 (row-major), by a dual pass over the axis alone:
+// the norm has no derivative at a zero rotation (every seed pair's first image)
+// and this keeps that 0/0 in the axis columns, where isfinite guards drop it.
+inline void angleAxisJacobian(const double axis[3], const double p[3], double J[9], double out[3]) {
+    Jet<3> aa[3], pj[3], oj[3];
+    for (int i = 0; i < 3; i++) aa[i] = Jet<3>::var(axis[i], i);
+    for (int i = 0; i < 3; i++) pj[i] = Jet<3>(p[i]);
+    angleAxisRotate<Jet<3>>(aa, pj, oj);
+    for (int k = 0; k < 3; k++) {
+        out[k] = oj[k].a;
+        for (int j = 0; j < 3; j++) J[3 * k + j] = oj[k].d[j];
+    }
+}
+
+// The projection's derivative in the camera-frame point and the intrinsics:
+// dp[row][k] = dr/dp_cam[k], di[row][i] = dr/dintr[i].
+template <class M>
+inline void projectJacobian(const double* intr, const double p[3], const double obs[2],
+                            double r[2], double dp[2][3], double* di) {
+    constexpr int NI = M::kNumIntr;
+    constexpr int NP = 3 + NI;
+    Jet<NP> pc[3], ic[NI], px[2];
+    for (int i = 0; i < 3; i++) pc[i] = Jet<NP>::var(p[i], i);
+    for (int i = 0; i < NI; i++) ic[i] = Jet<NP>::var(intr[i], 3 + i);
+    M::template project<Jet<NP>>(ic, pc, px);
+    Jet<NP> rr[2] = {px[0] - obs[0], px[1] - obs[1]};
+    if constexpr (M::kPeriodicX) {
+        const double half = 0.5 * intr[0];
+        if (rr[0].a > half) rr[0] = rr[0] - ic[0];
+        else if (rr[0].a < -half) rr[0] = rr[0] + ic[0];
+    }
+    for (int row = 0; row < 2; row++) {
+        r[row] = rr[row].a;
+        for (int k = 0; k < 3; k++) dp[row][k] = rr[row].d[k];
+        for (int i = 0; i < NI; i++) di[row * NI + i] = rr[row].d[3 + i];
+    }
+}
+
+// Jc is [row][6 pose | kNumIntr intrinsics], Jp is [row][3].
 template <class M>
 inline void jacobian(const double pose[6], const double* intr, const double X[3],
                      const double obs[2], double r[2], double* Jc, double* Jp) {
     constexpr int NI = M::kNumIntr;
-    constexpr int NP = 3 + NI;
     constexpr int DOF = 6 + NI;
-
-    Jet<3> aa[3], Xj[3], pj[3];
-    for (int i = 0; i < 3; i++) aa[i] = Jet<3>::var(pose[i], i);
-    for (int i = 0; i < 3; i++) Xj[i] = Jet<3>(X[i]);
-    angleAxisRotate<Jet<3>>(aa, Xj, pj);
-    double R[9];
+    double Ja[9], R[9], p[3];
+    angleAxisJacobian(pose, X, Ja, p);
     angleAxisMatrix(pose, R);
-
-    Jet<NP> pc[3], ic[NI], px[2];
-    for (int i = 0; i < 3; i++) pc[i] = Jet<NP>::var(pj[i].a + pose[3 + i], i);
-    for (int i = 0; i < NI; i++) ic[i] = Jet<NP>::var(intr[i], 3 + i);
-    M::template project<Jet<NP>>(ic, pc, px);
-
+    for (int i = 0; i < 3; i++) p[i] += pose[3 + i];
+    double dp[2][3], di[2 * NI];
+    projectJacobian<M>(intr, p, obs, r, dp, di);
     for (int row = 0; row < 2; row++) {
-        r[row] = px[row].a - obs[row];
         double* jc = Jc + row * DOF;
         double* jp = Jp + row * 3;
         for (int j = 0; j < 3; j++) {
             double da = 0, dx = 0;
             for (int k = 0; k < 3; k++) {
-                da += px[row].d[k] * pj[k].d[j];
-                dx += px[row].d[k] * R[3 * k + j];
+                da += dp[row][k] * Ja[3 * k + j];
+                dx += dp[row][k] * R[3 * k + j];
             }
             jc[j] = da;
-            jc[3 + j] = px[row].d[j];
+            jc[3 + j] = dp[row][j];
             jp[j] = dx;
         }
-        for (int i = 0; i < NI; i++) jc[6 + i] = px[row].d[3 + i];
+        for (int i = 0; i < NI; i++) jc[6 + i] = di[row * NI + i];
+    }
+}
+
+// Jc is [row][6 frame | 6 extrinsic | kNumIntr intrinsics]: the frame block is
+// chained through the extrinsic rotation, the point block through both.
+template <class M>
+inline void jacobianRig(const double pose[6], const double ext[6], const double* intr,
+                        const double X[3], const double obs[2], double r[2], double* Jc,
+                        double* Jp) {
+    constexpr int NI = M::kNumIntr;
+    constexpr int DOF = 12 + NI;
+    double Jf[9], Rf[9], q[3];
+    angleAxisJacobian(pose, X, Jf, q);
+    angleAxisMatrix(pose, Rf);
+    for (int i = 0; i < 3; i++) q[i] += pose[3 + i];
+    double Je[9], Re[9], p[3];
+    angleAxisJacobian(ext, q, Je, p);
+    angleAxisMatrix(ext, Re);
+    for (int i = 0; i < 3; i++) p[i] += ext[3 + i];
+    double dp[2][3], di[2 * NI];
+    projectJacobian<M>(intr, p, obs, r, dp, di);
+    // dp_cam / d q = Re; dq / d frame_aa = Jf, dq / d frame_t = I, dq / dX = Rf
+    double ReJf[9], ReRf[9];
+    for (int k = 0; k < 3; k++)
+        for (int j = 0; j < 3; j++) {
+            double a = 0, b = 0;
+            for (int m = 0; m < 3; m++) {
+                a += Re[3 * k + m] * Jf[3 * m + j];
+                b += Re[3 * k + m] * Rf[3 * m + j];
+            }
+            ReJf[3 * k + j] = a;
+            ReRf[3 * k + j] = b;
+        }
+    for (int row = 0; row < 2; row++) {
+        double* jc = Jc + row * DOF;
+        double* jp = Jp + row * 3;
+        for (int j = 0; j < 3; j++) {
+            double fa = 0, ft = 0, ea = 0, dx = 0;
+            for (int k = 0; k < 3; k++) {
+                fa += dp[row][k] * ReJf[3 * k + j];
+                ft += dp[row][k] * Re[3 * k + j];
+                ea += dp[row][k] * Je[3 * k + j];
+                dx += dp[row][k] * ReRf[3 * k + j];
+            }
+            jc[j] = fa;
+            jc[3 + j] = ft;
+            jc[6 + j] = ea;
+            jc[9 + j] = dp[row][j];
+            jp[j] = dx;
+        }
+        for (int i = 0; i < NI; i++) jc[12 + i] = di[row * NI + i];
     }
 }
 

@@ -96,6 +96,9 @@ src/
 │                             -- READ src/sam/README.md
 ├── aliked/                 ALIKED keypoints + LightGlue, on top of nn/
 │                             -- READ src/aliked/README.md
+├── loma/                   LoMa: DaD keypoints + DeDoDe descriptors + the LoMa
+│                             matcher, on top of nn/. The other learned SfM
+│                             frontend -- READ src/loma/README.md
 ├── metric3d/               Metric3D v2 depth + normals, on top of nn/
 │                             -- READ src/metric3d/README.md
 ├── moge/                   MoGe-2 point maps + normals + a sky mask, on top of
@@ -122,8 +125,14 @@ src/
 │   │                         geometry_main.cpp (depth + normals)
 │   ├── FrameExtract.{h,cpp}  video -> sharp frames (`spirula sam extract` also
 │   │                         masks them in the same pass; the GUI masks after)
+│   ├── Pano360.{h,cpp}     a 360 camera's own frame layout (the GoPro MAX
+│   │                         .360 EAC packing) and the views a dataset wants
+│   │                         out of it -- one implementation, both decode paths
 │   ├── WriterPool.h        threads that encode/write images while the GPU runs
 │   │                         the next frame; every masking loop uses it
+│   ├── AppPaths.{h,cpp}    the config / cache directories and this exe's own path
+│   ├── CrashLog.{h,cpp}    the stack trace every tool leaves in <config>/crash.log
+│   │                         when it faults -- armed for all of them in Main.cpp
 │   ├── gui/                Dear ImGui desktop app (`spirula` with no arguments)
 │   ├── webviewer/          HTTP server + render worker + viewer.html (the ONE
 │   │                         browser client, embedded into the engine library
@@ -157,27 +166,29 @@ src/
 Always use the dev scripts; they run codegen first and pick a sane job count.
 
 ```bash
-# Linux
-bash build_develop.bash -DSS_BUILD_CLI=ON -DSS_BUILD_GUI=ON -DSS_BACKEND=cuda
-bash build_develop.bash -DSS_BUILD_CLI=ON -DSS_BACKEND=vulkan   # separate build dir advised
+# Linux -- one tree per backend, so both can live in one checkout
+bash build_develop.bash -DSS_BACKEND=cuda     # -> build_cuda/
+bash build_develop.bash -DSS_BACKEND=vulkan   # -> build_vulkan/
 # Windows (cmd)
-build_develop.bat -DSS_BUILD_CLI=ON -DSS_BACKEND=vulkan
+build_develop.bat -DSS_BACKEND=vulkan         # -> build_vulkan\
 ```
 
 Use
 `build_develop.bash`; it runs codegen first and picks a RAM-aware job count.
 
-Everything builds into **one executable**, `build/spirula`: no arguments opens
-the GUI, `spirula sfm|train|sam|mesh` are the command-line tools, and a symlink
-named `spirula-sfm` runs that tool directly (`src/app/Tools.h`);
+Everything builds into **one executable**, `<build dir>/spirula`: no arguments opens
+the GUI (`-DSS_BUILD_GUI=OFF` leaves a headless binary that needs neither a
+display nor GL), `spirula sfm|train|sam|mesh` are the command-line tools, and
+a symlink named `spirula-sfm` runs that tool directly (`src/app/Tools.h`);
 `spirula geometry` estimates depth and normals for a dataset. The GUI runs
 reconstruction and that estimation by re-running itself as a child process, so
 there is no sibling binary to keep next to it. `-DSS_SEPARATE_TOOLS=ON` also builds the old
 per-tool executables.
 
-Backends build into different trees; keep them separate (`-B build_cuda`,
-`-B build`) so you can test both without reconfiguring. Options:
-`SS_BACKEND` (`cuda`|`vulkan`), `SS_BUILD_CLI`, `SS_BUILD_GUI`,
+The dev scripts put each backend in its own tree -- `build_cuda/` or
+`build_vulkan/`, and `build/` on macOS, which has one backend -- so testing
+both needs no reconfiguring and no `-B`. Options:
+`SS_BACKEND` (`cuda`|`vulkan`), `SS_BUILD_GUI`,
 `SS_BUILD_BACKEND_TESTS`, `SS_DEBUG_SYMBOLS`,
 `SS_BUILD_SFM`, `SS_BUILD_SAM`, `SS_ENABLE_PATENTED`,
 `SS_SEPARATE_TOOLS`.
@@ -238,8 +249,9 @@ Rules:
 
 ## The Vulkan-only subsystems
 
-`src/sfm/`, `src/nn/`, `src/sam/`, `src/aliked/`, `src/metric3d/`,
-`src/moge/` and `src/video/` are **not** part of the two-backend rule below. They are Vulkan + Slang only, carry their own Vulkan
+`src/sfm/`, `src/nn/`, `src/sam/`, `src/aliked/`, `src/loma/`,
+`src/metric3d/`, `src/moge/` and `src/video/` are **not** part of the
+two-backend rule below. They are Vulkan + Slang only, carry their own Vulkan
 context, share nothing with the training engine, and are absent from a CUDA
 build by default (`SS_BUILD_SFM` / `SS_BUILD_SAM` default OFF there).
 Nothing in them goes through `cmake/sources.txt`.
@@ -249,6 +261,7 @@ The layering runs one way and must keep doing so:
 ```
 app/gui, app/cli ──► sam ──────┬──► nn ──► nn/vk
                  ├──► aliked ──┤
+                 ├──► loma ────┤
                  ├──► metric3d ┤
                  ├──► moge ────┤
                  └──► video ───┘
@@ -281,7 +294,7 @@ before touching anything under `backend/vulkan/`.
 
 ```bash
 # native parity tests (CUDA build)
-bash build_develop.bash -DSS_BUILD_BACKEND_TESTS=ON && ./build/<test_name>
+bash build_develop.bash -DSS_BUILD_BACKEND_TESTS=ON && ./build_cuda/<test_name>
 # the Vulkan build produces the same test binaries unconditionally
 ```
 
@@ -479,6 +492,11 @@ no ceremony — do not ask, do not leave a note saying you removed it.
   free of CUDA intrinsics for the same reason.
 - **Quantized gradient codecs must decode code 0 to exactly `0.0`.** Anything
   else and Adam amplifies the pseudo-gradient into visible floaters.
+- **`isfinite` has no spelling that works everywhere a `core/` header goes.**
+  MSVC declares `std::isfinite` as a host function template, so nvcc will not
+  call it from `__device__` code; gcc's `<cmath>` leaves nothing in the global
+  namespace for an unqualified call inside a template to find. `q_finite`
+  (`core/Tensor.h`) is the exponent test that does. Same for `isnan`/`isinf`.
 - **Never name a `thread_local` inside an `omp parallel` region.** The team
   threads are different threads, so each one resolves it to its *own* copy —
   which the calling thread never sized. Keep the storage `thread_local` if you
@@ -519,16 +537,32 @@ no ceremony — do not ask, do not leave a note saying you removed it.
   `kernels/bilagrid/BilagridConfig.cuh` for the 3D case) and pass the fold
   factor to the kernel. Related: the bilagrid samplers index cells with
   int32, which `engine_init_bilagrid_*` enforces up front.
+- **Some pool buffers do not own their memory.** A slot listed in
+  `POOL_ALIAS_TABLE` (`core/PoolSlots.h`) is a slice of one arena that every
+  `PoolPhase` reuses, so the arena costs the largest phase rather than the sum
+  (626 MiB on a 15M-splat step). Acquiring one outside its phase throws;
+  `SS_POOL_ALIAS_POISON=1` fills the arena at every phase switch so a read
+  that outlives its phase becomes NaNs a parity test catches, and
+  `SS_POOL_ALIAS=0` turns the whole thing off. Read
+  `docs/notes/vram-splat-x-img.md` before adding a row.
 - **`SS_PROFILE=1`** enables the per-stage backend timing breakdown
-  (H2D / D2H / D2D / memset / device / host), header-only, both backends.
+  (H2D / D2H / D2D / memset / device / host), header-only, both backends, plus
+  a per-category VRAM breakdown after any run that trained. What the biggest
+  category costs per element, and what has already been tried against it, is
+  `docs/notes/vram-splat-x-img.md`.
+- **A kernel that fills the gaps between sorted keys is a scaling trap.** One
+  thread per INPUT walking `[ids[i-1]+1, ids[i]]` is fine while the ids are
+  dense and quadratic when they are not: `qgrad_camera_id_bounds` measured
+  478 ms/call at 20M splats with 0.8M visible, 92% of the whole step. One
+  thread per OUTPUT doing a `lower_bound` is the shape that does not care.
 - **The engine is a process-global singleton.** Call `engine_reset()` between
   runs that swap datasets, or the new run inherits the old splats, camera
   table, optimizer moments and color-space matrices. The one exception is
   read-only: `engine_scene_*` keeps several splat SETS resident and binds one
   per render, which is how the GUI shows four models side by side
   (`docs/notes/compare-view.md`).
-- **`build/_deps` on WSL drvfs** may need `git config safe.directory` entries
-  for the FetchContent'd GLFW/imgui.
+- **`_deps` in the build tree, on WSL drvfs**, may need `git config
+  safe.directory` entries for the FetchContent'd GLFW/imgui.
 - **A static library whose only content is a static initializer is not
   linked.** The generated SPIR-V blob tables are archive members that nothing
   references, so registration is an explicit call at each library's entry point
@@ -570,6 +604,25 @@ no ceremony — do not ask, do not leave a note saying you removed it.
   destructor) releases it; anything that keys a pool slot per instance must
   namespace the key per owner, as `Tracker`'s memory bank does -- two trackers
   numbering slots from zero write over each other.
+- **A saved preset's field table is hand-written, so a new setting is silent
+  until it is added.** `DatasetPreset.cpp` and `MeshPreset.cpp` each carry one
+  `X(key, member)` row per setting; a field added to `SfmJob`, `ColmapJob` or
+  `MeshJob` and not added there saves, loads, and quietly runs at its default.
+  `preset_roundtrip_test` is the guard: it moves every field the table
+  names off its default and compares after a round trip.
+- **A mesh format lives in four places and reads back in two.** `kMeshFormats`
+  (`app/gui/MeshJob.h`) is the GUI's list, `parse_one_mesh_format` and
+  `write_mesh` (`mesh/MeshExport.cpp`) are the writer, `check_export_support`
+  decides which colors it can carry, and `mesh/MeshImport.cpp` plus
+  `viewer/src/viewer.cpp` are the two readers that have to open it.
+  `mesh_format_roundtrip` writes every format and reads it back, which is
+  the only thing keeping the two writers' idea of a file and the two readers'
+  from drifting.
+- **One meshing run can be asked for several colors**, and the texture atlas
+  SPLITS seam vertices -- so anything written from the un-split mesh (no color,
+  vertex color) is written BEFORE the bake, not after. `generate_mesh()` is
+  ordered that way on purpose; moving a write past the atlas ships a file whose
+  colors no longer match its vertices.
 - **A GUI worker that clears a `busy` flag at the end of its function will
   strand it.** Every early `return set_error(...)` skips the line, and the next
   request is refused forever. Use a scope guard (`SegmentPanel::start_job`).

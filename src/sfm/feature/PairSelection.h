@@ -69,6 +69,7 @@ struct PairSelectionOptions {
     // pairs per submit than the full matcher does.
     int batch_pairs = 256;
     int device = -1;
+    std::string device_selector;   // canonical uuid:<hex>; "" = shared precedence
 };
 
 // Gather f's K best-ranked features (K = 0 or >= count keeps everything, but
@@ -118,6 +119,7 @@ inline std::vector<uint32_t> scoreOrderedPairs(
     const std::function<void(size_t, size_t)>& progress) {
     MatchOptions mo;
     mo.device = opt.device;
+    mo.device_selector = opt.device_selector;
     mo.batch_pairs = opt.batch_pairs;
     mo.max_num_matches = 0;
     mo.max_ratio = opt.ratio;
@@ -129,11 +131,11 @@ inline std::vector<uint32_t> scoreOrderedPairs(
     BruteForceMatcher matcher(mo);
 
     std::vector<uint32_t> score(pairs.size(), 0);
-    // Only a bound on how often progress is reported and how much of the list
-    // the matcher sees at once -- it splits the range into device-sized chunks
-    // itself, and a scoring pair's results are small enough that thousands fit
-    // in one submit.
-    const size_t chunk = (size_t)std::max(1, opt.batch_pairs) * 64;
+    // How often progress is reported, and how much of the list the matcher sees
+    // at once -- it chunks the range itself. A hundredth of the list, so a
+    // selection that is minutes long reports through it and not once at the end.
+    const size_t batch = (size_t)std::max(1, opt.batch_pairs);
+    const size_t chunk = std::max(batch, std::min(batch * 64, pairs.size() / 100 + 1));
     std::vector<uint32_t> out;
     for (size_t b = 0; b < pairs.size(); b += chunk) {
         const size_t e = std::min(b + chunk, pairs.size());

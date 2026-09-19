@@ -63,6 +63,10 @@ public:
     // shutdown() asks to stop too, and must not undo the user's answer.
     void request_stop(bool save = true);
     void shutdown();              // stop + join (app exit / new session)
+    // ... and give the engine's VRAM back with it. The session goes too, so
+    // the trainer screen has nothing left to render: call it only when
+    // something else needs the device -- a reconstruction, a meshing child.
+    void release_engine();
 
     Phase phase() const { return _phase.load(); }
     // Did the finished run write a final checkpoint? False only after a stop
@@ -84,6 +88,10 @@ public:
 
     // Latest per-step progress (copy).
     spirula::TrainerProgress latest_progress();
+    // Mean over the last 100 steps, which is also what the ETA is built from.
+    // A single step's latency swings several-fold with whether a viewer
+    // render landed on it, so it is not a number to put on screen.
+    double avg_step_latency();
     double eta_seconds();         // < 0 when unknown
     // Time spent in the step loop, pauses excluded: < 0 before a session
     // exists, 0 until the loop starts, frozen once it ends.
@@ -102,6 +110,7 @@ public:
 
 private:
     void push_log(const std::string& s);
+    double avg_latency_locked() const;   // caller holds _mu
     void join_worker();
     bool await_data_decision(const std::string& what);
 

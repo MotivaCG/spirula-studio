@@ -1,6 +1,7 @@
 // TrainerCore.cpp -- see TrainerCore.h.
 
 #include "app/TrainerCore.h"
+#include "data/SceneTransform.h"
 #include "app/EvalMetrics.h"
 #include "checkpoint/Adapt.h"
 #include "checkpoint/Resume.h"
@@ -10,6 +11,8 @@
 #include "core/ExrImage.h"
 #include "i18n/catalog/Log.h"
 #include "data/CameraMath.h"
+#include "data/ImageProbe.h"
+#include "data/RandomPoints.h"
 #include "data/Knn.h"
 #include "sfm/core/Exif.h"
 
@@ -76,24 +79,48 @@ Mat3f gamut_to_rec709(const std::string& name) {
 
 Mat3f invert3x3(const Mat3f& m) { return colorspace::invert3x3(m); }
 
+// "none" is how both front ends spell unset for a string field, and the GUI
+// writes it literally when a preset gave the field a value.
+static bool unset(const std::string& v) { return v.empty() || v == "none"; }
+
+// "Rec.709" is the config saying "sRGB, and do not take the file's word for
+// it"; resolved it is the identity, same as unset.
+static std::string resolved_gamut(const std::string& name) {
+    return name == "Rec.709" ? std::string() : name;
+}
+
 ColorResolution resolve_color(const TrainConfig& c) {
     ColorResolution r;
-    // "Rec.709" is how the config says "sRGB, and do not take the file's word
-    // for it"; resolved it is the identity, same as the unset "".
-    r.image_gamut  = c.image_color_gamut == "Rec.709" ? "" : c.image_color_gamut;
-    r.image_linear = c.image_color_is_linear.value_or(false);
+    r.image_gamut    = unset(c.image_color_gamut)
+                           ? std::string() : resolved_gamut(c.image_color_gamut);
+    r.image_linear   = c.image_color_is_linear.value_or(false);
+    r.image_transfer = colorspace::transfer_or(c.image_color_transfer,
+                                               colorspace::Transfer::Srgb);
     std::optional<bool> convert = c.convert_initial_point_cloud_color;
+    auto declared = [&] { if (!convert.has_value()) convert = true; };
 
-    r.splat_gamut = c.splat_color_gamut;
-    if (r.splat_gamut.empty()) r.splat_gamut = r.image_gamut;
-    else if (!convert.has_value()) convert = true;
-    if (r.splat_gamut == "Rec.709") r.splat_gamut = "";
+    // Each splat-side half falls back to the images, so declaring only the
+    // input still renders back into the space the input came from.
+    if (unset(c.splat_color_gamut)) {
+        r.splat_gamut = r.image_gamut;
+    } else {
+        r.splat_gamut = resolved_gamut(c.splat_color_gamut);
+        declared();
+    }
 
     if (c.splat_color_is_linear.has_value()) {
         r.splat_linear = *c.splat_color_is_linear;
-        if (!convert.has_value()) convert = true;
+        declared();
     } else {
         r.splat_linear = r.image_linear;
+    }
+
+    if (unset(c.splat_color_transfer)) {
+        r.splat_transfer = r.image_transfer;
+    } else {
+        r.splat_transfer = colorspace::transfer_or(c.splat_color_transfer,
+                                                   r.image_transfer);
+        declared();
     }
     r.convert_seed = convert.value_or(false);
     return r;
@@ -174,12 +201,13 @@ SeedSplats seed_splats(const ColmapPoints3D& pts, const TrainConfig& cfg,
         std::shuffle(pick.begin(), pick.end(), rng);
         pick.resize(cfg.cap_max);
     } else {
-        // Repeat modulo when under min_init. TODO: jitter the repeats toward
-        // a nearest neighbor instead of duplicating exactly.
+        // Repeat modulo when under min_init; the repeats are jittered apart
+        // below, and pick[0 .. n_src) stay one per source point.
         int64_t n = std::max(n_src, min_init);
         pick.resize(n);
         for (int64_t i = 0; i < n; i++) pick[i] = i % n_src;
     }
+    const int64_t n_distinct = std::min<int64_t>((int64_t)pick.size(), n_src);
     const int64_t num = (int64_t)pick.size();
     const int64_t cap = cfg.preallocate_splat_tensors
         ? std::max<int64_t>(num, cfg.cap_max) : num;
@@ -194,17 +222,23 @@ SeedSplats seed_splats(const ColmapPoints3D& pts, const TrainConfig& cfg,
     s.features_dc.assign(cap * 3, 0.f);
     s.features_sh.assign(cap * (dim_sh - 1) * 3, 0.f);
 
-    // means, scaled into the training frame
-    float rescale = cfg.relative_scale.value_or(1.0f);
+    // `pts` is in the training frame already: load_dataset() applied
+    // relative_scale to it along with the cameras.
     for (int64_t i = 0; i < num; i++)
         for (int d = 0; d < 3; d++)
-            s.means[i*3 + d] = pts.xyz[pick[i]*3 + d] * rescale;
+            s.means[i*3 + d] = (float)pts.xyz[pick[i]*3 + d];
 
-    // log(scale_init * sqrt(mean d^2 of 4-NN)) over xyz.
-    // TODO: suppress_initial_scales.
-    std::vector<float> nn = knn::mean_knn_dist(s.means, num, 4);
+    // log(scale_init * sqrt(mean d^2 of 4-NN)) over xyz, over the DISTINCT
+    // points: a repeat is its own zero-distance neighbor, and would seed
+    // every splat at log(1e-8). TODO: suppress_initial_scales.
+    std::vector<float> nn = knn::mean_knn_dist(s.means, n_distinct, 4);
     for (int64_t i = 0; i < num; i++) {
-        float v = std::log(scale_init * nn[i] + 1e-8f);
+        float d = nn[i % n_distinct];
+        // Scatter the repeats through the neighborhood they copy.
+        if (i >= n_distinct)
+            for (int k = 0; k < 3; k++)
+                s.means[i*3 + k] += 0.25f * d * gauss(rng);
+        float v = std::log(scale_init * d + 1e-8f);
         s.scales[i*3+0] = s.scales[i*3+1] = s.scales[i*3+2] = v;
     }
 
@@ -228,7 +262,10 @@ SeedSplats seed_splats(const ColmapPoints3D& pts, const TrainConfig& cfg,
         for (int d = 0; d < 3; d++)
             col[d] = all_same ? uni(rng) : pts.rgb[pick[i]*3 + d] / 255.f;
         if (color.convert_seed) {
-            for (int d = 0; d < 3; d++) col[d] = colorspace::srgb_to_linear(col[d]);
+            // The gamut matrix belongs in linear light, so decode through the
+            // transfer, rotate, and re-encode only if the splats are stored so.
+            for (int d = 0; d < 3; d++)
+                col[d] = colorspace::tone_decode(col[d], color.splat_transfer);
             colorspace::apply3x3(to_splat, col);
             if (!color.splat_linear)
                 for (int d = 0; d < 3; d++) col[d] = colorspace::linear_to_srgb(col[d]);
@@ -398,7 +435,7 @@ build_loss_weights(const TrainConfig& c, int step) {
     float median_factor = std::min((float)step / std::max(c.median_warmup, 1), 1.0f);
     float alpha_reg_factor = c.alpha_reg_weight *
         std::min((float)step / std::max(c.alpha_reg_warmup, 1), 1.0f);
-    float mask = c.apply_loss_for_mask ? 1.0f : 0.0f;
+    float mask = c.apply_loss_for_mask.value_or(false) ? 1.0f : 0.0f;
 
     float w_rgb_l1 = std::max(0.0f, c.l1_weight);
     float w_rgb_l2 = std::max(0.0f, c.l2_weight);
@@ -453,6 +490,8 @@ EngineStepConfig build_step_config(const TrainConfig& c, const RunState& st, int
     cfg.loss.loss_map_clip_quantile = c.densify_loss_map_clip_quantile;
     cfg.loss.loss_map_power = c.densify_loss_map_power;
     cfg.loss.loss_map_accum_mode = densify_accum_mode_int(c.densify_accum_mode);
+    cfg.loss.saturation_threshold = c.loss_saturation_threshold;
+    cfg.loss.luminance_normalization = c.loss_luminance_normalization;
     cfg.loss.overexposure_reg_weight = c.overexposure_reg;
     if (st.bilagrid_rgb_init || st.ppisp_init) {
         cfg.loss.color_shift_reg_weight = c.color_shift_reg_weight;
@@ -472,12 +511,24 @@ EngineStepConfig build_step_config(const TrainConfig& c, const RunState& st, int
     cfg.optim.lr_features_sh = scheduled_lr(step, max_steps_lr, c.features_sh_lr);
     cfg.optim.max_gauss_ratio             = c.max_gauss_ratio;
     cfg.optim.scale_regularization_weight = c.scale_regularization_weight;
-    cfg.optim.mcmc_opacity_reg_weight     = c.opacity_reg;
-    cfg.optim.mcmc_scale_reg_weight       = c.scale_reg / alpha;
+    // Front-loaded shape penalty. (p+1)(1-t)^p has unit integral over the run,
+    // so p moves when the pressure is spent, not how much of it.
+    float reg_t = std::min((float)step / (float)std::max(c.num_iterations, 1), 1.0f);
+    auto reg_decay = [reg_t](float p) {
+        p = std::max(p, 0.0f);
+        return (p + 1.0f) * std::pow(1.0f - reg_t, p);
+    };
+    cfg.optim.mcmc_opacity_reg_weight     =
+        c.opacity_reg * reg_decay(c.opacity_reg_decay_power);
+    cfg.optim.mcmc_scale_reg_weight       =
+        c.scale_reg * reg_decay(c.scale_reg_decay_power) / alpha;
     cfg.optim.erank_reg_weight            = c.erank_reg;
     cfg.optim.erank_reg_weight_s3         = c.erank_reg_s3;
     cfg.optim.quat_norm_reg_weight        = c.quat_norm_reg;
+    cfg.optim.dc_reg_weight               = c.dc_reg;
     cfg.optim.sh_reg_weight               = c.sh_reg;
+    cfg.optim.max_screen_size             = c.max_screen_size;
+    cfg.optim.max_screen_size_penalty     = c.max_screen_size_penalty;
     cfg.optim.use_scale_agnostic_mean     = c.use_scale_agnostic_mean;
     // quantization level -> bit depths
     cfg.optim.quantization_level = c.quantization_level;
@@ -503,6 +554,7 @@ EngineStepConfig build_step_config(const TrainConfig& c, const RunState& st, int
     cfg.densify.min_opacity                   = c.min_opacity;
     cfg.densify.max_screen_size               = c.max_screen_size;
     cfg.densify.max_screen_size_clip_hardness = c.max_screen_size_clip_hardness;
+    cfg.densify.clip_screen_size_at_refine    = c.max_screen_size_penalty > 0.0f;
     cfg.densify.max_world_size                = c.max_world_size * alpha;
     cfg.densify.noise_lr                      = c.noise_lr * noise_lr_scalar;
     cfg.densify.noise_lr_final                = c.noise_lr_final * noise_lr_scalar;
@@ -514,6 +566,8 @@ EngineStepConfig build_step_config(const TrainConfig& c, const RunState& st, int
     cfg.densify.score_power = c.densify_score_power;
     cfg.densify.score_clip_quantile = c.densify_score_clip_quantile;
     cfg.densify.final_score_power = c.densify_final_score_power;
+    cfg.densify.oversize_split_fraction = c.densify_oversize_split_fraction;
+    cfg.densify.oversize_score_blend = c.densify_oversize_score_blend;
     cfg.densify.las_split_opacity_k_init   = c.long_axis_split_opacity_k[0];
     cfg.densify.las_split_opacity_k_final  = c.long_axis_split_opacity_k[1];
     cfg.densify.las_split_opacity_k_warmup = (int)c.long_axis_split_opacity_k[2];
@@ -557,12 +611,15 @@ EngineStepConfig build_step_config(const TrainConfig& c, const RunState& st, int
     // Outside the guard: it is an ordering flag, not a rate, so it reflects
     // the config whether or not PPISP is live.
     cfg.ppisp.run_before_bilagrid = c.apply_ppisp_before_bilagrid;
+    cfg.ppisp.run_before_color_space = c.apply_ppisp_before_color_space;
 
     // ---- background ----------------------------------------------------
-    if (c.background_mode == "noise") {
+    if (c.background_mode == "noise" || c.background_mode == "pseudorandom" ||
+        c.background_mode == "random") {
         float rw = std::min((float)step / std::max(c.background_noise_warmup, 1), 1.0f);
         cfg.background.randomize_weight =
             1.0f - (1.0f - c.background_noise_pre_warmup) * (1.0f - rw);
+        cfg.background.match_luminance = c.background_match_luminance;
     } else if (c.background_mode == "sh") {
         cfg.background.lr_dc = scheduled_lr(step, max_steps_lr, c.background_dc_lr);
         cfg.background.lr_sh = scheduled_lr(step, max_steps_lr, c.background_sh_lr);
@@ -577,18 +634,26 @@ EngineStepConfig build_step_config(const TrainConfig& c, const RunState& st, int
 // config.json dump
 // ===========================================================================
 
-// Flat dump: one key per flag, spelled exactly as the flag is. It used to be
-// nested under the field table's group column, which quietly made a
-// presentational choice part of an on-disk format -- moving a flag to another
-// heading moved its key, and a reader that could not find it silently fell
-// back to the default. Flat, a heading can be renamed or reshuffled without
-// touching anything that reads this file (`spirula mesh`, --resume).
-//
-// Macro flags (--quality and friends) are written alongside the values they
-// resolved to, so a reader takes the values and never re-resolves them.
-//
-// The encoding itself is config/TrainConfigJson.h, shared with --resume's
-// reader and the GUI's saved presets so the three cannot disagree.
+// p_train = relative_scale * (p_dataset - center): the parser's shift and the
+// trainer's own rescale, which is every way the splats' frame differs from
+// the dataset's.
+void save_scene_transform_json(const ParsedDataset& ds, const TrainConfig& c,
+                               const fs::path& out_dir) {
+    SceneTransform T;
+    T.scale = (double)c.relative_scale.value_or(1.0f);
+    for (int i = 0; i < 3; i++) T.t[i] = -T.scale * ds.center[i];
+    const std::string text =
+        scene_transform_json(T, ds.center_mode, ds.center.data());
+    const fs::path path = out_dir / "scene_transform.json";
+    FILE* f = std::fopen(path.string().c_str(), "w");
+    if (!f) throw std::runtime_error("cannot write " + path.string());
+    std::fputs(text.c_str(), f);
+    std::fclose(f);
+}
+
+// Flat, one key per flag: a key that followed the field table's heading
+// moved whenever a flag was reshuffled, and readers fell back to the default.
+// Macro flags are written beside what they resolved to; config/TrainConfigJson.h.
 void save_config_json(const TrainConfig& c, const fs::path& out_dir,
                       const std::string& preset) {
     FILE* f = std::fopen((out_dir / "config.json").string().c_str(), "w");
@@ -627,25 +692,12 @@ std::string train_config_unsupported(const TrainConfig& c) {
     if (c.deblur_training_images)     return not_impl("--deblur-training-images");
     if (!c.optimizer_offload.empty()) return not_impl("--optimizer-offload");
     if (c.cache_images == "gpu")      return not_impl("--cache-images gpu");
-    if (c.rescale_camera_to_fit < 0)  return not_impl("--rescale-camera-to-fit auto-detect");
     if (c.train_frame != "points")    return not_impl("--train-frame " + c.train_frame);
     if (c.primitive != "3dgs" && c.primitive != "mip" && c.primitive != "3dgut")
         return not_impl("--primitive " + c.primitive);
     if (c.quantization_level != 0 && c.quantization_level != 1)
         return lmsg::bad_quantization_level.get();
     return {};
-}
-
-std::string format_duration(double seconds) {
-    if (seconds < 0) return "--:--";
-    int t = (int)(seconds + 0.5);
-    char buf[32];
-    if (t >= 3600)
-        std::snprintf(buf, sizeof buf, "%d:%02d:%02d", t / 3600, (t / 60) % 60,
-                      t % 60);
-    else
-        std::snprintf(buf, sizeof buf, "%d:%02d", t / 60, t % 60);
-    return buf;
 }
 
 // Unported-feature guards: fail early rather than ignore a flag.
@@ -663,6 +715,46 @@ void TrainerSession::check_config() {
                  {cfg.orientation_method, cfg.center_method}));
 }
 
+// A cut-out image's alpha is its mask when masks are on, and against a constant
+// background its colour is that background where transparent -- which is what
+// eval scores a render against, and what a soft edge renders as.
+void TrainerSession::set_alpha_config(DataManagerConfig& dm,
+                                      const std::vector<uint8_t>& alpha) const {
+    if (cfg.load_masks) dm.alpha_masks = alpha;
+    if (cfg.background_mode == "color") {
+        dm.composite_alpha = alpha;
+        for (int c = 0; c < 3; c++) dm.composite_color[c] = cfg.background_color[c];
+    }
+}
+
+// After relative_scale, so the cloud is sized by the cameras it will train
+// with. Into ds.points itself: the GUI's preview draws the seed that is used.
+void TrainerSession::seed_at_random() {
+    const std::string& mode = cfg.random_init;
+    if (mode != "never" && mode != "auto" && mode != "always")
+        throw std::runtime_error("unknown random_init '" + mode + "'");
+    const int64_t had = ds.points.num();
+    if (had == 0 && mode == "never")
+        throw std::runtime_error(lmsg::random_init_never.get());
+    if (mode == "never" || (mode == "auto" && had > 0)) return;
+
+    RandomPointsConfig rc;
+    rc.count = std::max<int64_t>(
+        1, (int64_t)std::llround((double)cfg.random_init_fraction * cfg.cap_max));
+    rc.distribution = cfg.random_init_distribution;
+    rc.center = cfg.random_init_center;
+    rc.spread = cfg.random_init_spread;
+    rc.std_scale = cfg.random_init_std;
+    RandomPointsFit fit;
+    ds.points = random_seed_points(ds.c2w.data(), ds.num_cameras, rc, &fit);
+    if (had > 0) log(lfmt(lmsg::random_init_replaced, {(long long)had}));
+    char sigma[96];
+    std::snprintf(sigma, sizeof sigma, "%.4g, %.4g, %.4g",
+                  fit.sigma[0], fit.sigma[1], fit.sigma[2]);
+    log(lfmt(lmsg::random_init_drawn,
+             {(long long)rc.count, rc.distribution, rc.center, sigma, mode}));
+}
+
 void TrainerSession::load_dataset() {
     DatasetParserConfig pcfg;
     pcfg.recon_dir            = cfg.colmap_recon_dir;
@@ -675,12 +767,21 @@ void TrainerSession::load_dataset() {
     pcfg.eval_interval        = cfg.eval_interval;
     pcfg.train_split_fraction = cfg.train_split_fraction;
     pcfg.outlier_threshold    = cfg.outlier_threshold;
-    pcfg.rescale_camera_to_fit   = cfg.rescale_camera_to_fit;
+    pcfg.center_mode          = cfg.scene_center;
+    pcfg.exif_orientation     = cfg.exif_orientation;
+    pcfg.probe_image_size        = probe_image_size;
+    pcfg.train_resolution_divisor = cfg.train_resolution_divisor;
     pcfg.downscale_rounding_mode = cfg.downscale_rounding_mode;
     pcfg.metashape_xml           = cfg.metashape_xml;
     pcfg.metashape_ply           = cfg.metashape_ply;
     pcfg.metashape_psx           = cfg.metashape_psx;
     ds = parse_dataset(cfg.data, pcfg, cfg.data_format);
+    if (ds.center_mode != "none") {
+        char xyz[96];
+        std::snprintf(xyz, sizeof xyz, "%.12g, %.12g, %.12g",
+                      ds.center[0], ds.center[1], ds.center[2]);
+        log(lfmt(lmsg::scene_centered, {ds.center_mode, xyz}));
+    }
 
     // An EXR carries its own colour space, and nothing downstream can recover
     // it: DataManager hands the engine the file's raw scene-linear floats. The
@@ -711,13 +812,29 @@ void TrainerSession::load_dataset() {
     }
     if (!cfg.auto_scale_poses) ds.train_frame_scale = 1.0f;
 
+    seed_at_random();
+
     // POST-split camera bake (identity when no warp flag applies).
     post = bake_post_split(
         ds, cfg.warp_to_pinhole, cfg.warp_spherical_to_pinhole,
-        resolve_face_fit(cfg));
+        resolve_face_fit(cfg), cfg.warp_back_face);
 
     // Warp-path guards, plus: a modality no weight reads is not loaded at all.
-    has_mask   = !ds.mask_filenames.empty()   && cfg.load_masks;
+    alpha_images = probe_alpha_masks(ds.image_filenames);
+    has_mask   = (!ds.mask_filenames.empty() || !alpha_images.empty()) &&
+                 cfg.load_masks;
+    if (!alpha_images.empty() && cfg.load_masks) {
+        const long long n = std::count(alpha_images.begin(), alpha_images.end(), 1);
+        log(lfmt(ds.mask_filenames.empty() ? lmsg::alpha_masks_found
+                                           : lmsg::alpha_masks_with_files,
+                 {n, (long long)ds.num_cameras}));
+    }
+    // A cut-out's transparent pixels are empty space, not distractors. Mask
+    // files could be either, so with any of them the default stays "ignore".
+    if (!cfg.apply_loss_for_mask.has_value()) {
+        cfg.apply_loss_for_mask = !alpha_images.empty() && ds.mask_filenames.empty();
+        if (*cfg.apply_loss_for_mask) log(lmsg::alpha_masks_cut_out.get());
+    }
     has_depth  = !ds.depth_filenames.empty()  && cfg.load_depths &&
                  cfg.depth_supervision_weight > 0.0f;
     has_normal = !ds.normal_filenames.empty() && cfg.load_normals &&
@@ -784,34 +901,39 @@ static void check_cuda_runtime() {
 }
 #endif  // SS_BACKEND_VULKAN
 
-// PPISP exposure seeds: mean-relative EXIF EV x 0.5 per POST-split slot; empty
-// when no image has the tags. The 0.5: PPISP multiplies the sRGB-encoded
+// PPISP exposure seeds: 0.5 x EXIF EV per POST-split slot, centred like the
+// exposure-mean regularizer; empty without tags. 0.5: PPISP scales the sRGB
 // render, where a bracketed +1 EV measures x2^0.49 (0.34-0.76 by tone curve).
 static std::vector<float> exif_exposure_evs(const ParsedDataset& ds,
                                             const PostSplitCameras& post,
+                                            bool arithmetic_mean,
                                             int& n_found) {
     int64_t n = ds.num_cameras;
-    std::vector<double> ev(n, 0.0);
+    std::vector<double> gain(n, 0.0);
     std::vector<char> has(n, 0);
     double sum = 0.0;
     n_found = 0;
     for (int64_t i = 0; i < n; i++) {
         double v;
         if (sfm::exifExposureEv(sfm::readExif(ds.image_filenames[i]), v)) {
-            ev[i] = v;
+            gain[i] = 0.5 * v;
             has[i] = 1;
-            sum += v;
-            // sum += std::exp2(v);
+            sum += gain[i];
             n_found++;
         }
     }
     if (n_found == 0) return {};
-    double mean = sum / n_found;
-    // double mean = std::log2(sum / n_found);
+    double center = sum / n_found;
+    if (arithmetic_mean) {
+        double sum_exp = 0.0;
+        for (int64_t i = 0; i < n; i++)
+            if (has[i]) sum_exp += std::exp2(gain[i] - center);
+        center += std::log2(sum_exp / n_found);
+    }
     std::vector<float> out((size_t)post.n_post, 0.0f);
     for (int64_t i = 0; i < n; i++) {
         if (!has[i]) continue;
-        float v = 0.5f * (float)(ev[i] - mean);
+        float v = (float)(gain[i] - center);
         if (post.K_per_camera.empty()) {
             out[i] = v;
         } else {
@@ -840,8 +962,10 @@ void TrainerSession::setup_engine() {
                   (fs::path(cfg.data).stem().string() + "_" + stamp);
     }
     fs::create_directories(out_dir);
-    if (write_config_json)
+    if (write_config_json) {
         save_config_json(cfg, out_dir, preset);
+        save_scene_transform_json(ds, cfg, out_dir);
+    }
     log(lfmt(lmsg::output_directory, {fs::absolute(out_dir).string()}));
 
     // ---- Engine setup -------------------------------------------------
@@ -862,21 +986,44 @@ void TrainerSession::setup_engine() {
                   tv(seed.features_dc, {cap, 3}),
                   tv(seed.features_sh, {cap, dim_sh - 1, 3}));
 
+    // Binning granularity for the splat-tile intersection (0 = automatic).
+    engine_set_bin_tile_size(cfg.bin_tile_size);
+
     // Background blending.
     if (cfg.background_mode == "noise")
-        engine_init_background_noise(color.splat_linear);
+        engine_init_background_noise((int)color.splat_transfer,
+                                     color.splat_linear);
+    else if (cfg.background_mode == "pseudorandom")
+        engine_init_background_pseudorandom((int)color.splat_transfer,
+                                            color.splat_linear);
+    else if (cfg.background_mode == "random")
+        engine_init_background_random((int)color.splat_transfer,
+                                      color.splat_linear);
+    else if (cfg.background_mode == "color")
+        engine_init_background_color(cfg.background_color.data(),
+                                     (int)color.splat_transfer,
+                                     color.splat_linear);
     else if (cfg.background_mode == "sh")
-        engine_init_background_sh(cfg.background_sh_degree, color.splat_linear);
+        engine_init_background_sh(cfg.background_sh_degree,
+                                  (int)color.splat_transfer,
+                                  color.splat_linear);
 
-    // Linear / wide-gamut color space.
-    bool splat_cs_on = color.splat_linear || !color.splat_gamut.empty();
-    bool image_cs_on = color.image_linear || !color.image_gamut.empty();
+    // Output transfer / wide-gamut color space.
+    const bool splat_cs_on = color.splat_on();
+    const bool image_cs_on = color.image_on();
+    // PPISP ahead of the conversion leaves the bilagrid on the display side,
+    // where it belongs, so the two order flags cannot disagree.
+    if (splat_cs_on && cfg.apply_ppisp_before_color_space &&
+        !cfg.apply_ppisp_before_bilagrid)
+        throw std::runtime_error(lfmt(lmsg::ppisp_before_color_space_order,
+                                      {"--apply-ppisp-before-color-space",
+                                       "--apply-ppisp-before-bilagrid"}));
     {
         auto vec = [](const Mat3f& m) { return std::vector<float>(m.begin(), m.end()); };
         engine_init_color_space(
-            splat_cs_on, color.splat_linear,
+            splat_cs_on, (int)color.splat_transfer, color.splat_linear,
             splat_cs_on ? vec(gamut_to_rec709(color.splat_gamut)) : std::vector<float>{},
-            image_cs_on, color.image_linear,
+            image_cs_on, (int)color.image_transfer, color.image_linear,
             image_cs_on ? vec(gamut_to_rec709(color.image_gamut)) : std::vector<float>{});
     }
 
@@ -901,7 +1048,10 @@ void TrainerSession::setup_engine() {
     dm.load_normals     = has_normal;
     dm.train_batch_size = train_bs;
     dm.val_batch_size   = val_bs;
+    dm.flip_mask = cfg.flip_mask;
+    set_alpha_config(dm, alpha_images);
     dm.mask_boundary_offset = cfg.mask_boundary_offset;
+    dm.exif_quarter_turns = ds.exif_quarter_turns;
     engine_setup_data_manager(
         dm, ds.camera_models, ds.camera_distortions,
         ds.image_filenames,
@@ -978,13 +1128,16 @@ void TrainerSession::setup_engine() {
         std::vector<float> exif_ev;
         if (cfg.ppisp_exposure_from_exif) {
             int n_exif = 0;
-            exif_ev = exif_exposure_evs(ds, post, n_exif);
+            exif_ev = exif_exposure_evs(ds, post,
+                                        cfg.ppisp_exposure_arithmetic_mean,
+                                        n_exif);
             if (n_exif > 0)
                 log(lfmt(lmsg::ppisp_exif_exposure,
                          {(long long)n_exif, (long long)ds.num_cameras}));
         }
         engine_init_ppisp(n_grids, cfg.ppisp_param_type,
-                          cfg.use_adagrad_ppisp_optim, exif_ev);
+                          cfg.use_adagrad_ppisp_optim,
+                          cfg.ppisp_exposure_arithmetic_mean, exif_ev);
         st.ppisp_init = true;
     }
 
@@ -1082,9 +1235,36 @@ void TrainerSession::save_checkpoint(int step) {
 std::map<std::string, float> TrainerSession::train_step(int step) {
     int sh_degree_to_use = step / std::max(cfg.sh_degree_warmup_every, 1);
     EngineStepConfig sc = build_step_config(cfg, st, step);
-    return engine_train_step_managed(
+    auto losses = engine_train_step_managed(
         step, cfg.num_iterations, cfg.primitive, sh_degree_to_use,
         cfg.packed || cfg.use_bvh, sc);
+
+    // Sticky and returns-and-clears, and nothing else on the training thread
+    // reads it: a failed dispatch or copy would otherwise leave a buffer
+    // unwritten and training would carry on over whatever was in it.
+    if (const char* err = backend::last_error())
+        throw std::runtime_error("GPU backend error at step " +
+                                 std::to_string(step) + ": " + err);
+
+    // Divergence never recovers, and the run otherwise continues in silence to
+    // a black render and a checkpoint with zero splats. Reported values sit
+    // well under 10, so 1e3 is clear of anything legitimate.
+    if (!_diverged_loss_reported) {
+        for (const auto& [name, value] : losses) {
+            if (name == "cur_num_splats" || name == "max_num_splats" ||
+                name == "num_added")
+                continue;
+            // Magnitude only for rgb_loss: the others carry scene-dependent
+            // units (depth, TV) with no comparable ceiling.
+            const bool huge = name == "rgb_loss" && std::fabs(value) > 1e3f;
+            if (std::isfinite(value) && !huge) continue;
+            _diverged_loss_reported = true;
+            log(lfmt(lmsg::warn_diverged_loss,
+                     {(long long)step, name, (double)value}));
+            break;
+        }
+    }
+    return losses;
 }
 
 void TrainerSession::pause_clock_start() {
@@ -1147,10 +1327,13 @@ void TrainerSession::train(const TrainerCallbacks& cb) {
             pause_clock_stop();
         }
         if (stop_requested.load()) break;
+        // Clock starts before the yield: a render the trainer stood aside for
+        // is time this step took. Timing only the work below reported 6 ms on
+        // a step the run was actually spending 24 ms on.
+        auto step_start = std::chrono::steady_clock::now();
         while (render_pending.load())
             std::this_thread::sleep_for(std::chrono::microseconds(500));
 
-        auto step_start = std::chrono::steady_clock::now();
         std::map<std::string, float> losses;
         std::string data_error;
         {
@@ -1211,6 +1394,7 @@ void TrainerSession::train(const TrainerCallbacks& cb) {
         for (const auto& e : engine_get_pool_breakdown()) cap += std::get<2>(e);
         engine_vram_mb = (double)(cap + engine_get_scratch_bytes()) / (1024.0 * 1024.0);
     }
+    engine_profile_capture_vram();
 
     if (cfg.steps_per_save != 0 && save_on_stop.load()) {
         std::lock_guard<std::mutex> lk(engine_mutex);
@@ -1260,7 +1444,9 @@ ViewerRenderConfig TrainerSession::make_viewer_config() const {
                            cfg.depth_distortion_reg != 0.0f ||
                            cfg.normal_distortion_reg != 0.0f;
     const auto color = resolve_color(cfg);
-    vc.color_space_on = color.splat_linear || !color.splat_gamut.empty();
+    vc.color_space_on = color.splat_on();
+    vc.centers = dsparse::scene_centers(ds);
+    vc.center_cameras = ds.num_cameras > 0;
     vc.train_frame_scale = ds.train_frame_scale;
     vc.train_to_normalized = ds.train_to_normalized;
     vc.base_camera_size = viewer_base_camera_size;
@@ -1319,7 +1505,10 @@ void TrainerSession::eval() {
     pcfg.eval_interval        = cfg.eval_interval;
     pcfg.train_split_fraction = cfg.train_split_fraction;
     pcfg.outlier_threshold    = cfg.outlier_threshold;
-    pcfg.rescale_camera_to_fit   = cfg.rescale_camera_to_fit;
+    pcfg.center_mode          = cfg.scene_center;
+    pcfg.exif_orientation     = cfg.exif_orientation;
+    pcfg.probe_image_size        = probe_image_size;
+    pcfg.train_resolution_divisor = cfg.train_resolution_divisor;
     pcfg.downscale_rounding_mode = cfg.downscale_rounding_mode;
     pcfg.metashape_xml           = cfg.metashape_xml;
     pcfg.metashape_ply           = cfg.metashape_ply;
@@ -1342,19 +1531,24 @@ void TrainerSession::eval() {
     // and its metrics stay comparable between the two fits.
     PostSplitCameras epost = bake_post_split(
         eds, cfg.warp_to_pinhole, cfg.warp_spherical_to_pinhole,
-        WarpFaceFit::Uniform);
+        WarpFaceFit::Uniform, cfg.warp_back_face);
 
     // One image per step: metrics are per-image, and the batch scheduler would
     // otherwise pack several resolutions into one step.
     DataManagerConfig dm;
     dm.cache_mode  = (cfg.cache_images == "disk") ? CacheMode::DISK : CacheMode::CPU;
-    const bool eval_masks = !eds.mask_filenames.empty() && cfg.load_masks;
+    const std::vector<uint8_t> eval_alpha = probe_alpha_masks(eds.image_filenames);
+    const bool eval_masks =
+        (!eds.mask_filenames.empty() || !eval_alpha.empty()) && cfg.load_masks;
     dm.load_masks  = eval_masks || epost.any_fov_mask;
+    set_alpha_config(dm, eval_alpha);
     dm.load_depths = false;
     dm.load_normals = false;
     dm.train_batch_size = 1;
     dm.val_batch_size   = 1;
+    dm.flip_mask = cfg.flip_mask;
     dm.mask_boundary_offset = cfg.mask_boundary_offset;
+    dm.exif_quarter_turns = eds.exif_quarter_turns;
     std::vector<int32_t> all_idx((size_t)eds.num_cameras);
     std::iota(all_idx.begin(), all_idx.end(), 0);
 
@@ -1576,6 +1770,9 @@ void TrainerSession::eval() {
     mf << ",\n    \"engine_vram\": " << engine_vram_mb;
     mf << "\n}\n";
     log(lfmt(lmsg::eval_metrics_written, {(out_dir / "metrics.json").string()}));
+    // Eval renders at full resolution and can push the pool past its
+    // training-time mark, so re-capture over train()'s snapshot.
+    engine_profile_capture_vram();
 }
 
 }  // namespace spirula

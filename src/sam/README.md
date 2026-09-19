@@ -191,7 +191,7 @@ session.encodeImage(nn::load_image("street.jpg"));   // once per frame
 sam::Result r = session.segmentConcept({.text = "yellow school bus"});
 ```
 
-Runtime knobs: `SS_NN_LOG=0..3`, `SS_VK_DEVICE=<index|name>`,
+Runtime knobs: `SS_NN_LOG=0..3`, `SS_VK_DEVICE=<index|name|auto|uuid:hex>`,
 `SS_PROFILE=1`, `SS_VK_VALIDATION=1`, `SS_NN_DEBUG_SYNC=1`.
 
 ## Checkpoints
@@ -376,8 +376,8 @@ Faithful to the reference numerics; what changed is the execution model.
 ## Tests
 
 ```bash
-./build/nn_ops_test        # every GPU kernel vs an independent CPU reference
-./build/sam_pipeline_test  # the whole library over a synthetic checkpoint
+./build_vulkan/nn_ops_test        # every GPU kernel vs an independent CPU reference
+./build_vulkan/sam_pipeline_test  # the whole library over a synthetic checkpoint
 ```
 
 `sam_pipeline_test` writes real, format-correct checkpoints at a shrunken

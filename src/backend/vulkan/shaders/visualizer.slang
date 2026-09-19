@@ -66,8 +66,7 @@ bool vis_ray_dyn(float2 uv, int camera_model, int tier,
     switch (tier) {
     case 0:  _vis_ray_call(DistNone); break;
     case 1:  _vis_ray_call(DistOpenCV); break;
-    case 2:  _vis_ray_call(DistThinPrism); break;
-    default: _vis_ray_call(DistRational); break;
+    default: _vis_ray_call(DistThinPrism); break;
     }
     return ok;
 }

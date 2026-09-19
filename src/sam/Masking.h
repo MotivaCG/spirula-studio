@@ -44,7 +44,11 @@ struct SeedPrompt {
 };
 
 struct MaskOptions {
-    std::string model, device;
+    std::string model;
+    // The device request, in the spelling core/VulkanDeviceSelection.h parses:
+    // "auto", an ordinal, a name substring, or "uuid:<32 hex>". Empty leaves
+    // SS_VK_DEVICE and then Auto in charge; a bad value fails the run.
+    std::string device;
     std::string text, neg_text;
     // Clicks seeding tracked instances. The only way to prompt a SAM 2
     // checkpoint, and usable alongside text on a SAM 3 one.
@@ -52,6 +56,10 @@ struct MaskOptions {
 
     bool  video = true;           // track across frames vs. segment each alone
     bool  keep_prompted = false;  // white = the prompted objects
+    // Move every detection's boundary by this share of its own bounding-box
+    // mean side before the union. SIGNED: positive grows the region, covering
+    // the halo a tight outline leaves; negative trims inside the outline.
+    float dilate_ratio = 0.05f;
     float threshold = 0.5f, nms = 0.1f;
     int   detect_every = 1;
     int   memory_frames = 0;
@@ -69,6 +77,22 @@ std::vector<std::string> split_phrases(const std::string& s);
 
 // Longest-side cap. Returns `src` unchanged when it already fits.
 nn::Image downscale_to_fit(const nn::Image& src, int max_size);
+
+// Euclidean pixels a detection of `box` moves by at `dilate_ratio`, signed as
+// the ratio is. A fraction of the object's own size, so it is the same fraction
+// whatever resolution the box is measured in, and a distant object moves less.
+int dilate_radius_px(const Box& box, float dilate_ratio);
+
+// ORs one detection's mask into `hit` (1 = covered), its boundary first moved
+// by `radius` Euclidean pixels: outward for a positive one, stopping at the
+// frame border rather than wrapping, and inward for a negative one.
+void accumulate_dilated(const Mask& mask, int radius, std::vector<uint8_t>& hit);
+
+// The union of `positive`, each detection moved by `dilate_ratio`, minus every
+// pixel `negative` covers. The order is load-bearing and is why this is one
+// function: a negative phrase is an explicit keep and must beat the margin.
+void compose_hit(const Result& positive, const Result& negative,
+                 float dilate_ratio, std::vector<uint8_t>& hit);
 
 class Masker {
 public:

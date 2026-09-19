@@ -1,24 +1,25 @@
 // mesh_main.cpp -- standalone mesh-extraction CLI.
 //
 //     spirula-mesh <checkpoint> [--data <dir>] [--format ply,glb]
-//                 [--color none|vertex|texture] [--flag value ...]
+//                 [--color none,vertex,texture] [--flag value ...]
 //
 // <checkpoint> is a run directory (containing config.json and a step-*.ckpt/
 // folder), a *.ckpt directory, or a splat.ply file directly. The dataset
 // (for camera-based occupancy + colors) defaults to config.json's `data`;
 // pass --no-data to mesh from Gaussian densities only.
 //
-// It loads the raw
-// (un-activated) Gaussians from the checkpoint PLY, parses the dataset with
-// the same C++ parsers the CLI trainer uses, and calls meshing::generate_mesh
-// (Meshing.h) for the heavy lifting.
+// It loads the un-activated Gaussians from the checkpoint PLY, parses the
+// dataset with the same C++ parsers the CLI trainer uses, and calls
+// meshing::generate_mesh (Meshing.h) for the heavy lifting.
 
 #include "app/Tools.h"
 
+#include "backend/api/BackendRuntime.h"
 #include "checkpoint/SplatPly.h"
 #include "mesh/Meshing.h"
 #include "core/Camera.h"
 #include "data/DatasetParser.h"
+#include "data/ImageProbe.h"
 #include "data/Json.h"
 #include "i18n/catalog/Cli.h"
 #include "mesh/MeshLog.h"
@@ -53,9 +54,11 @@ struct MeshCameras {
     std::vector<float>   positions;    // [C*3] camera centers, splat frame
     std::vector<float>   viewmats;     // [C*16] world->cam, engine convention
     std::vector<float>   intrins;      // [C*4]
-    std::vector<float>   dist_coeffs;  // [C*10]
+    std::vector<float>   dist_coeffs;  // [C*8]
     std::vector<int32_t> widths, heights;
-    std::string          model;
+    std::vector<int32_t> models;       // [C] CameraModelType
+    std::vector<int32_t> distortions;  // [C] CameraDistortionType
+    std::string          model;        // the distinct models, for the log
     int64_t num() const { return (int64_t)widths.size(); }
 };
 
@@ -75,11 +78,12 @@ MeshCameras load_cameras(const JsonValue& run_cfg, const std::string& data_dir,
     pcfg.metashape_ply = dp_str("metashape_ply", "");
     pcfg.metashape_psx = dp_str("metashape_psx", "");
     pcfg.downscale_rounding_mode = dp_str("downscale_rounding_mode", "floor");
+    pcfg.center_mode = dp_str("scene_center", "none");
+    pcfg.probe_image_size = probe_image_size;
     {
-        const JsonValue* v = run_cfg.find("rescale_camera_to_fit");
-        // bool auto-detect is unported; a number divides intrinsics
+        const JsonValue* v = run_cfg.find("train_resolution_divisor");
         if (v && v->type == JsonValue::Type::Number)
-            pcfg.rescale_camera_to_fit = (float)v->as_double(0.0);
+            pcfg.train_resolution_divisor = (float)v->as_double(0.0);
         const JsonValue* fmt = run_cfg.find("data_format");
         if (data_format.empty() && fmt && !fmt->is_null()) data_format = fmt->as_string();
     }
@@ -112,20 +116,16 @@ MeshCameras load_cameras(const JsonValue& run_cfg, const std::string& data_dir,
     out.viewmats = std::move(post.viewmats);
     out.intrins = std::move(post.intrins);
     out.dist_coeffs = std::move(post.dist_coeffs);
-    out.widths = ds.widths;
-    out.heights = ds.heights;
+    out.widths = std::move(post.post_widths);
+    out.heights = std::move(post.post_heights);
+    out.models = std::move(post.post_models);
+    out.distortions = std::move(post.post_distortions);
     out.positions.resize(C * 3);
     for (int64_t i = 0; i < C; ++i)
         for (int r = 0; r < 3; ++r)
             out.positions[i*3 + r] = ds.c2w[i*12 + r*4 + 3];
 
-    int32_t m0 = ds.camera_models.empty() ? 0 : ds.camera_models[0];
-    for (int32_t m : ds.camera_models)
-        if (m != m0) {
-            mlog::warn(mlog::Stage::Loading, cmsg::mesh_mixed_camera_models);
-            break;
-        }
-    out.model = camera_model_to_string((CameraModelType)m0);
+    out.model = meshing::camera_models_summary(out.models.data(), (int)C);
     return out;
 }
 
@@ -139,8 +139,10 @@ struct Options {
     bool no_data = false;
     std::string output;                 // base path (extension optional)
     std::string format = "ply";
-    std::string color = "vertex";       // none | vertex | texture
+    std::string color = "vertex";       // a list of none/vertex/texture
     std::string data_format;            // "" = config/auto
+    // Canonical selector passed by GUI children; empty uses shared precedence.
+    std::string device;
     std::optional<float> iso;           // default depends on cameras
     meshing::MeshingConfig m;           // remaining knobs live here
 };
@@ -182,13 +184,18 @@ void print_help(const char* argv0) {
     Options d;
     std::printf("%s\n\n", format(mmsg::help_usage, {argv0}).c_str());
     std::printf("%s\n\n", mmsg::help_intro.get());
-
     help_row("--data <dir>", mmsg::help_data);
     help_row("--no-data", mmsg::help_no_data);
     help_row("--data-format <fmt>", mmsg::help_data_format);
     help_row("--output <path>", mmsg::help_output);
+
+#ifdef SS_BACKEND_VULKAN
+    help_row("--device <sel>", mmsg::help_device);
+#else
+    help_row("--device <index>", mmsg::help_device_cuda);
+#endif
     help_row("--format <list>", mmsg::help_format, {d.format});
-    help_row("--color <mode>", mmsg::help_color, {d.color});
+    help_row("--color <list>", mmsg::help_color, {d.color});
     help_row("--texture-size <n>", mmsg::help_texture_size, {d.m.texture_size});
     help_row("--tex-gutter-px <n>", mmsg::help_tex_gutter, {d.m.tex_gutter_px});
     help_row("--chart-angle-deg <a>", mmsg::help_chart_angle,
@@ -256,6 +263,7 @@ Options parse_args(int argc, char** argv) {
         if      (key == "data")            o.data = next();
         else if (key == "no_data")         o.no_data = true;
         else if (key == "data_format")     o.data_format = next();
+        else if (key == "device")          o.device = next();
         else if (key == "output")          o.output = next();
         else if (key == "format")          o.format = next();
         else if (key == "color")           o.color = next();
@@ -293,24 +301,38 @@ int spirula_mesh_main(int argc, char** argv) {
     try {
         Options o = parse_args(argc, argv);
 
-        // ---- resolve color mode + formats, and validate BEFORE any work ----
-        meshing::MeshColorMode mode;
-        if      (o.color == "none")    mode = meshing::MeshColorMode::None;
-        else if (o.color == "vertex")  mode = meshing::MeshColorMode::Vertex;
-        else if (o.color == "texture") mode = meshing::MeshColorMode::Texture;
-        else throw std::runtime_error("--color: expected none/vertex/texture, got '"
-                                      + o.color + "'");
-        o.m.color_mode = mode;
+        // The identity API is Vulkan-only; a CUDA child receives its ordinal.
+#ifdef SS_BACKEND_VULKAN
+        const std::string resolved =
+            o.device.empty() ? backend::device_current_selector() : o.device;
+        if (!resolved.empty() &&
+            !backend::device_select_identity(resolved.c_str())) {
+            std::string detail = backend::device_selection_error();
+            if (detail.empty()) detail = "device selection failed";
+            throw std::runtime_error("--device " + resolved + ": " + detail);
+        }
+#else
+        if (!o.device.empty()) {
+            const int index = parse_i("device", o.device.c_str());
+            if (!backend::device_select(index))
+                throw std::runtime_error(
+                    "--device " + o.device +
+                    ": no usable CUDA device matches (see --help)");
+        }
+#endif
+
+        // ---- resolve color modes + formats, and validate BEFORE any work ----
+        std::vector<meshing::MeshColorMode> modes =
+            meshing::parse_mesh_colors(o.color);
+        if (modes.empty())
+            throw std::runtime_error("--color: no color mode given");
         std::vector<meshing::MeshFormatSpec> specs =
             meshing::parse_mesh_formats(o.format);
         if (specs.empty())
             throw std::runtime_error("--format: no valid format given");
+        o.m.colors = modes;
         o.m.formats.clear();
-        for (const auto& spec : specs) {
-            std::string err = meshing::check_export_support(spec, mode);
-            if (!err.empty()) throw std::runtime_error(err);
-            o.m.formats.push_back(spec.token());
-        }
+        for (const auto& spec : specs) o.m.formats.push_back(spec.token());
 
         // ---- checkpoint ----
         auto [splat_ply_s, run_dir_s] = spirula::find_splat_ply(o.checkpoint);
@@ -323,12 +345,19 @@ int spirula_mesh_main(int argc, char** argv) {
         // is usually the only copy of itself. Checked before a single byte is
         // read, so the refusal costs nothing and can never come after the
         // pipeline has already earned the right to destroy it.
-        std::string out_base = o.output;
+        std::string out_base = meshing::mesh_output_strip_ext(o.output);
         if (out_base.empty())
             out_base = (splat_ply.parent_path() / "mesh").string();
         {
+            std::vector<std::string> dropped;
+            const std::vector<meshing::MeshOutputRequest> outputs =
+                meshing::plan_mesh_outputs(specs, modes, out_base, &dropped);
+            if (outputs.empty())
+                throw std::runtime_error(dropped.empty()
+                                             ? std::string("nothing to write")
+                                             : dropped.front());
             std::string err = meshing::check_mesh_outputs_safe(
-                specs, mode, out_base, {splat_ply.string()});
+                outputs, {splat_ply.string()});
             if (!err.empty()) throw std::runtime_error(err);
         }
         // Meshing reads geometry and DC colour only; skipping f_rest
@@ -378,7 +407,8 @@ int spirula_mesh_main(int argc, char** argv) {
             cp.dist_coeffs = cams.dist_coeffs.data();
             cp.widths = cams.widths.data();
             cp.heights = cams.heights.data();
-            cp.camera_model = cams.model;
+            cp.camera_models = cams.models.data();
+            cp.distortions = cams.distortions.data();
         }
         bool ok = meshing::generate_mesh(
             splats.means.data(), splats.quats.data(), splats.scales.data(),

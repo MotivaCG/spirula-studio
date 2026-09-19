@@ -163,13 +163,13 @@ Variant axes follow the CUDA instantiation structure
 
 ### The lens-distortion tier (`kDistortion`)
 
-`CameraDistortionType` (0 None / 1 OpenCV / 2 ThinPrism / 3 Rational, see
+`CameraDistortionType` (0 None / 1 OpenCV / 2 ThinPrism, see
 `core/CameraModel.h`) is a Slang generic `D : ICameraDistortion` in
 `shaders/projection_utils.slang`. `backend/vulkan/shaders/dist_spec.slang`
 carries the glue: `load_dist_coeffs<D>` (a camera's prefix of the 8-float
 storage row), `pixel_ray<D>`, and the `SS_DISPATCH_DIST` /
 `SS_DISPATCH_CAM_DIST` macros that fold the constant — the latter covering
-only the eleven compiled (model, tier) pairs, with the rest falling through
+only the ten compiled (model, tier) pairs, with the rest falling through
 to the nearest compiled tier. Launchers reject an uncompiled pair up front
 (`vkk::cam_dist_spec`), so the fallthrough is never reached.
 
@@ -257,7 +257,7 @@ in registers, and measure on Apple either way.
 MoltenVK translates our SPIR-V to Metal Shading Language through
 SPIRV-Cross, and two of its habits turn correct SPIR-V into wrong or
 uncompilable MSL. Both are invisible on every other driver, and both were
-found the same way: `spirv-cross --msl --stage comp build/spirv/<blob>.spv`
+found the same way: `spirv-cross --msl --stage comp build_vulkan/spirv/<blob>.spv`
 prints exactly what the Metal compiler will see, so read that before
 guessing.
 
@@ -371,9 +371,11 @@ rasterizer for culling). Params exceeding the 128-byte push floor use the
 params-ring pattern (`vk::params_alloc` + 8-byte address push); the packed
 mask kernel fits and is pushed directly. Float `atomicMax` on radii is
 `InterlockedMax` on the u32 bit pattern (exact for non-negative floats).
-Packed projection substitutes an int32 0/1 mask (bool would need 8-bit
-stores) scanned by `backend::inclusive_sum<int32>` with a 4-byte nnz
-readback. Parity: `backend/tests/projection_parity.cpp` builds under BOTH
+Packed projection stores visibility as a bitmask (`shaders/packed_mask.h`):
+one bit per (camera, gaussian) pair built with `InterlockedOr` on
+groupshared words, plus one `countbits` per workgroup; only those workgroup
+counts go through `backend::inclusive_sum<int32>`, and the compaction pass
+rebuilds an element's slot from the scanned count and the bits below it. Parity: `backend/tests/projection_parity.cpp` builds under BOTH
 backends (CUDA `-DSS_BUILD_BACKEND_TESTS=ON` dumps, Vulkan compares);
 30 fused + 6 packed fp32 configs plus 12 fused + 2 packed value-quant
 configs, ~7.2M floats, zero tolerance violations on all three local devices
@@ -402,12 +404,11 @@ Vulkan.
   constant; camera model is a runtime int (as in CUDA). The backward throws
   until the training phase (`TODO` in the file).
 - `kernels/IntersectTile.cpp` + `backend/vulkan/shaders/intersect_tile.slang`:
-  `do_intersect_tile_generic` = count -> `backend::inclusive_sum<int64>` ->
-  8-byte n_isects readback -> key write -> `backend::sort_pairs<int64,int32>`
+  `do_intersect_tile_generic` = count -> `backend::inclusive_sum<int32>` ->
+  4-byte n_isects readback -> key write -> `backend::sort_pairs<int64,int32>`
   (begin 0, end 32 + tile bits, exactly the CUB call) -> offset kernel.
   Ellipse-vs-AABB mode is a runtime null-check on proj_conic (the CUDA
-  template bool only folds that check). `do_intersect_tile_post` has no
-  callers and is not ported.
+  template bool only folds that check).
 - `kernels/RasterizeFwd.cpp` + `backend/vulkan/shaders/rasterize_fwd.slang`: closely
   follows RasterizationEval3DFwd_kernel.cuh (the CUDA source of both the 2D
   and eval3D kernels). Two entries (2D shared by 3DGS/MIP; 3DGUT eval3d
@@ -434,6 +435,7 @@ the engine level.
 - `kernels/PixelWiseRender.cpp` + `backend/vulkan/shaders/pixel_wise_render.slang`:
   the render-path PixelWise subset — `blend_background_forward`,
   `blend_background_noise_forward` (hash_uint3 ported bit-exact),
+  `blend_background_color_forward`,
   `rgb_to_srgb_forward`, `depth_to_normal_forward{,_tv}` (16x16 shared-mem
   apron tile as a flat 256-thread workgroup per the X-dim subgroup rule).
 - `kernels/Visualizer.cpp` + `backend/vulkan/shaders/visualizer.slang`: full
@@ -458,6 +460,16 @@ the engine level.
   Intel spins forever -> VK_ERROR_DEVICE_LOST. The port uses the bounded
   ceil-halving form (identical probe sequence and converged split). Grep any
   future kernel port for loops whose exit depends on overflow.
+- **Nested-dynamic-loop rule (NVIDIA shader-compiler SIGILL)**: a
+  variable-trip-count loop under an `if` under another variable-trip-count
+  loop makes `libnvidia-gpucomp` (580.105.08) execute a `ud2` inside
+  `vkCreateComputePipelines` -- the process dies with SIGILL and no
+  `VkResult`, so nothing host-side can catch it. It cost
+  projection_qgrad.slang's SH writeback its `for (k = fb; k <= b; ++k)` byte
+  mask, now the closed-form `(~0u >> 8*(3-b)) & (~0u << 8*fb)`. Either
+  flattening (closed form, or a constant-trip loop with a predicated body)
+  clears it; the atomics around it are irrelevant. A 22-line shader with just
+  that loop nest reproduces it.
 - `EngineBackground.cu` became portable `EngineBackground.cpp` (its one raw
   kernel replaced by the existing `float_add_into` launcher, cudaMemcpy* ->
   backend::). It now compiles into BOTH backends unchanged.
@@ -503,7 +515,7 @@ the engine level.
   randomness — parity compares only its deterministic count channel.
 - **Pixel-wise training + background-SH backward (phase 5, second slice)**:
   `kernels/PixelWiseTrain.cpp` + `pixel_wise_train.slang` implement the
-  blend/noise/srgb backwards, overexposure_grad_add, depth_to_normal_backward
+  blend/noise/color/srgb backwards, overexposure_grad_add, depth_to_normal_backward
   (16x16 tile apron + neighbor scatter), linear_depth_to_ray_depth_inplace,
   and color_shift_reg_step (ColorShiftReg.cu; shared-mem float atomics ->
   groupshared serial reduce + one portable atomic add per channel/block).
@@ -816,7 +828,7 @@ the engine level.
 - **Real-dataset training via CLI/GUI (phase 5 wrap-up)**: the
   `SS_BACKEND=vulkan` CMake branch now builds `spirula train` (always —
   it is this build's primary artifact, as in the CUDA no-torch build) and
-  the GUI (with `SS_BUILD_GUI=ON`), linking `csrc_portable` +
+  the GUI (unless `SS_BUILD_GUI=OFF`), linking `csrc_portable` +
   `ss_backend_vulkan` through the shared app-target section
   (`SS_APP_LIBS` selects the per-backend libraries). `spirula mesh` builds
   here too since the phase-6 meshing port. The app layer
@@ -861,17 +873,20 @@ the engine level.
   quantized paths; kernels that early-return on a flat-index guard before
   any barrier need nothing.
 - **Device enumeration / selection** (`backend::device_count / device_info /
-  device_select / device_current` in BackendRuntime.h): enumeration uses a
-  throwaway VkInstance (never initializes the Context singleton), so apps
-  can list devices before committing. Selection precedence inside
-  `Context::init`: `device_select()` > `SS_VK_DEVICE` env (index or
-  name substring) > auto-score (discrete > integrated, VRAM tie-break).
-  One device per process: after the context exists, `device_select` only
-  succeeds for the device already in use. The CUDA backend implements the
-  same four calls inline over cudart. `spirula train` prints the device
-  table at startup (`*` marks the device in use, VkSplat-style) and takes
-  `--device <index|name substring>`; the GUI has a Device combo in
-  the train panel that locks once training starts.
+  device_select / device_select_identity / device_selection_error /
+  device_current` in `BackendRuntime.h`): enumeration uses a throwaway
+  VkInstance (never initializes the Context singleton), so apps can list
+  devices before committing. Native selectors accept `auto`, a raw ordinal, a
+  unique case-insensitive name substring, or `uuid:<32 hex digits>`. Explicit
+  selection wins over `SS_VK_DEVICE`, then shared Auto ranking resolves to a
+  canonical UUID plus the diagnostic name; failed selection details are
+  available through `device_selection_error()`.
+  One device per process: after the context exists, selection only succeeds
+  for the device already in use. The CUDA backend is separate and ordinal-only;
+  `device_bind()` reapplies its frozen ordinal on each CUDA worker thread.
+  `spirula train` uses `--device <index|name|auto|uuid:hex>` for Vulkan and
+  `--device <index>` for CUDA. The GUI's native picker is shared by built-in
+  Vulkan workflows; CUDA training has its own ordinal picker.
 - **Training stubs**: `kernels/TrainingStubs.gen.cpp` (generated by
   `tools/codegen/generate_vulkan_stubs.py` from a link probe of
   csrc_portable vs the backend lib) provides throwing

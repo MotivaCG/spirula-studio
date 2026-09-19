@@ -38,7 +38,7 @@ endfunction()
 # friendlier than silently ignoring one.
 # ---------------------------------------------------------------------------
 set(SS_LEGACY_OPTIONS
-    BUILD_CLI BUILD_GUI BUILD_SFM BUILD_SAM BUILD_BACKEND_TESTS
+    BUILD_GUI BUILD_SFM BUILD_SAM BUILD_BACKEND_TESTS
     BACKEND SEPARATE_TOOLS DEBUG_SYMBOLS ENABLE_PATENTED
     SLANGC SFM_REALS SFM_LOSSES)
 foreach(opt ${SS_LEGACY_OPTIONS})
@@ -69,18 +69,46 @@ add_compile_definitions(SS_SOURCE_ROOT="${SS_ROOT}")
 
 # The version the apps report with --version. Declared here and nowhere else;
 # it used to be read out of pyproject.toml, back when there was a package.
-set(SS_VERSION "2026.8.23")
+set(SS_VERSION "2026.9.13")
+
+# The commit goes in it too, so a crash report names an exact tree without
+# anyone having to bump a string by hand. Read at configure time, which is
+# every dev build: build_develop.bash/.bat re-run `cmake -B build`.
+find_package(Git QUIET)
+set(SS_COMMIT "")
+if(GIT_FOUND)
+    execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --short=7 HEAD
+                    WORKING_DIRECTORY ${SS_ROOT}
+                    OUTPUT_VARIABLE SS_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET)
+    if(SS_COMMIT)
+        execute_process(COMMAND ${GIT_EXECUTABLE} diff --quiet HEAD
+                        WORKING_DIRECTORY ${SS_ROOT}
+                        RESULT_VARIABLE SS_GIT_CLEAN ERROR_QUIET)
+        if(NOT SS_GIT_CLEAN STREQUAL "0")
+            string(APPEND SS_COMMIT "-dirty")
+        endif()
+        string(APPEND SS_VERSION " (${SS_COMMIT})")
+    endif()
+endif()
 
 # ---------------------------------------------------------------------------
 # Options
 #
-# Everything the build has goes into ONE executable, `spirula`, which dispatches
-# on its first argument (`spirula sfm auto ...`); see src/app/Tools.h. These two
-# options decide what is in it: the command-line tools, the window, or both.
+# One executable, `spirula`, dispatching on argv[1] (src/app/Tools.h). The
+# command-line tools are always in it; SS_BUILD_GUI adds the window.
 # ---------------------------------------------------------------------------
-option(SS_BUILD_CLI "Build the command-line tools into spirula" OFF)
-option(SS_BUILD_GUI "Build the graphical application into spirula (fetches GLFW + Dear ImGui)" OFF)
+option(SS_BUILD_GUI "Build the graphical application into spirula (fetches GLFW + Dear ImGui)" ON)
 option(SS_BUILD_BACKEND_TESTS "Build backend parity test tools" OFF)
+
+# SS_BUILD_CLI is gone. Warn rather than let CMake's unused-variable notice
+# carry it: a script passing OFF asked for something it is silently not getting.
+if(DEFINED SS_BUILD_CLI OR DEFINED SSPLAT_BUILD_CLI)
+    message(WARNING "SS_BUILD_CLI no longer exists; the command-line tools are "
+        "always built. Drop the flag.")
+    unset(SS_BUILD_CLI CACHE)
+    unset(SSPLAT_BUILD_CLI CACHE)
+endif()
 
 # Also build spirula-sfm and spirula-sam as standalone executables. Same code
 # and the same dispatcher (src/app/Main.cpp reads argv[0]), but built alone
@@ -106,12 +134,8 @@ option(SS_CUDA_EMBED_PTX "Embed PTX in the CUDA fatbin for forward-compatible JI
 # ---------------------------------------------------------------------------
 # Compute backend selection
 #
-# cuda (default): the full build -- CUDA kernels,
-# and the app targets.
-# vulkan: the portable engine layer (Engine*.cpp + host support) against the
-# Vulkan compute runtime (src/backend/vulkan/, see its README.md), built
-# WITHOUT the CUDA toolkit. Produces the backend tests and `spirula` -- with
-# the command-line tools always, and the GUI with SS_BUILD_GUI=ON.
+# cuda (default): CUDA kernels + the app targets. vulkan: the portable engine
+# layer on the Vulkan runtime (src/backend/vulkan/README.md), no CUDA toolkit.
 # ---------------------------------------------------------------------------
 set(SS_BACKEND "cuda" CACHE STRING "Compute backend: cuda | vulkan")
 set_property(CACHE SS_BACKEND PROPERTY STRINGS cuda vulkan)
@@ -284,8 +308,29 @@ else()
     set(SPLAT_C_FLAGS "-O3")
 endif()
 
+# Host line info. The option reached only the CUDA and SPIR-V compilers, so a
+# Vulkan build got none and crash reports stayed module+RVA (CrashLog.h). /Z7
+# rather than /Zi: one shared vc140.pdb serializes a parallel Ninja build.
+if(SS_DEBUG_SYMBOLS)
+    if(MSVC)
+        list(APPEND SPLAT_CXX_FLAGS "/Z7")
+        list(APPEND SPLAT_C_FLAGS "/Z7")
+        add_link_options("/DEBUG" "/OPT:REF" "/OPT:ICF")
+    else()
+        list(APPEND SPLAT_CXX_FLAGS "-g")
+        list(APPEND SPLAT_C_FLAGS "-g")
+    endif()
+endif()
+
 if(WIN32)
     add_compile_definitions(_USE_MATH_DEFINES NOMINMAX _CRT_SECURE_NO_WARNINGS)
+endif()
+
+# MSVC 14.40 zeroes std::mutex storage in a constexpr constructor instead of
+# calling _Mtx_init_in_situ; an MSVCP140.dll older than that still dispatches
+# through a vptr there, and null-derefs on the first lock(). Global on purpose.
+if(MSVC)
+    add_compile_definitions(_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
 endif()
 
 # The same trim for the __FILE__ this project does not write: assert() in

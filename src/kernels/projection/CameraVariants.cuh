@@ -12,7 +12,6 @@
     F(PINHOLE,         None)          \
     F(PINHOLE,         OpenCV)        \
     F(PINHOLE,         ThinPrism)     \
-    F(PINHOLE,         Rational)      \
     F(FISHEYE,         None)          \
     F(FISHEYE,         OpenCV)        \
     F(FISHEYE,         ThinPrism)     \

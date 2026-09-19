@@ -22,17 +22,14 @@ set(SS_SFM_SHADERS ${SS_SFM_SRC}/shaders)
 # ---------------------------------------------------------------------------
 # Shader variant matrix
 # ---------------------------------------------------------------------------
-# The BA kernels are compiled as whole modules (all entry points in one blob,
-# hence -fvk-use-entrypoint-name), once per (Real, Loss) configuration. SIFT and
-# matching are single float-only blobs with no matrix, so a trimmed
-# -DSS_SFM_REALS=df build still includes them.
-#
-# Trim the matrix while iterating:
-#   cmake -DSS_SFM_REALS=df -DSS_SFM_LOSSES=trivial
-# Both are cached, so a trimmed value sticks until you pass the full list again
-# or wipe the build tree. The CLI errors out at runtime with "variant not built
-# into this binary" for a combination that was trimmed away.
-set(SS_SFM_REALS "float;double;df" CACHE STRING
+# One BA blob per cached (Real, Loss) pair (src/sfm/README.md). slangc aborts
+# on every ba_df_* variant under Windows (docs/build.md), so no df default there.
+if(WIN32)
+    set(_sfm_reals_default "float;double")
+else()
+    set(_sfm_reals_default "float;double;df")
+endif()
+set(SS_SFM_REALS "${_sfm_reals_default}" CACHE STRING
     "SfM bundle-adjustment scalar configurations to compile")
 set(SS_SFM_LOSSES "trivial;huber;cauchy" CACHE STRING
     "SfM bundle-adjustment robust losses to compile")
@@ -102,12 +99,14 @@ foreach(real ${SS_SFM_REALS})
     endforeach()
 endforeach()
 
-# Single-blob stages: <name> is the blob name the host looks up. The trailing
-# field is the shader directory the dependency glob watches (match_nodot is a
-# second build of the matcher, for devices without integer dot product).
+# Single-blob stages: blob name, source, the directory the dependency glob
+# watches, comma-separated defines. The matcher is built four times: with and
+# without the integer dot product, at 128- and 256-byte descriptors.
 foreach(stage sift:sift/sift.slang:sift:none
               match:match/bruteforce.slang:match:none
-              match_nodot:match/bruteforce.slang:match:-DNO_DOT4)
+              match_nodot:match/bruteforce.slang:match:-DNO_DOT4
+              match_d256:match/bruteforce.slang:match:-DDESC_WORDS=64
+              match_nodot_d256:match/bruteforce.slang:match:-DNO_DOT4,-DDESC_WORDS=64)
     string(REPLACE ":" ";" _parts ${stage})
     list(GET _parts 0 _name)
     list(GET _parts 1 _rel)
@@ -115,6 +114,8 @@ foreach(stage sift:sift/sift.slang:sift:none
     list(GET _parts 3 _def)
     if(_def STREQUAL "none")
         set(_def "")
+    else()
+        string(REPLACE "," ";" _def "${_def}")
     endif()
     file(GLOB _deps CONFIGURE_DEPENDS
         ${SS_SFM_SHADERS}/${_dir}/*.slang ${SS_SFM_SHADERS}/common/*.slang)
@@ -157,6 +158,7 @@ add_library(ss_sfm STATIC
     # pulled in when nothing else provides them, so spirula-gui -- which links
     # the engine, and with it the same TUs -- sees no duplicate definition.
     ${SS_SRC}/external/stb_image_impl.cpp
+    ${SS_SRC}/external/stb_image_write_impl.cpp
     ${SS_SRC}/core/ExrImage.cpp
     ${SS_SRC}/external/miniz.c
 )
@@ -169,10 +171,10 @@ target_link_libraries(ss_sfm PUBLIC ss_vulkan Threads::Threads ss_i18n)
 # a machine that only wants SIFT. PUBLIC because sfm/feature/Extractor.h's
 # factory is compiled into whatever links this.
 if(SS_BUILD_SAM)
-    target_link_libraries(ss_sfm PUBLIC ss_aliked)
-    target_compile_definitions(ss_sfm PUBLIC SS_HAVE_ALIKED=1)
+    target_link_libraries(ss_sfm PUBLIC ss_aliked ss_loma)
+    target_compile_definitions(ss_sfm PUBLIC SS_HAVE_ALIKED=1 SS_HAVE_LOMA=1)
 else()
-    target_compile_definitions(ss_sfm PUBLIC SS_HAVE_ALIKED=0)
+    target_compile_definitions(ss_sfm PUBLIC SS_HAVE_ALIKED=0 SS_HAVE_LOMA=0)
 endif()
 target_compile_options(ss_sfm PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:${SPLAT_CXX_FLAGS}>

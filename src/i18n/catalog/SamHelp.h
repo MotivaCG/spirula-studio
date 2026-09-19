@@ -469,6 +469,54 @@ SS_MSG(trk_keep_prompted,
        "kalan her şey beyazdır; \"insanları maskele\" denince bir yeniden "
        "oluşturma hattının istediği budur"));
 
+SS_MSG(mask_dilate,
+    EN("move every detection's outline by this share of its own size before it "
+       "joins the mask. Positive grows it, covering the rim of colour a tight "
+       "outline leaves behind; negative trims it back inside. 0 turns the "
+       "margin off"),
+    JA("マスクに加える前に、検出ごとに輪郭を自身の大きさのこの割合だけ動かします。"
+       "正なら外側へ広げて、輪郭がきつすぎて残る色の縁を覆います。負なら内側へ"
+       "削ります。0 で余白なし"),
+    ZH_HANS("在并入蒙版之前，把每个检测的轮廓按自身尺寸的这个比例移动。正值向外"
+            "扩张，用来盖住紧贴轮廓留下的一圈残色；负值向内收进去。填 0 关闭"),
+    ZH_HANT("在併入遮罩之前，把每個偵測的輪廓按自身尺寸的這個比例移動。正值向外"
+            "擴張，用來蓋住緊貼輪廓留下的一圈殘色；負值向內收進去。填 0 關閉"),
+    KO("마스크에 합치기 전에 각 검출의 윤곽선을 자기 크기의 이 비율만큼 옮깁니다. "
+       "양수면 바깥으로 넓혀 윤곽선이 너무 딱 맞아 남는 테두리 색을 덮고, 음수면 "
+       "안쪽으로 깎습니다. 0이면 여백 없음"),
+    DE("die Kontur jeder Erkennung vor dem Zusammenfassen um diesen Anteil "
+       "ihrer eigenen Größe verschieben. Positiv lässt sie wachsen und deckt "
+       "den Farbsaum ab, den eine zu enge Kontur zurücklässt; negativ trägt sie "
+       "nach innen ab. 0 schaltet den Rand ab"),
+    FR("déplacer le contour de chaque détection de cette fraction de sa propre "
+       "taille avant de la fondre dans le masque. Positif l'élargit et couvre "
+       "le liseré que laisse un contour trop serré ; négatif le rentre. 0 "
+       "supprime la marge"),
+    ES("mover el contorno de cada detección en esta fracción de su propio "
+       "tamaño antes de unirla a la máscara. En positivo lo agranda y tapa el "
+       "borde que deja un contorno demasiado ceñido; en negativo lo mete hacia "
+       "dentro. 0 quita el margen"),
+    PT("mover o contorno de cada detecção nesta fração do seu próprio tamanho "
+       "antes de a juntar à máscara. Positivo aumenta-o e tapa a orla que um "
+       "contorno demasiado justo deixa; negativo puxa-o para dentro. 0 desliga "
+       "a margem"),
+    IT("spostare il contorno di ogni rilevamento di questa frazione della "
+       "propria dimensione prima di unirlo alla maschera. Positivo lo ingrandisce "
+       "e copre il bordo che un contorno troppo aderente lascia; negativo lo "
+       "ritira all'interno. 0 toglie il margine"),
+    NL("de omtrek van elke detectie met dit deel van haar eigen grootte "
+       "verplaatsen voordat ze in het masker opgaat. Positief laat hem groeien "
+       "en dekt de kleurrand die een te strakke omtrek achterlaat; negatief "
+       "trekt hem naar binnen. 0 zet de marge uit"),
+    RU("сместить контур каждого обнаружения на эту долю его собственного "
+       "размера перед объединением в маску. Положительное расширяет его и "
+       "закрывает кайму, которую оставляет слишком плотный контур; "
+       "отрицательное втягивает внутрь. 0 отключает поле"),
+    TR("her algılamanın dış çizgisini maskeye katılmadan önce kendi boyutunun "
+       "bu oranı kadar kaydırır. Artı değer büyütür ve fazla dar bir sınırın "
+       "bıraktığı renk kenarını kapatır; eksi değer içeri çeker. 0 payı "
+       "kapatır"));
+
 SS_MSG(trk_overlay,
     EN("write a colour overlay instead"),
     JA("代わりにカラーのオーバーレイを書き出します"),
@@ -615,6 +663,109 @@ SS_MSG(xh_frame_selection,
     RU("Выбор кадров"),
     TR("Kare seçimi"));
 
+SS_MSG(xh_360_section,
+    EN("360 cameras:"),
+    JA("360 度カメラ:"),
+    ZH_HANS("360 相机："),
+    ZH_HANT("360 相機："),
+    KO("360 카메라:"),
+    DE("360-Kameras:"),
+    FR("Caméras 360 :"),
+    ES("Cámaras 360:"),
+    PT("Câmeras 360:"),
+    IT("Fotocamere 360:"),
+    NL("360-camera's:"),
+    RU("Камеры 360:"),
+    TR("360 kameralar:"));
+
+SS_MSG(xh_360,
+    EN("what a GoPro MAX .360 becomes: faces (ten seam-free perspective views, "
+       "five per lens), equirect (one 2:1 panorama) or off (the raw tracks). "
+       "Default: faces"),
+    JA("GoPro MAX の .360 の変換先: faces（継ぎ目のない透視ビュー 10 枚、レンズ"
+       "ごとに 5 枚）、equirect（2:1 のパノラマ 1 枚）、off（生のトラック）。既定は "
+       "faces"),
+    ZH_HANS("GoPro MAX .360 的展开方式：faces（十个无拼缝透视视角，每镜头五个）、"
+            "equirect（一张 2:1 全景）或 off（原始轨道）。默认 faces"),
+    ZH_HANT("GoPro MAX .360 的展開方式：faces（十個無拼縫透視視角，每鏡頭五個）、"
+            "equirect（一張 2:1 全景）或 off（原始軌道）。預設 faces"),
+    KO("GoPro MAX .360을 무엇으로 바꿀지: faces(이음매 없는 원근 뷰 10장, 렌즈당 "
+       "5장), equirect(2:1 파노라마 1장), off(원본 트랙). 기본값 faces"),
+    DE("wozu eine GoPro-MAX-.360 wird: faces (zehn nahtfreie perspektivische "
+       "Ansichten, fünf je Objektiv), equirect (ein 2:1-Panorama) oder off (die "
+       "rohen Spuren). Vorgabe: faces"),
+    FR("ce que devient un .360 GoPro MAX : faces (dix vues en perspective sans "
+       "couture, cinq par objectif), equirect (un panorama 2:1) ou off (les "
+       "pistes brutes). Défaut : faces"),
+    ES("en qué se convierte un .360 de GoPro MAX: faces (diez vistas en "
+       "perspectiva sin costuras, cinco por objetivo), equirect (un panorama "
+       "2:1) u off (las pistas en bruto). Por defecto: faces"),
+    PT("no que um .360 da GoPro MAX se torna: faces (dez vistas em perspectiva "
+       "sem emendas, cinco por lente), equirect (um panorama 2:1) ou off (as "
+       "faixas brutas). Padrão: faces"),
+    IT("in che cosa diventa un .360 GoPro MAX: faces (dieci viste prospettiche "
+       "senza cuciture, cinque per obiettivo), equirect (un panorama 2:1) "
+       "oppure off (le tracce grezze). Predefinito: faces"),
+    NL("wat een GoPro MAX-.360 wordt: faces (tien naadloze perspectiefaanzichten, "
+       "vijf per lens), equirect (één 2:1-panorama) of off (de ruwe sporen). "
+       "Standaard: faces"),
+    RU("во что превращается .360 с GoPro MAX: faces (десять перспективных видов "
+       "без швов, по пять на объектив), equirect (одна панорама 2:1) или off "
+       "(исходные дорожки). По умолчанию: faces"),
+    TR("GoPro MAX .360 dosyasının neye dönüşeceği: faces (dikişsiz on perspektif "
+       "görünüm, objektif başına beş), equirect (tek 2:1 panorama) veya off (ham "
+       "izler). Varsayılan: faces"));
+
+SS_MSG(xh_360_size,
+    EN("pixels a side for each face, or the width of the equirectangular "
+       "image; default is from the source"),
+    JA("各ビューの一辺のピクセル数、または正距円筒画像の幅。既定は入力から決めます"),
+    ZH_HANS("每个视角的边长像素，或等距柱状图像的宽度；默认由输入决定"),
+    ZH_HANT("每個視角的邊長像素，或等距柱狀影像的寬度；預設由輸入決定"),
+    KO("각 뷰의 한 변 픽셀 수 또는 등장방형 이미지의 너비. 기본값은 입력에서 정합니다"),
+    DE("Pixel je Kante einer Ansicht oder die Breite des äquirektangulären "
+       "Bildes; Vorgabe richtet sich nach der Quelle"),
+    FR("pixels de côté pour chaque vue, ou largeur de l'image équirectangulaire ; "
+       "par défaut d'après la source"),
+    ES("píxeles de lado de cada vista, o el ancho de la imagen equirectangular; "
+       "por defecto según la fuente"),
+    PT("pixels de lado de cada vista, ou a largura da imagem equirretangular; "
+       "por padrão conforme a fonte"),
+    IT("pixel di lato per ogni vista, o la larghezza dell'immagine "
+       "equirettangolare; per impostazione predefinita dalla sorgente"),
+    NL("pixels per zijde van elk aanzicht, of de breedte van het "
+       "equirectangulaire beeld; standaard uit de bron"),
+    RU("пикселей на сторону каждого вида или ширина равнопромежуточного "
+       "изображения; по умолчанию — из источника"),
+    TR("her görünümün kenar piksel sayısı ya da eş dikdörtgen görüntünün "
+       "genişliği; varsayılan kaynaktan alınır"));
+
+SS_MSG(xh_360_orient,
+    EN("how the camera was held: yaw,pitch,roll in degrees, applied to the "
+       "whole sphere. 0,0,180 turns an inverted mount the right way up"),
+    JA("カメラの向き: ヨー,ピッチ,ロール（度）。全天球に適用します。逆さ付けは "
+       "0,0,180 で正立します"),
+    ZH_HANS("相机的姿态：偏航,俯仰,翻滚（度），作用于整个球面。倒装时用 0,0,180 摆正"),
+    ZH_HANT("相機的姿態：偏航,俯仰,翻滾（度），作用於整個球面。倒裝時用 0,0,180 擺正"),
+    KO("카메라를 든 방향: 요,피치,롤(도)이며 구 전체에 적용됩니다. 거꾸로 장착했다면 "
+       "0,0,180"),
+    DE("wie die Kamera gehalten wurde: Gier,Nick,Roll in Grad, auf die ganze "
+       "Kugel angewandt. 0,0,180 stellt eine kopfüber montierte Kamera aufrecht"),
+    FR("comment la caméra était tenue : lacet,tangage,roulis en degrés, "
+       "appliqués à toute la sphère. 0,0,180 redresse un montage à l'envers"),
+    ES("cómo se sostuvo la cámara: guiñada,cabeceo,alabeo en grados, aplicados "
+       "a toda la esfera. 0,0,180 endereza un montaje invertido"),
+    PT("como a câmera foi segurada: guinada,arfagem,rolagem em graus, "
+       "aplicados a toda a esfera. 0,0,180 endireita uma montagem invertida"),
+    IT("come era tenuta la fotocamera: imbardata,beccheggio,rollio in gradi, "
+       "applicati a tutta la sfera. 0,0,180 raddrizza un montaggio capovolto"),
+    NL("hoe de camera gehouden werd: gier,stamp,rol in graden, op de hele bol "
+       "toegepast. 0,0,180 zet een omgekeerde montage rechtop"),
+    RU("как держали камеру: рыскание,тангаж,крен в градусах для всей сферы. "
+       "0,0,180 переворачивает перевёрнутое крепление"),
+    TR("kameranın nasıl tutulduğu: derece cinsinden sapma,yunuslama,yalpa; "
+       "tüm küreye uygulanır. 0,0,180 ters takılan kamerayı düzeltir"));
+
 SS_MSG(xh_masking,
     EN("Masking (needs --model)"),
     JA("マスク（--model が必要）"),
@@ -732,6 +883,21 @@ SS_MSG(xh_rotate,
     RU("0, 90, 180 или 270 по часовой стрелке"),
     TR("0, 90, 180 ya da 270, saat yönünde"));
 
+SS_MSG(xh_no_autorotate,
+    EN("do not turn frames by the rotation the capture asks for"),
+    JA("撮影が指定する回転をフレームに適用しない"),
+    ZH_HANS("不按素材要求的角度旋转帧"),
+    ZH_HANT("不按素材要求的角度旋轉影格"),
+    KO("촬영본이 요구하는 회전을 프레임에 적용하지 않음"),
+    DE("Einzelbilder nicht um die von der Aufnahme verlangte Drehung drehen"),
+    FR("ne pas tourner les images selon la rotation demandée par la capture"),
+    ES("no girar los fotogramas según el giro que pide la captura"),
+    PT("não girar os fotogramas pela rotação que a captura pede"),
+    IT("non ruotare i fotogrammi secondo la rotazione chiesta dalla ripresa"),
+    NL("beelden niet draaien volgens de door de opname gevraagde rotatie"),
+    RU("не поворачивать кадры на угол, который требует съёмка"),
+    TR("kareleri çekimin istediği açıyla döndürme"));
+
 SS_MSG(xh_scale,
     EN("resize factor, at most 1"),
     JA("リサイズ倍率。1 以下"),
@@ -746,6 +912,101 @@ SS_MSG(xh_scale,
     NL("schaalfactor, hoogstens 1"),
     RU("коэффициент масштабирования, не больше 1"),
     TR("yeniden boyutlandırma katsayısı, en çok 1"));
+
+SS_MSG(xh_sync,
+    EN("decode a multi-track file in lockstep so every track keeps the same instants "
+       "(one sharpness window over all of them); the frames of one stem are then a rig"),
+    JA("複数トラックのファイルを同期して読み、全トラックで同じ瞬間を残します（シャープさの判定窓は"
+       "全トラック共通）。同じステムのフレームがリグになります"),
+    ZH_HANS("多轨道文件同步解码，让每条轨道保留相同时刻（清晰度窗口对所有轨道共用）；同一文件名的帧"
+            "就构成装置"),
+    ZH_HANT("多軌道檔案同步解碼，讓每條軌道保留相同時刻（清晰度視窗對所有軌道共用）；同一檔名的幀"
+            "就構成裝置"),
+    KO("다중 트랙 파일을 맞물려 디코딩해 모든 트랙이 같은 순간을 남기게 합니다(선명도 창은 전체 "
+       "트랙에 하나). 같은 이름의 프레임이 리그가 됩니다"),
+    DE("eine Mehrspur-Datei im Gleichschritt lesen, sodass jede Spur dieselben Augenblicke "
+       "behält (ein Schärfefenster über alle); die Bilder eines Stamms sind dann ein Rig"),
+    FR("décoder un fichier multipiste en synchronisme pour que chaque piste garde les mêmes "
+       "instants (une fenêtre de netteté sur toutes) ; les images d'un même nom forment "
+       "alors un rig"),
+    ES("decodificar un archivo multipista al unísono para que cada pista conserve los mismos "
+       "instantes (una ventana de nitidez sobre todas); los fotogramas de un mismo nombre "
+       "forman entonces un rig"),
+    PT("decodificar um ficheiro multipista em sincronia para que cada pista guarde os mesmos "
+       "instantes (uma janela de nitidez sobre todas); os quadros de um mesmo nome formam "
+       "então um rig"),
+    IT("decodificare un file multitraccia in sincronia perché ogni traccia tenga gli stessi "
+       "istanti (una finestra di nitidezza su tutte); i fotogrammi di uno stesso nome sono "
+       "allora un rig"),
+    NL("een meersporenbestand gelijkop decoderen zodat elk spoor dezelfde momenten houdt (één "
+       "scherptevenster over alle); de beelden van één naam vormen dan een rig"),
+    RU("декодировать многодорожечный файл синхронно, чтобы каждая дорожка сохраняла те же "
+       "мгновения (одно окно резкости на все); кадры с одним именем тогда образуют риг"),
+    TR("çok izli bir dosyayı adım adım birlikte çözerek her izin aynı anları tutmasını sağla "
+       "(tüm izler için tek keskinlik penceresi); aynı adlı kareler böylece bir rig olur"));
+
+SS_MSG(xh_adaptive,
+    EN("space the kept frames by how much the view changes rather than by time: "
+       "more where the camera moves fast or passes close to something, fewer "
+       "where it turns on the spot. --skip then sets the average"),
+    JA("残すフレームの間隔を時間ではなく見えの変化量で決めます。速く動いたときや近くの物の"
+       "そばを通ったときは多く、その場で向きを変えただけのときは少なくなります。--skip は"
+       "平均値の指定になります"),
+    ZH_HANS("按画面变化量而不是按时间来安排保留的帧：相机移动快或贴近物体时多取，原地转动时"
+            "少取。--skip 此时表示平均值"),
+    ZH_HANT("依畫面變化量而非時間安排保留的影格：相機移動快或貼近物體時多取，原地轉動時少取。"
+            "--skip 此時表示平均值"),
+    KO("남길 프레임 간격을 시간이 아니라 시야가 바뀐 정도로 정합니다. 빠르게 움직이거나 "
+       "가까운 물체를 지날 때는 많이, 제자리에서 돌기만 할 때는 적게 남깁니다. --skip은 "
+       "평균값이 됩니다"),
+    DE("die behaltenen Bilder nach der Änderung des Blicks statt nach der Zeit verteilen: "
+       "mehr, wo die Kamera schnell fährt oder dicht an etwas vorbeikommt, weniger, wo sie "
+       "sich nur dreht. --skip gibt dann den Durchschnitt an"),
+    FR("espacer les images conservées selon le changement de vue plutôt que selon le temps : "
+       "davantage là où la caméra va vite ou frôle un objet, moins là où elle pivote sur "
+       "place. --skip donne alors la moyenne"),
+    ES("espaciar los fotogramas conservados según cuánto cambia la vista y no según el tiempo: "
+       "más donde la cámara va rápido o pasa cerca de algo, menos donde solo gira sobre sí "
+       "misma. --skip pasa a indicar el promedio"),
+    PT("espaçar os quadros guardados pela mudança da vista em vez do tempo: mais onde a câmara "
+       "anda depressa ou passa perto de algo, menos onde apenas gira no lugar. --skip passa a "
+       "indicar a média"),
+    IT("distanziare i fotogrammi tenuti in base a quanto cambia la vista anziché al tempo: di "
+       "più dove la camera va veloce o sfiora qualcosa, di meno dove ruota sul posto. --skip "
+       "indica allora la media"),
+    NL("de bewaarde beelden verdelen naar hoeveel het beeld verandert in plaats van naar tijd: "
+       "meer waar de camera snel gaat of vlak langs iets komt, minder waar hij alleen draait. "
+       "--skip geeft dan het gemiddelde"),
+    RU("располагать сохраняемые кадры по изменению вида, а не по времени: чаще там, где камера "
+       "идёт быстро или проходит близко к предмету, реже там, где она лишь поворачивается на "
+       "месте. --skip тогда задаёт среднее"),
+    TR("saklanan kareleri zamana göre değil görüntünün ne kadar değiştiğine göre yerleştir: "
+       "kamera hızlı giderken ya da bir şeyin yakınından geçerken daha sık, yerinde dönerken "
+       "daha seyrek. --skip böylece ortalamayı verir"));
+
+SS_MSG(xh_adaptive_range,
+    EN("how far the adaptive rate may stray from the average, either way "
+       "(default 4: a quarter of it to four times it)"),
+    JA("可変レートが平均からどれだけ離れてよいかです（既定 4: 平均の 1/4 から 4 倍まで）"),
+    ZH_HANS("自适应帧率相对平均值的上下浮动倍数（默认 4：平均值的 1/4 到 4 倍）"),
+    ZH_HANT("自適應影格率相對平均值的上下浮動倍數（預設 4：平均值的 1/4 到 4 倍）"),
+    KO("가변 프레임 속도가 평균에서 벗어날 수 있는 배수입니다(기본 4: 평균의 1/4에서 4배)"),
+    DE("wie weit die angepasste Rate nach beiden Seiten vom Durchschnitt abweichen darf "
+       "(Vorgabe 4: ein Viertel bis das Vierfache)"),
+    FR("de combien le débit adaptatif peut s'écarter de la moyenne, dans les deux sens "
+       "(4 par défaut : du quart au quadruple)"),
+    ES("cuánto puede alejarse la tasa adaptativa del promedio, en ambos sentidos "
+       "(4 por defecto: de la cuarta parte al cuádruple)"),
+    PT("quanto a taxa adaptativa pode afastar-se da média, nos dois sentidos "
+       "(4 por omissão: de um quarto ao quádruplo)"),
+    IT("di quanto la frequenza adattiva può scostarsi dalla media, in entrambi i sensi "
+       "(4 di default: da un quarto al quadruplo)"),
+    NL("hoever het aangepaste tempo van het gemiddelde mag afwijken, beide kanten op "
+       "(standaard 4: een kwart tot vier keer)"),
+    RU("насколько адаптивная частота может отходить от средней в обе стороны "
+       "(по умолчанию 4: от четверти до четырёхкратной)"),
+    TR("uyarlanan hızın ortalamadan iki yöne de ne kadar sapabileceği "
+       "(varsayılan 4: dörtte birinden dört katına)"));
 
 SS_MSG(xh_track,
     EN("video track to read; default is every track, written to <out>/cam0, "

@@ -2,6 +2,7 @@
 
 #include "app/gui/ImageCompare.h"
 
+#include "backend/api/BackendRuntime.h"
 #include "app/DepthColor.h"
 #include "app/TrainerCore.h"
 #include "app/gui/Layout.h"
@@ -243,6 +244,12 @@ void ImageCompare::worker_loop() {
         s.job = j;
         const auto t0 = std::chrono::steady_clock::now();
         try {
+#ifndef SS_BACKEND_VULKAN
+            // CUDA current-device state is per thread; bind before the first engine call.
+            if (!backend::device_bind())
+                throw std::runtime_error(
+                    "compare: the selected GPU is not usable on this thread");
+#endif
             run_job(j, s);
         } catch (const std::exception& e) {
             s.error = e.what();
@@ -278,8 +285,7 @@ void ImageCompare::run_job(const Job& j, Shot& out) {
     // The source file is shown undecoded, so pair it with the render before
     // the working-space -> sRGB conversion rather than after.
     const auto color = spirula::resolve_color(s.cfg);
-    const bool want_raw = j.source_gt &&
-                          (color.splat_linear || !color.splat_gamut.empty());
+    const bool want_raw = j.source_gt && color.splat_on();
     int64_t C = 3;
     bool got_err = false;
     // This step's config, so the forward renders the channels the trainer's
@@ -664,8 +670,10 @@ int ImageCompare::faces() const {
     return std::max(1, K[(size_t)_index]);
 }
 
+// The session's own answer: mask files, the images' alpha, or neither when
+// load_masks is off.
 bool ImageCompare::has_masks() const {
-    return !_session->ds.mask_filenames.empty() || _session->post.any_fov_mask;
+    return _session->has_mask || _session->post.any_fov_mask;
 }
 
 void ImageCompare::select(int index) {
@@ -1051,12 +1059,18 @@ void ImageCompare::handle_keys() {
     if (!ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
         !ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows))
         return;
-    if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, true))  select(_index - 1);
-    if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, true)) select(_index + 1);
-    if (ImGui::IsKeyPressed(ImGuiKey_PageUp, true))     select(_index - 10);
-    if (ImGui::IsKeyPressed(ImGuiKey_PageDown, true))   select(_index + 10);
-    if (ImGui::IsKeyPressed(ImGuiKey_Home, false))      select(0);
-    if (ImGui::IsKeyPressed(ImGuiKey_End, false))
+    // Shortcut() rather than IsKeyPressed(): it claims the key. An unclaimed
+    // arrow is ALSO read by imgui's nav, which walks the focus along the
+    // toolbar. Routed from the root window so hovering is enough, as before.
+    const ImGuiInputFlags route = ImGuiInputFlags_RouteFocused |
+                                  ImGuiInputFlags_RouteFromRootWindow;
+    const ImGuiInputFlags rep = route | ImGuiInputFlags_Repeat;
+    if (ImGui::Shortcut(ImGuiKey_LeftArrow, rep))  select(_index - 1);
+    if (ImGui::Shortcut(ImGuiKey_RightArrow, rep)) select(_index + 1);
+    if (ImGui::Shortcut(ImGuiKey_PageUp, rep))     select(_index - 10);
+    if (ImGui::Shortcut(ImGuiKey_PageDown, rep))   select(_index + 10);
+    if (ImGui::Shortcut(ImGuiKey_Home, route))     select(0);
+    if (ImGui::Shortcut(ImGuiKey_End, route))
         select((int)_session->ds.num_cameras - 1);
 }
 

@@ -3,6 +3,9 @@
 
 #include <core/Tensor.h>
 
+#include <stdexcept>
+#include <string>
+
 enum class RawPPISPRegLossIndex {
     SumExposure,
     SumVignettingCrSquared,
@@ -51,6 +54,19 @@ enum class RawPPISPRegLossIndexNoCRF {
     length
 };
 
+enum class RawPPISPRegLossIndexNoCRFNoVig {
+    SumExposure,
+    SumColorBx,
+    SumColorBy,
+    SumColorRx,
+    SumColorRy,
+    SumColorGx,
+    SumColorGy,
+    SumColorNx,
+    SumColorNy,
+    length
+};
+
 enum class RawPPISPRegLossIndexRQS {
     SumExposure,
     SumVignettingCrSquared,
@@ -87,6 +103,51 @@ enum class PPISPRegLossIndex {
     CRFChannelVariance,
     length
 };
+
+
+// Parameter table layout a PPISP mode uses. The output clamp is orthogonal to
+// it (same table, one extra step), so it stays out of the enum and off the
+// kernel template.
+enum class PpispParamLayout : int {
+    Original = 0,
+    RQS = 1,
+    NoCRF = 2,
+    NoCRFNoVig = 3,
+};
+
+struct PpispParamSpec {
+    PpispParamLayout layout;
+    bool clamp_output;
+    int num_params;
+    int num_raw_losses;
+};
+
+// The one decoder for a `param_type` string, shared by both backends and the
+// engine so a mode name cannot mean two things.
+inline PpispParamSpec ppisp_param_spec(const std::string& param_type) {
+    if (param_type == "original" || param_type.empty())
+        return {PpispParamLayout::Original, false, 36,
+                (int)RawPPISPRegLossIndex::length};
+    if (param_type == "rqs")
+        return {PpispParamLayout::RQS, false, 39,
+                (int)RawPPISPRegLossIndexRQS::length};
+    if (param_type == "no_crf")
+        return {PpispParamLayout::NoCRF, false, 24,
+                (int)RawPPISPRegLossIndexNoCRF::length};
+    if (param_type == "no_crf_clamp")
+        return {PpispParamLayout::NoCRF, true, 24,
+                (int)RawPPISPRegLossIndexNoCRF::length};
+    if (param_type == "no_crf_no_vig")
+        return {PpispParamLayout::NoCRFNoVig, false, 9,
+                (int)RawPPISPRegLossIndexNoCRFNoVig::length};
+    if (param_type == "no_crf_no_vig_clamp")
+        return {PpispParamLayout::NoCRFNoVig, true, 9,
+                (int)RawPPISPRegLossIndexNoCRFNoVig::length};
+    throw std::runtime_error(
+        "invalid PPISP param_type \"" + param_type +
+        "\", must be one of original, rqs, no_crf, no_crf_clamp, "
+        "no_crf_no_vig, no_crf_no_vig_clamp");
+}
 
 
 /* == AUTO HEADER GENERATOR - DO NOT EDIT THIS LINE OR ANYTHING BELOW THIS LINE == */
@@ -142,21 +203,31 @@ void blend_background_backward(
 
 
 void blend_background_noise_forward(
+    int transfer,
     bool is_linear,
+    bool blocky,                          // tiled RGB corners instead of U[0,1)
+    unsigned block_px,                    // cell side; 0 = one cell per image
     DeviceTensor3D<float3> rgb,           // [B, H, W, 3]
     DeviceTensor3D<float>  transmittance, // [B, H, W, 1]
     float randomize_weight,
     uint32_t seed,
+    const float* exponent_by_cam,         // power per camera slot; null = 1
+    const int32_t* cam_indices,           // [B] slot per image
     DeviceTensor3D<float3> out_rgb        // [B, H, W, 3]
 );
 
 
 void blend_background_noise_backward(
+    int transfer,
     bool is_linear,
+    bool blocky,                             // tiled RGB corners instead of noise
+    unsigned block_px,                       // cell side; 0 = one cell per image
     DeviceTensor3D<float3> rgb,              // [B, H, W, 3] PRE-blend
     DeviceTensor3D<float>  transmittance,    // [B, H, W, 1]
     float randomize_weight,
     uint32_t seed,
+    const float* exponent_by_cam,            // as in the forward
+    const int32_t* cam_indices,
     float overexposure_weight,               // fused image-space reg, 0 = off
     DeviceTensor3D<float3> v_out_rgb,        // [B, H, W, 3]
     DeviceTensor3D<float3> v_rgb,            // [B, H, W, 3]
@@ -164,16 +235,37 @@ void blend_background_noise_backward(
 );
 
 
-void rgb_to_srgb_forward(
-    bool is_input_linear,
+void blend_background_color_forward(
+    DeviceTensor3D<float3> rgb,           // [B, H, W, 3]
+    DeviceTensor3D<float>  transmittance, // [B, H, W, 1]
+    float3 background,                    // working color space
+    DeviceTensor3D<float3> out_rgb        // [B, H, W, 3]
+);
+
+
+void blend_background_color_backward(
+    DeviceTensor3D<float3> rgb,              // [B, H, W, 3] PRE-blend
+    DeviceTensor3D<float>  transmittance,    // [B, H, W, 1]
+    float3 background,                       // working color space
+    float overexposure_weight,               // fused image-space reg, 0 = off
+    DeviceTensor3D<float3> v_out_rgb,        // [B, H, W, 3]
+    DeviceTensor3D<float3> v_rgb,            // [B, H, W, 3]
+    DeviceTensor3D<float>  v_transmittance   // [B, H, W, 1]
+);
+
+
+void working_to_display_forward(
+    int transfer,                        // colorspace::Transfer
+    bool is_linear,                      // does the source store linear light
     DeviceTensor3D<float3> rgb,          // [B, H, W, 3]
     DeviceTensor2D<float3> color_matrix, // [3, 3] stored as 3 float3
     DeviceTensor3D<float3> out_rgb       // [B, H, W, 3]
 );
 
 
-void rgb_to_srgb_backward(
-    bool is_input_linear,
+void working_to_display_backward(
+    int transfer,
+    bool is_linear,
     DeviceTensor3D<float3> rgb,          // [B, H, W, 3]
     DeviceTensor2D<float3> color_matrix, // [3, 3] stored as 3 float3
     DeviceTensor3D<float3> v_out_rgb,    // [B, H, W, 3]
@@ -507,6 +599,7 @@ void compute_ppsip_regularization_forward(
     TorchTensorView ppisp_params,       // [B, PPISP_NUM_PARAMS]
     const std::array<float, (int)PPISPRegLossIndex::length> loss_weights_0,
     std::string param_type,
+    bool exposure_arithmetic_mean,      // log2(mean gain) = 0, else mean(log2 gain) = 0
     TorchTensorView losses,             // [PPISPRegLossIndex::length] (must be pre-zeroed)
     TorchTensorView raw_losses          // [B+1, RawPPISPRegLossIndex::length] (must be pre-zeroed)
 );
@@ -518,5 +611,6 @@ void compute_ppsip_regularization_backward(
     TorchTensorView raw_losses,         // [B+1, RawPPISPRegLossIndex::length]
     TorchTensorView v_losses,           // [PPISPRegLossIndex::length]
     std::string param_type,
+    bool exposure_arithmetic_mean,
     TorchTensorView v_ppisp_params      // [B, PPISP_NUM_PARAMS] (must be pre-zeroed)
 );

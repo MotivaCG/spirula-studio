@@ -6,7 +6,7 @@
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<1>,
-    CameraModelType::EQUISOLID,
+    CameraModelType::EQUIRECTANGULAR,
     CameraDistortionType::None,
     true,
     false,
@@ -26,8 +26,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     // fwd outputs
     const int32_t *__restrict__ camera_id_bounds,   // [N+1]
     const int32_t *__restrict__ camera_ids,   // [nnz] -- ORIGINAL (unsorted) order
-    const int32_t *__restrict__ perm,         // [nnz] -- sorted_pos -> original_pos
-    const float4 *__restrict__ aabb,   // [C, N, 4] or [nnz, 4]
+    const uint2 *__restrict__ aabb,    // [C, N] or [nnz], packed
     // grad outputs from rasterization
     Vanilla3DGS<1>::WorldBuffer v_splats_world,
     Vanilla3DGS<1>::ScreenBuffer v_splats_screen,
@@ -56,7 +55,10 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     const float erank_reg_weight,
     const float erank_reg_weight_s3,
     const float quat_norm_reg_weight,
+    const float dc_reg_weight,
     const float sh_reg_weight,
+    const float max_screen_size,
+    const float max_screen_size_penalty,
     const float eps_tr,
     const int32_t scalar_step,
     const int32_t* __restrict__ steps
@@ -64,7 +66,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<1>,
-    CameraModelType::EQUISOLID,
+    CameraModelType::EQUIRECTANGULAR,
     CameraDistortionType::None,
     true,
     false,
@@ -84,8 +86,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     // fwd outputs
     const int32_t *__restrict__ camera_id_bounds,   // [N+1]
     const int32_t *__restrict__ camera_ids,   // [nnz] -- ORIGINAL (unsorted) order
-    const int32_t *__restrict__ perm,         // [nnz] -- sorted_pos -> original_pos
-    const float4 *__restrict__ aabb,   // [C, N, 4] or [nnz, 4]
+    const uint2 *__restrict__ aabb,    // [C, N] or [nnz], packed
     // grad outputs from rasterization
     Vanilla3DGS<1>::WorldBuffer v_splats_world,
     Vanilla3DGS<1>::ScreenBuffer v_splats_screen,
@@ -114,7 +115,10 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     const float erank_reg_weight,
     const float erank_reg_weight_s3,
     const float quat_norm_reg_weight,
+    const float dc_reg_weight,
     const float sh_reg_weight,
+    const float max_screen_size,
+    const float max_screen_size_penalty,
     const float eps_tr,
     const int32_t scalar_step,
     const int32_t* __restrict__ steps
@@ -122,7 +126,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<1>,
-    CameraModelType::EQUISOLID,
+    CameraModelType::EQUIRECTANGULAR,
     CameraDistortionType::None,
     false,
     true,
@@ -142,8 +146,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     // fwd outputs
     const int32_t *__restrict__ camera_id_bounds,   // [N+1]
     const int32_t *__restrict__ camera_ids,   // [nnz] -- ORIGINAL (unsorted) order
-    const int32_t *__restrict__ perm,         // [nnz] -- sorted_pos -> original_pos
-    const float4 *__restrict__ aabb,   // [C, N, 4] or [nnz, 4]
+    const uint2 *__restrict__ aabb,    // [C, N] or [nnz], packed
     // grad outputs from rasterization
     Vanilla3DGS<1>::WorldBuffer v_splats_world,
     Vanilla3DGS<1>::ScreenBuffer v_splats_screen,
@@ -172,7 +175,10 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     const float erank_reg_weight,
     const float erank_reg_weight_s3,
     const float quat_norm_reg_weight,
+    const float dc_reg_weight,
     const float sh_reg_weight,
+    const float max_screen_size,
+    const float max_screen_size_penalty,
     const float eps_tr,
     const int32_t scalar_step,
     const int32_t* __restrict__ steps
@@ -180,7 +186,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<1>,
-    CameraModelType::EQUISOLID,
+    CameraModelType::EQUIRECTANGULAR,
     CameraDistortionType::None,
     false,
     true,
@@ -200,8 +206,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     // fwd outputs
     const int32_t *__restrict__ camera_id_bounds,   // [N+1]
     const int32_t *__restrict__ camera_ids,   // [nnz] -- ORIGINAL (unsorted) order
-    const int32_t *__restrict__ perm,         // [nnz] -- sorted_pos -> original_pos
-    const float4 *__restrict__ aabb,   // [C, N, 4] or [nnz, 4]
+    const uint2 *__restrict__ aabb,    // [C, N] or [nnz], packed
     // grad outputs from rasterization
     Vanilla3DGS<1>::WorldBuffer v_splats_world,
     Vanilla3DGS<1>::ScreenBuffer v_splats_screen,
@@ -230,7 +235,10 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     const float erank_reg_weight,
     const float erank_reg_weight_s3,
     const float quat_norm_reg_weight,
+    const float dc_reg_weight,
     const float sh_reg_weight,
+    const float max_screen_size,
+    const float max_screen_size_penalty,
     const float eps_tr,
     const int32_t scalar_step,
     const int32_t* __restrict__ steps
@@ -238,7 +246,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<1>,
-    CameraModelType::EQUISOLID,
+    CameraModelType::EQUIRECTANGULAR,
     CameraDistortionType::None,
     false,
     false,
@@ -258,8 +266,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     // fwd outputs
     const int32_t *__restrict__ camera_id_bounds,   // [N+1]
     const int32_t *__restrict__ camera_ids,   // [nnz] -- ORIGINAL (unsorted) order
-    const int32_t *__restrict__ perm,         // [nnz] -- sorted_pos -> original_pos
-    const float4 *__restrict__ aabb,   // [C, N, 4] or [nnz, 4]
+    const uint2 *__restrict__ aabb,    // [C, N] or [nnz], packed
     // grad outputs from rasterization
     Vanilla3DGS<1>::WorldBuffer v_splats_world,
     Vanilla3DGS<1>::ScreenBuffer v_splats_screen,
@@ -288,7 +295,10 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     const float erank_reg_weight,
     const float erank_reg_weight_s3,
     const float quat_norm_reg_weight,
+    const float dc_reg_weight,
     const float sh_reg_weight,
+    const float max_screen_size,
+    const float max_screen_size_penalty,
     const float eps_tr,
     const int32_t scalar_step,
     const int32_t* __restrict__ steps
@@ -296,7 +306,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     Vanilla3DGS<1>,
-    CameraModelType::EQUISOLID,
+    CameraModelType::EQUIRECTANGULAR,
     CameraDistortionType::None,
     false,
     false,
@@ -316,8 +326,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     // fwd outputs
     const int32_t *__restrict__ camera_id_bounds,   // [N+1]
     const int32_t *__restrict__ camera_ids,   // [nnz] -- ORIGINAL (unsorted) order
-    const int32_t *__restrict__ perm,         // [nnz] -- sorted_pos -> original_pos
-    const float4 *__restrict__ aabb,   // [C, N, 4] or [nnz, 4]
+    const uint2 *__restrict__ aabb,    // [C, N] or [nnz], packed
     // grad outputs from rasterization
     Vanilla3DGS<1>::WorldBuffer v_splats_world,
     Vanilla3DGS<1>::ScreenBuffer v_splats_screen,
@@ -346,16 +355,19 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     const float erank_reg_weight,
     const float erank_reg_weight_s3,
     const float quat_norm_reg_weight,
+    const float dc_reg_weight,
     const float sh_reg_weight,
+    const float max_screen_size,
+    const float max_screen_size_penalty,
     const float eps_tr,
     const int32_t scalar_step,
     const int32_t* __restrict__ steps
 );
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
-    Vanilla3DGS<1>,
-    CameraModelType::EQUISOLID,
-    CameraDistortionType::OpenCV,
+    MipSplatting<1>,
+    CameraModelType::PINHOLE,
+    CameraDistortionType::None,
     true,
     true,
     0
@@ -365,7 +377,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     const uint32_t C,
     const uint32_t N,
     const uint32_t num_sh_buffer,
-    Vanilla3DGS<1>::WorldBuffer splats_world,
+    MipSplatting<1>::WorldBuffer splats_world,
     const float *__restrict__ viewmats, // [C, 4, 4]
     const float4 *__restrict__ intrins,  // [C, 4], fx, fy, cx, cy
     const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
@@ -374,14 +386,13 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     // fwd outputs
     const int32_t *__restrict__ camera_id_bounds,   // [N+1]
     const int32_t *__restrict__ camera_ids,   // [nnz] -- ORIGINAL (unsorted) order
-    const int32_t *__restrict__ perm,         // [nnz] -- sorted_pos -> original_pos
-    const float4 *__restrict__ aabb,   // [C, N, 4] or [nnz, 4]
+    const uint2 *__restrict__ aabb,    // [C, N] or [nnz], packed
     // grad outputs from rasterization
-    Vanilla3DGS<1>::WorldBuffer v_splats_world,
-    Vanilla3DGS<1>::ScreenBuffer v_splats_screen,
+    MipSplatting<1>::WorldBuffer v_splats_world,
+    MipSplatting<1>::ScreenBuffer v_splats_screen,
     // optimizer states
-    Vanilla3DGS<1>::WorldBuffer g1_splats_world,
-    Vanilla3DGS<1>::WorldBuffer g2_splats_world,
+    MipSplatting<1>::WorldBuffer g1_splats_world,
+    MipSplatting<1>::WorldBuffer g2_splats_world,
     const uint8_t* __restrict__ sh_packed,      // AoS (u, sqrt_g2) packed SH state
     float4* __restrict__ sh_quant_bounds,
     const uint8_t* __restrict__ sh_value_packed,
@@ -404,16 +415,19 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     const float erank_reg_weight,
     const float erank_reg_weight_s3,
     const float quat_norm_reg_weight,
+    const float dc_reg_weight,
     const float sh_reg_weight,
+    const float max_screen_size,
+    const float max_screen_size_penalty,
     const float eps_tr,
     const int32_t scalar_step,
     const int32_t* __restrict__ steps
 );
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
-    Vanilla3DGS<1>,
-    CameraModelType::EQUISOLID,
-    CameraDistortionType::OpenCV,
+    MipSplatting<1>,
+    CameraModelType::PINHOLE,
+    CameraDistortionType::None,
     true,
     true,
     1
@@ -423,7 +437,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     const uint32_t C,
     const uint32_t N,
     const uint32_t num_sh_buffer,
-    Vanilla3DGS<1>::WorldBuffer splats_world,
+    MipSplatting<1>::WorldBuffer splats_world,
     const float *__restrict__ viewmats, // [C, 4, 4]
     const float4 *__restrict__ intrins,  // [C, 4], fx, fy, cx, cy
     const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
@@ -432,14 +446,13 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     // fwd outputs
     const int32_t *__restrict__ camera_id_bounds,   // [N+1]
     const int32_t *__restrict__ camera_ids,   // [nnz] -- ORIGINAL (unsorted) order
-    const int32_t *__restrict__ perm,         // [nnz] -- sorted_pos -> original_pos
-    const float4 *__restrict__ aabb,   // [C, N, 4] or [nnz, 4]
+    const uint2 *__restrict__ aabb,    // [C, N] or [nnz], packed
     // grad outputs from rasterization
-    Vanilla3DGS<1>::WorldBuffer v_splats_world,
-    Vanilla3DGS<1>::ScreenBuffer v_splats_screen,
+    MipSplatting<1>::WorldBuffer v_splats_world,
+    MipSplatting<1>::ScreenBuffer v_splats_screen,
     // optimizer states
-    Vanilla3DGS<1>::WorldBuffer g1_splats_world,
-    Vanilla3DGS<1>::WorldBuffer g2_splats_world,
+    MipSplatting<1>::WorldBuffer g1_splats_world,
+    MipSplatting<1>::WorldBuffer g2_splats_world,
     const uint8_t* __restrict__ sh_packed,      // AoS (u, sqrt_g2) packed SH state
     float4* __restrict__ sh_quant_bounds,
     const uint8_t* __restrict__ sh_value_packed,
@@ -462,16 +475,19 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     const float erank_reg_weight,
     const float erank_reg_weight_s3,
     const float quat_norm_reg_weight,
+    const float dc_reg_weight,
     const float sh_reg_weight,
+    const float max_screen_size,
+    const float max_screen_size_penalty,
     const float eps_tr,
     const int32_t scalar_step,
     const int32_t* __restrict__ steps
 );
 
 template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
-    Vanilla3DGS<1>,
-    CameraModelType::EQUISOLID,
-    CameraDistortionType::OpenCV,
+    MipSplatting<1>,
+    CameraModelType::PINHOLE,
+    CameraDistortionType::None,
     true,
     false,
     0
@@ -481,7 +497,7 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     const uint32_t C,
     const uint32_t N,
     const uint32_t num_sh_buffer,
-    Vanilla3DGS<1>::WorldBuffer splats_world,
+    MipSplatting<1>::WorldBuffer splats_world,
     const float *__restrict__ viewmats, // [C, 4, 4]
     const float4 *__restrict__ intrins,  // [C, 4], fx, fy, cx, cy
     const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
@@ -490,14 +506,13 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     // fwd outputs
     const int32_t *__restrict__ camera_id_bounds,   // [N+1]
     const int32_t *__restrict__ camera_ids,   // [nnz] -- ORIGINAL (unsorted) order
-    const int32_t *__restrict__ perm,         // [nnz] -- sorted_pos -> original_pos
-    const float4 *__restrict__ aabb,   // [C, N, 4] or [nnz, 4]
+    const uint2 *__restrict__ aabb,    // [C, N] or [nnz], packed
     // grad outputs from rasterization
-    Vanilla3DGS<1>::WorldBuffer v_splats_world,
-    Vanilla3DGS<1>::ScreenBuffer v_splats_screen,
+    MipSplatting<1>::WorldBuffer v_splats_world,
+    MipSplatting<1>::ScreenBuffer v_splats_screen,
     // optimizer states
-    Vanilla3DGS<1>::WorldBuffer g1_splats_world,
-    Vanilla3DGS<1>::WorldBuffer g2_splats_world,
+    MipSplatting<1>::WorldBuffer g1_splats_world,
+    MipSplatting<1>::WorldBuffer g2_splats_world,
     const uint8_t* __restrict__ sh_packed,      // AoS (u, sqrt_g2) packed SH state
     float4* __restrict__ sh_quant_bounds,
     const uint8_t* __restrict__ sh_value_packed,
@@ -520,7 +535,10 @@ template void fused_projection_bwd_optimizer_3dgs_kernel_wrapper<
     const float erank_reg_weight,
     const float erank_reg_weight_s3,
     const float quat_norm_reg_weight,
+    const float dc_reg_weight,
     const float sh_reg_weight,
+    const float max_screen_size,
+    const float max_screen_size_penalty,
     const float eps_tr,
     const int32_t scalar_step,
     const int32_t* __restrict__ steps

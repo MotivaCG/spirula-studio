@@ -53,6 +53,14 @@ struct LossConfig {
     // backward reduces the map to one score per splat. Ignored when the map
     // is off.
     int   loss_map_accum_mode    = (int)DensifyAccumMode::Max;
+    // Positive: a pixel above this in every channel of BOTH the render and the
+    // reference leaves the photometric loss (value, map, gradient, SSIM), the
+    // way a masked pixel does. Negative (default) keeps every pixel.
+    float saturation_threshold   = -1.0f;
+    // Divide the photometric weights (RGB / YUV supervision and SSIM) by
+    // 0.5 / max(mean sRGB luma of this step's reference pixels, 1/255), so a
+    // dark capture pulls on the splats as hard as a bright one.
+    float luminance_normalization = 0.0f;   // power on 0.5 / mean luma; 0 = off
     // Image-space overexposure regularization weight. When non-zero, a
     // dedicated kernel adds dL/dx of L = w * mean(max(-x, x-1, 0)^2) directly
     // into v_render_rgb (in the pre-bilagrid / pre-PPISP / pre-color-space
@@ -97,7 +105,14 @@ struct OptimConfig {
     float erank_reg_weight             = 0.0f;
     float erank_reg_weight_s3          = 0.0f;
     float quat_norm_reg_weight         = 0.0f;
+    float dc_reg_weight                = 0.0f;
     float sh_reg_weight                = 0.0f;
+
+    // Soft on-screen size limit. The penalty enters the scale gradient
+    // scaled by Adam's denominator, so it reads as the share of one full
+    // learning-rate step spent per octave over the limit.
+    float max_screen_size              = 0.0f;
+    float max_screen_size_penalty      = 0.0f;
 
     bool  use_scale_agnostic_mean         = false;
     // SH-Adam optimizer-state quantization bit depth. 32 = no quantization (full
@@ -185,6 +200,10 @@ struct DensifyConfig {
     float min_opacity                   = 0.0f;
     float max_screen_size               = 0.0f;
     float max_screen_size_clip_hardness = 0.0f;
+    // With the soft penalty on, the hard clip drops to a once-per-refine
+    // backstop: the penalty needs room to find a balance above the limit,
+    // and a same-step split is what pays for the shrink.
+    bool  clip_screen_size_at_refine    = false;
     float max_world_size                = 0.0f;
     float noise_lr                      = 0.0f;
     float noise_lr_final                = 0.0f;
@@ -209,6 +228,11 @@ struct DensifyConfig {
     // sampling draw. Fused into the clip pass but written to a side buffer:
     // powering the running accumulator in place would compound every step.
     float final_score_power             = 1.0f;
+    // Share of each refine step's new splats drawn from the oversize channel
+    // (weight = accumulated log2 oversize * score^oversize_score_blend)
+    // instead of the plain error score. 0 keeps the single draw.
+    float oversize_split_fraction       = 0.0f;
+    float oversize_score_blend          = 0.5f;
     // Long-axis-split opacity split factor `k`, linearly scheduled from
     // `las_split_opacity_k_init` to `..._final` over `..._warmup` steps.
     float las_split_opacity_k_init      = 0.5f;
@@ -241,21 +265,18 @@ struct BackgroundStepConfig {
     float    lr_sh           = 0.0f;
     float    randomize_weight = 0.0f;
     uint32_t seed             = 0;
+    bool     match_luminance  = false;   // randomized draw ^ per-image power
 };
 
 
-// PPISP Adam LR + 6-component regularization weights (indexed by PPISPRegLossIndex).
-//
-// run_before_bilagrid controls the forward order when both PPISP and bilagrid
-// RGB are enabled:
-//   false (default): render -> bilagrid -> PPISP -> loss.
-//   true           : render -> PPISP    -> bilagrid -> loss.
-// Backward hooks invert this automatically (the inner hook runs first).
-// Ignored when only one of the two is enabled.
+// PPISP Adam LR, the 6 regularization weights (PPISPRegLossIndex order), and
+// where PPISP sits in the chain render -> bg -> [PPISP] -> display encode ->
+// bilagrid -> [PPISP] -> loss. The backward hooks invert whichever it picks.
 struct PpispStepConfig {
     float lr = 0.0f;
     std::array<float, (int)PPISPRegLossIndex::length> reg_weights{};
     bool  run_before_bilagrid = false;
+    bool  run_before_color_space = false;
 };
 
 

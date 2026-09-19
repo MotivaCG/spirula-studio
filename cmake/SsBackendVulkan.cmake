@@ -9,10 +9,8 @@ message(STATUS "SS_BACKEND=vulkan: portable engine layer + "
     "backend/vulkan runtime; kernel coverage is tracked in "
     "src/backend/vulkan/README.md.")
 
-# The command-line tools are this build's primary artifact; the GUI is opt-in.
-set(SS_BUILD_CLI ON)
-
 include(SsVulkan)
+include(SsMacBundle)
 ss_vulkan_lib()
 find_package(Threads REQUIRED)
 
@@ -35,7 +33,12 @@ target_link_libraries(csrc_portable PUBLIC ss_i18n)
 
 find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
+    ss_mac_prefer_static(OpenMP::OpenMP_CXX
+        "`brew install libomp` ships the archive; \
+-DCMAKE_DISABLE_FIND_PACKAGE_OpenMP=ON drops OpenMP instead.")
     target_link_libraries(csrc_portable PUBLIC OpenMP::OpenMP_CXX)
+else()
+    message(STATUS "No OpenMP: meshing, UV unwrap and metrics run serial")
 endif()
 
 # ---------------------------------------------------------------------------

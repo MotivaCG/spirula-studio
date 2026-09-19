@@ -42,7 +42,10 @@ float fused_ssim_inplace(
     bool return_ssim_val,
     TorchTensorView ssim_loss_map,  // [B, H, W, 1] output, or null
     float ssim_loss_map_weight,
-    int ssim_loss_map_mode
+    int ssim_loss_map_mode,
+    // Positive: a pixel above it in every channel of BOTH images drops out,
+    // exactly as a masked one does.
+    float saturation_threshold
 );
 
 
@@ -55,5 +58,6 @@ float fused_ssim_inplace_async(
     TorchTensorView ssim_loss_map,
     float ssim_loss_map_weight,
     int ssim_loss_map_mode,
+    float saturation_threshold,
     AsyncReadout<float>& readout
 );

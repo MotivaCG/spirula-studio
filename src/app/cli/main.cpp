@@ -3,16 +3,14 @@
 //     spirula train [<preset>] --data <dir> [--flag value ...]
 //
 // where <preset> is one of 3dgs (the default), 360-camera, in-the-wild,
-// linear-color, synthetic, meshing, academic-baseline. Flags are the
-// FLATTENED training config fields
-// (--sh-degree, not --model.sh-degree); '-' and '_' are interchangeable;
-// booleans take a value (--warp-to-pinhole 1). The config struct, flag
-// table, and preset appliers all come from config/TrainConfig.h.
+// centered-object, hdr, synthetic, meshing, academic-baseline. Flags are the
+// FLATTENED config fields (--sh-degree, not --model.sh-degree); '-' and '_'
+// are interchangeable; booleans take a value (--warp-to-pinhole 1). Struct,
+// flag table and preset appliers all come from config/TrainConfig.h.
 //
-// The engine plumbing (dataset -> seeding -> per-step configs -> train loop)
-// lives in TrainerCore.{h,cpp}, shared with the native GUI (gui/). This file
-// adds only CLI parsing, --help, stdout progress printing, and the web
-// viewer wiring.
+// The engine plumbing lives in TrainerCore.{h,cpp}, shared with the native
+// GUI (gui/); this file adds CLI parsing, --help, progress printing and the
+// web viewer wiring.
 
 #include "app/Tools.h"
 #include "app/TrainerCore.h"
@@ -23,10 +21,10 @@
 #include "i18n/catalog/TrainFields.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
@@ -179,12 +177,9 @@ int char_columns(unsigned cp) {
            ? 2 : 1;
 }
 
-// The first sentence of a help string, cut to one terminal line.
-//
-// Two things stop this from being substr(0, s.find(". ")): a Japanese or
-// Chinese sentence ends in "。" with no space after it, and a width limit in
-// bytes would both slice a multi-byte character in half and still overflow
-// the line, since those characters are twice as wide as they are numerous.
+// The first sentence of a help string, cut to one terminal line. Not
+// substr(0, s.find(". ")): a CJK sentence ends in "。" with no space after
+// it, and a byte limit would both split a character and overflow the line.
 std::string help_summary(const char* text, size_t max_columns = 110) {
     std::string s = text;
 
@@ -224,36 +219,54 @@ std::string help_summary(const char* text, size_t max_columns = 110) {
 
 // ---- Compute device listing / selection -----------------------------------
 
-// Applies --device (index or case-sensitive name substring) through the
-// backend-neutral device API, then prints the device table VkSplat-style
-// (all visible devices, '*' on the one in use).
-void select_and_print_devices(const std::string& requested) {
+// Applies --device through the backend-neutral device API, then prints the
+// device table VkSplat-style (all visible devices, '*' on the one in use).
+// Vulkan takes the shared selector forms, CUDA only a nonnegative ordinal.
+void select_and_print_devices(const std::string& requested, bool requested_set) {
+    const bool explicit_request = requested_set || !requested.empty();
     int n = backend::device_count();
     if (n == 0) {
-        if (!requested.empty())
+        if (explicit_request)
             throw std::runtime_error("--device: no compute devices found");
         return;  // let the backend report its own error on first use
     }
-    if (!requested.empty()) {
-        char* end = nullptr;
-        long idx = std::strtol(requested.c_str(), &end, 10);
-        int want = -1;
-        if (end && *end == '\0') {
-            want = (int)idx;
-        } else {
-            for (int i = 0; i < n && want < 0; i++) {
-                backend::DeviceInfo d = backend::device_info(i);
-                if (d.usable &&
-                    std::string(d.name).find(requested) != std::string::npos)
-                    want = i;
-            }
+    if (explicit_request) {
+#ifdef SS_BACKEND_VULKAN
+        const std::string selector = requested.empty() ? "auto" : requested;
+        if (!backend::device_select_identity(selector.c_str())) {
+            std::string detail = backend::device_selection_error();
+            if (detail.empty()) detail = "device selection failed";
+            throw std::runtime_error("--device " + selector + ": " + detail);
         }
-        if (want < 0 || !backend::device_select(want))
+#else
+        // CUDA accepts only a nonnegative ordinal here; from_chars rejects
+        // names, `auto`, UUIDs and negative spellings.
+        int want = -1;
+        const char* b = requested.c_str();
+        const char* e = b + requested.size();
+        const std::from_chars_result r = std::from_chars(b, e, want);
+        if (b == e || *b == '-' || r.ec != std::errc() || r.ptr != e)
             throw std::runtime_error(
                 "--device " + requested +
-                ": no usable device matches (see the device list printed by "
-                "a run without --device)");
+                ": expected a CUDA device index (see --help)");
+        if (!backend::device_select(want))
+            throw std::runtime_error(
+                "--device " + requested +
+                ": no usable CUDA device matches (see the device list printed "
+                "by a run without --device)");
+#endif
     }
+#ifdef SS_BACKEND_VULKAN
+    // Pin implicit Auto/environment selection before the engine can create its
+    // own Vulkan context; the UUID, not a second ordinal lookup, is carried.
+    const std::string resolved = backend::device_current_selector();
+    if (!resolved.empty() &&
+        !backend::device_select_identity(resolved.c_str())) {
+        std::string detail = backend::device_selection_error();
+        if (detail.empty()) detail = "device selection failed";
+        throw std::runtime_error("--device " + resolved + ": " + detail);
+    }
+#endif
     int cur = backend::device_current();
     std::printf("%s\n", cmsg::devices_header.get());
     for (int i = 0; i < n; i++) {
@@ -265,6 +278,9 @@ void select_and_print_devices(const std::string& requested) {
         std::printf("  %c [%d] %s (%s, %llu MB)%s\n", i == cur ? '*' : ' ',
                     i, d.name, d.type,
                     (unsigned long long)(d.vram_bytes >> 20), note.c_str());
+        if (!d.uuid.empty())
+            std::printf("      %s\n",
+                        format(cmsg::device_uuid_line, {d.uuid}).c_str());
     }
     std::fflush(stdout);
 }
@@ -287,8 +303,13 @@ void print_help(const char* argv0, const TrainConfig& c, int max_tier) {
         std::printf("  %-18s %s\n", p.name, t ? t->help->get() : "");
     }
     std::printf("\n%s\n", cmsg::train_app_flags_header.get());
-    std::printf("  --device <index|name substring>\n      %s\n",
+#ifdef SS_BACKEND_VULKAN
+    std::printf("  --device <index|name|auto|uuid:hex>\n      %s\n",
                 cmsg::train_device_help.get());
+#else
+    std::printf("  --device <index>\n      %s\n",
+                cmsg::train_device_help_cuda.get());
+#endif
     std::printf("\n%s\n", cmsg::train_flags_header.get());
 
     // Pass 1: how many flags each heading has left after the tier filter, so
@@ -330,16 +351,15 @@ void print_help(const char* argv0, const TrainConfig& c, int max_tier) {
 }
 
 
-// Debug dump for numeric verification against the Python dataparser /
-// trainer camera algebra (SS_DUMP_CAMERAS=<path> env). Full precision.
+// Debug dump of the parsed and post-split camera algebra (SS_DUMP_CAMERAS=<path>).
 void dump_cameras_json(const char* path, const ParsedDataset& ds,
                        const PostSplitCameras& post) {
     FILE* f = std::fopen(path, "w");
     if (!f) throw std::runtime_error(std::string("cannot write ") + path);
-    auto arr_f = [&](const char* k, const std::vector<float>& v) {
+    auto arr_f = [&](const char* k, const auto& v) {
         std::fprintf(f, "\"%s\": [", k);
         for (size_t i = 0; i < v.size(); i++)
-            std::fprintf(f, "%s%.9g", i ? "," : "", v[i]);
+            std::fprintf(f, "%s%.9g", i ? "," : "", (double)v[i]);
         std::fprintf(f, "]");
     };
     auto arr_i = [&](const char* k, const std::vector<int32_t>& v) {
@@ -367,9 +387,8 @@ void dump_cameras_json(const char* path, const ParsedDataset& ds,
     arr_f("dist_coeffs", post.dist_coeffs);     std::fprintf(f, ",\n");
     arr_f("input_intrins", post.input_intrins); std::fprintf(f, ",\n");
     arr_f("input_dist_coeffs", post.input_dist_coeffs); std::fprintf(f, ",\n");
-    std::vector<float> t2n(ds.train_to_normalized.begin(), ds.train_to_normalized.end());
-    arr_f("train_to_normalized", t2n);          std::fprintf(f, ",\n");
-    std::vector<float> pts_head(ds.points.xyz.begin(),
+    arr_f("train_to_normalized", ds.train_to_normalized); std::fprintf(f, ",\n");
+    std::vector<double> pts_head(ds.points.xyz.begin(),
         ds.points.xyz.begin() + std::min<size_t>(ds.points.xyz.size(), 30));
     arr_f("points_head", pts_head);
     std::fprintf(f, "\n}\n");
@@ -400,6 +419,7 @@ int spirula_train_main(int argc, char** argv) {
         }
 
         std::string device_flag;
+        bool device_set = false;
         for (int i = argi; i < argc; i++) {
             std::string arg = argv[i];
             if (arg == "--help" || arg == "-h") {
@@ -413,10 +433,15 @@ int spirula_train_main(int argc, char** argv) {
             if (arg.rfind("--", 0) != 0)
                 throw std::runtime_error("unexpected argument: " + arg + " (flags are --key value)");
             // App-level flag, not part of the generated training config.
-            if (arg.rfind("--device=", 0) == 0) { device_flag = arg.substr(9); continue; }
+            if (arg.rfind("--device=", 0) == 0) {
+                device_flag = arg.substr(9);
+                device_set = true;
+                continue;
+            }
             if (arg == "--device") {
                 if (i + 1 >= argc) throw std::runtime_error("--device: missing value");
                 device_flag = argv[++i];
+                device_set = true;
                 continue;
             }
             // --key=value form: re-parse via a 2-token mini-argv. Tuple
@@ -459,7 +484,7 @@ int spirula_train_main(int argc, char** argv) {
         SS_CONFIG_REQUIRED_FIELDS(SS_CHECK_REQUIRED)
 #undef SS_CHECK_REQUIRED
 
-        select_and_print_devices(device_flag);
+        select_and_print_devices(device_flag, device_set);
 
         // ---- Session -------------------------------------------------------
         TrainerSession session;

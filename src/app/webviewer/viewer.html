@@ -443,6 +443,10 @@
         </div>
         <input type="range" id="move-speed" min="-2" max="2" step="0.1" value="0" autocomplete="off"/>
       </div>
+      <div class="ctrl-row">
+        <div class="ctrl-label"><span>Center</span></div>
+        <select id="center-mode" autocomplete="off" title="What the view orbits about and Reset Camera frames. Moves the view, never the model."></select>
+      </div>
       <button class="btn" id="btn-reset-pose">Reset Camera</button>
     </div>
 
@@ -637,9 +641,10 @@ const cam = {
   forward() { return quat.rotVec(this.rot, [0,0,-1]); },
 
   reset() {
-    this.pos = [0, 0, 1];
+    const c = Scene.center();
+    this.pos = [c[0], c[1], c[2] + 1];
     this.rot = quat.identity();
-    this.target = [0, 0, 0];
+    this.target = c.slice();
     Nav.orbit(0, -250);
   },
 };
@@ -909,6 +914,63 @@ function showHint(text) {
 // ═══════════════════════════════════════════════════════
 // HTTP client
 // ═══════════════════════════════════════════════════════
+
+// The centering choices, which only the server can compute: the client holds
+// no splats and no camera table, just the normalized frame both live in.
+const Scene = {
+  modes: [],          // [{name, center}] in dsparse::CenterMode order
+  hasCameras: false,
+  mode: 2,            // camera position median
+  center() {
+    const m = this.modes[this.mode];
+    return m ? m.center.slice() : [0, 0, 0];
+  },
+  // A file has no cameras, so a camera statistic falls back to the point one.
+  isCameraMode(i) { return i === 2 || i === 3 || i === 5; },
+  fallback(i) { return i === 2 ? 1 : 4; },
+};
+
+const CENTER_LABELS = {
+  "none": "None (model origin)",
+  "point-median": "Point cloud median",
+  "camera-median": "Camera position median",
+  "camera-focus": "Camera focus",
+  "point-mean": "Point cloud mean",
+  "camera-mean": "Camera position mean",
+};
+
+async function fetchScene() {
+  try {
+    const response = await fetch(`${CFG.serverUrl}/scene`);
+    if (!response.ok) throw new Error("no /scene");
+    const j = await response.json();
+    Scene.modes = j.center_modes || [];
+    Scene.hasCameras = !!j.has_cameras;
+  } catch (e) {
+    // A server without /scene (an older build) keeps the model origin.
+    Scene.modes = [];
+    Scene.hasCameras = false;
+  }
+  const sel = $("center-mode");
+  sel.innerHTML = "";
+  if (!Scene.modes.length) {
+    sel.parentElement.parentElement.style.display = "none";
+    return;
+  }
+  if (!Scene.hasCameras && Scene.isCameraMode(Scene.mode))
+    Scene.mode = Scene.fallback(Scene.mode);
+  Scene.modes.forEach((m, i) => {
+    if (!Scene.hasCameras && Scene.isCameraMode(i)) return;
+    const o = document.createElement("option");
+    o.value = String(i);
+    o.textContent = CENTER_LABELS[m.name] || m.name;
+    sel.appendChild(o);
+  });
+  sel.value = String(Scene.mode);
+  // The pose was reset before the centres arrived; put it where it belongs.
+  cam.reset();
+  Viewer.requestRender();
+}
 
 async function fetchBuffers() {
   try {
@@ -1377,6 +1439,13 @@ $("btn-reset-pose").addEventListener("click", () => {
   Viewer.requestRender();
 });
 
+// The model stays where it is: the orbit pivot moves to the new centre, and so
+// does the pose Reset Camera returns to.
+$("center-mode").addEventListener("change", e => {
+  Scene.mode = +e.target.value;
+  recenterAt(Scene.center());
+});
+
 $("btn-pause").addEventListener("click", async () => {
   try {
     const response = await fetch('/pause-toggle');
@@ -1460,6 +1529,7 @@ setInterval(updateProgress, 1000);
   cam.reset();
   showHint(hintFor("turntable"));
   fetchBuffers();
+  fetchScene();
   Viewer.loopRender();
   // Initial res label
   const res = getResolution($("res-slider").value);

@@ -13,6 +13,7 @@
 // a transforms.json, only a pointcloud.ply, ...) still shows what is available.
 
 #include "data/DatasetParser.h"
+#include "data/FrustumSize.h"
 #include "data/Json.h"
 #include "data/Xml.h"
 
@@ -43,11 +44,14 @@ static std::string   g_format;      // "COLMAP" / "Nerfstudio" / "Metashape" / "
 static std::string   g_json;        // reused output buffer (enumerate / summary)
 static std::string   g_names;       // newline-joined image basenames
 static std::string   g_error;       // last parse error ("" = clean load)
+static std::vector<float> g_pts;    // the seed cloud as JS reads it, [N, 3]
 static float         g_fit[4];      // (cx, cy, cz, radius)
 static float         g_pick[3];     // (index, t, perp) for point picking
 
 static void reset_result() {
     g_ds = ParsedDataset();
+    g_pts.clear();
+    g_pts.shrink_to_fit();
     g_loaded = false;
     g_format.clear();
     g_names.clear();
@@ -363,7 +367,12 @@ KEEP int ssv_ds_parse(const char* token_c) {
 
     g_ds.num_cameras = (int64_t)g_ds.camera_models.size();
     build_names();
-    g_loaded = (g_ds.num_cameras > 0 || g_ds.points.num() > 0);
+    // The parsers keep the cloud in double; JS wants one Float32Array view of
+    // it, and the double copy has no reader left once that exists.
+    g_pts.assign(g_ds.points.xyz.begin(), g_ds.points.xyz.end());
+    g_ds.points.xyz.clear();
+    g_ds.points.xyz.shrink_to_fit();
+    g_loaded = (g_ds.num_cameras > 0 || g_pts.size() > 0);
     return g_loaded ? 1 : 0;
 }
 
@@ -374,8 +383,8 @@ KEEP int      ssv_ds_ok()          { return g_loaded ? 1 : 0; }
 KEEP char*    ssv_ds_json()        { return (char*)g_json.c_str(); }
 KEEP char*    ssv_ds_last_error()  { return (char*)g_error.c_str(); }
 
-KEEP int      ssv_ds_num_points()  { return (int)g_ds.points.num(); }
-KEEP float*   ssv_ds_points_xyz()  { return g_ds.points.xyz.empty()? nullptr : g_ds.points.xyz.data(); }
+KEEP int      ssv_ds_num_points()  { return (int)(g_pts.size() / 3); }
+KEEP float*   ssv_ds_points_xyz()  { return g_pts.empty()? nullptr : g_pts.data(); }
 KEEP uint8_t* ssv_ds_points_rgb()  { return g_ds.points.rgb.empty()? nullptr : g_ds.points.rgb.data(); }
 
 KEEP int      ssv_ds_num_cameras() { return (int)g_ds.num_cameras; }
@@ -446,39 +455,36 @@ KEEP char* ssv_ds_summary_json() {
 }
 
 // ---------------------------------------------------------------------------
-// Robust fit sphere over points + camera centers (median center, median
-// distance) -> (cx, cy, cz, radius). Mirrors ssv_fit_sphere in viewer.cpp.
+// Fit sphere: the dsparse::CenterMode `mode` over points + cameras, and a
+// radius about it -> (cx, cy, cz, radius). Mirrors ssv_fit_sphere in
+// viewer.cpp.
 // ---------------------------------------------------------------------------
-KEEP float* ssv_ds_fit_sphere() {
-    std::vector<float> xs, ys, zs;      // combined (for a robust center)
+KEEP float* ssv_ds_fit_sphere(int mode) {
     std::vector<float> pd, cd;          // squared distances: points / cameras
-    const auto& P = g_ds.points.xyz;
-    int64_t np = g_ds.points.num();
-    int64_t step = np > (1<<20) ? np / (1<<20) : 1; if (step < 1) step = 1;
-    for (int64_t i = 0; i < np; i += step) {
-        xs.push_back(P[i*3]); ys.push_back(P[i*3+1]); zs.push_back(P[i*3+2]);
+    const int64_t np = (int64_t)g_pts.size() / 3;
+    const int64_t ncam = std::min<int64_t>(g_ds.num_cameras, (int64_t)g_ds.c2w.size() / 12);
+    if (np == 0 && ncam == 0) { g_fit[0]=g_fit[1]=g_fit[2]=0.f; g_fit[3]=1.f; return g_fit; }
+    {
+        std::vector<double> c2w(g_ds.c2w.begin(), g_ds.c2w.begin() + ncam * 12);
+        mode = std::max(0, std::min(mode, dsparse::kNumCenterModes - 1));
+        const std::array<double, 3> c = dsparse::scene_center(
+            (dsparse::CenterMode)mode, c2w.data(), ncam, g_pts.data(), np, 3, 1 << 20);
+        for (int k = 0; k < 3; k++) g_fit[k] = (float)c[k];
     }
-    // camera centers = translation column of c2w [N,3,4]
-    int ncam = 0;
-    for (int i = 0; i < (int)g_ds.num_cameras; i++) {
-        if (12*i+11 >= (int)g_ds.c2w.size()) break;
-        xs.push_back(g_ds.c2w[12*i+3]);
-        ys.push_back(g_ds.c2w[12*i+7]);
-        zs.push_back(g_ds.c2w[12*i+11]);
-        ncam++;
-    }
-    if (xs.empty()) { g_fit[0]=g_fit[1]=g_fit[2]=0.f; g_fit[3]=1.f; return g_fit; }
     auto quantile = [](std::vector<float>& v, float q)->float{
         if (v.empty()) return 0.f;
         size_t k = (size_t)(q * (v.size()-1));
         std::nth_element(v.begin(), v.begin()+k, v.end());
         return v[k];
     };
-    g_fit[0]=quantile(xs,0.5f); g_fit[1]=quantile(ys,0.5f); g_fit[2]=quantile(zs,0.5f);
-    size_t nps = xs.size() - ncam;
-    for (size_t i = 0; i < xs.size(); i++) {
-        float dx=xs[i]-g_fit[0], dy=ys[i]-g_fit[1], dz=zs[i]-g_fit[2];
-        (i < nps ? pd : cd).push_back(dx*dx+dy*dy+dz*dz);
+    int64_t step = np > (1<<20) ? np / (1<<20) : 1; if (step < 1) step = 1;
+    for (int64_t i = 0; i < np; i += step) {
+        float dx=g_pts[i*3]-g_fit[0], dy=g_pts[i*3+1]-g_fit[1], dz=g_pts[i*3+2]-g_fit[2];
+        pd.push_back(dx*dx+dy*dy+dz*dz);
+    }
+    for (int64_t i = 0; i < ncam; i++) {
+        float dx=g_ds.c2w[12*i+3]-g_fit[0], dy=g_ds.c2w[12*i+7]-g_fit[1], dz=g_ds.c2w[12*i+11]-g_fit[2];
+        cd.push_back(dx*dx+dy*dy+dz*dz);
     }
     // Frame the capture volume: points are dense (median), cameras are the
     // outer boundary we still want in view (90th percentile, robust to a stray
@@ -490,13 +496,19 @@ KEEP float* ssv_ds_fit_sphere() {
     return g_fit;
 }
 
+// Base frustum size in the dataset's frame (js/main.js multiplies in the slider).
+KEEP float ssv_ds_frustum_size() {
+    int64_t n = std::min<int64_t>(g_ds.num_cameras, (int64_t)g_ds.c2w.size() / 12);
+    return (float)camhost::frustum_display_size(g_ds.c2w.data(), n);
+}
+
 // Nearest point to a ray (model-native frame): returns (index, t, perp) so JS
 // can accept the hit against a screen-space threshold. index = -1 if empty.
 KEEP float* ssv_ds_pick_point(float ox, float oy, float oz,
                               float dx, float dy, float dz) {
     g_pick[0] = -1.f; g_pick[1] = 0.f; g_pick[2] = 3.4e38f;
-    const auto& P = g_ds.points.xyz;
-    int64_t np = g_ds.points.num();
+    const auto& P = g_pts;
+    int64_t np = (int64_t)g_pts.size() / 3;
     float dd = dx*dx + dy*dy + dz*dz; if (dd < 1e-20f) return g_pick;
     float best_score = 3.4e38f;
     for (int64_t i = 0; i < np; i++) {

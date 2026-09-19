@@ -4,6 +4,32 @@
 
 #include "kernels/optim/OptimizerCommon.cuh"
 
+// SH stays in coefficient space under a linear working colour space (the DC
+// reparameterization needs |sh| << c_dc, which 3DGS does not satisfy); only
+// the gradient carry and the trust-region clip apply. Matches FPBO.
+struct _ShColorTrust {
+    float scale = 1.0f;   // 1 / (dx/d(dc)) at this cell's DC colour
+    float clip  = 0.0f;   // step rail; 0 disables clipping
+
+    __device__ static _ShColorTrust make(const ColorTrustState& ct,
+                                         int64_t idx, int stride) {
+        _ShColorTrust r;
+        const int64_t splat = idx / stride;
+        const int     ch    = (int)(idx % 3);
+        const float   c_dc  = kSh0 * ct.features_dc[3 * splat + ch] + 0.5f;
+        r.scale = 1.0f / SlangPixelWise::linear_rgb_to_srgb_grad(c_dc);
+        const float c_cl = fmaxf(c_dc, (1.0f/255.0f)*(1.0f/255.0f));
+        const float opac = fmaxf(sigmoid(ct.opacities[splat]), 1e-12f);
+        r.clip = kSh0 * sqrtf(4.0f * ct.eps_tr * c_cl / opac);
+        return r;
+    }
+
+    __device__ float clamp_step(float delta) const {
+        delta = fminf(fmaxf(delta, -clip), clip);
+        return isfinite(delta) ? delta : 0.0f;
+    }
+};
+
 // ================
 // Fused appearance optimizer
 // ================
@@ -44,15 +70,23 @@ __global__ void fused_adam_with_steps_kernel(
     v += decay * (fmaxf(x - decay_offset, 0.0f) + fminf(x + decay_offset, 0.0f));
     float g1 = exp_avg[idx];
     float g2 = exp_avg_sq[idx];
+    // Self-heal: a moment that is already non-finite would otherwise pin this
+    // parameter for the rest of the run.
+    if (!isfinite(g1)) g1 = 0.0f;
+    if (!isfinite(g2)) g2 = 0.0f;
 
     g1 = beta1 * g1 + (1.0f - beta1) * v;
     g2 = beta2 * g2 + (1.0f - beta2) * v * v;
 
-    x -= lr * inv_bias_correction1 * g1 / (sqrtf(g2 * inv_bias_correction2) + eps);
+    float x_new = x - lr * inv_bias_correction1 * g1 /
+                          (sqrtf(g2 * inv_bias_correction2) + eps);
 
-    param[idx] = x;
-    exp_avg[idx] = g1;
-    exp_avg_sq[idx] = g2;
+    // For the per-photo appearance tables (PPISP, bilagrid) one non-finite
+    // entry poisons every pixel of that photo for the rest of the run, and
+    // nothing restores it. Drop the step instead.
+    if (isfinite(x_new)) param[idx] = x_new;
+    if (isfinite(g1)) exp_avg[idx] = g1;
+    if (isfinite(g2)) exp_avg_sq[idx] = g2;
 }
 
 /*[AutoHeaderGeneratorExport]*/
@@ -109,8 +143,14 @@ __global__ void fused_adagrad_kernel(
     if (idx >= numel) return;
     float v = grad[idx];
     if (!isfinite(v)) v = 0.0f;
-    float a = accum[idx] + v * v;
-    param[idx] -= lr * v / (sqrtf(a) + eps);
+    float a0 = accum[idx];
+    if (!isfinite(a0)) a0 = 0.0f;   // self-heal, see fused_adam_with_steps_kernel
+    float a = a0 + v * v;
+    if (!isfinite(a)) a = a0;
+    // See fused_adam_with_steps_kernel: a finite parameter must not become
+    // non-finite, or the photo it corrects renders NaN for the rest of the run.
+    float x_new = param[idx] - lr * v / (sqrtf(a) + eps);
+    if (isfinite(x_new)) param[idx] = x_new;
     accum[idx] = a;
 }
 
@@ -134,7 +174,7 @@ void fused_adagrad_step(
 }
 
 
-template<int BLOCK_SIZE, int QUANT_BITS, bool zero_grad>
+template<int BLOCK_SIZE, int QUANT_BITS, bool zero_grad, bool color_trust_linear>
 __global__ void fused_adam_with_steps_8bit_kernel(
     float* __restrict__ param,
     float* __restrict__ grad,
@@ -146,6 +186,7 @@ __global__ void fused_adam_with_steps_8bit_kernel(
     const float decay,
     const float decay_offset,
     const float grad_scale,
+    [[maybe_unused]] const ColorTrustState ct,
     const int64_t numel,
     const int stride
 ) {
@@ -171,6 +212,14 @@ __global__ void fused_adam_with_steps_8bit_kernel(
     v *= grad_scale;
     v += decay * (fmaxf(x - decay_offset, 0.0f) + fminf(x + decay_offset, 0.0f));
 
+    [[maybe_unused]] _ShColorTrust trust;
+    if constexpr (color_trust_linear) {
+        if (inside) {
+            trust = _ShColorTrust::make(ct, idx, stride);
+            v *= trust.scale;
+        }
+    }
+
     // Decode joint (u, sqrt(g2)) via QuantizedAdamState codec.
     float4 mm = quant_bounds[blockIdx.x];
     float g1, g2;
@@ -186,8 +235,11 @@ __global__ void fused_adam_with_steps_8bit_kernel(
     g1 = beta1 * g1 + (1.0f - beta1) * v;
     g2 = beta2 * g2 + (1.0f - beta2) * v*v;
 
-    x -= lr * inv_bias_correction1 * g1 / (sqrtf(g2 * inv_bias_correction2) + eps);
-    param[idx] = x;
+    float delta = -lr * inv_bias_correction1 * g1 /
+                  (sqrtf(g2 * inv_bias_correction2) + eps);
+    if constexpr (color_trust_linear) delta = trust.clamp_step(delta);
+    x += delta;
+    if (inside) param[idx] = x;
 
     // Re-encode the new Adam state in the (u, sqrt(g2)) basis.
     float2 us_new = QState::g1g2_to_us(g1, g2);
@@ -238,6 +290,7 @@ void fused_adam_step_quantized(
     float l2_reg,
     float l2_reg_offset,
     int bits,                           // 4 or 8 -- selects QuantizedAdamState<BITS, 256>
+    ColorTrustState color_trust,
     float grad_scale, bool zero_grad
 ) {
     int64_t param_numel = param.numel();
@@ -250,22 +303,28 @@ void fused_adam_step_quantized(
         param.data_ptr(), grad.data_ptr(), packed, quant_bounds, \
         lr, step, per_splat_steps.data_ptr(), \
         2.0f*l2_reg/(float)(num_splats*stride), l2_reg_offset, \
-        grad_scale, \
+        grad_scale, color_trust, \
         num_splats*stride, stride
 
+    #define _PICK_Q(BITS) \
+        (zero_grad \
+             ? (color_trust.enabled \
+                    ? fused_adam_with_steps_8bit_kernel<BLOCK_SIZE, BITS, true,  true> \
+                    : fused_adam_with_steps_8bit_kernel<BLOCK_SIZE, BITS, true,  false>) \
+             : (color_trust.enabled \
+                    ? fused_adam_with_steps_8bit_kernel<BLOCK_SIZE, BITS, false, true> \
+                    : fused_adam_with_steps_8bit_kernel<BLOCK_SIZE, BITS, false, false>))
+
     if (bits == 4) {
-        auto kfn = zero_grad ? fused_adam_with_steps_8bit_kernel<BLOCK_SIZE, 4, true>
-                             : fused_adam_with_steps_8bit_kernel<BLOCK_SIZE, 4, false>;
-        kfn<<<_LAUNCH_ARGS_1D(num_splats*stride, BLOCK_SIZE)>>>(_ARGS_TAIL);
+        _PICK_Q(4)<<<_LAUNCH_ARGS_1D(num_splats*stride, BLOCK_SIZE)>>>(_ARGS_TAIL);
     } else if (bits == 8) {
-        auto kfn = zero_grad ? fused_adam_with_steps_8bit_kernel<BLOCK_SIZE, 8, true>
-                             : fused_adam_with_steps_8bit_kernel<BLOCK_SIZE, 8, false>;
-        kfn<<<_LAUNCH_ARGS_1D(num_splats*stride, BLOCK_SIZE)>>>(_ARGS_TAIL);
+        _PICK_Q(8)<<<_LAUNCH_ARGS_1D(num_splats*stride, BLOCK_SIZE)>>>(_ARGS_TAIL);
     } else {
         throw std::runtime_error(
             "fused_adam_step_quantized: bits must be 4 or 8, got " +
             std::to_string(bits));
     }
+    #undef _PICK_Q
     #undef _ARGS_TAIL
     CHECK_DEVICE_ERROR(cudaGetLastError());
 }
@@ -288,7 +347,8 @@ void fused_adam_step_quantized(
 // the packed buffer IS the canonical storage).
 // ================
 
-template<int BLOCK_SIZE, int OPTIM_BITS, int VALUE_BITS, bool zero_grad>
+template<int BLOCK_SIZE, int OPTIM_BITS, int VALUE_BITS, bool zero_grad,
+         bool color_trust_linear>
 __global__ void fused_adam_with_steps_qq_kernel(
     float* __restrict__ grad,           // fp32 grad (dense); null when grad-quant on
     // Block-wise QUANTIZED SH grad (non-FPBO grad-quant path). When
@@ -306,6 +366,7 @@ __global__ void fused_adam_with_steps_qq_kernel(
     const float decay,
     const float decay_offset,
     const float grad_scale,
+    [[maybe_unused]] const ColorTrustState ct,
     const int64_t numel,
     const int stride
 ) {
@@ -343,6 +404,14 @@ __global__ void fused_adam_with_steps_qq_kernel(
     v *= grad_scale;
     v += decay * (fmaxf(x - decay_offset, 0.0f) + fminf(x + decay_offset, 0.0f));
 
+    [[maybe_unused]] _ShColorTrust trust;
+    if constexpr (color_trust_linear) {
+        if (inside) {
+            trust = _ShColorTrust::make(ct, idx, stride);
+            v *= trust.scale;
+        }
+    }
+
     // Decode joint (u, sqrt_g2) for Adam state.
     float4 optim_mm = optim_bounds[blockIdx.x];
     float g1 = 0.0f, g2 = 0.0f;
@@ -355,7 +424,10 @@ __global__ void fused_adam_with_steps_qq_kernel(
     g1 = beta1 * g1 + (1.0f - beta1) * v;
     g2 = beta2 * g2 + (1.0f - beta2) * v * v;
 
-    x -= lr * inv_bias_correction1 * g1 / (sqrtf(g2 * inv_bias_correction2) + eps);
+    float delta = -lr * inv_bias_correction1 * g1 /
+                  (sqrtf(g2 * inv_bias_correction2) + eps);
+    if constexpr (color_trust_linear) delta = trust.clamp_step(delta);
+    x += delta;
 
     // ---- value bounds block-reduce (float2 min/max) ----
     float2 value_mm_new = inside ? float2{x, x} : float2{1e30f, -1e30f};
@@ -436,6 +508,7 @@ void fused_adam_step_quantized_value(
     float l2_reg_offset,
     int optim_bits,                     // 4 or 8
     int value_bits,                     // 8 or 16
+    ColorTrustState color_trust,
     float grad_scale, bool zero_grad
 ) {
     if (param_numel == 0 || num_splats == 0)
@@ -447,33 +520,35 @@ void fused_adam_step_quantized_value(
         grad.data_ptr(), grad_q_packed, grad_q_bounds, optim_packed, optim_bounds, value_packed, value_bounds, \
         lr, step, per_splat_steps.data_ptr(), \
         2.0f*l2_reg/(float)(num_splats*stride), l2_reg_offset, \
-        grad_scale, \
+        grad_scale, color_trust, \
         num_splats*stride, stride
 
-    // 4 instantiations: (optim_bits in {4, 8}) x (value_bits in {8, 16}) x
-    // (zero_grad in {false, true}). Throw on any other combination.
+    // 16 instantiations: (optim_bits in {4, 8}) x (value_bits in {8, 16}) x
+    // (zero_grad) x (color_trust_linear). Throw on any other combination.
+    #define _PICK_QQ(OB, VB) \
+        (zero_grad \
+             ? (color_trust.enabled \
+                    ? fused_adam_with_steps_qq_kernel<BLOCK_SIZE, OB, VB, true,  true> \
+                    : fused_adam_with_steps_qq_kernel<BLOCK_SIZE, OB, VB, true,  false>) \
+             : (color_trust.enabled \
+                    ? fused_adam_with_steps_qq_kernel<BLOCK_SIZE, OB, VB, false, true> \
+                    : fused_adam_with_steps_qq_kernel<BLOCK_SIZE, OB, VB, false, false>))
+
     if (optim_bits == 4 && value_bits == 8) {
-        auto kfn = zero_grad ? fused_adam_with_steps_qq_kernel<BLOCK_SIZE, 4, 8,  true>
-                             : fused_adam_with_steps_qq_kernel<BLOCK_SIZE, 4, 8,  false>;
-        kfn<<<_LAUNCH_ARGS_1D(num_splats*stride, BLOCK_SIZE)>>>(_ARGS_TAIL_QQ);
+        _PICK_QQ(4, 8)<<<_LAUNCH_ARGS_1D(num_splats*stride, BLOCK_SIZE)>>>(_ARGS_TAIL_QQ);
     } else if (optim_bits == 4 && value_bits == 16) {
-        auto kfn = zero_grad ? fused_adam_with_steps_qq_kernel<BLOCK_SIZE, 4, 16, true>
-                             : fused_adam_with_steps_qq_kernel<BLOCK_SIZE, 4, 16, false>;
-        kfn<<<_LAUNCH_ARGS_1D(num_splats*stride, BLOCK_SIZE)>>>(_ARGS_TAIL_QQ);
+        _PICK_QQ(4, 16)<<<_LAUNCH_ARGS_1D(num_splats*stride, BLOCK_SIZE)>>>(_ARGS_TAIL_QQ);
     } else if (optim_bits == 8 && value_bits == 8) {
-        auto kfn = zero_grad ? fused_adam_with_steps_qq_kernel<BLOCK_SIZE, 8, 8,  true>
-                             : fused_adam_with_steps_qq_kernel<BLOCK_SIZE, 8, 8,  false>;
-        kfn<<<_LAUNCH_ARGS_1D(num_splats*stride, BLOCK_SIZE)>>>(_ARGS_TAIL_QQ);
+        _PICK_QQ(8, 8)<<<_LAUNCH_ARGS_1D(num_splats*stride, BLOCK_SIZE)>>>(_ARGS_TAIL_QQ);
     } else if (optim_bits == 8 && value_bits == 16) {
-        auto kfn = zero_grad ? fused_adam_with_steps_qq_kernel<BLOCK_SIZE, 8, 16, true>
-                             : fused_adam_with_steps_qq_kernel<BLOCK_SIZE, 8, 16, false>;
-        kfn<<<_LAUNCH_ARGS_1D(num_splats*stride, BLOCK_SIZE)>>>(_ARGS_TAIL_QQ);
+        _PICK_QQ(8, 16)<<<_LAUNCH_ARGS_1D(num_splats*stride, BLOCK_SIZE)>>>(_ARGS_TAIL_QQ);
     } else {
         throw std::runtime_error(
             "fused_adam_step_quantized_value: optim_bits in {4, 8} and "
             "value_bits in {8, 16}; got optim_bits=" + std::to_string(optim_bits) +
             ", value_bits=" + std::to_string(value_bits));
     }
+    #undef _PICK_QQ
     #undef _ARGS_TAIL_QQ
     CHECK_DEVICE_ERROR(cudaGetLastError());
 }

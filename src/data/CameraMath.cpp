@@ -52,13 +52,6 @@ void distort_lens(double u, double v, int tier, const float* d, double out[2]) {
         out[1] = v*radial + 2*d[3]*u*v + d[2]*(r2 + 2*v*v);
         return;
     }
-    if (tier == (int)CameraDistortionType::Rational) {
-        double radial = (1 + r2*(d[0] + r2*(d[1] + r2*d[2])))
-                      / (1 + r2*(d[3] + r2*(d[4] + r2*d[5])));
-        out[0] = u*radial + 2*d[6]*u*v + d[7]*(r2 + 2*u*u);
-        out[1] = v*radial + 2*d[7]*u*v + d[6]*(r2 + 2*v*v);
-        return;
-    }
     double radial = 1 + r2*(d[0] + r2*(d[1] + r2*(d[2] + r2*d[3])));
     out[0] = u*radial + 2*d[4]*u*v + d[5]*(r2 + 2*u*u) + d[6]*r2;
     out[1] = v*radial + 2*d[5]*u*v + d[4]*(r2 + 2*v*v) + d[7]*r2;
@@ -361,8 +354,8 @@ const double kEquirectAxes[6][3][3] = {
 constexpr int kSizeStep = 32;
 
 // A frame under this share of the image's rays is noise, not a face (what
-// --check calls a hole). A fisheye's back frame needs a quarter of its own 90
-// degrees: corners past 135 degrees are usually outside the image circle.
+// --check calls a hole). A fisheye's back frame is opt-in and then needs a
+// quarter of its own 90 degrees: past 135 degrees a real lens is folding.
 constexpr double kMinShare       = 0.002;
 constexpr double kMinVisibleBack = 0.25;
 
@@ -391,7 +384,8 @@ int face_origin(const Crop& c, int axis, int side, int half) {
 const double* fisheye_face_axes()  { return &kFisheyeAxes[0][0][0]; }
 const double* equirect_face_axes() { return &kEquirectAxes[0][0][0]; }
 
-std::vector<SplitFace> plan_split_faces(const Camera& cam_in, FaceFit fit) {
+std::vector<SplitFace> plan_split_faces(const Camera& cam_in, FaceFit fit,
+                                        bool back_face) {
     Camera cam = cam_in;
     const bool equi = cam.model == M_EQUIRECT;
     if (equi) {
@@ -421,7 +415,8 @@ std::vector<SplitFace> plan_split_faces(const Camera& cam_in, FaceFit fit) {
     std::vector<Crop> crops;
     for (int k = 0; k < 6; ++k) {
         if (fraction[k] < kMinShare * total) continue;
-        if (k == 5 && !equi && fraction[k] < kMinVisibleBack) continue;
+        if (k == 5 && !equi && (!back_face || fraction[k] < kMinVisibleBack))
+            continue;
         Crop c;
         c.face = k;
         for (int a = 0; a < 2; ++a) {

@@ -59,11 +59,22 @@ public:
     bool next(FrameHandle& out, std::string& error);
     void release(FrameHandle& h);
 
+    // To the sync sample at or before `index`, reporting the frame the next
+    // next() hands back; false where the container carries no index, leaving
+    // the pipeline as it was. Release every FrameHandle first.
+    bool seek(int64_t index, int64_t& landed, std::string& error);
+
     // Records the sharpness reduction for a live frame. Values become readable
     // after flushSharpness(), which costs one queue sync for the whole batch.
     void  queueSharpness(const FrameHandle& h);
     void  flushSharpness();
     float sharpness(const FrameHandle& h) const;
+
+    // A box-filtered grey copy of the frame at `w` x `h`, on the host. What
+    // motion analysis reads: the GPU does the reduction, so a frame costs a
+    // dispatch and a few tens of kilobytes over the bus rather than a download.
+    bool toGray(const FrameHandle& h, int w, int h_out, std::vector<uint8_t>& out,
+                std::string& error);
 
     // Converts to host RGB. Blocks until the frame is ready.
     bool toImage(const FrameHandle& h, const ConvertOpts& opts, nn::Image& out,

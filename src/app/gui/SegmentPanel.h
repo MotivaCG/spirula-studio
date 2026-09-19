@@ -27,8 +27,8 @@
 // says so -- when there is none.
 
 #include "app/FrameMask.h"
-#include "app/gui/DatasetPrep.h"   // MaskClick
 #include "app/gui/GlLoader.h"
+#include "app/gui/MaskSettings.h"
 #include "app/gui/PreviewFrames.h"
 
 #include <atomic>
@@ -40,38 +40,16 @@
 
 namespace gui {
 
-// The mask settings the panel edits, owned by the dataset screen so what is
-// tried here is what runs.
-struct MaskSettings {
-    std::string prompt;              // "people; cars"
-    std::string negative_prompt;
-    bool keep_subject = false;       // prompt names what to KEEP
-    int  max_image_size = 1600;
-    float threshold = 0.5f;
-    float nms = 0.1f;
-    // Clicked objects, across every frame and every input the user visited;
-    // each carries the input it was drawn on (MaskClick::source).
-    std::vector<MaskClick> clicks;
-    int object_count = 1;            // how many the user has opened
-    int current_object = 0;          // which one a new click joins
-};
-
 class SegmentPanel {
 public:
     // Both out of line: the pimpl'd Job is incomplete here.
     SegmentPanel();
     ~SegmentPanel();
 
-    // `input` is a folder of images or a video file. Cheap: the frame list is
-    // gathered here, nothing is decoded or loaded until the panel draws (a
-    // video is asked how long it is, which is one probe either way).
-    //
-    // `ffmpeg_exe` and `force_ffmpeg` are the same two settings the dataset run
-    // takes: a machine whose driver cannot decode video reads the preview frame
-    // with an external ffmpeg, exactly as preparation would.
-    void open(const std::string& input, bool is_video,
-              const std::string& model_path, const std::string& ffmpeg_exe,
-              bool force_ffmpeg);
+    // `src` carries the decoder and the FrameLook the run will use, so the
+    // picture here is the file it writes. Video listing and probing run on the
+    // panel worker; frame decoding follows there after the list is ready.
+    void open(const PreviewSource& src, const std::string& model_path);
     bool is_open() const { return _open; }
     void close();
 
@@ -102,22 +80,41 @@ private:
     // The settings hold every input's clicks; these are the ones on this picture.
     bool mine(const MaskClick& c) const { return c.source == _src.input; }
 
+    // Which camera folder a file of a photo input belongs to, keyed the way
+    // the run keys them (DatasetPrep's StencilRaster). "" for a video.
+    std::string camera_of(const std::string& file) const;
+
+    // The folder the shown frame lands in under the input's images: a 360
+    // view, one lens of a multi-lens file, or the photo's own subfolder.
+    std::string shown_camera() const;
+
     bool _open = false;
     std::string _model_path;
     PreviewSource _src;
+    // What the run splits this input into; one empty name for one camera.
+    std::vector<std::string> _folders;
+    int  _folder_idx = 0;
     std::vector<PreviewFrame> _frames;
-    // Every image of a photo input, which is what the border fit reads. The
-    // slider offers a dozen of them; a fit wants a spread of two dozen.
+    // Every image of a photo input; the border fit reads the ones sharing the
+    // shown frame's camera folder. The slider offers a dozen, a fit two dozen.
     std::vector<std::string> _all_files;
+    bool _frames_ready = false;         // guarded by _mu
+    PreviewSource _listed_src;          // guarded by _mu
+    std::vector<PreviewFrame> _frames_pending;
+    std::vector<std::string> _all_files_pending;
+    std::vector<std::string> _folders_pending;
     int  _frame_idx = 0;
     bool _frame_dirty = true;           // the chosen frame changed
     bool _needs_run = false;            // prompt edited; rerun on release
+    std::atomic<bool> _listing{false};
 
     // ---- the stencil ----
-    // The border found for the frames this panel is showing, with no shrink
-    // applied -- the slider re-applies it without another fit. The dataset run
-    // fits one per camera; this is the one the preview can show.
+
+    // The border of the camera the shown frame belongs to -- the run fits one
+    // per camera and so does this -- carrying no shrink, so the slider
+    // re-applies it without another fit.
     app::BorderDetect _border;          // UI thread
+    std::string _border_camera;         // which camera _border was fitted on
     app::BorderDetect _border_pending;  // guarded by _mu
     bool _border_ready = false;         // guarded by _mu
     std::atomic<bool> _detecting{false};
@@ -138,7 +135,7 @@ private:
     int _preview_w = 0, _preview_h = 0;
     bool _preview_dirty = false;
     std::string _status, _error;
-    float _kept_fraction = -1.0f;
+    float _kept_fraction = -1.0f; // guarded by _mu
 
     GLuint _tex = 0;
     int _tex_w = 0, _tex_h = 0;

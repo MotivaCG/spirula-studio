@@ -7,7 +7,8 @@
 
 #include "checkpoint/SplatPly.h"
 #include "data/Json.h"
-#include "app/gui/AppPaths.h"
+#include "app/AppPaths.h"
+#include "app/CrashLog.h"
 #include "app/gui/DatasetPrep.h"
 #include "app/gui/MaskPrompt.h"
 #include "app/gui/Subprocess.h"
@@ -26,16 +27,31 @@
 #include "app_generated/app_banner.h"
 #include "external/stb_image.h"
 
+#include "core/Env.h"
+#if defined(SS_BUILD_SAM) || defined(SS_TOOL_SFM) || defined(SS_BACKEND_VULKAN)
+#include "core/VulkanDeviceSelection.h"
+#endif
+
 #include "imgui.h"
 #include "imgui_stdlib.h"
 
+// Side-effect-free native listing; it must not publish the engine selection.
+#if defined(SS_BUILD_SAM)
+#include "nn/Device.h"
+#include "nn/vk/Context.h"
+#elif defined(SS_TOOL_SFM)
+#include "sfm/vk/VkContext.h"
+#endif
+
 #include <algorithm>
 #include <cfloat>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 
 namespace fs = std::filesystem;
 namespace i18n = spirula::i18n;
@@ -43,6 +59,7 @@ namespace msg = spirula::i18n::msg::gui;
 namespace fld = spirula::i18n::msg::field;
 namespace dmsg = spirula::i18n::msg::dataset;
 namespace gmsg = spirula::i18n::msg::geometry;
+namespace tmsg = spirula::i18n::msg::train;
 using spirula::i18n::Msg;
 using spirula::format_duration;
 
@@ -54,6 +71,24 @@ const ImVec4 kOk(0.35f, 0.85f, 0.45f, 1.0f);
 const ImVec4 kErr(1.0f, 0.42f, 0.42f, 1.0f);
 const ImVec4 kWarn(0.95f, 0.75f, 0.30f, 1.0f);
 const ImVec4 kDim(0.6f, 0.6f, 0.6f, 1.0f);
+#if defined(SS_BUILD_SAM) || defined(SS_TOOL_SFM) || defined(SS_BACKEND_VULKAN)
+inline const Msg& device_detail(spirula::vkselect::ResolveStatus s) {
+    switch (s) {
+        case spirula::vkselect::ResolveStatus::Malformed:
+            return msg::device_detail_malformed;
+        case spirula::vkselect::ResolveStatus::OutOfRange:
+            return msg::device_detail_out_of_range;
+        case spirula::vkselect::ResolveStatus::Unusable:
+            return msg::device_unusable_native;
+        case spirula::vkselect::ResolveStatus::NoDevice:
+            return msg::device_detail_no_device;
+        case spirula::vkselect::ResolveStatus::Missing:
+        case spirula::vkselect::ResolveStatus::Ok:
+            break;
+    }
+    return msg::device_detail_missing;
+}
+#endif
 
 std::string format_gib(uint64_t bytes) {
     char buf[32];
@@ -118,7 +153,16 @@ bool parse_settings_equal(const TrainConfig& a, const TrainConfig& b) {
 // format the mesher writes -- one list, so the picker and the drop handler
 // cannot disagree about what is openable.
 const std::vector<std::string> kViewableExtensions = {".ply", ".obj", ".gltf",
-                                                      ".glb"};
+                                                      ".glb", ".stl"};
+
+// Can this format carry this color? The child's own answer, asked through the
+// same function it refuses the run with.
+bool mesh_format_carries(int format, int color) {
+    meshing::MeshFormatSpec spec;
+    spec.fmt = kMeshFormats[format];
+    return meshing::check_export_support(spec, (meshing::MeshColorMode)color)
+        .empty();
+}
 
 std::vector<std::string> video_dialog_filters() {
     return std::vector<std::string>(kVideoExtensions,
@@ -140,9 +184,8 @@ GuiApp::GuiApp() {
     // overrides this anyway if the stored choice is unavailable.
     if (!builtin_sfm_available()) _engine = Engine::Colmap;
     _compare.set_pick_file([this] {
-        _pick = PickAction::AddSplatFile;
-        _dialog.open(msg::viewer_pick_file.get(), FileDialog::Mode::File,
-                     kViewableExtensions);
+        open_pick(PickAction::AddSplatFile, msg::viewer_pick_file.get(),
+                  FileDialog::Mode::File, kViewableExtensions);
     });
 }
 
@@ -161,13 +204,13 @@ void GuiApp::shutdown() {
     _compare.destroy_gl();
     _compare.close();
     _mesh_preview_open = false;
-    _segment.close();
+    close_native_previews();
     _segment.destroy_gl();
-    _geometry_panel.close();
     _geometry_panel.destroy_gl();
     _colmap.cancel();
     _sfm.cancel();
     reset_dataset_preview();
+    _source_probe.stop();
     _download.cancel();
     _geom_download.cancel();
     _feat_download.cancel();
@@ -175,11 +218,42 @@ void GuiApp::shutdown() {
     _runner.shutdown();
 }
 
+// One line per remembered pick directory, keyed by dir_key().
+static constexpr char kDirPrefix[] = "dialog_dir.";
+
+// gui.conf is one setting per line, so a setting that may HOLD line breaks --
+// the batch's finish command -- is written with them escaped. An escape that
+// means nothing is left alone, so a hand-typed `C:\Users` still reads back.
+static std::string escape_setting(const std::string& v) {
+    std::string out;
+    for (char c : v) {
+        if (c == '\\') out += "\\\\";
+        else if (c == '\n') out += "\\n";
+        else if (c != '\r') out += c;
+    }
+    return out;
+}
+static std::string unescape_setting(const std::string& v) {
+    std::string out;
+    for (size_t i = 0; i < v.size(); i++) {
+        if (v[i] != '\\' || i + 1 >= v.size()) { out += v[i]; continue; }
+        const char next = v[i + 1];
+        if (next == 'n') { out += '\n'; i++; }
+        else if (next == '\\') { out += '\\'; i++; }
+        else out += v[i];
+    }
+    return out;
+}
+
 std::string GuiApp::settings_path() {
-    return (fs::path(config_dir()) / "gui.conf").string();
+    return (fs::path(app::config_dir()) / "gui.conf").string();
 }
 
 void GuiApp::load_settings() {
+    // Presets have a folder of their own; every other kind of pick starts at
+    // the home directory until one of that kind has been made.
+    _dialog_dirs["preset"] = preset_dir(PresetKind::Train);
+
     std::string saved_lang;
     FILE* f = std::fopen(settings_path().c_str(), "r");
     if (!f) {
@@ -205,6 +279,7 @@ void GuiApp::load_settings() {
         else if (k == "python_exe" && !v.empty()) _python_exe = v;
         else if (k == "sfm_engine") _engine = v == "colmap" ? Engine::Colmap
                                                             : Engine::BuiltIn;
+        else if (k == "batch_command") _batch_cmd = unescape_setting(v);
         else if (k == "accepted_license" && !v.empty() && !license_accepted(v))
             _accepted_licenses.push_back(v);
         else if (k == "lang" && !v.empty()) saved_lang = v;
@@ -219,6 +294,11 @@ void GuiApp::load_settings() {
         else if (k == "preview_h") _preview_h = (float)atof(v.c_str());
         else if (k == "show_settings") _show_settings = v != "0";
         else if (k == "native_dialogs") _dialog.use_native(v != "0");
+        // Absent -- an upgrade from a build that did not write it -- leaves the
+        // default, which is ON: the files are what makes a run resumable.
+        else if (k == "keep_intermediate") _sfm_job.keep_intermediate = v != "0";
+        else if (k.rfind(kDirPrefix, 0) == 0 && !v.empty())
+            _dialog_dirs[k.substr(sizeof kDirPrefix - 1)] = v;
     }
     std::fclose(f);
 
@@ -248,6 +328,7 @@ void GuiApp::save_settings() {
     std::fprintf(f, "python_exe=%s\n", _python_exe.c_str());
     std::fprintf(f, "sfm_engine=%s\n",
                  _engine == Engine::Colmap ? "colmap" : "builtin");
+    std::fprintf(f, "batch_command=%s\n", escape_setting(_batch_cmd).c_str());
     std::fprintf(f, "lang=%s\n", spirula::i18n::code(spirula::i18n::current()));
     std::fprintf(f, "ui_scale=%.3f\n", _scale.user());
     std::fprintf(f, "panel_w=%.1f\n", _panel_w);
@@ -259,6 +340,9 @@ void GuiApp::save_settings() {
     std::fprintf(f, "preview_h=%.1f\n", _preview_h);
     std::fprintf(f, "show_settings=%d\n", _show_settings ? 1 : 0);
     std::fprintf(f, "native_dialogs=%d\n", _dialog.native_enabled() ? 1 : 0);
+    std::fprintf(f, "keep_intermediate=%d\n", _sfm_job.keep_intermediate ? 1 : 0);
+    for (const auto& [key, dir] : _dialog_dirs)
+        std::fprintf(f, "%s%s=%s\n", kDirPrefix, key.c_str(), dir.c_str());
     for (const auto& l : _accepted_licenses)
         std::fprintf(f, "accepted_license=%s\n", l.c_str());
     std::fclose(f);
@@ -279,13 +363,122 @@ void GuiApp::add_model_recent(std::string path) {
     if (_model_recents.size() > 10) _model_recents.resize(10);
 }
 
-// One entry per SCREEN line: the panel clips with a list clipper and
-// compensates its scroll for trimmed lines, and both want a uniform height.
-void GuiApp::log(const std::string& s, bool detail) {
+// Local wall-clock stamp for log lines: [yyyy-MM-dd HH:mm:ss.fff].
+static std::string log_stamp() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    const int ms = int(std::chrono::duration_cast<std::chrono::milliseconds>(
+                           now.time_since_epoch()).count() % 1000);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char date[32], frac[16];
+    std::strftime(date, sizeof(date), "[%Y-%m-%d %H:%M:%S", &tm);
+    std::snprintf(frac, sizeof(frac), ".%03d] ", ms);
+    return std::string(date) + frac;
+}
+
+// Run-start stamp for log file names: yyyyMMddHHmmss.
+static std::string run_log_stamp() {
+    const std::time_t t =
+        std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char buf[24];
+    std::strftime(buf, sizeof(buf), "%Y%m%d%H%M%S", &tm);
+    return buf;
+}
+
+// Open this run's log file: <dir>/logs/<kind>_<stamp>.log, where dir is the
+// folder the images folder lives in. A run that cannot name that folder keeps
+// its log on the panel only. Returns the file's path, empty when none.
+static fs::path open_run_log(std::ofstream& f, const std::string& dataset_dir,
+                             const char* kind, const std::string& stamp) {
+    if (f.is_open()) f.close();
+    f.clear();
+    if (dataset_dir.empty()) return {};
+    std::error_code ec;
+    const fs::path dir = fs::path(dataset_dir) / "logs";
+    fs::create_directories(dir, ec);
+    if (ec) return {};
+    const fs::path file = dir / (std::string(kind) + "_" + stamp + ".log");
+    f.open(file, std::ios::out | std::ios::app);
+    return file;
+}
+
+// Hand a value to the reconstruction engines through the process environment
+// (the SS_* namespace core/Env.h owns); the SfM subprocess inherits it too.
+// Empty clears.
+static void set_ss_env(const char* suffix, const std::string& value) {
+    const std::string name = std::string("SS_") + suffix;
+#ifdef _WIN32
+    _putenv_s(name.c_str(), value.c_str());
+#else
+    setenv(name.c_str(), value.c_str(), 1);
+#endif
+}
+
+// Mirror a log() message into the run's file, stamped the same way.
+static void file_log_line(std::ofstream& f, const std::string& s) {
+    if (!f.is_open()) return;
     size_t at = 0;
     do {
         const size_t nl = s.find('\n', at);
-        _log.push_back({s.substr(at, nl == std::string::npos ? nl : nl - at),
+        f << log_stamp()
+          << s.substr(at, nl == std::string::npos ? nl : nl - at) << '\n';
+        at = nl == std::string::npos ? nl : nl + 1;
+    } while (at != std::string::npos);
+    f.flush();
+}
+
+// Value formatting for the settings snapshot.
+static std::string cfg_str(const std::string& v) { return v; }
+static std::string cfg_str(bool v) { return v ? "true" : "false"; }
+static std::string cfg_str(int v) { return std::to_string(v); }
+static std::string cfg_str(float v) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.7g", double(v));
+    return buf;
+}
+template <typename T>
+static std::string cfg_str(const std::optional<T>& v) {
+    return v ? cfg_str(*v) : std::string("none");
+}
+template <typename T, size_t N>
+static std::string cfg_str(const std::array<T, N>& v) {
+    std::string s;
+    for (size_t i = 0; i < N; i++) {
+        if (i) s += ',';
+        s += cfg_str(v[i]);
+    }
+    return s;
+}
+
+static const char* photo_import_name(PhotoImport m) {
+    switch (m) {
+        case PhotoImport::ConvertJpeg: return "convert-jpeg";
+        case PhotoImport::Copy:        return "copy";
+        case PhotoImport::Move:        return "move";
+        case PhotoImport::InPlace:     return "in-place";
+    }
+    return "?";
+}
+
+// One entry per SCREEN line: the panel clips with a list clipper and
+// compensates its scroll for trimmed lines, and both want a uniform height.
+void GuiApp::log(const std::string& s, bool detail) {
+    const std::string stamp = log_stamp();
+    size_t at = 0;
+    do {
+        const size_t nl = s.find('\n', at);
+        _log.push_back({stamp + s.substr(at, nl == std::string::npos ? nl : nl - at),
                         detail});
         at = nl == std::string::npos ? nl : nl + 1;
     } while (at != std::string::npos);
@@ -296,12 +489,147 @@ void GuiApp::log(const std::string& s, bool detail) {
     _log_shown_dirty = true;
 }
 
+void GuiApp::clear_log() {
+    _log.clear();
+    _log_shown.clear();
+    _log_dropped = 0;
+    _log_shown_dirty = true;
+}
+
+// The panel snapshot at the top of every run log: plain key=value lines in
+// sections, no timestamps -- the timestamps start below the separator.
+void GuiApp::write_run_settings(std::ofstream& f) {
+    if (!f.is_open()) return;
+    std::string out;
+    auto section = [&out](const std::string& name) { out += "[" + name + "]\n"; };
+    auto line = [&out](const std::string& k, const std::string& v) {
+        out += "  " + k + " = " + v + "\n";
+    };
+
+    section(msg::runlog_section_run.get());
+    line("run_started", run_log_stamp());
+    line("engine", effective_engine() == Engine::BuiltIn ? "builtin" : "colmap");
+#if defined(SS_BUILD_SAM) || defined(SS_TOOL_SFM) || defined(SS_BACKEND_VULKAN)
+    line("native_device", _native_device_uuid.empty() ? "auto" : _native_device_uuid);
+    if (!_native_device_name.empty()) line("native_device_name", _native_device_name);
+#endif
+#ifndef SS_BACKEND_VULKAN
+    if (_cuda_device_index >= 0)
+        line("cuda_device", std::to_string(_cuda_device_index));
+#endif
+    line("preset", _preset);
+    if (!_train_presets.file.empty()) line("preset_file", _train_presets.file);
+    if (!_ds_presets.file.empty()) line("dataset_preset_file", _ds_presets.file);
+
+    section(msg::runlog_section_prep.get());
+    line("workspace", _workspace);
+    line("photo_import", photo_import_name(_photo_import));
+    for (const PrepInput& s : _sources)
+        line(s.is_video ? "video_source" : "photo_source", s.path);
+    line("use_found_masks", cfg_str(_use_found_masks));
+    line("flip_found_masks", cfg_str(_flip_found_masks));
+    line("masking_enabled", cfg_str(_mask_enable));
+    line("mask_features", cfg_str(_mask_features));
+    line("mask_detect_every", std::to_string(_mask_detect_every));
+
+    section(i18n::format(msg::runlog_section_recon, {"SfM"}));
+    const SfmJob& j = _sfm_job;
+    line("quality", std::to_string(j.quality));
+    line("data_type", std::to_string(j.data_type));
+    line("camera_model", j.camera_model);
+    line("camera_mode", std::to_string(j.camera_mode));
+    line("pairs", std::to_string(j.pairs));
+    line("overlap", std::to_string(j.overlap));
+    line("loop_closure", cfg_str(j.loop_closure));
+    line("features", std::to_string(j.features));
+    line("matcher", std::to_string(j.matcher));
+    line("mapper", std::to_string(j.mapper));
+    line("init_focal_px", cfg_str(j.init_focal_px));
+    if (!j.init_distortion.empty()) line("init_distortion", j.init_distortion);
+    line("distortion_refine", std::to_string(j.distortion_refine));
+    line("final_per_image_intrinsics", cfg_str(j.final_per_image_intrinsics));
+    line("final_free_rig", cfg_str(j.final_free_rig));
+    line("max_features", std::to_string(j.max_features));
+    line("max_image_size", std::to_string(j.max_image_size));
+    line("metric_gps", std::to_string(j.metric_gps));
+    line("sensor_gauge", std::to_string(j.sensor_gauge));
+    line("exif_attitude", std::to_string(j.exif_attitude));
+    line("keep_intermediate", cfg_str(j.keep_intermediate));
+    line("ba_cpu", cfg_str(j.ba_cpu));
+    line("subprocess", cfg_str(j.subprocess));
+    line("force_external_decode", cfg_str(j.prep.force_external_decode));
+    line("force_external_masking", cfg_str(j.prep.force_external_masking));
+    line("video_fps", cfg_str(j.prep.video_fps));
+    line("adaptive_fps", cfg_str(j.prep.adaptive_fps));
+    if (j.prep.adaptive_fps) line("adaptive_range", cfg_str(j.prep.adaptive_range));
+    for (const PrepInput& s : _sources)
+        if (s.is_video && s.fps > 0.0f)
+            line("video_fps:" + (s.subdir.empty() ? s.path : s.subdir),
+                 cfg_str(s.fps));
+    line("sharp_window", std::to_string(j.prep.sharp_window));
+    line("sync_tracks", cfg_str(j.prep.sync_tracks));
+    line("max_frames", std::to_string(j.prep.max_frames));
+    if (!j.extra_args.empty()) line("extra_args", j.extra_args);
+
+    if (effective_engine() == Engine::Colmap) {
+        section(i18n::format(msg::runlog_section_recon, {"COLMAP"}));
+        line("colmap_exe", _colmap_job.colmap_exe);
+        line("camera_model", _colmap_job.camera_model);
+        line("camera_mode", std::to_string(_colmap_job.camera_mode));
+    }
+
+    section(msg::runlog_section_geometry.get());
+    line("enabled", cfg_str(_geometry.enable));
+    line("model", _geometry.model);
+    line("want_depth", cfg_str(_geometry.want_depth));
+    line("want_normal", cfg_str(_geometry.want_normal));
+    line("max_size", std::to_string(_geometry.max_size));
+
+    // The training config, grouped the way the options editor groups it.
+    for (int si = 0; si < kTrainNumSections; si++) {
+        const TrainConfig& c = _cfg;
+        std::string body;
+#define SS_SNAP_FIELD(type, member, default_, s, tier, choices)              \
+        if (!std::strcmp(s, kTrainSections[si]))                             \
+            body += std::string("  ") + #member + " = " +                    \
+                    cfg_str(c.member) + "\n";
+        SS_CONFIG_FIELDS(SS_SNAP_FIELD)
+#undef SS_SNAP_FIELD
+        if (!body.empty()) {
+            const Msg* label = tmsg::section_label(kTrainSections[si]);
+            section(i18n::format(
+                msg::runlog_section_train,
+                {label ? label->get() : kTrainSections[si]}));
+            out += body;
+        }
+    }
+
+    // A fixed-width rule, so the separator still reads as one whatever the
+    // translated label measures.
+    const std::string end = msg::runlog_settings_end.get();
+    const int fill = std::max(72 - i18n::display_width(end) - 2, 6);
+    out += std::string(fill / 2, '=') + " " + end + " " +
+           std::string(fill - fill / 2, '=') + "\n\n";
+    f << out;
+    f.flush();
+}
+
 void GuiApp::append_logs() {
-    for (auto& s : _runner.drain_log()) log(s);
-    for (auto& l : _colmap.steps().drain()) log(l.text, l.detail);
-    for (auto& l : _sfm.steps().drain()) log(l.text, l.detail);
+    for (auto& s : _runner.drain_log()) {
+        file_log_line(_train_log, s);
+        log(s);
+    }
+    for (auto& l : _colmap.steps().drain()) {
+        file_log_line(_prep_log, l.text);
+        log(l.text, l.detail);
+    }
+    for (auto& l : _sfm.steps().drain()) {
+        file_log_line(_prep_log, l.text);
+        log(l.text, l.detail);
+    }
     for (auto& s : _compare.drain_log()) log(s);
     for (auto& s : _mesh.drain_log()) log(s);
+    poll_batch_command();
     for (auto& s : _download.drain_log()) log(s);
     for (auto& s : _font_download.drain_log()) log(s);
     // A finished font download is the one thing besides a language switch
@@ -326,6 +654,7 @@ bool GuiApp::training_busy() const {
 }
 
 void GuiApp::apply_preset(const std::string& preset) {
+    if (native_work_busy() || _batch_active) return;
     TrainConfig fresh;
     train_apply_preset(fresh, preset);
     // Keep GUI-managed context across preset switches.
@@ -337,10 +666,10 @@ void GuiApp::apply_preset(const std::string& preset) {
     // re-enabled in Basic Options for remote monitoring.
     fresh.disable_viewer = true;
     _preset = preset;
-    _preset_file.clear();
-    _preset_display.clear();
-    _preset_desc.clear();
-    _preset_msg.clear();   // whatever it reported was about the last preset
+    _train_presets.file.clear();
+    _train_presets.display.clear();
+    _train_presets.desc.clear();
+    _train_presets.msg.clear();   // whatever it reported was about the last preset
     _cfg = fresh;
     _defaults = fresh;
     _cfg_ui.touched.clear();
@@ -354,6 +683,7 @@ void GuiApp::apply_preset(const std::string& preset) {
 // built-in preset does -- but the same four fields stay out of its reach
 // (SS_PRESET_CONTEXT_FIELDS), because a preset is "how", not "where".
 void GuiApp::apply_user_preset(const TrainPreset& p) {
+    if (native_work_busy() || _batch_active) return;
     const TrainConfig stock;
     TrainConfig fresh = p.cfg;
     fresh.data = _cfg.data;
@@ -369,10 +699,10 @@ void GuiApp::apply_user_preset(const TrainPreset& p) {
     fresh.disable_viewer = true;   // as apply_preset: the native viewport
 
     _preset = p.base;
-    _preset_file = p.path;
-    _preset_display = p.name;
-    _preset_desc = p.description;
-    _preset_msg.clear();   // whatever it reported was about the last preset
+    _train_presets.file = p.path;
+    _train_presets.display = p.name;
+    _train_presets.desc = p.description;
+    _train_presets.msg.clear();   // whatever it reported was about the last preset
     _cfg = fresh;
     _defaults = fresh;
     // What the preset spelled out is off limits to the macro options, exactly
@@ -386,24 +716,24 @@ void GuiApp::apply_user_preset(const TrainPreset& p) {
 
 void GuiApp::load_preset_file(const std::string& path) {
     if (path.empty()) return;
-    // Applying a preset re-parses the dataset, which takes the live session
-    // down with it. Refuse rather than kill a run somebody is watching.
-    if (training_busy() || _batch_active) {
-        _preset_msg = dmsg::log_drop_while_training.get();
-        _preset_msg_err = true;
-        log(_preset_msg);
+    // Applying a preset re-parses the dataset, which takes a live session
+    // down with it. Refuse while native work is running.
+    if (native_work_busy() || _batch_active) {
+        _train_presets.msg = dmsg::log_drop_while_training.get();
+        _train_presets.msg_err = true;
+        log(_train_presets.msg);
         return;
     }
     try {
         TrainPreset p = load_preset(path);
         apply_user_preset(p);
-        _preset_msg = i18n::format(msg::preset_loaded, {p.name});
-        _preset_msg_err = false;
+        _train_presets.msg = i18n::format(msg::preset_loaded, {p.name});
+        _train_presets.msg_err = false;
     } catch (const std::exception& e) {
-        _preset_msg = i18n::format(msg::preset_failed, {e.what()});
-        _preset_msg_err = true;
+        _train_presets.msg = i18n::format(msg::preset_failed, {e.what()});
+        _train_presets.msg_err = true;
     }
-    log(_preset_msg);
+    log(_train_presets.msg);
     refresh_presets();
 }
 
@@ -412,14 +742,205 @@ void GuiApp::refresh_presets() {
     // a directory listing plus a small JSON parse per file, which is cheap
     // twice a second and silly at 120 Hz.
     double now = ImGui::GetTime();
-    if (_presets_scanned_at >= 0.0 && now - _presets_scanned_at < 2.0) return;
-    _presets_scanned_at = now;
-    _presets = list_presets();
+    if (_train_presets.scanned_at >= 0.0 && now - _train_presets.scanned_at < 2.0) return;
+    _train_presets.scanned_at = now;
+    _train_presets.items = list_presets();
 }
 
+void GuiApp::refresh_dataset_presets() {
+    double now = ImGui::GetTime();
+    if (_ds_presets.scanned_at >= 0.0 && now - _ds_presets.scanned_at < 2.0) return;
+    _ds_presets.scanned_at = now;
+    _ds_presets.items = list_dataset_presets();
+}
+
+void GuiApp::refresh_mesh_presets() {
+    double now = ImGui::GetTime();
+    if (_mesh_presets.scanned_at >= 0.0 && now - _mesh_presets.scanned_at < 2.0) return;
+    _mesh_presets.scanned_at = now;
+    _mesh_presets.items = list_mesh_presets();
+}
+
+
+// ---------------------------------------------------------------------------
+// Dataset and meshing presets
+//
+// A preset carries the "how" (DatasetPreset.h); the inputs, the output folder,
+// the clicks and the stencils stay where they are.
+// ---------------------------------------------------------------------------
+
+DatasetSettings GuiApp::capture_dataset_settings() const {
+    DatasetSettings s;
+    s.colmap_engine = effective_engine() == Engine::Colmap;
+    s.sfm = _sfm_job;
+    s.colmap = _colmap_job;
+    s.mask = _mask;
+    s.mask_model_id = _model_id;
+    s.use_found_masks = _use_found_masks;
+    s.border_enable = _border_enable;
+    // The panel-level copies are what the user edits; sync_dataset_jobs() fans
+    // them out, and a preset has to carry what was edited rather than what a
+    // sync happened to leave behind.
+    s.sfm.prep.resume = _resume;
+    s.sfm.prep.photo_import = _photo_import;
+    s.sfm.prep.flip_found_masks = _flip_found_masks;
+    s.sfm.prep.mask_enable = _mask_enable;
+    s.sfm.prep.mask_memory = _mask_memory;
+    s.sfm.prep.mask_detect_every = _mask_detect_every;
+    s.sfm.prep.mask_memory_frames = _mask_memory_frames;
+    s.sfm.mask_features = _mask_features;
+    s.sfm.geometry = _geometry;
+    return s;
+}
+
+void GuiApp::apply_dataset_settings(const DatasetSettings& in) {
+    DatasetSettings s = in;
+    sanitize_dataset_settings(s);
+
+    _engine = s.colmap_engine ? Engine::Colmap : Engine::BuiltIn;
+    _sfm_job = s.sfm;
+    _colmap_job = s.colmap;
+    // Clicks belong to the frames they were drawn on, so a preset neither
+    // carries them nor is allowed to throw away the ones on screen.
+    const std::vector<MaskClick> clicks = _mask.clicks;
+    const int objects = _mask.object_count, current = _mask.current_object;
+    _mask = s.mask;
+    _mask.clicks = clicks;
+    _mask.object_count = objects;
+    _mask.current_object = current;
+    if (find_model(s.mask_model_id)) _model_id = s.mask_model_id;
+    _use_found_masks = s.use_found_masks;
+    _border_enable = s.border_enable;
+    _resume = s.sfm.prep.resume;
+    _photo_import = s.sfm.prep.photo_import;
+    _flip_found_masks = s.sfm.prep.flip_found_masks;
+    _mask_enable = s.sfm.prep.mask_enable;
+    _mask_memory = s.sfm.prep.mask_memory;
+    _mask_detect_every = s.sfm.prep.mask_detect_every;
+    _mask_memory_frames = s.sfm.prep.mask_memory_frames;
+    _mask_features = s.sfm.mask_features;
+    _geometry = s.sfm.geometry;
+    // A colour space the preset spelled out is a decision, so the EXR probe
+    // must not overwrite it later.
+    _color_space_touched =
+        !s.sfm.image_gamut.empty() || s.sfm.image_is_linear.has_value();
+    resolve_source_lenses(_sources, _sfm_job, _colmap_job);
+    // A preset answers "how", never "where": refresh_sources() re-derives the
+    // output folder whenever the user has not taken it over, and a fresh one
+    // beside the last would silently orphan the run already in it.
+    const std::string ws = _workspace, ws_auto = _workspace_auto;
+    rescan_found_masks();
+    _workspace = ws;
+    _workspace_auto = ws_auto;
+    // These settings did not build whatever model is sitting in the output
+    // folder, so its stamp no longer describes the screen.
+    _built_workspace.clear();
+}
+
+void GuiApp::apply_dataset_preset(const DatasetPreset& p) {
+    apply_dataset_settings(p.s);
+    _ds_presets.file = p.path;
+    _ds_presets.builtin.clear();
+    _ds_presets.display = p.name;
+    _ds_presets.desc = p.description;
+    _ds_presets.msg.clear();
+}
+
+// A built-in is the capture's own answers with the preset's over them, and
+// then the one question only the frames can settle -- which is why it is not
+// simply a DatasetSettings the way a saved one is.
+void GuiApp::apply_dataset_builtin(const std::string& name) {
+    const std::string use = name.empty() ? std::string("general") : name;
+    DatasetSettings s;
+    apply_capture_defaults(_sources, s.sfm, s.colmap);
+    if (!dataset_apply_preset(s, use)) return;
+    dataset_adapt_preset(use, _sources, s.sfm, s.colmap, _ffmpeg_exe);
+    apply_dataset_settings(s);
+    _ds_presets.file.clear();
+    _ds_presets.builtin = use;
+    _ds_presets.display.clear();
+    _ds_presets.desc.clear();
+    _ds_presets.msg.clear();
+}
+
+// The capture's own defaults have just moved settings a built-in preset
+// decided, so it goes back on top of them and asks the new frames its own
+// question. Only a built-in: re-applying a FILE would undo every edit since.
+void GuiApp::reapply_dataset_builtin() {
+    if (!_ds_presets.file.empty() || _ds_presets.builtin.empty()) return;
+    DatasetSettings s = capture_dataset_settings();
+    if (dataset_apply_preset(s, _ds_presets.builtin)) apply_dataset_settings(s);
+    dataset_adapt_preset(_ds_presets.builtin, _sources, _sfm_job, _colmap_job,
+                         _ffmpeg_exe);
+}
+
+void GuiApp::load_dataset_preset_file(const std::string& path) {
+    if (path.empty()) return;
+    if (dataset_busy()) {
+        _ds_presets.msg = dmsg::log_drop_while_training.get();
+        _ds_presets.msg_err = true;
+        log(_ds_presets.msg);
+        return;
+    }
+    try {
+        DatasetPreset p = load_dataset_preset(path);
+        apply_dataset_preset(p);
+        _ds_presets.msg = i18n::format(msg::preset_loaded, {p.name});
+        _ds_presets.msg_err = false;
+    } catch (const std::exception& e) {
+        _ds_presets.msg = i18n::format(msg::preset_failed, {e.what()});
+        _ds_presets.msg_err = true;
+    }
+    log(_ds_presets.msg);
+    _ds_presets.scanned_at = -1.0;
+    refresh_dataset_presets();
+}
+
+void GuiApp::apply_mesh_preset(const MeshPreset& p) {
+    const std::string checkpoint = _mesh_job.checkpoint;
+    const std::string data_dir = _mesh_job.data_dir;
+    const std::string output = _mesh_job.output;
+    _mesh_job = p.job;
+    _mesh_job.checkpoint = checkpoint;
+    _mesh_job.data_dir = data_dir;
+    _mesh_job.output = output;
+    sanitize_mesh_job(_mesh_job);
+    _mesh_presets.file = p.path;
+    _mesh_presets.display = p.name;
+    _mesh_presets.desc = p.description;
+    _mesh_presets.msg.clear();
+    _mesh_data_probe_key.clear();   // use_data may have moved
+}
+
+void GuiApp::load_mesh_preset_file(const std::string& path) {
+    if (path.empty()) return;
+    if (_mesh.busy()) {
+        _mesh_presets.msg = dmsg::log_drop_while_training.get();
+        _mesh_presets.msg_err = true;
+        log(_mesh_presets.msg);
+        return;
+    }
+    try {
+        MeshPreset p = load_mesh_preset(path);
+        apply_mesh_preset(p);
+        _mesh_presets.msg = i18n::format(msg::preset_loaded, {p.name});
+        _mesh_presets.msg_err = false;
+    } catch (const std::exception& e) {
+        _mesh_presets.msg = i18n::format(msg::preset_failed, {e.what()});
+        _mesh_presets.msg_err = true;
+    }
+    log(_mesh_presets.msg);
+    _mesh_presets.scanned_at = -1.0;
+    refresh_mesh_presets();
+}
+
+
 void GuiApp::open_dataset(std::string dir, std::string image_dir,
-                          std::string mask_dir, bool keep_log) {
-    if (dir.empty()) return;
+                          std::string mask_dir, bool mask_flipped,
+                          bool keep_log) {
+    if (dir.empty() || native_work_busy()) return;
+    app::set_crash_note("opening dataset " + dir);
+    close_native_previews();
     close_mesh_preview();
     close_splat();
     // A different dataset means the log so far is about something else --
@@ -430,7 +951,7 @@ void GuiApp::open_dataset(std::string dir, std::string image_dir,
     // one (a reload, not a new job), and the handoff straight out of a
     // reconstruction, where the log is that reconstruction's and is the first
     // thing anyone would look at if the result seems wrong.
-    if (dir != _cfg.data && !keep_log) _log.clear();
+    if (dir != _cfg.data && !keep_log) clear_log();
     _cfg.data = dir;
     // image_dir / mask_dir: the runner hands its (possibly external) folders
     // over in-memory right after a run -- photos indexed where they are keep
@@ -438,6 +959,7 @@ void GuiApp::open_dataset(std::string dir, std::string image_dir,
     // user can set data.image_dir / data.mask_dir under Advanced.
     _cfg.image_dir = !image_dir.empty() ? image_dir : _defaults.image_dir;
     _cfg.mask_dir = !mask_dir.empty() ? mask_dir : _defaults.mask_dir;
+    _cfg.flip_mask = mask_flipped;
     // Default the output next to the dataset -- much easier to find than a
     // CWD-relative "outputs" for someone who launched from a desktop icon.
     // Follows the dataset unless the user customized it (i.e. it still
@@ -451,6 +973,9 @@ void GuiApp::open_dataset(std::string dir, std::string image_dir,
     _defaults.mask_dir = _cfg.mask_dir;
     _defaults.output_dir_prefix = _cfg.output_dir_prefix;
     add_recent(dir);
+    // However it was opened -- picked, dropped, from the recents list -- this
+    // is where the picker starts next time.
+    remember_dir("dataset", dir);
     save_settings();
     detach_session_views();
     // Training is the end of the dataset screen's business with the run, so
@@ -461,24 +986,39 @@ void GuiApp::open_dataset(std::string dir, std::string image_dir,
 }
 
 void GuiApp::request_open_dataset(std::string dir) {
-    if (training_busy()) {
+    const bool loading = _runner.phase() == TrainRunner::Phase::Loading;
+    if (training_busy() || loading) {
         _pending = Pending::OpenDataset;
         _pending_path = dir;
-        _open_confirm = true;
+        if (loading) {
+            _stop_confirmed = true;
+            _runner.request_stop();
+        } else {
+            _open_confirm = true;
+        }
         return;
     }
+    if (native_work_busy()) return;
     open_dataset(dir);
 }
 
 void GuiApp::request_go_home() {
-    if (training_busy()) {
+    const bool loading = _runner.phase() == TrainRunner::Phase::Loading;
+    if (training_busy() || loading) {
         _pending = Pending::GoHome;
-        _open_confirm = true;
+        if (loading) {
+            _stop_confirmed = true;
+            _runner.request_stop();
+        } else {
+            _open_confirm = true;
+        }
         return;
     }
+    if (native_work_busy()) return;
     // The mesh preview holds the engine through _splat and two attached
     // viewports; leaving the screen by ANY route (the button, the menu, the
     // deferred confirmation) has to hand them back.
+    close_native_previews();
     close_mesh_preview();
     close_splat();
     _screen = Screen::Home;
@@ -488,23 +1028,37 @@ void GuiApp::request_go_home() {
 // asynchronous (a large model is a few hundred MB), so this only starts it;
 // frame() attaches the viewport once the splats are on the device.
 void GuiApp::open_splat(std::string path) {
-    if (path.empty()) return;
-    _log.clear();
+    if (path.empty() || native_work_busy()) return;
+    clear_log();
+    close_native_previews();
+    close_splat();
+#ifdef SS_BACKEND_VULKAN
+    if (!freeze_native_device()) return;
+#else
+    if (!freeze_cuda_device()) return;
+#endif
+    app::set_crash_note("opening model " + path);
     close_mesh_preview();
     detach_session_views();
-    // Opening a file resets the engine; a finished run's session cannot be
-    // rendered from once that has happened.
     _runner.note_engine_taken();
     _compare.open(path);
     add_model_recent(path);
+    remember_dir("model", path);
     save_settings();
     _screen = Screen::Viewer;
 }
 
 void GuiApp::add_splat(std::string path) {
-    if (path.empty()) return;
+    if (path.empty() || native_work_busy()) return;
+    close_native_previews();
+#ifdef SS_BACKEND_VULKAN
+    if (!freeze_native_device()) return;
+#else
+    if (!freeze_cuda_device()) return;
+#endif
     _compare.add(path);
     add_model_recent(path);
+    remember_dir("model", path);
     save_settings();
 }
 
@@ -515,6 +1069,7 @@ void GuiApp::request_open_splat(std::string path) {
         _open_confirm = true;
         return;
     }
+    if (native_work_busy()) return;
     open_splat(std::move(path));
 }
 
@@ -525,15 +1080,29 @@ void GuiApp::close_splat() {
     _compare.close();
     _mesh_preview_open = false;
 }
+void GuiApp::close_native_previews() {
+    _segment.close();
+    _geometry_panel.close();
+}
 
 void GuiApp::launch_training(const TrainConfig& cfg, const std::string& preset) {
-    if (cfg.data.empty()) return;
+    if (cfg.data.empty() || native_work_busy()) return;
+    close_native_previews();
+    close_splat();
+#ifdef SS_BACKEND_VULKAN
+    if (!freeze_native_device()) return;
+#else
+    if (!freeze_cuda_device()) return;
+#endif
+    app::set_crash_note("training " + cfg.data);
     close_mesh_preview();
-    close_splat();      // the engine is one object; the viewer has to let go
     detach_session_views();
-    // Engine setup initializes the backend on the selected device; from
-    // here on the device combo is display-only (one device per process).
-    _device_locked = true;
+    std::string data_dir = cfg.data;
+    if (fs::path(data_dir).filename() == "images")
+        data_dir = fs::path(data_dir).parent_path().string();
+    open_run_log(_train_log, data_dir, "train", run_log_stamp());
+    set_ss_env("UNREG_LOG", "");
+    write_run_settings(_train_log);
     _runner.start_training(cfg, preset);
 }
 
@@ -561,7 +1130,7 @@ void GuiApp::request_close() {
 }
 
 void GuiApp::run_pending_if_stopped() {
-    if (_pending == Pending::None || training_busy()) return;
+    if (_pending == Pending::None || native_work_busy()) return;
     // Only fire once the user confirmed the stop (or training was never
     // busy); a dismissed modal must not leave a delayed action armed.
     if (!_stop_confirmed) { _pending = Pending::None; return; }
@@ -580,48 +1149,120 @@ void GuiApp::run_pending_if_stopped() {
 
 
 // ===========================================================================
-// Batch training
+// Batch processing
 //
-// The queue itself is BatchTrain.h; what lives here is the three lines of
-// state machine that turn it into runs. Everything a row needs -- parse,
-// engine setup, the step loop, the checkpoint -- is one TrainRunner session,
-// the same one the Start button makes, which is why a batch shows up on the
-// trainer screen with a live viewport and plots rather than as a progress bar
-// over a black box.
+// The queue is BatchProcess.h; this drives the three live runners rather than
+// reimplementing them, so a batch shows up on their screens as a run does.
 // ===========================================================================
 
 // Append a row for `dataset`, seeded with whatever preset the trainer screen
 // is on -- a queue is usually built right after tuning the settings it should
 // run with. Shared by the picker, the recents menu and drag-and-drop.
+BatchRun GuiApp::batch_run_on_screen() const {
+    BatchRun run;
+    run.preset.path = _train_presets.file;
+    run.preset.name =
+        _train_presets.file.empty() ? _preset : _train_presets.display;
+    return run;
+}
+
 void GuiApp::add_batch_row(const std::string& dataset) {
     if (dataset.empty()) return;
-    BatchJob j;
-    j.dataset = dataset;
-    j.preset_path = _preset_file;
-    j.preset_name = _preset_file.empty() ? _preset : _preset_display;
-    _batch.push_back(std::move(j));
+    BatchRow r;
+    r.dataset = dataset;
+    r.does(BatchStage::Train) = true;
+    r.runs.push_back(batch_run_on_screen());
+    _batch.push_back(std::move(r));
+    _batch_open_row = (int)_batch.size() - 1;
+    batch_edited();
+}
+
+void GuiApp::add_batch_source_row(const std::vector<std::string>& sources) {
+    if (sources.empty()) return;
+    BatchRow r;
+    r.sources = sources;
+    // Building a dataset and then training it is the whole reason a row can
+    // do more than one thing; the checkboxes still say so, and still undo it.
+    r.does(BatchStage::Dataset) = true;
+    r.does(BatchStage::Train) = true;
+    r.dataset_preset.path = _ds_presets.file;
+    r.dataset_preset.name =
+        _ds_presets.file.empty() ? _ds_presets.builtin : _ds_presets.display;
+    r.runs.push_back(batch_run_on_screen());
+    _batch.push_back(std::move(r));
+    _batch_open_row = (int)_batch.size() - 1;
+    batch_edited();
+}
+
+void GuiApp::add_batch_mesh_row(const std::string& model) {
+    if (model.empty()) return;
+    BatchRow r;
+    r.model = model;
+    r.does(BatchStage::Train) = false;
+    r.does(BatchStage::Mesh) = true;
+    r.mesh.preset.path = _mesh_presets.file;
+    r.mesh.preset.name = _mesh_presets.display;
+    _batch.push_back(std::move(r));
+    _batch_open_row = (int)_batch.size() - 1;
+    batch_edited();
+}
+
+void GuiApp::batch_edited() {
     _batch_dirty = true;
     _batch_checked = false;
 }
 
+BatchCapabilities GuiApp::batch_capabilities() const {
+    BatchCapabilities caps;
+    caps.device = backend::device_count() > 0 && backend::device_current() >= 0;
+    caps.builtin_sfm = builtin_sfm_available();
+    caps.colmap = colmap_available();
+    caps.masking = backends().builtin_masking;
+    caps.geometry = geometry_availability().empty();
+    caps.mask_model_ready = [](const std::string& id) {
+        const ModelEntry* e = find_model(id);
+        return e && model_is_cached(*e);
+    };
+    caps.geometry_model_ready = [](const std::string& id) {
+        return geometry_model_cached(id);
+    };
+    return caps;
+}
+
 void GuiApp::check_batch() {
+    const BatchCapabilities caps = batch_capabilities();
     for (int i = 0; i < (int)_batch.size(); i++)
-        _batch[i].issues = batch_check(_batch[i], _batch, i);
+        _batch[i].issues = batch_check_row(_batch[i], _batch, i, caps);
     _batch_checked = true;
-    _batch_msg.clear();
-    _batch_msg_err = false;
-    bool any = false;
-    for (const BatchJob& j : _batch) any = any || !j.issues.empty();
-    if (!any && !_batch.empty()) _batch_msg = msg::batch_checked_ok.get();
+    _batch_checked_at = ImGui::GetTime();
+}
+
+// Nothing waits for a button: an edit re-checks at once, and a timer catches
+// a preset file or a dataset folder that went missing while the screen was
+// up. A few stats and a small JSON per preset, so the cost is noise.
+void GuiApp::check_batch_if_stale() {
+    if (_batch_active) return;
+    const double now = ImGui::GetTime();
+    if (_batch_checked && _batch_checked_at >= 0.0 && now - _batch_checked_at < 2.0)
+        return;
+    check_batch();
 }
 
 void GuiApp::request_start_batch(bool skip_invalid) {
+    // A reconstruction or a meshing child owns the device and has no
+    // stop-and-do-this-instead confirmation; only training does.
+    if (dataset_busy() || _mesh.busy()) {
+        _batch_msg = msg::batch_busy_elsewhere.get();
+        _batch_msg_err = true;
+        return;
+    }
     if (training_busy()) {
         _pending = Pending::StartBatch;
         _pending_batch_skip = skip_invalid;
         _open_confirm = true;
         return;
     }
+    if (native_work_busy()) return;
     start_batch(skip_invalid);
 }
 
@@ -629,7 +1270,10 @@ void GuiApp::start_batch(bool skip_invalid) {
     check_batch();
 
     int bad = 0, runnable = 0;
-    for (const BatchJob& j : _batch) (batch_has_error(j) ? bad : runnable)++;
+    for (const BatchRow& r : _batch) {
+        if (!r.enabled) continue;
+        (batch_has_error(r.issues) ? bad : runnable)++;
+    }
     if (bad > 0 && !skip_invalid) {
         _batch_msg = i18n::format(msg::batch_blocked, {(long long)bad});
         _batch_msg_err = true;
@@ -640,14 +1284,19 @@ void GuiApp::start_batch(bool skip_invalid) {
         _batch_msg_err = true;
         return;
     }
-
-    for (BatchJob& j : _batch) {
-        j.status = batch_has_error(j) ? BatchJob::Status::Skipped
-                                      : BatchJob::Status::Pending;
-        j.message.clear();
-        j.out_dir.clear();
-        j.steps = 0;
+    // Frozen once for the whole queue, so no task halfway down it can be
+    // refused the device the ones before it ran on.
+    if (!freeze_native_device() || !freeze_cuda_device()) {
+        _batch_msg = _native_device_error.empty() ? msg::no_device_found.get()
+                                                  : _native_device_error;
+        _batch_msg_err = true;
+        return;
     }
+
+    _batch_tasks = batch_plan(_batch);
+    for (BatchTask& t : _batch_tasks)
+        if (batch_has_error(_batch[(size_t)t.row].issues))
+            t.status = BatchStatus::Skipped;
     _batch_dirty = false;
     save_batch_list(_batch);
 
@@ -656,82 +1305,274 @@ void GuiApp::start_batch(bool skip_invalid) {
     _batch_current = -1;
     _batch_stop_after = false;
     _batch_stop_now = false;
-    _batch_msg = i18n::format(msg::batch_log_started, {(long long)runnable});
+    int todo = 0;
+    for (const BatchTask& t : _batch_tasks)
+        todo += t.status == BatchStatus::Pending ? 1 : 0;
+    _batch_msg = i18n::format(msg::batch_log_started, {(long long)todo});
     _batch_msg_err = false;
     log(_batch_msg);
-    // The run is worth watching even when nobody has to: same viewport, same
-    // metrics, same log as a hand-started one.
-    _screen = Screen::Train;
+}
+
+bool GuiApp::batch_stage_busy(BatchStage stage) const {
+    switch (stage) {
+        case BatchStage::Dataset: return dataset_busy();
+        case BatchStage::Mesh:    return _mesh.busy();
+        case BatchStage::Train: {
+            const TrainRunner::Phase ph = _runner.phase();
+            return ph == TrainRunner::Phase::Preparing ||
+                   ph == TrainRunner::Phase::Training;
+        }
+    }
+    return false;
+}
+
+const BatchTask* GuiApp::batch_task_of(int row, BatchStage stage,
+                                       int variant) const {
+    for (const BatchTask& t : _batch_tasks)
+        if (t.row == row && t.stage == stage && t.variant == variant) return &t;
+    return nullptr;
+}
+
+void GuiApp::fail_batch_task(BatchTask& task, const std::string& error) {
+    task.status = BatchStatus::Failed;
+    task.message = error;
+    log(i18n::format(msg::batch_log_job_failed,
+                     {(long long)(_batch_current + 1), error}));
+}
+
+// What became of the task that was running, read off the runner that owned it.
+void GuiApp::record_batch_task() {
+    if (_batch_current < 0 || _batch_current >= (int)_batch_tasks.size()) return;
+    BatchTask& t = _batch_tasks[(size_t)_batch_current];
+    const long long n = _batch_current + 1;
+    t.seconds = std::max(0.0, ImGui::GetTime() - t.started_at);
+
+    bool ok = false, cancelled = false;
+    std::string error;
+    switch (t.stage) {
+        case BatchStage::Dataset: {
+            const bool builtin = effective_engine() == Engine::BuiltIn;
+            ok = builtin ? _sfm.state() == SfmRunner::State::Done
+                         : _colmap.state() == ColmapRunner::State::Done;
+            cancelled = builtin
+                            ? _sfm.state() == SfmRunner::State::Cancelled
+                            : _colmap.state() == ColmapRunner::State::Cancelled;
+            error = builtin ? _sfm.error() : _colmap.error();
+            if (ok) {
+                t.result = builtin ? _sfm.dataset_dir() : _colmap.dataset_dir();
+                t.image_dir = builtin ? _sfm.image_dir() : _colmap.image_dir();
+                t.mask_dir = builtin ? _sfm.mask_dir() : _colmap.mask_dir();
+                t.mask_flipped = builtin ? _sfm.mask_flipped()
+                                         : _colmap.mask_flipped();
+                // The rest of the row trains and meshes this folder, so the
+                // row remembers it even for a re-run started later.
+                if (t.row < (int)_batch.size() && _batch[(size_t)t.row].dataset.empty()) {
+                    _batch[(size_t)t.row].dataset = t.result;
+                    _batch_dirty = true;
+                }
+            }
+            break;
+        }
+        case BatchStage::Train: {
+            ok = _runner.phase() == TrainRunner::Phase::Done && !_batch_stop_now;
+            error = _runner.error();
+            if (ok) {
+                t.steps = _runner.latest_progress().step + 1;
+                if (auto* s = _runner.session()) t.result = s->out_dir.string();
+            }
+            break;
+        }
+        case BatchStage::Mesh: {
+            ok = _mesh.state() == MeshRunner::State::Done;
+            cancelled = _mesh.state() == MeshRunner::State::Cancelled;
+            error = _mesh.error();
+            if (ok) t.result = _mesh.output_path();
+            break;
+        }
+    }
+
+    if (ok) {
+        t.status = BatchStatus::Done;
+        log(i18n::format(msg::batch_log_job_done, {n, t.result}));
+    } else if (_batch_stop_now || cancelled) {
+        t.status = BatchStatus::Stopped;
+        log(i18n::format(msg::batch_log_job_stopped, {n}));
+    } else {
+        // Anything the pipeline threw: an unreadable dataset, an OOM, a driver
+        // fault. Recorded and left behind -- the point of a queue is that the
+        // next row still gets its turn.
+        t.status = BatchStatus::Failed;
+        t.message = error;
+        log(i18n::format(msg::batch_log_job_failed, {n, error}));
+    }
+}
+
+bool GuiApp::launch_batch_dataset(BatchTask& task, const BatchRow& row) {
+    std::vector<PrepInput> sources;
+    DatasetSettings settings;
+    std::string workspace, error;
+    if (!batch_build_dataset_job(row, _ffmpeg_exe, sources, settings, workspace,
+                                 error)) {
+        fail_batch_task(task, error);
+        return false;
+    }
+    // The screen is driven rather than bypassed: one implementation of "start
+    // a dataset run", and whoever is watching sees what is running.
+    detach_session_views();
+    close_splat();
+    // A reconstruction brings up a Vulkan device of its own and wants the
+    // VRAM the last training run is still holding.
+    _runner.release_engine();
+    _sources = sources;
+    _workspace = _workspace_auto = workspace;
+    apply_dataset_settings(settings);
+    _sources = sources;          // rescan_found_masks() re-derived the list
+    _source_path_edits.clear();  // re-seeded from _sources by the next draw
+    _redo_frames = _redo_masks = _redo_model = _redo_geometry = false;
+    log(i18n::format(msg::batch_log_build,
+                     {(long long)(_batch_current + 1), workspace}));
+    follow_batch_screen(BatchStage::Dataset);
+    if (!launch_dataset_job()) {
+        fail_batch_task(task, _native_device_error);
+        return false;
+    }
+    return true;
+}
+
+bool GuiApp::launch_batch_train(BatchTask& task, const BatchRow& row) {
+    // What this row produced upstream, or what it was pointed at.
+    std::string dataset = row.dataset, image_dir, mask_dir;
+    bool flipped = false;
+    if (const BatchTask* made = batch_task_of(task.row, BatchStage::Dataset, 0)) {
+        if (made->status != BatchStatus::Done) {
+            task.status = BatchStatus::Skipped;
+            log(i18n::format(msg::batch_log_task_skipped,
+                             {(long long)(_batch_current + 1)}));
+            return false;
+        }
+        dataset = made->result;
+        image_dir = made->image_dir;
+        mask_dir = made->mask_dir;
+        flipped = made->mask_flipped;
+    }
+
+    TrainConfig cfg;
+    std::string base, error;
+    if (!batch_build_train_config(row, task.variant, dataset, image_dir, mask_dir,
+                                  flipped, cfg, base, error)) {
+        fail_batch_task(task, error);
+        return false;
+    }
+    log(i18n::format(msg::batch_log_train,
+                     {(long long)(_batch_current + 1), dataset}));
+    follow_batch_screen(BatchStage::Train);
+    // A run's own dataset options must not be re-parsed under it by a stale
+    // edit made on the trainer screen before the queue started.
+    _parse_dirty = false;
+    launch_training(cfg, base);
+    return true;
+}
+
+bool GuiApp::launch_batch_mesh(BatchTask& task, const BatchRow& row) {
+    std::string model = row.model, dataset = row.dataset;
+    if (const BatchTask* made = batch_task_of(task.row, BatchStage::Dataset, 0))
+        if (made->status == BatchStatus::Done) dataset = made->result;
+    if (model.empty()) {
+        const BatchTask* run = batch_task_of(task.row, BatchStage::Train,
+                                             task.variant);
+        if (!run || run->status != BatchStatus::Done) {
+            task.status = BatchStatus::Skipped;
+            log(i18n::format(msg::batch_log_task_skipped,
+                             {(long long)(_batch_current + 1)}));
+            return false;
+        }
+        model = run->result;
+    }
+
+    MeshJob job;
+    std::string error;
+    if (!batch_build_mesh_job(row, model, dataset, job, error)) {
+        fail_batch_task(task, error);
+        return false;
+    }
+    log(i18n::format(msg::batch_log_mesh,
+                     {(long long)(_batch_current + 1), model}));
+    follow_batch_screen(BatchStage::Mesh);
+    // The engine has to be free: the mesh child wants the VRAM, and both the
+    // last preview and the run that trained this model are holding it.
+    close_native_previews();
+    close_mesh_preview();
+    close_splat();
+    _runner.release_engine();
+    job.device_uuid = _native_device_uuid;
+    job.cuda_device = _cuda_device_index;
+    _mesh_job = job;
+    _mesh_shown_run = _mesh.run_id();   // a batch opens no preview
+    _mesh.start(job);
+    return true;
+}
+
+bool GuiApp::launch_batch_task(BatchTask& task) {
+    const BatchRow& row = _batch[(size_t)task.row];
+    task.started_at = ImGui::GetTime();
+    try {
+        switch (task.stage) {
+            case BatchStage::Dataset: return launch_batch_dataset(task, row);
+            case BatchStage::Train:   return launch_batch_train(task, row);
+            case BatchStage::Mesh:    return launch_batch_mesh(task, row);
+        }
+    } catch (const std::exception& e) {
+        // Nothing below here is supposed to throw, and a queue that dies on
+        // one row that does is the failure this whole screen exists to avoid.
+        fail_batch_task(task, e.what());
+    }
+    return false;
 }
 
 void GuiApp::advance_batch() {
     if (!_batch_active) return;
 
     if (_batch_launched) {
-        const TrainRunner::Phase ph = _runner.phase();
-        if (ph == TrainRunner::Phase::Preparing ||
-            ph == TrainRunner::Phase::Training)
+        if (_batch_current >= 0 && _batch_current < (int)_batch_tasks.size() &&
+            batch_stage_busy(_batch_tasks[(size_t)_batch_current].stage))
             return;   // still going
-        if (_batch_current < 0 || _batch_current >= (int)_batch.size()) {
-            finish_batch();   // the list moved under us; nothing to record
-            return;
-        }
-
-        BatchJob& j = _batch[_batch_current];
-        const long long n = _batch_current + 1;
-        if (ph == TrainRunner::Phase::Done && !_batch_stop_now) {
-            j.status = BatchJob::Status::Done;
-            j.steps = _runner.latest_progress().step + 1;
-            if (auto* s = _runner.session()) j.out_dir = s->out_dir.string();
-            log(i18n::format(msg::batch_log_job_done, {n, j.out_dir}));
-        } else if (ph == TrainRunner::Phase::Done) {
-            j.status = BatchJob::Status::Stopped;
-            log(i18n::format(msg::batch_log_job_stopped, {n}));
-        } else {
-            // Anything the pipeline threw: an unreadable dataset, an OOM, a
-            // driver fault. Recorded on the row and left behind -- the point
-            // of a queue is that the next dataset still gets its turn.
-            j.status = BatchJob::Status::Failed;
-            j.message = _runner.error();
-            log(i18n::format(msg::batch_log_job_failed, {n, j.message}));
-        }
+        record_batch_task();
         _batch_launched = false;
         _batch_current = -1;
         if (_batch_stop_after) { finish_batch(); return; }
     }
 
-    int next = -1;
-    for (int i = 0; i < (int)_batch.size(); i++)
-        if (_batch[i].status == BatchJob::Status::Pending) { next = i; break; }
-    if (next < 0) { finish_batch(); return; }
-
-    BatchJob& j = _batch[next];
-    TrainConfig cfg;
-    std::string base, error;
-    if (!batch_build_config(j, cfg, base, error)) {
-        // The preset went missing between the pre-flight and now. Same
-        // treatment as any other failure; the loop picks up the next row on
-        // the following frame.
-        j.status = BatchJob::Status::Failed;
-        j.message = error;
-        log(i18n::format(msg::batch_log_job_failed,
-                         {(long long)(next + 1), error}));
-        return;
+    // The next task, skipping the ones whose input never arrived. Nothing is
+    // started on a pass that skips, so the loop is bounded by the task count.
+    for (;;) {
+        int next = -1;
+        for (int i = 0; i < (int)_batch_tasks.size(); i++)
+            if (_batch_tasks[(size_t)i].status == BatchStatus::Pending) {
+                next = i;
+                break;
+            }
+        if (next < 0) { finish_batch(); return; }
+        _batch_current = next;
+        BatchTask& t = _batch_tasks[(size_t)next];
+        if (t.row < 0 || t.row >= (int)_batch.size()) {
+            t.status = BatchStatus::Skipped;
+            continue;
+        }
+        if (launch_batch_task(t)) {
+            t.status = BatchStatus::Running;
+            _batch_launched = true;
+            return;
+        }
+        // launch_batch_task always recorded an outcome, so the next pass
+        // picks a different task.
     }
-
-    j.status = BatchJob::Status::Running;
-    _batch_current = next;
-    _batch_launched = true;
-    log(i18n::format(msg::batch_log_job_start,
-                     {(long long)(next + 1), j.dataset}));
-    launch_training(cfg, base);
 }
 
 void GuiApp::finish_batch() {
     int done = 0, failed = 0, other = 0;
-    for (const BatchJob& j : _batch) {
-        if (j.status == BatchJob::Status::Done) done++;
-        else if (j.status == BatchJob::Status::Failed) failed++;
+    for (const BatchTask& t : _batch_tasks) {
+        if (t.status == BatchStatus::Done) done++;
+        else if (t.status == BatchStatus::Failed) failed++;
         else other++;
     }
     _batch_active = false;
@@ -744,15 +1585,65 @@ void GuiApp::finish_batch() {
                                (long long)other});
     _batch_msg_err = failed > 0;
     log(_batch_msg);
+    if (_batch_dirty) {
+        _batch_dirty = false;
+        save_batch_list(_batch);
+    }
+    run_batch_command(i18n::format(msg::batch_cmd_message,
+                                   {(long long)done, (long long)failed,
+                                    (long long)other}));
+}
+
+// The whole point of an unattended queue is not watching it, so the one thing
+// it can do on its own behalf is tell somebody it is over. Runs however the
+// queue ended -- finished, failed or stopped; the message says which.
+void GuiApp::run_batch_command(const std::string& message) {
+    if (_batch_cmd.empty()) return;
+    const std::vector<std::string> argv =
+        command_argv(_batch_cmd, kBatchMessageToken, message);
+    if (argv.empty()) return;
+    log(i18n::format(msg::batch_cmd_running, {_batch_cmd}));
+    if (!_batch_cmd_run.start(argv)) log(msg::batch_cmd_busy.get());
+}
+
+// What it printed and how it ended, in the log like any other runner's.
+void GuiApp::poll_batch_command() {
+    for (const std::string& s : _batch_cmd_run.drain_log()) log(s);
+    const int code = _batch_cmd_run.take_exit_code();
+    if (code == CommandRunner::kNoResult || code == kCancelled) return;
+    if (code == kSpawnFailed)
+        log(i18n::format(msg::batch_cmd_missing, {_batch_cmd_run.program()}));
+    else if (code != 0)
+        log(i18n::format(msg::batch_cmd_exit, {(long long)code}));
+    else
+        log(msg::batch_cmd_ok.get());
 }
 
 void GuiApp::cancel_batch() {
     if (!_batch_active) return;
-    if (_batch_current >= 0 && _batch_current < (int)_batch.size())
-        _batch[_batch_current].status = BatchJob::Status::Stopped;
+    if (_batch_current >= 0 && _batch_current < (int)_batch_tasks.size())
+        _batch_tasks[(size_t)_batch_current].status = BatchStatus::Stopped;
     _batch_launched = false;
     _batch_current = -1;
     finish_batch();
+}
+
+// The screen a running stage belongs to, unless whoever is here has walked off
+// to the list or the viewer to look at something else.
+void GuiApp::follow_batch_screen(BatchStage stage) {
+    if (_screen == Screen::Batch || _screen == Screen::Viewer) return;
+    switch (stage) {
+        case BatchStage::Dataset: _screen = Screen::NewDataset; break;
+        case BatchStage::Train:   _screen = Screen::Train; break;
+        case BatchStage::Mesh:    _screen = Screen::Mesh; break;
+    }
+}
+
+// A path's extension, lowercased, for the tables that list them.
+static std::string lower_ext(const fs::path& p) {
+    std::string e = p.extension().string();
+    for (char& c : e) c = (char)std::tolower((unsigned char)c);
+    return e;
 }
 
 static bool is_image_ext(const fs::path& p) {
@@ -788,7 +1679,7 @@ void GuiApp::handle_drop(const std::vector<std::string>& paths) {
     // after looking at the first is exactly how someone works through a
     // folder of runs. (A run in flight does -- its inputs are already gone
     // to the child.)
-    if (_screen == Screen::Mesh && !_mesh.busy() && paths.size() == 1) {
+    if (_screen == Screen::Mesh && !native_work_busy() && paths.size() == 1) {
         const fs::path p(paths[0]);
         std::string ext = p.extension().string();
         for (char& c : ext) c = (char)std::tolower((unsigned char)c);
@@ -820,23 +1711,55 @@ void GuiApp::handle_drop(const std::vector<std::string>& paths) {
     }
 
     // A preset, or the config.json of a run that came out well. Checked first
-    // and by content rather than by name: it is a file that changes settings,
-    // never a dataset or a model, so there is nothing else it could be.
-    if (paths.size() == 1 && fs::is_regular_file(paths[0], ec) &&
-        is_preset_file(paths[0])) {
-        load_preset_file(paths[0]);
-        if (!_preset_msg_err && !_cfg.data.empty()) _screen = Screen::Train;
-        return;
+    // and by content rather than by name: nothing else it could be. Its own
+    // kind decides which screen it lands on.
+    if (paths.size() == 1 && fs::is_regular_file(paths[0], ec)) {
+        const std::optional<PresetKind> kind = probe_preset_kind(paths[0]);
+        if (kind == PresetKind::Dataset) {
+            load_dataset_preset_file(paths[0]);
+            if (!_ds_presets.msg_err) _screen = Screen::NewDataset;
+            return;
+        }
+        if (kind == PresetKind::Mesh) {
+            load_mesh_preset_file(paths[0]);
+            if (!_mesh_presets.msg_err) _screen = Screen::Mesh;
+            return;
+        }
+        if (kind == PresetKind::Train && is_preset_file(paths[0])) {
+            load_preset_file(paths[0]);
+            if (!_train_presets.msg_err && !_cfg.data.empty())
+                _screen = Screen::Train;
+            return;
+        }
     }
-    // Dropping dataset folders onto the batch screen extends the queue, which
-    // is how a five-dataset run gets set up without typing five paths.
+    // Dropping onto the batch screen extends the queue, which is how a
+    // five-dataset run gets set up without typing five paths. What each path
+    // is decides what its row does.
     if (_screen == Screen::Batch && !_batch_active) {
-        std::vector<std::string> datasets;
-        for (const std::string& p : paths)
-            if (fs::is_directory(p, ec) && folder_looks_like_dataset(p))
+        std::vector<std::string> datasets, models, raw;
+        for (const std::string& p : paths) {
+            if (fs::is_directory(p, ec) && looks_like_model(p)) models.push_back(p);
+            else if (fs::is_directory(p, ec) && folder_looks_like_dataset(p))
                 datasets.push_back(p);
-        if (datasets.size() == paths.size() && !datasets.empty()) {
+            else if (fs::is_directory(p, ec) && folder_has_images(p)) raw.push_back(p);
+            else if (fs::is_regular_file(p, ec) && is_video_path(p)) raw.push_back(p);
+            else if (fs::is_regular_file(p, ec) &&
+                     std::find(kViewableExtensions.begin(), kViewableExtensions.end(),
+                               lower_ext(p)) != kViewableExtensions.end())
+                models.push_back(p);
+        }
+        if (datasets.size() + models.size() + raw.size() == paths.size() &&
+            !paths.empty()) {
             for (const std::string& d : datasets) add_batch_row(d);
+            for (const std::string& m : models) add_batch_mesh_row(m);
+            // Videos dropped together are one capture, as they are everywhere
+            // else; folders are one each.
+            std::vector<std::string> clips;
+            for (const std::string& r : raw) {
+                if (fs::is_directory(r, ec)) add_batch_source_row({r});
+                else clips.push_back(r);
+            }
+            if (!clips.empty()) add_batch_source_row(clips);
             return;
         }
     }
@@ -854,7 +1777,7 @@ void GuiApp::handle_drop(const std::vector<std::string>& paths) {
             models.push_back(p);
         }
         if (models.size() == paths.size() && models.size() > 1 &&
-            !training_busy()) {
+            !native_work_busy()) {
             open_splat(models[0]);
             for (size_t i = 1; i < models.size() &&
                                i < (size_t)CompareView::kMaxModels; i++)
@@ -874,9 +1797,15 @@ void GuiApp::handle_drop(const std::vector<std::string>& paths) {
         request_open_splat(paths[0]);
         return;
     }
+    // ... except on the dataset screen, where a finished dataset is an input
+    // like any other: that is how one gets masks, depth and normals added to
+    // it without its cameras being solved a second time.
     if (paths.size() == 1 && fs::is_directory(paths[0], ec) &&
         folder_looks_like_dataset(paths[0])) {
-        request_open_dataset(paths[0]);
+        if (_screen == Screen::NewDataset && !dataset_busy())
+            add_existing_dataset(paths[0]);
+        else
+            request_open_dataset(paths[0]);
         return;
     }
     if (paths.size() == 1 && fs::is_regular_file(paths[0], ec) &&
@@ -887,10 +1816,9 @@ void GuiApp::handle_drop(const std::vector<std::string>& paths) {
         const fs::path p(paths[0]);
         std::string ext = p.extension().string();
         for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
-        // A .ply is a model to look at -- Gaussians, a point cloud or a
-        // mesh, which the viewer works out for itself; .obj/.gltf/.glb can
-        // only be a mesh. (A Metashape dataset FOLDER is caught above, before
-        // this, so dropping one still opens the dataset.)
+        // A .ply is a model to look at -- Gaussians, a point cloud or a mesh,
+        // which the viewer works out for itself. (A Metashape dataset FOLDER is
+        // caught above, so dropping one still opens the dataset.)
         if (std::find(kViewableExtensions.begin(), kViewableExtensions.end(),
                       ext) != kViewableExtensions.end()) {
             request_open_splat(p.string());
@@ -916,95 +1844,14 @@ void GuiApp::handle_drop(const std::vector<std::string>& paths) {
         }
     }
     if (sources.empty()) return;
-    if (training_busy()) {
-        log(dmsg::log_drop_while_training.get());
+    if (native_work_busy()) {
+        if (training_busy()) log(dmsg::log_drop_while_training.get());
         return;
     }
     // Dropping onto the dataset screen adds to what is already listed there;
     // dropping from anywhere else starts a new dataset.
-    add_sources(sources, /*replace=*/_screen != Screen::NewDataset);
-    _screen = Screen::NewDataset;
-}
-
-// Default COLMAP workspace: never point at an existing non-empty directory
-// (e.g. a previous run) -- append _2, _3, ... instead of overwriting.
-static std::string fresh_workspace(const std::string& base) {
-    std::error_code ec;
-    if (!fs::exists(base, ec) || fs::is_empty(base, ec)) return base;
-    for (int i = 2; i < 1000; i++) {
-        std::string cand = base + "_" + std::to_string(i);
-        if (!fs::exists(cand, ec) || fs::is_empty(cand, ec)) return cand;
-    }
-    return base;
-}
-
-// The Insta360 X5 focal length: fx = fy ~ 0.269 * image width on every X5
-// dataset measured. A known focal makes fisheye initialization reliable, and a
-// fisheye started from the generic guess often does not initialize at all.
-static constexpr float kInsta360FocalFactor = 0.269f;
-
-// Is this folder the `images/` of a dataset folder, rather than a folder of
-// photos that happens to hold them? (resolve_photo_folder is what put us here.)
-static bool named_images(const fs::path& p) {
-    std::string n = p.filename().empty() ? p.parent_path().filename().string()
-                                         : p.filename().string();
-    for (char& c : n) c = (char)std::tolower((unsigned char)c);
-    return n == "images";
-}
-
-// A file or folder name that can be a directory of its own: what a path
-// separator, a colon or a space would do to `--camera-model DIR=MODEL` is not
-// worth finding out.
-static std::string sanitize_name(std::string s) {
-    for (char& c : s) {
-        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                        (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
-        if (!ok) c = '_';
-    }
-    while (!s.empty() && s.front() == '.') s.erase(s.begin());
-    return s.empty() ? std::string("input") : s;
-}
-
-// Folder names that say what is inside rather than which capture it is.
-// `/lab/images` and `/lab/omni/images` are two different inputs whose own
-// names are both "images", so the folder ABOVE is what tells them apart.
-static bool is_generic_folder_name(std::string n) {
-    for (char& c : n) c = (char)std::tolower((unsigned char)c);
-    return n == "images" || n == "image" || n == "img" || n == "imgs" ||
-           n == "photos" || n == "pictures" || n == "pics" || n == "frames" ||
-           n == "input" || n == "inputs" || n == "data";
-}
-
-// Names that mean something else inside a dataset: a per-input folder called
-// `images` produces `<ws>/images/images`, which is the layout `sfm auto`'s
-// nested-images shorthand exists for -- and taking that shorthand there drops
-// every other input from the reconstruction. Cheaper to never write the name.
-static bool is_reserved_dataset_name(std::string n) {
-    for (char& c : n) c = (char)std::tolower((unsigned char)c);
-    return n == "images" || n == "masks" || n == "sparse" || n == "features" ||
-           n == "depths" || n == "normals" || n == "colmap" || n == "outputs";
-}
-
-// The sub-folder one input's frames go into, before de-duplication: the
-// video's own name, or the photo folder's -- climbing past a folder whose name
-// only describes its contents, so two captures picked as `X/images` and
-// `Y/images` come out as `X` and `Y` rather than `images` and `images_2`.
-static std::string source_folder_base(const PrepInput& s) {
-    fs::path p(s.path);
-    if (s.is_video) return sanitize_name(p.stem().string());
-    if (!p.empty() && p.filename().empty()) p = p.parent_path();  // trailing '/'
-    for (int up = 0; up < 2 && !p.empty(); up++) {
-        std::string n = p.filename().string();
-        if (n.empty()) break;
-        if (!is_generic_folder_name(n)) return sanitize_name(n);
-        p = p.parent_path();
-    }
-    // Nothing but generic names all the way up: keep the leaf, but never as a
-    // name the dataset layout already uses.
-    fs::path leaf(s.path);
-    if (!leaf.empty() && leaf.filename().empty()) leaf = leaf.parent_path();
-    std::string n = sanitize_name(leaf.filename().string());
-    return is_reserved_dataset_name(n) ? n + "_input" : n;
+    if (add_sources(sources, /*replace=*/_screen != Screen::NewDataset))
+        _screen = Screen::NewDataset;
 }
 
 // Click sources that name an input the list no longer holds.
@@ -1038,28 +1885,7 @@ static std::string inputs_without_clicks(const std::vector<PrepInput>& sources,
 }
 
 void GuiApp::refresh_sources() {
-    // One input keeps the layout a one-video dataset has always had: frames
-    // straight into images/ (and cam0/, cam1/ under it for a dual-lens file).
-    // Several need a folder each, which is also what makes them separate
-    // cameras -- named after the file so the log and the camera list read like
-    // what the user picked.
-    std::vector<std::string> taken;
-    for (size_t i = 0; i < _sources.size(); i++) {
-        PrepInput& s = _sources[i];
-        if (_sources.size() < 2) {
-            s.subdir.clear();
-            continue;
-        }
-        std::string base = source_folder_base(s);
-        if (is_reserved_dataset_name(base)) base += "_input";
-        std::string name = base;
-        for (int n = 2; std::find(taken.begin(), taken.end(), name) != taken.end();
-             n++)
-            name = base + "_" + std::to_string(n);
-        taken.push_back(name);
-        s.subdir = name;
-    }
-
+    assign_source_subdirs(_sources);
     if (_mask_preview_input >= (int)_sources.size()) _mask_preview_input = 0;
 
     // Clicks describe one input's frames; when it leaves the list, they go.
@@ -1077,96 +1903,59 @@ void GuiApp::refresh_sources() {
         _mask.current_object = 0;
     }
 
-    // Camera folders inside each input. A capture that arrives already split
-    // into cam/, cam0/, cam1/ needs one lens each -- one of them being a
-    // fisheye does not make the others one -- and the folders are the only
-    // place that shows.
-    for (PrepInput& s : _sources) {
-        std::vector<std::string> found;
-        if (!s.is_video && !s.path.empty()) {
-            std::error_code ec;
-            if (fs::is_directory(s.path, ec)) found = camera_subfolders(s.path);
-        }
-        // One folder is a nested layout, not a choice to make.
-        if (found.size() < 2) {
-            s.subcameras.clear();
-            continue;
-        }
-        std::vector<SubCamera> next;
-        next.reserve(found.size());
-        for (const std::string& rel : found) {
-            SubCamera sc;
-            sc.rel = rel;
-            for (const SubCamera& old : s.subcameras)
-                if (old.rel == rel) sc = old;
-            next.push_back(std::move(sc));
-        }
-        s.subcameras.swap(next);
-    }
+    refresh_subcameras(_sources);
+    normalize_source_lenses(_sources, _sfm_job.camera_model);
+    normalize_source_fps(_sources, _sfm_job.prep.video_fps);
 
     // The output folder follows the input until the user takes it over.
     if (_workspace.empty() || _workspace == _workspace_auto) {
-        std::string base;
-        // ... and normally lands on a folder of its own, suffixed _2, _3, ...
-        // rather than pointing at something that already has content in it.
-        bool exact = false;
-        if (_sources.empty()) {
-            base.clear();
-        } else if (_sources.size() == 1) {
-            const fs::path p(_sources[0].path);
-            if (_sources[0].is_video) {
-                base = (p.parent_path() / (p.stem().string() + "_dataset")).string();
-            } else if (named_images(p)) {
-                // A dataset folder: images/ (and masks/) are already where every
-                // parser looks for them, so the reconstruction belongs beside
-                // them as sparse/ -- in that folder, not in a copy of it with a
-                // suffix. Whatever it would replace is warned about instead
-                // (draw_dataset_source).
-                base = p.parent_path().string();
-                exact = true;
-            } else {
-                base = _sources[0].path + "_dataset";
-            }
-        } else {
-            // Several inputs have no single name; the folder they came from is
-            // the closest thing to one.
-            const fs::path p(_sources[0].path);
-            const fs::path dir = p.parent_path();
-            base = (dir / (dir.filename().string() + "_dataset")).string();
-        }
-        _workspace = base.empty() ? "" : (exact ? base : fresh_workspace(base));
+        _workspace = default_workspace(_sources);
         _workspace_auto = _workspace;
     }
 }
-
-// One picked path -> the input it describes, with the defaults its kind wants.
-static PrepInput make_source(const std::string& path,
-                             bool use_found_masks) {
-    std::error_code ec;
-    PrepInput s;
-    s.path = path;
-    s.is_video = !fs::is_directory(path, ec) && is_video_path(path);
-    // What a folder of photos means: the images/ under it when there is one,
-    // and the masks/ that belongs to them. Resolved here, on the path the user
-    // picked, so the row shows the folder that will actually be indexed rather
-    // than one that merely contains it.
-    if (!s.is_video) {
-        resolve_photo_folder(path, s.path, s.mask_dir);
-        if (!use_found_masks) s.mask_dir.clear();
+void GuiApp::mark_source_metadata_dirty() {
+    _source_probe.invalidate();
+    _source_probes_ready = true;
+    for (const PrepInput& s : _sources) {
+        if (s.is_video && !s.path.empty()) {
+            _source_probes_ready = false;
+            return;
+        }
     }
-    // Every input carries a concrete lens, so a list holding a 360 camera and a
-    // phone cannot end up applying one of them to the other.
-    //
-    // 360-camera preset for Insta360 .insv files: the two fisheye tracks land
-    // in one folder per lens (one camera each), the thin-prism fisheye model
-    // fits them, and the known focal length above starts them off.
-    s.camera_model = "opencv";
-    if (is_dual_fisheye_path(path)) {
-        s.camera_model = "thin-prism-fisheye";
-        // Commented - We don't assume every camera is Insta360 X5
-        // s.focal_factor = kInsta360FocalFactor;
+}
+void GuiApp::pump_source_probes() {
+    if (native_work_busy()) return;
+    bool pending = false;
+    bool pano_changed = false;
+    for (size_t i = 0; i < _sources.size(); i++) {
+        PrepInput& s = _sources[i];
+        if (!s.is_video || s.path.empty()) continue;
+        const std::string path = s.path;
+        const SourceProbeInfo info = _source_probe.get(path, _ffmpeg_exe);
+        if (!info.done) {
+            pending = true;
+            continue;
+        }
+        if (_sources[i].path != path || !_sources[i].is_video) continue;
+        if (info.width > 0 && info.height > 0)
+            _input_size[path] = {info.width, info.height};
+        s.pano360_unsupported = info.pano360_unsupported;
+        if (!s.pano360.valid() && info.pano360.valid()) {
+            s.pano360 = info.pano360;
+            pano_changed = true;
+        }
+        // A file with several lenses starts as a rig of its own, once; the row
+        // can still say otherwise.
+        if (s.video_tracks == 0 && info.video_tracks > 0) {
+            s.video_tracks = info.video_tracks;
+            if (s.pano360.valid() || s.video_tracks >= 2) s.rig = kRigOwn;
+        }
     }
-    return s;
+    if (native_work_busy()) return;
+    _source_probes_ready = !pending;
+    if (!pano_changed) return;
+    apply_capture_defaults(_sources, _sfm_job, _colmap_job);
+    reapply_dataset_builtin();
 }
 
 // Attach a picked `masks/` folder to the input whose images it describes --
@@ -1192,6 +1981,12 @@ static bool attach_mask_folder(std::vector<PrepInput>& sources,
 // Re-answer "are there masks beside these photos?" after the switch moves.
 // Turning it off forgets them; turning it back on has to look again, because
 // the answer was thrown away rather than remembered.
+bool GuiApp::any_found_masks() const {
+    for (const PrepInput& s : _sources)
+        if (!s.is_video && !s.mask_dir.empty()) return true;
+    return false;
+}
+
 void GuiApp::rescan_found_masks() {
     for (PrepInput& s : _sources) {
         if (s.is_video) continue;
@@ -1205,7 +2000,27 @@ void GuiApp::rescan_found_masks() {
     refresh_sources();
 }
 
-void GuiApp::add_sources(const std::vector<std::string>& paths, bool replace) {
+void GuiApp::replace_source(size_t input, const std::string& path) {
+    if (input >= _sources.size() || native_work_busy()) return;
+    close_native_previews();
+    close_splat();
+    _sources[input] = path.empty() ? PrepInput{}
+                                   : make_source(path, _use_found_masks);
+    if (input >= _source_path_edits.size())
+        _source_path_edits.resize(input + 1);
+    _source_path_edits[input] = _sources[input].path;
+    mark_source_metadata_dirty();
+    apply_capture_defaults(_sources, _sfm_job, _colmap_job);
+    reapply_dataset_builtin();
+    if (!_color_space_touched) {
+        _sfm_job.image_gamut.clear();
+        _sfm_job.image_is_linear.reset();
+    }
+    adopt_exr_color_space();
+    refresh_sources();
+}
+bool GuiApp::add_sources(const std::vector<std::string>& paths, bool replace) {
+    if (paths.empty() || native_work_busy()) return false;
     // A folder of masks is not an input of its own: it belongs to one, and the
     // images half may be in the same pick, in either order. Split before
     // anything else so that picking masks alone cannot clear the list.
@@ -1217,9 +2032,20 @@ void GuiApp::add_sources(const std::vector<std::string>& paths, bool replace) {
         else
             inputs.push_back(path);
     }
+    if (inputs.empty() && _sources.empty()) {
+        for (const std::string& masks : mask_folders)
+            log(i18n::format(dmsg::log_masks_orphaned, {masks}));
+        return false;
+    }
+    close_native_previews();
+    close_splat();
     if (replace && !inputs.empty()) {
         _sources.clear();
+        _source_path_edits.clear();
         _mask_preview_input = 0;
+        // apply_capture_defaults() is about to move settings the stamp is made
+        // of, so it no longer describes anything this panel built.
+        _built_workspace.clear();
         // A different capture is a different job, and the geometry options
         // are remembered nowhere: a run must never quietly cost an hour of
         // inference nobody asked for. (Not mid-run: that would disable it.)
@@ -1229,43 +2055,41 @@ void GuiApp::add_sources(const std::vector<std::string>& paths, bool replace) {
         _sfm_job.image_is_linear.reset();
         _color_space_touched = false;
     }
-    for (const std::string& path : inputs) _sources.push_back(make_source(path, _use_found_masks));
+    for (const std::string& path : inputs) {
+        _sources.push_back(make_source(path, _use_found_masks));
+        _source_path_edits.push_back(_sources.back().path);
+    }
     for (const std::string& masks : mask_folders) {
         if (attach_mask_folder(_sources, masks))
             log(i18n::format(dmsg::log_masks_attached, {masks}));
         else
             log(i18n::format(dmsg::log_masks_orphaned, {masks}));
     }
-    if (_sources.empty()) return;
-
-    // The engine-wide settings follow whatever the list is now. A video is a
-    // capture in order; a folder of photos is not.
-    const bool video = _sources[0].is_video;
-    const bool fisheye = is_dual_fisheye_path(_sources[0].path);
-    _sfm_job.data_type = video ? 1 : 0;
-    _sfm_job.pairs = 0;               // automatic
-    // Matching stays on "Automatic", which is NOT sequential for a dual-lens
-    // video: the two lens tracks are concatenated rather than temporally
-    // interleaved, so temporal neighbours miss every cross-lens pair (on a real
-    // X5 capture that topped out at 68/118 registered frames). Automatic gives
-    // every pair below a hundred images -- which is what beat it, at 116/118 --
-    // and GPU pair selection above that, which is content-based and so keeps
-    // the cross-lens pairs without the quadratic cost. Forcing exhaustive made
-    // a long capture unusably slow, and it also suppresses that switch.
-    _colmap_job.matcher = (video && !fisheye) ? 2 : 1;
-    _colmap_job.seq_loop_closure = true;   // if switched to sequential
-    if (fisheye) {
-        _colmap_job.camera_model = "THIN_PRISM_FISHEYE";
-        _colmap_job.init_focal_factor = kInsta360FocalFactor;
-    }
-    // Several inputs are several cameras, and so is one dual-lens file.
-    if (_sources.size() > 1 || fisheye) {
-        _sfm_job.camera_mode = 1;
-        _colmap_job.camera_mode = 1;
-    }
+    if (!inputs.empty()) mark_source_metadata_dirty();
+    if (_sources.empty()) return false;
+    apply_capture_defaults(_sources, _sfm_job, _colmap_job);
+    reapply_dataset_builtin();
     if (_mask_preview_input >= (int)_sources.size()) _mask_preview_input = 0;
     adopt_exr_color_space();
     refresh_sources();
+    return true;
+}
+
+void GuiApp::add_existing_dataset(const std::string& dir) {
+    if (dir.empty()) return;
+    // The ordinary route already lands on the right pair for the usual
+    // layout: resolve_photo_folder picks images/ out of the folder and
+    // refresh_sources makes its parent -- this folder -- the output.
+    if (!add_sources({dir}, /*replace=*/true)) return;
+    std::error_code ec;
+    if (!folder_looks_like_dataset(dir) ||
+        !fs::equivalent(_sources[0].path, dir, ec))
+        return;
+    // A dataset whose photographs sit at its root rather than under images/.
+    // They are read where they are: gathering them into an images/ beside the
+    // model would leave the folder holding the capture twice.
+    _photo_import = PhotoImport::InPlace;
+    _workspace = _workspace_auto = fs::absolute(dir, ec).string();
 }
 
 // A folder of EXRs declares its own colour space, and the picker for it is
@@ -1292,23 +2116,80 @@ void GuiApp::adopt_exr_color_space() {
     }
 }
 
+const char* GuiApp::dir_key(PickAction a, FileDialog::Mode m) {
+    switch (a) {
+        case PickAction::OpenDataset:
+        case PickAction::BatchDataset:
+        case PickAction::SourceDataset:
+        case PickAction::MeshPhotos:        return "dataset";
+        case PickAction::SourceImages:
+        case PickAction::BatchSourceImages: return "photos";
+        case PickAction::SourceVideo:
+        case PickAction::BatchSourceVideo:  return "video";
+        case PickAction::SourceReplace:
+            return m == FileDialog::Mode::File ? "video" : "photos";
+        case PickAction::SplatFile:
+        case PickAction::AddSplatFile:
+        case PickAction::BatchModel:
+        case PickAction::MeshSource:        return "model";
+        case PickAction::Workspace:
+        case PickAction::OutputPrefix:
+        case PickAction::BatchOutput:
+        case PickAction::MeshOutput:        return "output";
+        case PickAction::VocabTree:         return "vocab";
+        case PickAction::PresetFile:
+        case PickAction::DatasetPresetFile:
+        case PickAction::MeshPresetFile:
+        case PickAction::PresetSaveFolder:
+        case PickAction::BatchPresetFile:
+        case PickAction::BatchDatasetPresetFile:
+        case PickAction::BatchMeshPresetFile: return "preset";
+        case PickAction::MaskModelFile:
+        case PickAction::None:              return "";
+    }
+    return "";
+}
+
+void GuiApp::remember_dir(const std::string& key, const std::string& path) {
+    if (key.empty() || path.empty()) return;
+    std::string dir = fs::path(path).parent_path().string();
+    if (!dir.empty()) _dialog_dirs[key] = dir;
+}
+
+void GuiApp::open_pick(PickAction a, const std::string& title,
+                       FileDialog::Mode mode,
+                       const std::vector<std::string>& extensions,
+                       const std::string& start_dir, bool multi) {
+    _pick = a;
+    _pick_key = dir_key(a, mode);
+    std::string dir = start_dir;
+    if (dir.empty()) {
+        auto it = _dialog_dirs.find(_pick_key);
+        if (it != _dialog_dirs.end()) dir = it->second;
+    }
+    _dialog.open(title, mode, extensions, dir, multi);
+}
+
 void GuiApp::handle_dialog_result(const std::vector<std::string>& paths) {
     const std::string path = paths.empty() ? std::string() : paths[0];
+    remember_dir(_pick_key, path);
     switch (_pick) {
         case PickAction::OpenDataset:
             request_open_dataset(path);
             break;
         case PickAction::SourceImages:
         case PickAction::SourceVideo:
-            add_sources(paths, /*replace=*/_screen != Screen::NewDataset);
+            if (add_sources(paths, /*replace=*/_screen != Screen::NewDataset))
+                _screen = Screen::NewDataset;
+            break;
+        case PickAction::SourceDataset:
+            add_existing_dataset(path);
             _screen = Screen::NewDataset;
             break;
         case PickAction::SourceReplace:
             if (!path.empty() && _pick_source >= 0 &&
-                _pick_source < (int)_sources.size()) {
-                _sources[_pick_source] = make_source(path, _use_found_masks);
-                refresh_sources();
-            }
+                _pick_source < (int)_sources.size())
+                replace_source((size_t)_pick_source, path);
             _pick_source = -1;
             break;
         case PickAction::Workspace:
@@ -1355,12 +2236,17 @@ void GuiApp::handle_dialog_result(const std::vector<std::string>& paths) {
                     (fs::path(path) / fs::path(_preset_save_path).filename())
                         .string();
             break;
+        case PickAction::DatasetPresetFile:
+            load_dataset_preset_file(path);
+            break;
+        case PickAction::MeshPresetFile:
+            load_mesh_preset_file(path);
+            break;
         case PickAction::BatchDataset:
             if (!path.empty()) {
                 if (_pick_row >= 0 && _pick_row < (int)_batch.size()) {
                     _batch[_pick_row].dataset = path;
-                    _batch_dirty = true;
-                    _batch_checked = false;
+                    batch_edited();
                 } else {
                     // Several folders picked at once become several rows.
                     for (const std::string& p : paths) add_batch_row(p);
@@ -1368,11 +2254,67 @@ void GuiApp::handle_dialog_result(const std::vector<std::string>& paths) {
             }
             _pick_row = -1;
             break;
+        case PickAction::BatchSourceImages:
+        case PickAction::BatchSourceVideo:
+            if (!paths.empty()) {
+                if (_pick_row >= 0 && _pick_row < (int)_batch.size()) {
+                    for (const std::string& p : paths)
+                        _batch[_pick_row].sources.push_back(p);
+                    batch_edited();
+                } else {
+                    // Videos picked together are one capture, which is what
+                    // the dataset screen does with the same pick. A folder of
+                    // photos is a capture on its own.
+                    if (_pick == PickAction::BatchSourceVideo)
+                        add_batch_source_row(paths);
+                    else
+                        for (const std::string& p : paths)
+                            add_batch_source_row({p});
+                }
+            }
+            _pick_row = -1;
+            break;
+        case PickAction::BatchModel:
+            if (!path.empty()) {
+                if (_pick_row >= 0 && _pick_row < (int)_batch.size()) {
+                    _batch[_pick_row].model = path;
+                    batch_edited();
+                } else {
+                    for (const std::string& p : paths) add_batch_mesh_row(p);
+                }
+            }
+            _pick_row = -1;
+            break;
         case PickAction::BatchOutput:
             if (_pick_row >= 0 && _pick_row < (int)_batch.size()) {
                 _batch[_pick_row].output_dir = path;
-                _batch_dirty = true;
-                _batch_checked = false;
+                batch_edited();
+            }
+            _pick_row = -1;
+            break;
+        case PickAction::BatchDatasetPresetFile:
+            if (!path.empty() && _pick_row >= 0 && _pick_row < (int)_batch.size()) {
+                try {
+                    DatasetPreset p = load_dataset_preset(path);
+                    _batch[_pick_row].dataset_preset = {p.path, p.name};
+                    batch_edited();
+                } catch (const std::exception& e) {
+                    _batch_msg = i18n::format(msg::preset_failed, {e.what()});
+                    _batch_msg_err = true;
+                }
+            }
+            _pick_row = -1;
+            break;
+        case PickAction::BatchMeshPresetFile:
+            if (!path.empty() && _pick_row >= 0 && _pick_row < (int)_batch.size()) {
+                try {
+                    MeshPreset p = load_mesh_preset(path);
+                    _batch[_pick_row].mesh.preset = {p.path, p.name};
+                    batch_edited();
+                } catch (const std::exception& e) {
+                    _batch_msg = i18n::format(msg::preset_failed, {e.what()});
+                    _batch_msg_err = true;
+                }
             }
             _pick_row = -1;
             break;
@@ -1381,21 +2323,29 @@ void GuiApp::handle_dialog_result(const std::vector<std::string>& paths) {
                 _pick_row < (int)_batch.size()) {
                 try {
                     TrainPreset p = load_preset(path);
-                    _batch[_pick_row].preset_path = p.path;
-                    _batch[_pick_row].preset_name = p.name;
-                    _batch_dirty = true;
-                    _batch_checked = false;
+                    BatchRow& row = _batch[_pick_row];
+                    if (_pick_slot >= 0 && _pick_slot < (int)row.runs.size()) {
+                        row.runs[_pick_slot].preset.path = p.path;
+                        row.runs[_pick_slot].preset.name = p.name;
+                    } else {
+                        BatchRun run;
+                        run.preset = {p.path, p.name};
+                        row.runs.push_back(std::move(run));
+                    }
+                    batch_edited();
                 } catch (const std::exception& e) {
                     _batch_msg = i18n::format(msg::preset_failed, {e.what()});
                     _batch_msg_err = true;
                 }
             }
             _pick_row = -1;
+            _pick_slot = -1;
             break;
         default:
             break;
     }
     _pick = PickAction::None;
+    _pick_key.clear();
 }
 
 
@@ -1414,6 +2364,7 @@ void GuiApp::frame() {
     // are queues, stepped on from somewhere that runs whatever screen is up.
     _geom_download.pump();
     _feat_download.pump();
+    pump_source_probes();
     // Before the reload check below: between two batch rows the runner is
     // briefly idle, and a stale _parse_dirty would start a dataset parse right
     // where the next row wants the engine.
@@ -1434,9 +2385,8 @@ void GuiApp::frame() {
 
     // Dataset-parsing option changed: re-parse once the user finishes
     // editing (no active widget), so the preview / camera counts stay in
-    // sync with the config. Never fires while training (options are locked).
-    if (_parse_dirty && !training_busy() && !_batch_active &&
-        _runner.phase() != TrainRunner::Phase::Loading &&
+    // sync with the config. Never fires while native work is active.
+    if (_parse_dirty && !native_work_busy() && !_batch_active &&
         !ImGui::IsAnyItemActive()) {
         _parse_dirty = false;
         if (!_cfg.data.empty()) {
@@ -1504,17 +2454,20 @@ void GuiApp::draw_menu_bar() {
     if (!ImGui::BeginMenuBar()) return;
     if (ui::BeginMenu(msg::menu_file)) {
         if (ui::MenuItem(msg::menu_open_dataset)) {
-            _pick = PickAction::OpenDataset;
-            _dialog.open(msg::menu_open_dataset.get(), FileDialog::Mode::Folder);
+            open_pick(PickAction::OpenDataset, msg::menu_open_dataset.get(),
+                      FileDialog::Mode::Folder);
         }
-        if (ui::MenuItem(msg::menu_new_dataset)) _screen = Screen::NewDataset;
+        if (ui::MenuItem(msg::menu_new_dataset) && !native_work_busy()) {
+            close_splat();
+            _screen = Screen::NewDataset;
+        }
         if (ui::MenuItem(msg::menu_open_splat)) {
-            _pick = PickAction::SplatFile;
-            _dialog.open(msg::viewer_pick_file.get(), FileDialog::Mode::File,
-                         {".ply"});
+            open_pick(PickAction::SplatFile, msg::viewer_pick_file.get(),
+                      FileDialog::Mode::File, {".ply"});
         }
         ImGui::Separator();
-        if (ui::MenuItem(msg::menu_batch)) _screen = Screen::Batch;
+        if (ui::MenuItem(msg::menu_batch) && !native_work_busy())
+            _screen = Screen::Batch;
         ImGui::Separator();
         if (ui::MenuItem(msg::menu_quit)) request_close();
         ImGui::EndMenu();
@@ -1563,6 +2516,15 @@ void GuiApp::draw_menu_bar() {
         ImGui::EndMenu();
     }
     draw_language_menu();
+#if defined(SS_BUILD_SAM) || defined(SS_TOOL_SFM) || defined(SS_BACKEND_VULKAN)
+    {
+        // Native choice is reachable before previews and engine work.
+        if (ui::BeginMenu(msg::menu_device)) {
+            draw_device_picker(/*as_menu=*/true);
+            ImGui::EndMenu();
+        }
+    }
+#endif
     if (ui::BeginMenu(msg::menu_help)) {
         if (ui::BeginMenu(msg::menu_about)) {
             ui::Text(spirula::i18n::msg::brand::product);
@@ -1683,9 +2645,17 @@ void GuiApp::draw_home_banner(float avail, float indent) {
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
     const ImVec2 p1(p0.x + avail, p0.y + h);
 
+    // Full bleed: the artwork is painted out over the host window's padding on
+    // the three sides it touches, so the band meets the menu bar and both
+    // edges. Only the drawing grows -- p1 stays where the layout below it is.
+    const ImVec2 pad = ImGui::GetStyle().WindowPadding;
+    const ImVec2 q0(p0.x - pad.x, p0.y - pad.y);
+    const ImVec2 q1(p1.x + pad.x, p1.y);
+    const float band_w = q1.x - q0.x, band_h = q1.y - q0.y;
+
     // Cover, not fit: crop to the band's aspect so the artwork fills the width
     // whatever the window is doing.
-    const float want = avail / h, have = (float)bw / (float)bh;
+    const float want = band_w / band_h, have = (float)bw / (float)bh;
     ImVec2 uv0(0.0f, 0.0f), uv1(1.0f, 1.0f);
     const float f = have > want ? want / have : have / want;
     if (have > want) {
@@ -1697,10 +2667,10 @@ void GuiApp::draw_home_banner(float avail, float indent) {
     }
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddImage((ImTextureID)(intptr_t)tex, p0, p1, uv0, uv1);
+    dl->AddImage((ImTextureID)(intptr_t)tex, q0, q1, uv0, uv1);
     // The artwork is bright everywhere, so the text needs its own ground.
     const ImU32 clear = IM_COL32(14, 15, 18, 0), dark = IM_COL32(14, 15, 18, 232);
-    dl->AddRectFilledMultiColor(ImVec2(p0.x, p0.y + h * 0.30f), p1,
+    dl->AddRectFilledMultiColor(ImVec2(q0.x, q0.y + band_h * 0.30f), q1,
                                 clear, clear, dark, dark);
 
     ImGui::SetCursorScreenPos(ImVec2(p0.x + indent, p1.y - px(76.0f)));
@@ -1738,22 +2708,26 @@ void GuiApp::draw_home() {
     }
 
     if (ui::Button(msg::home_open_dataset, ImVec2(-1, bh))) {
-        _pick = PickAction::OpenDataset;
-        _dialog.open(msg::menu_open_dataset.get(), FileDialog::Mode::Folder);
+        open_pick(PickAction::OpenDataset, msg::menu_open_dataset.get(),
+                  FileDialog::Mode::Folder);
     }
     ui::help_on_hover(msg::home_open_dataset_help);
 
     // Photos and video are one screen and one input list: a capture can hold
     // both, so splitting the entry point in two only asked a question with no
     // right answer. The list is added to there, or dropped onto the window.
-    if (ui::Button(msg::home_new_dataset, ImVec2(-1, bh)))
+    ImGui::BeginDisabled(native_work_busy());
+    if (ui::Button(msg::home_new_dataset, ImVec2(-1, bh)) &&
+        !native_work_busy()) {
+        close_splat();
         _screen = Screen::NewDataset;
+    }
+    ImGui::EndDisabled();
     ui::help_on_hover(msg::home_new_dataset_help);
 
     if (ui::Button(msg::home_open_splat, ImVec2(-1, bh))) {
-        _pick = PickAction::SplatFile;
-        _dialog.open(msg::viewer_pick_file.get(), FileDialog::Mode::File,
-                     kViewableExtensions);
+        open_pick(PickAction::SplatFile, msg::viewer_pick_file.get(),
+                  FileDialog::Mode::File, kViewableExtensions);
     }
     ui::help_on_hover(msg::home_open_splat_help);
 
@@ -1819,6 +2793,13 @@ bool GuiApp::dataset_busy() const {
     return _sfm.state() == SfmRunner::State::Running ||
            _colmap.state() == ColmapRunner::State::Running;
 }
+bool GuiApp::native_work_busy() const {
+    const TrainRunner::Phase phase = _runner.phase();
+    return _mesh.busy() || dataset_busy() ||
+           phase == TrainRunner::Phase::Loading ||
+           phase == TrainRunner::Phase::Preparing ||
+           phase == TrainRunner::Phase::Training;
+}
 
 RunProgress* GuiApp::dataset_steps() {
     return effective_engine() == Engine::BuiltIn ? &_sfm.steps() : &_colmap.steps();
@@ -1831,6 +2812,9 @@ bool GuiApp::dataset_locked(Stage s) {
 }
 
 void GuiApp::cancel_dataset_job() {
+    // Cancelling the run on screen gives up the queue driving it, which is
+    // what the trainer's stop confirmation already does.
+    if (_batch_active) _batch_stop_after = _batch_stop_now = true;
     _sfm.cancel();
     _colmap.cancel();
 }
@@ -1883,6 +2867,7 @@ const WorkspaceState& GuiApp::workspace_state() {
         _ws_state_key = std::move(key);
         _ws_state_at = now;
         _ws_state = probe_workspace(_workspace, _sources);
+        _ws_artifacts = workspace_artifacts(_workspace, _sources);
     }
     return _ws_state;
 }
@@ -1900,16 +2885,23 @@ void GuiApp::sync_dataset_jobs() {
     prep.workspace = _workspace;
     prep.resume = _resume;
     prep.video_fps = _sfm_job.prep.video_fps;
+    prep.adaptive_fps = _sfm_job.prep.adaptive_fps;
+    prep.adaptive_range = _sfm_job.prep.adaptive_range;
     prep.sharp_window = _sfm_job.prep.sharp_window;
+    prep.pano = _sfm_job.prep.pano;
     prep.max_frames = _sfm_job.prep.max_frames;
     prep.force_external_decode = _sfm_job.prep.force_external_decode;
+    prep.sync_tracks = _sfm_job.prep.sync_tracks;
     prep.ffmpeg_exe = _ffmpeg_exe;
     prep.python_exe = _python_exe;
     prep.mask_enable = _mask_enable;
+    prep.flip_found_masks = _use_found_masks && _flip_found_masks;
+    prep.photo_import = _photo_import;
     prep.mask_prompt = _mask.prompt;
     prep.mask_negative_prompt = _mask.negative_prompt;
     prep.mask_keep_subject = _mask.keep_subject;
     prep.mask_max_image_size = _mask.max_image_size;
+    prep.mask_dilate_ratio = _mask.boundary_ratio();
     prep.mask_threshold = _mask.threshold;
     prep.mask_nms = _mask.nms;
     prep.mask_memory = _mask_memory;
@@ -1920,18 +2912,26 @@ void GuiApp::sync_dataset_jobs() {
     prep.force_external_masking = _sfm_job.prep.force_external_masking;
     if (const ModelEntry* e = find_model(_model_id))
         prep.mask_model_name = e->legacy_name;
+    // The one frozen choice, re-applied here because this function rebuilds
+    // prep from panel state and would otherwise drop it. Empty before the
+    // freeze, which is exactly what an unstarted job wants.
+    prep.device = _native_device_uuid;
     _sfm_job.prep = prep;
-    // The dataset-wide lens is the lone input's; with several, each input names
-    // its own and this is only what an image no override covers would get.
-    if (!_sources.empty()) _sfm_job.camera_model = _sources[0].camera_model;
 
     _colmap_job.inputs = prep.inputs;
     _colmap_job.workspace = prep.workspace;
     _colmap_job.resume = prep.resume;
+    // The frozen choice, so a later edit cannot drop the UUID the run has
+    // already committed to. Empty before the freeze.
+    _colmap_job.device = _native_device_uuid;
     _colmap_job.video_fps = prep.video_fps;
+    _colmap_job.adaptive_fps = prep.adaptive_fps;
+    _colmap_job.adaptive_range = prep.adaptive_range;
     _colmap_job.sharp_window = prep.sharp_window;
+    _colmap_job.pano = prep.pano;
     _colmap_job.max_frames = prep.max_frames;
     _colmap_job.force_external_decode = prep.force_external_decode;
+    _colmap_job.photo_import = prep.photo_import;
     _colmap_job.force_external_masking = prep.force_external_masking;
     _colmap_job.colmap_exe = _colmap_exe;
     _colmap_job.ffmpeg_exe = _ffmpeg_exe;
@@ -1941,6 +2941,7 @@ void GuiApp::sync_dataset_jobs() {
     _colmap_job.mask_negative_prompt = prep.mask_negative_prompt;
     _colmap_job.mask_keep_subject = prep.mask_keep_subject;
     _colmap_job.mask_max_image_size = prep.mask_max_image_size;
+    _colmap_job.mask_dilate_ratio = prep.mask_dilate_ratio;
     _colmap_job.mask_threshold = prep.mask_threshold;
     _colmap_job.mask_nms = prep.mask_nms;
     _colmap_job.mask_memory = prep.mask_memory;
@@ -1953,10 +2954,20 @@ void GuiApp::sync_dataset_jobs() {
     _sfm_job.prep.redo_frames = _colmap_job.redo_frames = _redo_frames;
     _sfm_job.prep.redo_masks = _colmap_job.redo_masks = _redo_masks;
     _sfm_job.redo_model = _colmap_job.redo_model = _redo_model;
+    _sfm_job.mask_features = _colmap_job.mask_features = _mask_features;
+    _sfm_job.settings_built_model = _colmap_job.settings_built_model =
+        !_workspace.empty() && _workspace == _built_workspace;
     // The same step either way: `spirula geometry` over the finished dataset.
     _sfm_job.geometry = _colmap_job.geometry = _geometry;
     _sfm_job.geometry.overwrite = _colmap_job.geometry.overwrite =
         _geometry.overwrite || _redo_geometry;
+    // The frozen choice survives the copy above, so a later panel edit cannot
+    // drop the UUID a run already committed to.
+    _sfm_job.geometry.device_uuid = _colmap_job.geometry.device_uuid =
+        _geometry.device_uuid = _native_device_uuid;
+    // ... and the reconstruction's own selector, which SfmRunner::update must
+    // not be able to overwrite once the run has started.
+    _sfm_job.device_selector = _native_device_uuid;
     // A settings file written by a build that HAS the inference layer must not
     // make a run on one that has not fail at the last step.
     _sfm_job.geometry.enable = _colmap_job.geometry.enable =
@@ -1980,61 +2991,275 @@ void GuiApp::update_dataset_job() {
     else                                           _colmap.update(_colmap_job);
 }
 
+// Masks the reconstruction being kept has never seen, with the panel asking
+// for masked feature points: the run can add them for training alone or spend
+// the reconstruction again on them, and only the user knows which.
+bool GuiApp::masks_miss_kept_model() {
+    if (!_mask_enable || !_mask_features || _redo_model) return false;
+    if (!workspace_state().model) return false;
+    // A model this panel built is one these settings built, masks included --
+    // and if they have moved since, the run replaces it anyway.
+    if (_workspace == _built_workspace) return false;
+    // An input that arrived with its own masks is not segmented, so the
+    // dataset gains nothing the model could have missed.
+    for (const PrepInput& s : _sources)
+        if (s.mask_dir.empty()) return true;
+    return false;
+}
+
 void GuiApp::start_dataset_job() {
+    if (native_work_busy()) return;
+    pump_source_probes();
+    if (!_source_probes_ready) {
+        log(dmsg::sensors_reading.get());
+        return;
+    }
+    if (masks_miss_kept_model()) {
+        _mask_recon_open = true;
+        return;
+    }
+    launch_dataset_job();
+}
+
+bool GuiApp::launch_dataset_job() {
+    // The first GPU-consuming operation of this session freezes the one native
+    // choice, before any preview, decode or child is dispatched. A rejected or
+    // conflicting request is reported and the run does not start.
+    if (native_work_busy()) return false;
+    close_native_previews();
+    close_splat();
+    if (!freeze_native_device()) return false;
+    app::set_crash_note("building dataset " + _workspace);
+    // The stamp this run leaves behind describes the settings on the screen
+    // only when the run actually reconstructs; after one that keeps the model
+    // it goes on describing whoever built it.
+    if (_redo_model || !workspace_state().model) _built_workspace = _workspace;
     sync_dataset_jobs();
+    const std::string stamp = run_log_stamp();
+    const fs::path prep_log_file =
+        open_run_log(_prep_log,
+                     fs::path(planned_image_dir(_sources, _workspace,
+                                                _photo_import)).parent_path().string(),
+                     "prep", stamp);
+    // The unregistered-images list, beside this log with the same stamp,
+    // written by whichever engine runs (sfm/Pipeline.cpp or ColmapRunner).
+    set_ss_env("UNREG_LOG", prep_log_file.empty()
+                                ? std::string()
+                                : (prep_log_file.parent_path() /
+                                   ("unreg_" + stamp + ".log")).string());
+    write_run_settings(_prep_log);
     // The preview holds a multi-gigabyte backbone; the run about to start
     // wants that VRAM for reconstruction.
-    _segment.close();
-    _geometry_panel.close();
-    reset_dataset_preview();
+    reset_dataset_preview(effective_engine() != Engine::BuiltIn);
     const RunFilms films{&_film_frames, &_film_masks, &_film_geometry};
     if (effective_engine() == Engine::BuiltIn) _sfm.start(_sfm_job, films);
     else                                      _colmap.start(_colmap_job, films);
     // One run each: a re-do that stayed armed would throw the same step away
     // again the next time the button is pressed.
     _redo_frames = _redo_masks = _redo_model = _redo_geometry = false;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
 // Source, destination, resume
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// Built by hand rather than with ui::Combo for the same reason as the lens
+// pickers: what each row costs is the whole of the question, and one tooltip
+// on the closed combo cannot answer it row by row.
+void photo_import_combo(PhotoImport* mode, bool several_inputs) {
+    const std::vector<const Msg*> labels{
+        &dmsg::photo_import_convert, &dmsg::photo_import_copy,
+        &dmsg::photo_import_move, &dmsg::photo_import_inplace};
+    const std::vector<const Msg*> helps{
+        &dmsg::photo_import_convert_help, &dmsg::photo_import_copy_help,
+        &dmsg::photo_import_move_help, &dmsg::photo_import_inplace_help};
+    int idx = (int)*mode;
+    ImGui::SetNextItemWidth(px(260.0f));
+    if (ui::BeginCombo(dmsg::photo_import, labels[(size_t)idx]->get())) {
+        for (int i = 0; i < kNumPhotoImports; i++) {
+            const bool blocked =
+                several_inputs && (PhotoImport)i == PhotoImport::InPlace;
+            ImGui::BeginDisabled(blocked);
+            if (ui::Selectable(*labels[(size_t)i], i == idx))
+                *mode = (PhotoImport)i;
+            ImGui::EndDisabled();
+            ui::help_on_hover(*helps[(size_t)i]);
+        }
+        ImGui::EndCombo();
+    }
+    ui::help_on_hover(dmsg::photo_import_help);
+}
+
+}  // namespace
+
+// What the sensors of this input hold, beside the row that chose it. The
+// reconstruction uses them without being asked (SfM's sensor and attitude
+// gauges), so what is worth seeing here is whether there is anything to use.
+void GuiApp::draw_sensor_badge(const PrepInput& s) {
+    std::error_code ec;
+    if (s.path.empty() ||
+        (s.is_video ? !fs::is_regular_file(s.path, ec)
+                    : !fs::is_directory(s.path, ec)))
+        return;
+    const TelemetryInfo t = _telemetry.get(s.path, s.is_video);
+    if (!t.done) {
+        ImGui::SameLine();
+        ui::TextDisabled(dmsg::sensors_reading);
+        return;
+    }
+    if (!s.is_video) {
+        if (t.photos == 0) return;
+        ImGui::SameLine();
+        const long long n = t.photos, gps = t.with_gps, att = t.with_attitude;
+        if (gps == 0 && att == 0) ui::TextDisabled(dmsg::sensors_none);
+        else if (att == 0) ui::TextDisabled(dmsg::sensors_photo_gps, {gps, n});
+        else if (gps == 0) ui::TextDisabled(dmsg::sensors_photo_attitude, {att, n});
+        else if (gps == att) ui::TextDisabled(dmsg::sensors_photo_gps_attitude, {gps, n});
+        else ui::TextDisabled(dmsg::sensors_photo_gps_attitude_split, {gps, att, n});
+        if (att > 0) ui::help_on_hover(dmsg::sensors_photo_attitude_help);
+        return;
+    }
+    ImGui::SameLine();
+    const bool imu = t.gyro || t.accel || t.attitude;
+    if (!imu && !t.gps) { ui::TextDisabled(dmsg::sensors_none); return; }
+    ui::TextDisabled(imu && t.gps ? dmsg::sensors_imu_gps
+                     : imu        ? dmsg::sensors_imu
+                                  : dmsg::sensors_gps);
+    if (!t.carrier.empty() && ImGui::IsItemHovered())
+        ui::SetTooltip(dmsg::sensors_carrier_tooltip, {t.carrier});
+}
+
+namespace {
+
+// The rate box's text. The first video spells its rate out with the unit, since
+// it is the one the rest of the list is written against; every row below it
+// shows the caret the lens column uses for the same idea.
+std::string fps_label(float fps) {
+    if (!(fps > 0.0f)) return "^";
+    char b[32];
+    std::snprintf(b, sizeof b, "%g fps", (double)fps);
+    return b;
+}
+
+// And back: a number is a rate (with or without the unit typed back), and
+// anything else -- or the rate the row above is already on -- means "^".
+float parse_fps(const std::string& text, float above) {
+    const double v = std::atof(text.c_str());
+    if (!(v > 0.0) || (float)v == above) return 0.0f;
+    return (float)v;
+}
+
+// The row whose box holds the dataset's own rate: it has nothing above it to
+// follow, so it is never a caret.
+size_t first_video_row(const std::vector<PrepInput>& sources) {
+    for (size_t i = 0; i < sources.size(); i++)
+        if (sources[i].is_video) return i;
+    return sources.size();
+}
+
+}  // namespace
+
 void GuiApp::draw_dataset_source() {
     // One row per input. Several videos reconstruct as one scene -- each gets
     // its own folder of frames under images/, and so its own camera.
     int remove = -1;
     bool edited = false;
+    if (_source_path_edits.size() != _sources.size()) {
+        const size_t old = _source_path_edits.size();
+        _source_path_edits.resize(_sources.size());
+        for (size_t i = old; i < _sources.size(); i++)
+            _source_path_edits[i] = _sources[i].path;
+    }
+    // The rate lives beside the video it describes rather than in the settings
+    // below, so a list of clips reads as the one decision it usually is.
+    bool any_video = false;
+    for (const PrepInput& s : _sources) any_video = any_video || s.is_video;
+    // The path box takes what the rows leave, measured on the frame before: a
+    // translated label or a badge still being read has no width until drawn.
+    // Below a dozen characters, the label and badge get a line of their own.
+    const float avail = ImGui::GetContentRegionAvail().x;
+    const float min_path = ImGui::GetFontSize() * 12.0f;
+    const float controls_w =
+        _source_controls_w > 0.0f ? _source_controls_w : px(any_video ? 250.0f : 160.0f);
+    const float info_w =
+        _source_info_w > 0.0f ? _source_info_w : px(any_video ? 340.0f : 240.0f);
+    const bool one_line = avail - controls_w - info_w >= min_path;
+    const float path_w =
+        std::max(min_path, avail - controls_w - (one_line ? info_w : 0.0f));
+    float row_controls = 0.0f, row_info = 0.0f;
     for (size_t i = 0; i < _sources.size(); i++) {
         PrepInput& s = _sources[i];
         ImGui::PushID((int)i);
-        // Room for Browse + Remove + where the frames go, which is longer than
-        // any other row on the screen.
-        ImGui::SetNextItemWidth(px(-380.0f));
-        if (ui::InputTextRaw("##in", &s.path)) {
-            std::error_code ec;
-            s.is_video = !fs::is_directory(s.path, ec) && is_video_path(s.path);
-            edited = true;
-        }
+        ImGui::SetNextItemWidth(path_w);
+        std::string& path_edit = _source_path_edits[i];
+        ui::InputTextRaw("##in", &path_edit);
+        const float path_right = ImGui::GetItemRectMax().x;
         // A typed path is only worth resolving once it is finished -- rewriting
         // `<folder>` to `<folder>/images` under the cursor is not helpful.
-        if (ImGui::IsItemDeactivatedAfterEdit() && !s.is_video) {
-            resolve_photo_folder(s.path, s.path, s.mask_dir);
-            if (!_use_found_masks) s.mask_dir.clear();
-            edited = true;
-        }
+        if (ImGui::IsItemDeactivatedAfterEdit() && path_edit != s.path)
+            replace_source(i, path_edit);
         ImGui::SameLine();
         if (ui::Button(dmsg::browse)) {
-            _pick = PickAction::SourceReplace;
             _pick_source = (int)i;
             if (s.is_video)
-                _dialog.open(msg::pick_video_file.get(), FileDialog::Mode::File,
-                             video_dialog_filters());
+                open_pick(PickAction::SourceReplace, msg::pick_video_file.get(),
+                          FileDialog::Mode::File, video_dialog_filters());
             else
-                _dialog.open(msg::pick_photo_folder.get(), FileDialog::Mode::Folder);
+                open_pick(PickAction::SourceReplace,
+                          msg::pick_photo_folder.get(),
+                          FileDialog::Mode::Folder);
         }
         ImGui::SameLine();
         if (ui::Button(dmsg::remove)) remove = (int)i;
-        ImGui::SameLine();
+        if (any_video) {
+            ImGui::SameLine();
+            if (s.is_video) {
+                ImGui::BeginDisabled(dataset_locked(Stage::Frames));
+                ImGui::SetNextItemWidth(px(84.0f));
+                // The first video's box IS the dataset's rate -- that is what a
+                // preset carries and what every item of a batch starts from --
+                // so its own `fps` stays 0 and the rest follow it.
+                const bool head = i == first_video_row(_sources);
+                const float above =
+                    head ? 0.0f
+                         : input_fps(_sources, _sfm_job.prep.video_fps, i - 1);
+                if (_fps_text.size() != _sources.size()) {
+                    _fps_text.assign(_sources.size(), std::string());
+                    _fps_editing = -1;
+                }
+                std::string& text = _fps_text[i];
+                if (_fps_editing != (int)i)
+                    text = fps_label(head ? _sfm_job.prep.video_fps : s.fps);
+                ui::InputTextRaw("##fps", &text);
+                if (ImGui::IsItemActive()) _fps_editing = (int)i;
+                else if (_fps_editing == (int)i) _fps_editing = -1;
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    const float v = parse_fps(text, above);
+                    // A head row cannot be a caret: an unreadable answer there
+                    // leaves the rate where it was rather than at nothing.
+                    if (head) {
+                        if (v > 0.0f) _sfm_job.prep.video_fps = v;
+                    } else {
+                        s.fps = v;
+                    }
+                    edited = true;
+                }
+                ui::help_on_hover(head ? (_sfm_job.prep.adaptive_fps
+                                              ? dmsg::frames_per_second_help_adaptive
+                                              : dmsg::frames_per_second_help)
+                                       : dmsg::video_fps_this_one_help);
+                ImGui::EndDisabled();
+            } else {
+                ImGui::Dummy(ImVec2(px(84.0f), 0.0f));
+            }
+        }
+        row_controls = std::max(row_controls, ImGui::GetItemRectMax().x - path_right +
+                                                  ImGui::GetStyle().ItemSpacing.x);
+        if (one_line) ImGui::SameLine();
+        const float info_left = ImGui::GetCursorScreenPos().x;
         // What this input is, and -- the part worth seeing before pressing the
         // button -- whether masks were found for it. Four whole messages
         // rather than a kind + a "+ masks" tail: the two do not compose in
@@ -2054,30 +3279,52 @@ void GuiApp::draw_dataset_source() {
         }
         if (masked && ImGui::IsItemHovered())
             ui::SetTooltip(dmsg::existing_masks_tooltip, {s.mask_dir});
+        if (s.pano360_unsupported) {
+            ImGui::SameLine();
+            ui::TextColored(kWarn, dmsg::pano360_unsupported);
+            ui::help_on_hover(dmsg::pano360_unsupported_help);
+        }
+        draw_sensor_badge(s);
+        row_info = std::max(row_info, ImGui::GetItemRectMax().x - info_left);
         ImGui::PopID();
     }
-    if (remove >= 0) {
+    if (!_sources.empty()) {
+        _source_controls_w = row_controls;
+        _source_info_w = row_info;
+    }
+    if (remove >= 0 && !native_work_busy()) {
+        close_native_previews();
+        close_splat();
         _sources.erase(_sources.begin() + remove);
+        _source_path_edits.erase(_source_path_edits.begin() + remove);
+        mark_source_metadata_dirty();
         edited = true;
     }
     if (edited) refresh_sources();
 
     if (ui::Button(dmsg::add_video)) {
-        _pick = PickAction::SourceVideo;
-        _dialog.open(msg::pick_videos.get(), FileDialog::Mode::File,
-                     video_dialog_filters(), "", /*multi_select=*/true);
+        open_pick(PickAction::SourceVideo, msg::pick_videos.get(),
+                  FileDialog::Mode::File, video_dialog_filters(), "",
+                  /*multi_select=*/true);
     }
     ui::help_on_hover(dmsg::add_video_help);
     ImGui::SameLine();
     if (ui::Button(dmsg::add_photos)) {
-        _pick = PickAction::SourceImages;
-        _dialog.open(msg::pick_photo_folder.get(), FileDialog::Mode::Folder);
+        open_pick(PickAction::SourceImages, msg::pick_photo_folder.get(),
+                  FileDialog::Mode::Folder);
     }
     ui::help_on_hover(dmsg::add_photos_help);
     if (_sources.empty()) {
         ImGui::SameLine();
         ui::TextDisabled(dmsg::no_input_yet);
     }
+    // A row of its own: a finished dataset is not raw input, and three button
+    // labels in a row run off the edge of a narrow panel in several languages.
+    if (ui::Button(dmsg::add_dataset)) {
+        open_pick(PickAction::SourceDataset, msg::pick_existing_dataset.get(),
+                  FileDialog::Mode::Folder);
+    }
+    ui::help_on_hover(dmsg::add_dataset_help);
 
     // Masks that came WITH the photos are adopted automatically, which is
     // right for a prepared capture and wrong for a folder whose masks/ happens
@@ -2089,6 +3336,16 @@ void GuiApp::draw_dataset_source() {
         if (ui::Checkbox(dmsg::use_found_masks, &_use_found_masks))
             rescan_found_masks();
         ui::help_on_hover(dmsg::use_found_masks_help);
+        // Which way round they are is a property of those files, so it is asked
+        // here rather than per stage: everything the run writes comes out in
+        // the one convention, whatever the folder arrived in.
+        if (_use_found_masks && any_found_masks()) {
+            ImGui::Indent();
+            ui::Checkbox(dmsg::flip_found_masks, &_flip_found_masks);
+            ui::help_on_hover(dmsg::flip_found_masks_help);
+            ImGui::Unindent();
+        }
+        photo_import_combo(&_photo_import, _sources.size() > 1);
     }
 
     ImGui::SetNextItemWidth(px(-220.0f));
@@ -2098,8 +3355,8 @@ void GuiApp::draw_dataset_source() {
     // they need distinguishing exactly as two identical literals would.
     ImGui::PushID("ws");
     if (ui::Button(dmsg::browse)) {
-        _pick = PickAction::Workspace;
-        _dialog.open(msg::pick_output_folder.get(), FileDialog::Mode::Folder);
+        open_pick(PickAction::Workspace, msg::pick_output_folder.get(),
+                  FileDialog::Mode::Folder);
     }
     ImGui::PopID();
     ImGui::SameLine();
@@ -2134,30 +3391,40 @@ void GuiApp::draw_dataset_source() {
 
 namespace {
 
-// The closed picker's tooltip: what the control decides, then what the model
-// standing in it is for. Two paragraphs rather than one message, because only
-// the second one changes with the selection.
-void lens_tooltip(const Msg& model_help) {
+// Two paragraphs rather than one message, because only the second one changes
+// with the selection. `inherited` names the model too, for a row reading "same
+// as above" -- the picker is no longer showing which lens that is.
+void lens_tooltip(const Msg& model_help, const Msg* inherited = nullptr) {
     if (!ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort) ||
         !ImGui::BeginTooltip())
         return;
     ImGui::PushTextWrapPos(px(420.0f));
     ui::Text(dmsg::camera_lens_help);
     ImGui::Separator();
+    if (inherited) ui::Text(*inherited);
     ui::Text(model_help);
     ImGui::PopTextWrapPos();
     ImGui::EndTooltip();
 }
 
-// The lens pickers. ImGui's Combo takes a flat list of strings and has
-// nowhere to hang a description on a row, so the popup is built by hand:
-// which physical camera each model is for is the whole of the question, and
-// one tooltip on the closed combo cannot answer it row by row.
-bool sfm_lens_combo(const char* id, int* idx) {
+// ImGui's Combo has nowhere to hang a description on a row, so the popup is
+// built by hand: which physical camera each model is for is the whole of the
+// question. `inherit` adds "(same as above)" and makes -1 a selection.
+bool sfm_lens_combo(const char* id, int* idx, bool inherit = false) {
     const auto labels = sfm_camera_model_labels();
     const auto helps = sfm_camera_model_helps();
-    if (!ui::BeginComboRaw(id, labels[(size_t)*idx]->get())) return false;
+    const char* shown = *idx < 0 ? dmsg::lens_same_as_above.get()
+                                 : labels[(size_t)*idx]->get();
+    if (!ui::BeginComboRaw(id, shown)) return false;
     bool changed = false;
+    if (inherit) {
+        if (ui::Selectable(dmsg::lens_same_as_above, *idx < 0)) {
+            *idx = -1;
+            changed = true;
+        }
+        ui::help_on_hover(dmsg::lens_same_as_above_help);
+        ImGui::Separator();
+    }
     for (int i = 0; i < (int)labels.size(); i++) {
         if (ui::Selectable(*labels[(size_t)i], i == *idx)) {
             *idx = i;
@@ -2192,10 +3459,22 @@ bool colmap_lens_combo(const char* id, int* idx) {
 void GuiApp::draw_dataset_basics() {
     const bool builtin = effective_engine() == Engine::BuiltIn;
 
+    // A model in the output folder is reused, so these settings reach it only
+    // through a rebuild -- which a mismatch against the stamp THIS panel wrote
+    // forces (ReconStamp.h). One it did not build is kept regardless.
+    const WorkspaceState& prior = workspace_state();
+    const bool reusing = !dataset_busy() && prior.model && !_redo_model;
+    const bool inert =
+        reusing && !(prior.recon_stamp && _workspace == _built_workspace);
+    if (reusing)
+        ui::TextColoredWrapped(inert ? kWarn : kDim,
+                               inert ? dmsg::recon_reuse_locked
+                                     : dmsg::recon_reuse_rebuild);
+
     // Everything down to the frame-rate control is read by feature extraction
     // and after; the frame settings below it were read the moment the run
     // began. Hence two guards rather than one round the lot.
-    ImGui::BeginDisabled(dataset_locked(Stage::Features));
+    ImGui::BeginDisabled(inert || dataset_locked(Stage::Features));
 
     // Quality means the same thing to both engines even though it moves
     // different knobs, so it is one control.
@@ -2234,13 +3513,14 @@ void GuiApp::draw_dataset_basics() {
     if (!per_input_lens) {
         ImGui::SetNextItemWidth(px(220.0f));
         if (builtin) {
-            std::string& model =
-                _sources.empty() ? _sfm_job.camera_model : _sources[0].camera_model;
+            // Kept equal to the first row's by normalize_source_lenses, so
+            // this reads the same lens whichever control last wrote it.
+            const std::string& model = _sfm_job.camera_model;
             int idx = 0;
             for (int i = 0; i < kNumSfmCameraModels; i++)
                 if (model == kSfmCameraModels[i]) idx = i;
             if (sfm_lens_combo(ui::detail::label(dmsg::camera_lens), &idx))
-                model = kSfmCameraModels[idx];
+                apply_lens_to_sources(_sources, _sfm_job, kSfmCameraModels[idx]);
             lens_tooltip(*sfm_camera_model_helps()[idx]);
         } else {
             int idx = 0;
@@ -2252,7 +3532,7 @@ void GuiApp::draw_dataset_basics() {
         }
         if (!_sources.empty())
             draw_lens_warning(_sources[0].path, _sources[0].is_video,
-                              builtin ? _sources[0].camera_model
+                              builtin ? _sfm_job.camera_model
                                       : _colmap_job.camera_model,
                               builtin);
         if (!builtin && _sources.size() > 1)
@@ -2297,14 +3577,30 @@ void GuiApp::draw_dataset_basics() {
     bool any_video = false;
     for (const PrepInput& s : _sources) any_video = any_video || s.is_video;
     if (any_video) {
+        // The rate itself is a column of the input list, beside the video it
+        // describes; what is left here is what it means for all of them.
         ImGui::BeginDisabled(dataset_locked(Stage::Frames));
-        ImGui::SetNextItemWidth(px(220.0f));
-        ui::InputFloat(dmsg::frames_per_second, &_sfm_job.prep.video_fps,
-                       0, 0, "%.2g");
-        ui::help_on_hover(dmsg::frames_per_second_help);
+        ui::Checkbox(dmsg::adaptive_fps, &_sfm_job.prep.adaptive_fps);
+        ui::help_on_hover(dmsg::adaptive_fps_help);
+        if (_sfm_job.prep.adaptive_fps) {
+            ImGui::Indent();
+            ImGui::SetNextItemWidth(px(220.0f));
+            ui::SliderFloat(dmsg::adaptive_range, &_sfm_job.prep.adaptive_range,
+                            1.0f, 16.0f, "%.1f");
+            ui::help_on_hover(dmsg::adaptive_range_help);
+            ImGui::Unindent();
+        }
         ImGui::SetNextItemWidth(px(220.0f));
         ui::SliderInt(dmsg::sharpness_window, &_sfm_job.prep.sharp_window, 1, 8);
         ui::help_on_hover(dmsg::sharpness_window_help);
+        bool any_multi = false;
+        for (const PrepInput& s : _sources)
+            any_multi = any_multi || (s.is_video && !s.pano360.valid() && s.video_tracks >= 2);
+        if (any_multi) {
+            ui::Checkbox(dmsg::sync_lenses, &_sfm_job.prep.sync_tracks);
+            ui::help_on_hover(dmsg::sync_lenses_help);
+        }
+        if (any_pano360(_sources)) draw_pano360_options();
         if (!backends().builtin_video) {
             // What the note says is a build-configuration diagnostic and
             // stays English; the sentence around it does not.
@@ -2318,87 +3614,156 @@ void GuiApp::draw_dataset_basics() {
     if (dataset_busy()) ui::help_on_hover_disabled(dmsg::step_locked);
 }
 
-// One lens per input, in place of the single "Camera / lens" control, once
-// there is more than one input to tell apart. The reconstruction takes these as
-// per-folder overrides (SfmRunner::append_camera_overrides), which is what lets
-// a 360 clip and a phone clip reconstruct as one scene without either being
-// fitted with the other's model.
+// What a 360 capture is unwrapped into, drawn among the video settings only
+// when one was detected. The lens follows the choice exactly (apply_pano_lens),
+// so there is no camera model to pick here.
+void GuiApp::draw_pano360_options() {
+    app::Pano360Options& p = _sfm_job.prep.pano;
+    int mode = p.mode == app::Pano360Mode::Equirect ? 1 : 0;
+    ImGui::SetNextItemWidth(px(220.0f));
+    if (ui::Combo(dmsg::pano360_output, &mode,
+                  {&dmsg::pano360_output_faces, &dmsg::pano360_output_equirect})) {
+        p.mode = mode == 1 ? app::Pano360Mode::Equirect : app::Pano360Mode::Faces;
+        // A face side and a panorama width are not the same number, so the one
+        // in the box is meaningless the moment the other is chosen.
+        reset_pano_size(_sources, _sfm_job.prep.pano);
+        apply_pano_lens(_sources, _sfm_job, _colmap_job);
+    }
+    ui::help_on_hover(dmsg::pano360_output_help);
+    if (mode == 1 && effective_engine() != Engine::BuiltIn)
+        ui::TextColoredWrapped(kWarn, dmsg::pano360_colmap_warning);
+}
+
+// The size of those views, which is under Advanced because the default is
+// derived from the source and is what almost everyone should use.
+void GuiApp::draw_pano360_size() {
+    ImGui::SetNextItemWidth(px(260.0f));
+    ui::InputInt(dmsg::pano360_size, &_sfm_job.prep.pano.size, 32, 128);
+    if (_sfm_job.prep.pano.size < 0) _sfm_job.prep.pano.size = 0;
+    ui::help_on_hover(dmsg::pano360_size_help);
+}
+
+
+// One lens control for the whole capture has to reach every input:
+// append_camera_overrides emits a --camera-model per input folder, and one
+// still holding the model its file type suggested wins on longest prefix.
+// The lens and starting focal an input's images are fitted with: its first
+// camera group's, once "same as above" has been followed down the list.
+void GuiApp::source_lens(size_t input, std::string& model, float& focal) const {
+    const std::vector<CameraGroup> groups = camera_groups(_sources);
+    const std::vector<std::string> models =
+        camera_group_models(_sources, groups, _sfm_job.camera_model);
+    for (size_t i = 0; i < groups.size(); i++) {
+        if (groups[i].input != input) continue;
+        model = models[i];
+        focal = group_focal(_sources, groups[i]);
+        return;
+    }
+}
+
+// One lens per camera group, in place of the single "Camera / lens" control,
+// once there is more than one camera to tell apart -- which lets a 360 clip and
+// a phone clip reconstruct as one scene, neither fitted with the other's model.
 void GuiApp::draw_source_cameras() {
     ui::Text(dmsg::camera_lens_per_input);
     ui::help_on_hover(dmsg::camera_lens_per_input_help);
     ImGui::Indent();
-    // `label` names the row, `dir` is the folder it measures, and model/focal
-    // are what the row edits -- an input with no camera folders under it is
-    // one row, an input with three is three.
-    auto row = [&](const char* id, const std::string& label,
-                   const std::string& dir, std::string& model, float& focal) {
-        ImGui::PushID(id);
-        ui::TextRaw(label);
+    const std::vector<CameraGroup> groups = camera_groups(_sources);
+    const std::vector<std::string> models =
+        camera_group_models(_sources, groups, _sfm_job.camera_model);
+    const auto labels = sfm_camera_model_labels();
+    const auto helps = sfm_camera_model_helps();
+
+    // A row names the folder it measures, which is also the prefix the
+    // override matches on -- so an input with several camera folders repeats
+    // its own name, and that is what says which rows belong together.
+    std::vector<std::string> names(groups.size());
+    float col = px(200.0f);
+    for (size_t i = 0; i < groups.size(); i++) {
+        fs::path p(_sources[groups[i].input].path);
+        if (p.filename().empty()) p = p.parent_path();   // trailing separator
+        names[i] = groups[i].rel.empty() ? p.filename().string() : groups[i].rel;
+        col = std::max(col, ImGui::CalcTextSize(names[i].c_str()).x + px(24.0f));
+    }
+    col = std::min(col, px(420.0f));
+
+    bool edited = false;
+    for (size_t i = 0; i < groups.size(); i++) {
+        const CameraGroup& g = groups[i];
+        const PrepInput& in = _sources[g.input];
+        const std::string dir =
+            g.sub < 0 ? in.path
+                      : (fs::path(in.path) /
+                         in.subcameras[(size_t)g.sub].rel).string();
+        // The row's own prefix as its ID, so adding or dropping an input does
+        // not carry an open picker or a half-typed focal onto another row.
+        ImGui::PushID(g.rel.c_str());
+        ui::TextRaw(names[i]);
         if (ImGui::IsItemHovered()) ui::SetTooltipRaw(dir);
-        ImGui::SameLine(px(200.0f));
+        // A name too long for the column takes the row and leaves the controls
+        // on the next one, rather than being drawn through them.
+        if (ImGui::CalcTextSize(names[i].c_str()).x + px(8.0f) < col)
+            ImGui::SameLine(col);
         ImGui::SetNextItemWidth(px(220.0f));
-        int idx = 0;
+        std::string& stored = group_model(_sources, g);
+        int idx = stored.empty() ? -1 : 0;
         for (int m = 0; m < kNumSfmCameraModels; m++)
-            if (model == kSfmCameraModels[m]) idx = m;
-        if (sfm_lens_combo("##lens", &idx)) model = kSfmCameraModels[idx];
-        lens_tooltip(*sfm_camera_model_helps()[(size_t)idx]);
+            if (stored == kSfmCameraModels[m]) idx = m;
+        if (sfm_lens_combo("##lens", &idx, /*inherit=*/i > 0)) {
+            stored = idx < 0 ? std::string() : kSfmCameraModels[idx];
+            edited = true;
+        }
+        int shown = 0;
+        for (int m = 0; m < kNumSfmCameraModels; m++)
+            if (models[i] == kSfmCameraModels[m]) shown = m;
+        lens_tooltip(*helps[(size_t)shown],
+                     idx < 0 ? labels[(size_t)shown] : nullptr);
         ImGui::SameLine();
         ImGui::SetNextItemWidth(px(90.0f));
-        ui::InputFloat(dmsg::focal_x_width, &focal, 0, 0, "%.4g");
+        ui::InputFloat(dmsg::focal_x_width, &group_focal(_sources, g), 0, 0,
+                       "%.4g");
         ui::help_on_hover(dmsg::focal_x_width_help);
-        draw_lens_warning(dir, /*is_video=*/false, model, /*builtin=*/true);
-        ImGui::PopID();
-    };
-
-    for (size_t i = 0; i < _sources.size(); i++) {
-        PrepInput& s = _sources[i];
-        ImGui::PushID((int)i);
-        if (s.subcameras.empty()) {
-            const std::string label =
-                s.subdir.empty() ? fs::path(s.path).filename().string() : s.subdir;
-            row("input", label, s.path, s.camera_model, s.focal_factor);
-        } else {
-            // The input itself is a heading here: every image under it is in
-            // one of the camera folders, so the input's own lens covers none.
-            if (_sources.size() > 1) {
-                ui::TextDisabledRaw(s.subdir.empty() ? s.path : s.subdir);
-                ImGui::Indent();
-            }
-            for (size_t k = 0; k < s.subcameras.size(); k++) {
-                SubCamera& sc = s.subcameras[k];
-                if (sc.camera_model.empty()) sc.camera_model = s.camera_model;
-                row(sc.rel.c_str(), sc.rel,
-                    (fs::path(s.path) / sc.rel).string(), sc.camera_model,
-                    sc.focal_factor);
-            }
-            if (_sources.size() > 1) ImGui::Unindent();
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(px(150.0f));
+        {
+            // "This input's lenses" only means something for an input with
+            // several: a lone photo folder or a one-lens video has none to rig.
+            const bool multi = g.sub >= 0 || !lens_dirs(_sfm_job.prep, in).empty();
+            const char* const items[] = {ui::detail::label(dmsg::rig_none),
+                                         ui::detail::label(dmsg::rig_own), "A", "B", "C", "D"};
+            int& rig = group_rig(_sources, g);
+            if (!multi && rig == kRigOwn) rig = kRigNone;
+            const int first = multi ? 0 : 1;
+            int idx = rig - first;
+            if (idx < 0) idx = 0;
+            if (ui::ComboRaw("##rig", &idx, items + first, kRigFirstShared + kRigShared - first))
+                rig = idx + first;
+            ui::help_on_hover(dmsg::rig_help);
         }
+        draw_lens_warning(dir, in.is_video, models[i], /*builtin=*/true);
         ImGui::PopID();
     }
     ImGui::Unindent();
+    // Only now: the edit is the row's own, and collapsing it into the row above
+    // rewrites what the loop was holding references into.
+    if (edited) {
+        normalize_source_lenses(_sources, _sfm_job.camera_model);
+        normalize_source_fps(_sources, _sfm_job.prep.video_fps);
+    }
 }
 
 bool GuiApp::input_pixel_size(const std::string& path, bool is_video,
                               int& w, int& h) {
     w = h = 0;
     if (path.empty()) return false;
-    const std::string& s_path = path;
     auto it = _input_size.find(path);
     if (it == _input_size.end()) {
+        if (is_video) return false;
         std::pair<int, int> size{0, 0};
         std::error_code ec;
-        if (is_video) {
-            // One `ffmpeg -i`, and only for a file that is already there:
-            // this runs from the draw, and a path being typed names nothing.
-            if (fs::is_regular_file(s_path, ec)) {
-                static const std::atomic<bool> never{false};
-                VideoFacts f;
-                if (ffmpeg_probe_video(_ffmpeg_exe, s_path, f, never))
-                    size = {f.width, f.height};
-            }
-        } else if (fs::is_directory(s_path, ec)) {
+        if (fs::is_directory(path, ec)) {
             int iw = 0, ih = 0;
-            if (DatasetPrep::first_image_dims(s_path, iw, ih)) size = {iw, ih};
+            if (DatasetPrep::first_image_dims(path, iw, ih)) size = {iw, ih};
         }
         it = _input_size.emplace(path, size).first;
     }
@@ -2414,6 +3779,10 @@ void GuiApp::draw_lens_warning(const std::string& path, bool is_video,
     // COLMAP has no panorama model, so the question only arises for the
     // built-in engine.
     const bool pano = builtin && model == "equirectangular";
+    // A 360 capture's lens describes the WARPED views, which are 2:1 (or square
+    // faces) by construction; the frame this would measure is the packing.
+    for (const PrepInput& s : _sources)
+        if (s.pano360.valid() && s.path == path) return;
     // A dual-lens file is two fisheye circles per frame whatever its pixel
     // dimensions are, so this one needs no measurement.
     if (is_dual_fisheye_path(path)) {
@@ -2433,18 +3802,362 @@ void GuiApp::draw_lens_warning(const std::string& path, bool is_video,
 // Masking
 // ---------------------------------------------------------------------------
 
+PreviewSource GuiApp::preview_source(size_t input) const {
+    PreviewSource src;
+    if (input >= _sources.size()) return src;
+    const PrepInput& in = _sources[input];
+    src.input = in.path;
+    src.is_video = in.is_video;
+    src.ffmpeg_exe = _ffmpeg_exe;
+    // In process where the driver can, ffmpeg where it cannot or where the job
+    // said to -- the choice preparation itself makes.
+    src.builtin_decode =
+        !_sfm_job.prep.force_external_decode && backends().builtin_video;
+    src.tracks = std::max(in.video_tracks, 1);
+    // The one frozen choice, so a preview decodes and segments on the GPU the
+    // run will use; empty leaves the panel's own precedence in charge.
+    src.device = _native_device_uuid;
+    src.image_gamut = _sfm_job.image_gamut;
+    src.image_is_linear = _sfm_job.image_is_linear;
+    src.look.auto_rotate = _sfm_job.prep.auto_rotate;
+    if (in.pano360.valid() && _sfm_job.prep.pano.mode != app::Pano360Mode::Off) {
+        src.look.eac = in.pano360;
+        src.look.views = app::pano360_views(in.pano360, _sfm_job.prep.pano);
+    }
+    return src;
+}
+
+// ---------------------------------------------------------------------------
+// The one native GPU choice
+//
+// A session-level choice: freeze one canonical UUID before native work and
+// pass it to every native job and child. No persisted preference.
+// ---------------------------------------------------------------------------
+
+void GuiApp::load_native_devices() {
+    if (_native_devices_loaded) return;
+    _native_devices.clear();
+#if defined(SS_BUILD_SAM)
+    // The inference layer's own side-effect-free enumeration.
+    for (const nn::DeviceInfo& d : nn::list_devices()) {
+        NativeDeviceRow r;
+        r.name = d.name;
+        r.type = d.type;
+        r.uuid = d.uuid;
+        r.vram_bytes = d.vram_bytes;
+        r.usable = d.usable;
+        _native_devices.push_back(std::move(r));
+    }
+#elif defined(SS_TOOL_SFM)
+    // No inference layer, but SfM carries its own Vulkan context: a listing
+    // that creates nothing. A build with neither has no native GPU work to
+    // choose a device for, and an empty list is the honest answer.
+    for (const VkDeviceRecord& d : VkContext::listDevices()) {
+        NativeDeviceRow r;
+        r.name = d.name;
+        r.type = d.type;
+        r.uuid = spirula::vkselect::selectorFor(d);
+        r.vram_bytes = d.vram_bytes;
+        r.usable = d.usable;
+        _native_devices.push_back(std::move(r));
+    }
+#elif defined(SS_BACKEND_VULKAN)
+    // Engine-only Vulkan build: the backend's own enumeration, which is also
+    // side-effect free. Its identity helpers exist only on this backend, so
+    // the whole branch is Vulkan-guarded.
+    for (int i = 0; i < backend::device_count(); i++) {
+        const backend::DeviceInfo d = backend::device_info(i);
+        NativeDeviceRow r;
+        r.name = d.name;
+        r.type = d.type;
+        r.vram_bytes = d.vram_bytes;
+        r.usable = d.usable;
+        r.uuid = d.uuid;
+        _native_devices.push_back(std::move(r));
+    }
+#endif
+    _native_devices_loaded = true;
+}
+
+void GuiApp::draw_device_picker(bool as_menu) {
+    load_native_devices();
+
+    const bool frozen = _native_device_frozen;
+    const bool no_devices = std::none_of(
+        _native_devices.begin(), _native_devices.end(),
+        [](const NativeDeviceRow& d) { return d.usable && !d.uuid.empty(); });
+    const bool disabled = frozen || no_devices;
+
+    auto row_label = [](const NativeDeviceRow& d, size_t index, bool with_id,
+                         char* buf, size_t n) {
+        char suffix[64] = {};
+        if (with_id)
+            std::snprintf(suffix, sizeof suffix, "##native_device_%zu", index);
+        std::snprintf(buf, n, "%s [%zu]%s", d.name.c_str(), index, suffix);
+    };
+
+    const bool auto_sel =
+        !frozen && _native_device_choice_set && _native_device_request.empty();
+    const char* env_sel = spirula::env("VK_DEVICE");
+    const bool inherited = !frozen && !_native_device_choice_set &&
+                           env_sel && env_sel[0];
+
+    size_t selected = _native_devices.size();
+    const std::string* selected_selector =
+        frozen ? &_native_device_uuid
+               : !_native_device_request.empty() ? &_native_device_request
+                                                 : nullptr;
+    if (selected_selector && !selected_selector->empty()) {
+        for (size_t i = 0; i < _native_devices.size(); ++i) {
+            if (_native_devices[i].uuid == *selected_selector) {
+                selected = i;
+                break;
+            }
+        }
+    } else if (inherited) {
+        for (size_t i = 0; i < _native_devices.size(); ++i) {
+            if (_native_devices[i].uuid == env_sel) {
+                selected = i;
+                break;
+            }
+        }
+    }
+
+    char selected_label[400];
+    const char* shown = nullptr;
+    if (selected < _native_devices.size()) {
+        row_label(_native_devices[selected], selected, false, selected_label,
+                  sizeof selected_label);
+        shown = selected_label;
+    } else if (frozen) {
+        shown = !_native_device_name.empty() ? _native_device_name.c_str()
+                                              : msg::no_device_found.get();
+    } else if (selected_selector) {
+        shown = msg::no_device_found.get();
+    } else {
+        shown = msg::device_auto.get();
+    }
+
+    if (as_menu) {
+        ImGui::BeginDisabled(disabled);
+        if (ui::MenuItem(msg::device_auto, nullptr, auto_sel)) {
+            _native_device_choice_set = true;
+            _native_device_request.clear();
+        }
+        ui::help_on_hover(msg::device_auto_help);
+        for (size_t i = 0; i < _native_devices.size(); ++i) {
+            const NativeDeviceRow& d = _native_devices[i];
+            char label[400];
+            row_label(d, i, true, label, sizeof label);
+            const bool sel = !_native_device_request.empty() &&
+                             _native_device_request == d.uuid;
+            ImGui::BeginDisabled(!d.usable || d.uuid.empty());
+            if (ui::MenuItemRaw(label, sel) && !d.uuid.empty()) {
+                _native_device_choice_set = true;
+                _native_device_request = d.uuid;
+            }
+            ImGui::EndDisabled();
+            ui::help_on_hover_raw(d.uuid.empty() ? "" : d.uuid.c_str());
+        }
+        ImGui::EndDisabled();
+    } else {
+        ImGui::BeginDisabled(disabled);
+        ImGui::SetNextItemWidth(px(220.0f));
+        if (ui::BeginCombo(msg::menu_device,
+                           no_devices ? msg::no_device_found.get() : shown)) {
+            if (ui::Selectable(msg::device_auto, auto_sel)) {
+                _native_device_choice_set = true;
+                _native_device_request.clear();
+            }
+            ui::help_on_hover(msg::device_auto_help);
+            for (size_t i = 0; i < _native_devices.size(); ++i) {
+                const NativeDeviceRow& d = _native_devices[i];
+                char label[400];
+                row_label(d, i, true, label, sizeof label);
+                const bool sel = !_native_device_request.empty() &&
+                                 _native_device_request == d.uuid;
+                ImGui::BeginDisabled(!d.usable || d.uuid.empty());
+                if (ui::SelectableRaw(label, sel) && !d.uuid.empty()) {
+                    _native_device_choice_set = true;
+                    _native_device_request = d.uuid;
+                }
+                if (sel) ImGui::SetItemDefaultFocus();
+                ImGui::EndDisabled();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::EndDisabled();
+    }
+
+    if (!_native_device_error.empty())
+        ui::TextColoredWrappedRaw(kErr, _native_device_error);
+}
+
+bool GuiApp::freeze_native_device() {
+#if !defined(SS_BUILD_SAM) && !defined(SS_TOOL_SFM) && !defined(SS_BACKEND_VULKAN)
+    _native_device_frozen = true;
+    return true;
+#else
+    if (_native_device_frozen) {
+        // Already frozen: the request must name the same device or the app has
+        // to be restarted. This is the invariant, not a new winner.
+        if (_native_device_request.empty() || _native_device_uuid.empty()) return true;
+        if (_native_device_request == _native_device_uuid) return true;
+        _native_device_error = spirula::i18n::format(
+            msg::device_conflict, {_native_device_request, _native_device_uuid});
+        return false;
+    }
+    load_native_devices();
+
+    const bool explicit_set = _native_device_choice_set;
+    const spirula::vkselect::Request req =
+        spirula::vkselect::requestFrom(_native_device_request, explicit_set);
+
+    std::string uuid, name;
+    const std::string requested = req.text.empty() ? "auto" : req.text;
+    std::string diagnostic;
+    const Msg* detail = nullptr;
+#if defined(SS_BUILD_SAM)
+    spirula::vkselect::Resolution res;
+    if (req.kind == spirula::vkselect::Request::Kind::Malformed) {
+        detail = &msg::device_detail_malformed;
+    } else {
+        try {
+            res = nn::vk::Context::resolveSelector(req);
+        } catch (const std::exception&) {
+            detail = &msg::device_detail_no_device;
+        }
+    }
+    if (!detail && !res.ok()) {
+        detail = &device_detail(res.status);
+    } else if (!detail) {
+        std::string live = nn::configured_device_selector();
+        if (live.empty()) live = nn::current_device_selector();
+        if (!live.empty() && live != res.selector) {
+            _native_device_error = spirula::i18n::format(
+                msg::device_conflict, {res.selector, live});
+            log(_native_device_error);
+            return false;
+        }
+#ifdef SS_BACKEND_VULKAN
+        if (!backend::device_select_identity(res.selector.c_str())) {
+            diagnostic = backend::device_selection_error();
+            if (diagnostic.empty()) detail = &msg::device_unusable_native;
+        }
+#endif
+        if (!detail && diagnostic.empty()) {
+            try {
+                nn::configure_device(res.selector);
+            } catch (const std::exception& e) {
+                _native_device_error = spirula::i18n::format(
+                    msg::device_error, {requested, e.what()});
+                log(_native_device_error);
+                return false;
+            }
+            uuid = nn::configured_device_selector();
+        }
+    }
+#elif defined(SS_TOOL_SFM)
+    const spirula::vkselect::Resolution res = VkContext::resolveSelector(req);
+    if (!res.ok()) detail = &device_detail(res.status);
+    else           uuid = res.selector;
+#elif defined(SS_BACKEND_VULKAN)
+    if (req.kind == spirula::vkselect::Request::Kind::Malformed) {
+        detail = &msg::device_detail_malformed;
+    } else if (!backend::device_select_identity(requested.c_str())) {
+        diagnostic = backend::device_selection_error();
+        if (diagnostic.empty()) detail = &msg::device_unusable_native;
+    } else {
+        uuid = backend::device_current_selector();
+    }
+#endif
+#if defined(SS_BACKEND_VULKAN)
+    if (!detail && !uuid.empty() &&
+        !backend::device_select_identity(uuid.c_str())) {
+        diagnostic = backend::device_selection_error();
+        if (diagnostic.empty()) detail = &msg::device_unusable_native;
+    }
+#endif
+    if (!detail && !diagnostic.empty()) {
+        _native_device_error = spirula::i18n::format(
+            msg::device_error, {requested, diagnostic});
+        log(_native_device_error);
+        return false;
+    }
+    if (!detail && uuid.empty())
+        detail = &msg::device_detail_no_device;
+    if (detail) {
+        _native_device_error = spirula::i18n::format(
+            msg::device_error, {requested, detail->get()});
+        log(_native_device_error);
+        return false;
+    }
+
+    _native_device_uuid = uuid;
+    // The driver's name for the resolved device, for the display line and the
+    // startup log. Falls back to the UUID when a listing is unavailable.
+    for (const NativeDeviceRow& d : _native_devices)
+        if (d.uuid == uuid) { name = d.name; break; }
+    _native_device_name = name.empty() ? uuid : name;
+    _native_device_frozen = true;
+    _native_device_error.clear();
+    propagate_frozen_device();
+    // The actual resolved identity at workload start, through the log the
+    // screen already shows -- not only the argv a child was handed.
+    log(spirula::i18n::format(
+        msg::device_frozen_at, {_native_device_name + " [" + uuid + "]"}));
+    return true;
+#endif
+}
+bool GuiApp::freeze_cuda_device() {
+#ifdef SS_BACKEND_VULKAN
+    return true;
+#else
+    if (_cuda_device_locked) return true;
+    const int n = backend::device_count();
+    const int current = backend::device_current();
+    if (n <= 0 || current < 0 || current >= n ||
+        !backend::device_select(current)) {
+        log(msg::no_device_found.get());
+        return false;
+    }
+    _cuda_device_index = current;
+    _cuda_device_locked = true;
+    return true;
+#endif
+}
+
+void GuiApp::propagate_frozen_device() {
+    const std::string& uuid = _native_device_uuid;
+    // Copy the frozen UUID into every native job and child launch field.
+    _sfm_job.prep.device = uuid;
+    _colmap_job.device = uuid;
+    _sfm_job.device_selector = uuid;
+    _sfm_job.geometry.device_uuid = uuid;
+    _colmap_job.geometry.device_uuid = uuid;
+    _geometry.device_uuid = uuid;
+    _mesh_job.device_uuid = uuid;
+}
+
 void GuiApp::open_mask_preview() {
+    if (native_work_busy()) return;
     if (_sources.empty()) {
         log(dmsg::mask_pick_input_first.get());
         return;
     }
-    const PrepInput& s = _sources[(size_t)_mask_preview_input];
-    // One backbone on the device at a time; see open_geometry_preview.
-    _geometry_panel.close();
-    // The preview reads the video the same way preparation will: in process
-    // where the driver can, ffmpeg where it cannot or where the job said to.
-    _segment.open(s.path, s.is_video, _mask_enable ? selected_model_path() : "",
-                  _ffmpeg_exe, _sfm_job.prep.force_external_decode);
+    pump_source_probes();
+    if (!_source_probes_ready) {
+        log(dmsg::sensors_reading.get());
+        return;
+    }
+    // A preview decodes and segments on the GPU, so it is a GPU-consuming
+    // operation like the run itself: it freezes the same one choice first.
+    // The other preview owns the same process-wide inference pool.
+    close_native_previews();
+    close_splat();
+    if (!freeze_native_device()) return;
+    _segment.open(preview_source((size_t)_mask_preview_input),
+                  _mask_enable ? selected_model_path() : "");
 }
 
 void GuiApp::draw_masking_options() {
@@ -2476,6 +4189,14 @@ void GuiApp::draw_masking_options() {
             if (in.stencil.empty()) in.stencil.detect_border = true;
     }
     ui::help_on_hover(dmsg::mask_border_enable_help);
+
+    // Asked wherever the dataset ends up with masks at all, including ones
+    // that arrived with the photographs: what it decides is the reconstruction,
+    // not whether they are written.
+    if (_mask_enable || _border_enable || with_masks > 0) {
+        ui::Checkbox(dmsg::mask_for_features, &_mask_features);
+        ui::help_on_hover(dmsg::mask_for_features_help);
+    }
     if (!_mask_enable && !_border_enable) return;
 
     ImGui::Indent();
@@ -2547,10 +4268,14 @@ void GuiApp::draw_masking_options() {
         ui::help_on_hover_raw(backends().masking_reason.c_str());
     }
 
-    // One button for both halves: it is the same panel on the same input, and
-    // the stencil half of it needs no model, so it must not sit behind one.
+    const bool mask_preview_busy = native_work_busy();
+    const bool mask_preview_blocked = mask_preview_busy || !_source_probes_ready;
+    ImGui::BeginDisabled(mask_preview_blocked);
     if (ui::Button(dmsg::mask_try)) open_mask_preview();
-    ui::help_on_hover(dmsg::mask_try_help);
+    ImGui::EndDisabled();
+    ui::help_on_hover_disabled(
+        mask_preview_busy ? dmsg::step_locked
+        : !_source_probes_ready ? dmsg::sensors_reading : dmsg::mask_try_help);
     // Which input it opens, and so which input a NEW click prompts; the ones
     // already made stay with their own (MaskClick::source).
     if (_sources.size() > 1) {
@@ -2626,6 +4351,15 @@ void GuiApp::draw_masking_options() {
         if (ui::InputInt(dmsg::mask_max_size, &_mask.max_image_size))
             _mask.max_image_size = std::max(0, _mask.max_image_size);
         ui::help_on_hover(dmsg::mask_max_size_help);
+        ImGui::SetNextItemWidth(px(220.0f));
+        float& ratio = keep_subject ? _mask.shrink_ratio : _mask.dilate_ratio;
+        float margin_pct = ratio * 100.0f;
+        if (ui::SliderFloat(keep_subject ? dmsg::mask_dilate_keep
+                                         : dmsg::mask_dilate_remove,
+                            &margin_pct, 0.0f, 50.0f, "%.0f%%"))
+            ratio = margin_pct / 100.0f;
+        ui::help_on_hover(keep_subject ? dmsg::mask_shrink_help
+                                       : dmsg::mask_dilate_help);
 
         // The rest is the memory bank, which photos never get.
         bool any_video = false;
@@ -2674,17 +4408,29 @@ void GuiApp::request_geometry_download() {
 }
 
 void GuiApp::open_geometry_preview() {
+    // The preview loads a depth backbone, so it is a GPU-consuming operation
+    // and freezes the one choice before the panel starts.
+    if (native_work_busy()) return;
+    pump_source_probes();
+    if (!_source_probes_ready) {
+        log(dmsg::sensors_reading.get());
+        return;
+    }
     // One multi-gigabyte backbone at a time: the mask preview holds SAM and
     // this one holds Metric3D, and the inference layer's pool is process-wide.
-    _segment.close();
-    const PrepInput* in =
-        _sources.empty() ? nullptr
-                         : &_sources[(size_t)std::min((size_t)_mask_preview_input,
-                                                      _sources.size() - 1)];
-    _geometry_panel.open(in ? in->path : std::string(), in && in->is_video,
-                         _workspace, in ? in->camera_model : std::string("opencv"),
-                         in ? in->focal_factor : 0.0f, _ffmpeg_exe,
-                         _sfm_job.prep.force_external_decode);
+    close_native_previews();
+    close_splat();
+    if (!freeze_native_device()) return;
+    const size_t idx =
+        _sources.empty() ? 0
+                         : std::min((size_t)_mask_preview_input,
+                                    _sources.size() - 1);
+    std::string lens = _sfm_job.camera_model;
+    float focal = 0.0f;
+    if (!_sources.empty()) source_lens(idx, lens, focal);
+    _geometry_panel.open(preview_source(idx), _workspace,
+                         planned_image_dir(_sources, _workspace, _photo_import),
+                         lens, focal);
 }
 
 void GuiApp::draw_geometry_options() {
@@ -2756,11 +4502,16 @@ void GuiApp::draw_geometry_options() {
     // Behind the checkpoint, unlike "Try the mask": there is no half of this
     // panel that works without one, and opening it would have the panel fetch
     // the weights itself.
-    ImGui::BeginDisabled(geometry_model_missing());
+    const bool geometry_preview_busy = native_work_busy();
+    const bool geometry_preview_blocked =
+        geometry_preview_busy || !_source_probes_ready || geometry_model_missing();
+    ImGui::BeginDisabled(geometry_preview_blocked);
     if (ui::Button(dmsg::geom_try)) open_geometry_preview();
     ImGui::EndDisabled();
-    ui::help_on_hover_disabled(geometry_model_missing() ? dmsg::geom_model_first
-                                                        : dmsg::geom_try_help);
+    ui::help_on_hover_disabled(
+        geometry_preview_busy ? dmsg::step_locked
+        : !_source_probes_ready ? dmsg::sensors_reading
+        : geometry_model_missing() ? dmsg::geom_model_first : dmsg::geom_try_help);
 
     if (ui::CollapsingHeader(dmsg::geom_advanced)) {
         ImGui::SetNextItemWidth(px(220.0f));
@@ -2869,15 +4620,84 @@ void GuiApp::draw_dataset_steps() {
         }
     }
 
-    if (!any) return;
-    const StageProgress p = prog->stage(running);
     // A step that can say how far through it is gets a bar; one that cannot
     // (the mapper counts registrations, not a total) gets its own sentence.
-    if (p.fraction >= 0.0f)
-        ui::ProgressBarRaw(p.fraction, ImVec2(-1, 0),
-                           p.detail.empty() ? nullptr : p.detail.c_str());
-    else if (!p.detail.empty())
-        ui::TextDisabledRaw(p.detail);
+    if (any) {
+        const StageProgress p = prog->stage(running);
+        if (p.fraction >= 0.0f)
+            ui::ProgressBarRaw(p.fraction, ImVec2(-1, 0),
+                               p.detail.empty() ? nullptr : p.detail.c_str());
+        else if (!p.detail.empty())
+            ui::TextDisabledRaw(p.detail);
+    }
+}
+
+// How much the view changed along every input, as the adaptive pass measures
+// it. One row per input in the order they were given, so a folder of photos
+// among the clips is a row that says it has no motion rather than a gap.
+void GuiApp::draw_scan_view(float h) {
+    const std::vector<ScanRow> rows = dataset_steps()->scan();
+    ImGui::BeginChild("##scanview", ImVec2(0, h));
+    // One scale over all of them: a clip that moves twice as much as its
+    // neighbour has to LOOK it, since that is what took the frames off it.
+    float top = 0.0f;
+    for (const ScanRow& r : rows)
+        for (float v : r.speed) top = std::max(top, v);
+
+    const float band = px(38.0f), strip = px(12.0f);
+    const ImU32 back = ImGui::GetColorU32(ImGuiCol_FrameBg);
+    const ImU32 ink = ImGui::GetColorU32(ImGuiCol_PlotHistogram);
+    const ImU32 keep = ImGui::GetColorU32(kOk);
+    const ImU32 veil = ImGui::GetColorU32(ImGuiCol_WindowBg, 0.55f);
+    for (const ScanRow& r : rows) {
+        ui::TextRaw(r.name);
+        ImGui::SameLine();
+        if (!r.video)
+            ui::TextDisabled(dmsg::scan_photos, {(long long)r.frames});
+        else if (r.kept_n > 0)
+            ui::TextDisabled(dmsg::scan_kept_frames, {(long long)r.kept_n});
+        else
+            ui::TextDisabledRaw("");
+
+        const float w = ImGui::GetContentRegionAvail().x;
+        const float tall = band + (r.kept.empty() ? 0.0f : strip + px(2.0f));
+        if (w < px(48.0f)) break;
+        const ImVec2 at = ImGui::GetCursorScreenPos();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(at, ImVec2(at.x + w, at.y + band), back);
+        const float step = w / (float)kScanSlices;
+        for (size_t i = 0; i < r.speed.size(); i++) {
+            if (r.hits[i] <= 0 || top <= 0.0f) continue;
+            const float v = std::min(1.0f, r.speed[i] / top);
+            const float x0 = at.x + step * (float)i;
+            dl->AddRectFilled(ImVec2(x0, at.y + band * (1.0f - v)),
+                              ImVec2(x0 + std::max(step - 1.0f, 1.0f), at.y + band),
+                              ink);
+        }
+        // What is not measured yet, dimmed rather than left blank: an empty
+        // stretch of a slow clip looks the same as one nobody has reached.
+        if (r.video && r.done < 1.0f)
+            dl->AddRectFilled(ImVec2(at.x + w * r.done, at.y),
+                              ImVec2(at.x + w, at.y + band), veil);
+        if (!r.kept.empty()) {
+            const float y = at.y + band + px(2.0f);
+            dl->AddRectFilled(ImVec2(at.x, y), ImVec2(at.x + w, y + strip), back);
+            for (size_t i = 0; i < r.kept.size(); i++) {
+                const float v = std::min(1.0f, std::max(0.0f, r.kept[i]));
+                if (v <= 0.0f) continue;
+                const float x0 = at.x + step * (float)i;
+                // The slowest stretch still keeps frames, so it still gets a
+                // mark: a strip that thins to nothing reads as a gap.
+                const float tall = std::max(strip * v, px(2.0f));
+                dl->AddRectFilled(ImVec2(x0, y + strip - tall),
+                                  ImVec2(x0 + std::max(step - 1.0f, 1.0f), y + strip),
+                                  keep);
+            }
+        }
+        ImGui::Dummy(ImVec2(w, tall));
+        ImGui::Spacing();
+    }
+    ImGui::EndChild();
 }
 
 // Which of the three previews the running step implies. Frames, masks and
@@ -2888,7 +4708,9 @@ int GuiApp::preview_for_stage() {
     // would hide it behind a click nobody knows to make.
     if (!dataset_busy()) return _preview_last_stage;
     switch (dataset_steps()->current()) {
-        case Stage::Frames:    return 0;
+        // Nothing is written while the motion is being measured, so the reel
+        // has nothing to show and the curves have everything.
+        case Stage::Frames:    return dataset_steps()->scanning() ? 6 : 0;
         case Stage::Masks:     return 1;
         case Stage::Features:  return 2;
         case Stage::Matching:  return 3;
@@ -2912,9 +4734,11 @@ void GuiApp::poll_sfm_progress() {
     // features are read off disk, which is what this watcher is for.
     if (dataset_busy() && dataset_steps()->current() == Stage::Features)
         _features.start(_sfm.sfm_image_dir(), _sfm.sfm_mask_dir(),
-                        _sfm.features_dir(), &_film_features);
+                        _sfm.features_dir(), &_film_features,
+                        _sfm.thumbs_dir());
     _pairs_view.configure(_sfm.sfm_image_dir(), _sfm.sfm_mask_dir(),
-                          _sfm.features_dir(), _sfm.matches_path());
+                          _sfm.features_dir(), _sfm.matches_path(),
+                          _sfm.live_matches_path());
 
     const std::string dir = _sfm.progress_dir();
     if (dir.empty()) return;
@@ -2931,13 +4755,10 @@ void GuiApp::poll_sfm_progress() {
     if (read_live_model(dir, _model_mtime, lm)) {
         _live_model = std::move(lm);
         // The mapper's own output is a wall of per-registration detail, so the
-        // default log used to go quiet for the whole of the longest step. The
-        // snapshot has the exact counts and needs no line parsed out of a
-        // translated sentence, so say it here instead -- and give the step a
-        // real bar rather than a spinner.
+        // default log used to go quiet for the longest step. These are the
+        // model in hand, not the bar -- a seed retry starts one over.
         if (dataset_busy() && _live_model.n_images) {
             RunProgress& p = _sfm.steps();
-            p.count(Stage::Mapping, _live_model.n_registered, _live_model.n_images);
             p.note(Stage::Mapping,
                    i18n::format(dmsg::model_live_counts,
                                 {(long long)_live_model.n_registered,
@@ -2959,9 +4780,10 @@ void GuiApp::poll_sfm_progress() {
 // the files behind them. The run leaves its features and its matches on disk
 // precisely so that this screen can go on reading them after it ends, so this
 // -- the screen being done with them -- is where they go.
-void GuiApp::reset_dataset_preview() {
-    _sfm.sweep_intermediates();
+void GuiApp::reset_dataset_preview(bool sweep) {
+    close_native_previews();
     _features.stop();
+    if (sweep) _sfm.sweep_intermediates();
     _model_view.detach();
     _model_view.destroy_gl();
     _model_attached = false;
@@ -2993,12 +4815,13 @@ bool GuiApp::preview_has_content() const {
 // `height` of 0 asks for the splitter, which is what the one-column layout
 // needs; a column of its own hands its own height down instead.
 void GuiApp::draw_dataset_preview(float height) {
-    // Null where the view is not a reel: the match map and the model.
-    FilmReel* reels[6] = {&_film_frames, &_film_masks, &_film_features,
-                          nullptr, nullptr, &_film_geometry};
-    const bool avail[6] = {_film_frames.has_frames(), _film_masks.has_frames(),
+    // Null where the view is not a reel: the match map, the model, the motion.
+    FilmReel* reels[7] = {&_film_frames, &_film_masks, &_film_features,
+                          nullptr, nullptr, &_film_geometry, nullptr};
+    const bool avail[7] = {_film_frames.has_frames(), _film_masks.has_frames(),
                            _film_features.has_frames(), !_matrix.empty(),
-                           _model_attached, _film_geometry.has_frames()};
+                           _model_attached, _film_geometry.has_frames(),
+                           !dataset_steps()->scan().empty()};
     bool any_avail = false;
     for (bool v : avail) any_avail = any_avail || v;
     if (!any_avail) return;
@@ -3011,15 +4834,16 @@ void GuiApp::draw_dataset_preview(float height) {
     if (dataset_busy() && implied >= 0) _preview_last_stage = implied;
     int tab = _preview_tab >= 0 ? _preview_tab : (implied >= 0 ? implied : 0);
     if (!avail[tab]) {
-        for (int i = 0; i < 6; i++)
+        for (int i = 0; i < 7; i++)
             if (avail[i]) { tab = i; break; }
     }
 
-    const Msg* names[6] = {&dmsg::view_frames, &dmsg::view_masks,
+    const Msg* names[7] = {&dmsg::view_frames, &dmsg::view_masks,
                            &dmsg::view_features, &dmsg::view_matrix,
-                           &dmsg::view_model, &dmsg::view_geometry};
+                           &dmsg::view_model, &dmsg::view_geometry,
+                           &dmsg::view_motion};
     bool first = true;
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 7; i++) {
         if (!avail[i]) continue;
         if (!first) ImGui::SameLine();
         first = false;
@@ -3032,6 +4856,7 @@ void GuiApp::draw_dataset_preview(float height) {
         }
     }
     if (tab == 3) ui::help_on_hover(dmsg::matrix_help);
+    if (tab == 6) ui::help_on_hover(dmsg::frame_spacing_help);
 
     // In a column of its own the height is the column's; otherwise a splitter,
     // as the log has -- what any of these views is worth depends entirely on
@@ -3054,6 +4879,10 @@ void GuiApp::draw_dataset_preview(float height) {
 
     if (reels[tab]) {
         reels[tab]->draw(h - px(8.0f));
+        return;
+    }
+    if (tab == 6) {
+        draw_scan_view(h - px(8.0f));
         return;
     }
     if (tab == 3) {
@@ -3161,11 +4990,191 @@ void GuiApp::draw_dataset_rerun(const WorkspaceState& prior) {
 }
 
 // ---------------------------------------------------------------------------
+// Starting over
+// ---------------------------------------------------------------------------
+
+void GuiApp::reset_recon_options() {
+    // The photographs' colour space was read off the files, not chosen, so it
+    // is not one of the options this puts back -- and keeping the intermediate
+    // files is a setting of the program's rather than of this project's.
+    const std::string gamut = _sfm_job.image_gamut;
+    const std::optional<bool> linear = _sfm_job.image_is_linear;
+    const bool keep = _sfm_job.keep_intermediate;
+    _sfm_job = SfmJob{};
+    _colmap_job = ColmapJob{};
+    _geometry = GeometryJob{};
+    _sfm_job.image_gamut = gamut;
+    _sfm_job.image_is_linear = linear;
+    _sfm_job.keep_intermediate = keep;
+    for (PrepInput& s : _sources) {
+        s.camera_model = default_lens(s.path);
+        s.focal_factor = 0.0f;
+        for (SubCamera& sc : s.subcameras) {
+            sc.camera_model = s.camera_model;
+            sc.focal_factor = 0.0f;
+        }
+    }
+    apply_capture_defaults(_sources, _sfm_job, _colmap_job);
+    normalize_source_lenses(_sources, _sfm_job.camera_model);
+    _redo_frames = _redo_masks = _redo_model = _redo_geometry = false;
+    _resume = true;
+    log(dmsg::reset_options_done.get());
+}
+
+void GuiApp::draw_dataset_reset() {
+    if (!ui::CollapsingHeader(dmsg::reset_section)) return;
+    ImGui::Indent();
+    ui::TextDisabledWrapped(dmsg::reset_section_help);
+    ImGui::BeginDisabled(native_work_busy());
+    // A transforms.json or a Metashape export is not on the list -- it is the
+    // dataset somebody handed over, not something a run here wrote -- so a
+    // folder can hold a model and still have nothing to delete.
+    ImGui::BeginDisabled(_ws_artifacts.empty());
+    if (ui::Button(dmsg::clear_project)) {
+        _clear_targets = _ws_artifacts;
+        _clear_open = true;
+    }
+    ImGui::EndDisabled();
+    ui::help_on_hover(dmsg::clear_project_help);
+    ImGui::SameLine();
+    if (ui::Button(dmsg::reset_options)) reset_recon_options();
+    ui::help_on_hover(dmsg::reset_options_help);
+    ImGui::EndDisabled();
+    ImGui::NewLine();
+    ImGui::Unindent();
+}
+
+// Deleting is the one thing here that cannot be undone, so the modal lists the
+// paths themselves rather than describing them.
+void GuiApp::draw_clear_project_modal() {
+    if (_clear_open) {
+        ui::OpenPopup(dmsg::clear_project_title);
+        _clear_open = false;
+        _clear_shown = true;
+    }
+    if (!_clear_shown) return;
+    if (!ui::BeginPopupModal(dmsg::clear_project_title, nullptr,
+                             ImGuiWindowFlags_AlwaysAutoResize)) {
+        _clear_shown = false;
+        return;
+    }
+    ImGui::PushTextWrapPos(px(460.0f));
+    ui::Text(dmsg::clear_project_confirm, {_workspace});
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+    for (const std::string& path : _clear_targets) ui::TextDisabledRaw(path);
+    ImGui::Spacing();
+
+    if (ui::Button(dmsg::clear_project_button, ImVec2(px(150.0f), 0)) &&
+        !native_work_busy()) {
+        // The screen is reading several of these; it has to let go first.
+        reset_dataset_preview();
+        for (const std::string& path : _clear_targets) {
+            std::error_code ec;
+            fs::remove_all(path, ec);
+            if (ec) log(i18n::format(dmsg::clear_project_failed,
+                                     {path, ec.message()}));
+        }
+        log(i18n::format(dmsg::clear_project_done, {_workspace}));
+        _clear_targets.clear();
+        _ws_state_at = -1.0;      // the answer changed; do not wait a second
+        _clear_shown = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ui::Button(dmsg::cancel, ImVec2(px(150.0f), 0))) {
+        _clear_shown = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+void GuiApp::draw_drop_intermediate_modal() {
+    if (_drop_intermediate_open) {
+        ui::OpenPopup(dmsg::drop_intermediate_title);
+        _drop_intermediate_open = false;
+        _drop_intermediate_shown = true;
+    }
+    if (!_drop_intermediate_shown) return;
+    // Closed by the window's own means rather than by a button: the setting
+    // stays as it was, which is the safe half of the question.
+    if (!ui::BeginPopupModal(dmsg::drop_intermediate_title, nullptr,
+                             ImGuiWindowFlags_AlwaysAutoResize)) {
+        _drop_intermediate_shown = false;
+        _sfm_job.keep_intermediate = true;
+        return;
+    }
+    ImGui::PushTextWrapPos(px(460.0f));
+    ui::Text(dmsg::drop_intermediate_confirm);
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+    if (ui::Button(dmsg::drop_intermediate_button, ImVec2(px(150.0f), 0))) {
+        _sfm_job.keep_intermediate = false;
+        save_settings();
+        _drop_intermediate_shown = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ui::Button(dmsg::cancel, ImVec2(px(150.0f), 0))) {
+        _sfm_job.keep_intermediate = true;
+        _drop_intermediate_shown = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+// Masks the reconstruction being kept has never seen. Adding them is minutes
+// and rebuilding with the masked feature points is the whole hour again; both
+// are what somebody means by the button, so it asks rather than choosing.
+void GuiApp::draw_mask_recon_modal() {
+    if (_mask_recon_open) {
+        ui::OpenPopup(dmsg::mask_recon_title);
+        _mask_recon_open = false;
+        _mask_recon_shown = true;
+    }
+    if (!_mask_recon_shown) return;
+    if (!ui::BeginPopupModal(dmsg::mask_recon_title, nullptr,
+                             ImGuiWindowFlags_AlwaysAutoResize)) {
+        _mask_recon_shown = false;
+        return;
+    }
+    ImGui::PushTextWrapPos(px(460.0f));
+    ui::Text(dmsg::mask_recon_confirm, {_workspace});
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+
+    bool go = false;
+    if (ui::Button(dmsg::mask_recon_rebuild, ImVec2(px(220.0f), 0))) {
+        _redo_model = go = true;
+    }
+    ImGui::SameLine();
+    if (ui::Button(dmsg::mask_recon_masks_only, ImVec2(px(220.0f), 0))) {
+        // Answered for good rather than per run: the checkbox now shows what
+        // was decided here, and the question does not come back.
+        _mask_features = false;
+        go = true;
+    }
+    ui::help_on_hover(dmsg::mask_recon_masks_only_help);
+    ImGui::SameLine();
+    if (ui::Button(dmsg::cancel, ImVec2(px(120.0f), 0))) {
+        _mask_recon_shown = false;
+        ImGui::CloseCurrentPopup();
+    }
+    if (go) {
+        _mask_recon_shown = false;
+        ImGui::CloseCurrentPopup();
+        launch_dataset_job();
+    }
+    ImGui::EndPopup();
+}
+
+// ---------------------------------------------------------------------------
 // Advanced: the photographs' colour space
 // ---------------------------------------------------------------------------
 
 void GuiApp::draw_color_space_options(bool with_point_color) {
     ui::SeparatorText(dmsg::section_color_space);
+    bool source_changed = false;
 
     // Item 0 of both pickers means "leave it to the file", which is what the
     // child processes do when the flag is absent; anything else is stated on
@@ -3181,6 +5190,7 @@ void GuiApp::draw_color_space_options(bool with_point_color) {
                    &dmsg::gamut_dcip3})) {
         _sfm_job.image_gamut = gamut == 0 ? "" : colorspace::kGamuts[gamut - 1];
         _color_space_touched = true;
+        source_changed = true;
     }
     ui::help_on_hover(dmsg::input_gamut_help);
 
@@ -3193,8 +5203,10 @@ void GuiApp::draw_color_space_options(bool with_point_color) {
         _sfm_job.image_is_linear =
             transfer == 0 ? std::optional<bool>{} : std::optional<bool>(transfer == 1);
         _color_space_touched = true;
+        source_changed = true;
     }
     ui::help_on_hover(dmsg::input_is_linear_help);
+    if (source_changed) close_native_previews();
 
     // COLMAP writes its own point cloud, so the choice is the built-in SfM's.
     if (!with_point_color) return;
@@ -3258,22 +5270,27 @@ void GuiApp::draw_sfm_advanced() {
               {&dmsg::capture_photos, &dmsg::capture_video,
                &dmsg::capture_internet});
     ui::help_on_hover(dmsg::capture_type_help);
+    if (any_pano360(_sources)) draw_pano360_size();
 
     ImGui::SetNextItemWidth(px(260.0f));
     ui::Combo(dmsg::features, &_sfm_job.features,
               {&dmsg::features_sift, &dmsg::features_aliked_n16,
-               &dmsg::features_aliked_n32});
+               &dmsg::features_aliked_n32, &dmsg::features_loma_b128,
+               &dmsg::features_loma_b});
     ui::help_on_hover(dmsg::features_help);
 
     {
         // Brute force is the only option for SIFT, so say so by disabling the
-        // combo rather than by letting the run fail.
+        // combo. The second entry is whichever learned matcher goes with the
+        // frontend above: each reads only the descriptors it was trained on.
         const bool learned = _sfm_job.features != 0;
+        const bool is_loma = _sfm_job.features >= 3;
         ImGui::BeginDisabled(!learned);
         ImGui::SetNextItemWidth(px(260.0f));
         int shown = learned ? _sfm_job.matcher : 0;
         if (ui::Combo(dmsg::matcher, &shown,
-                      {&dmsg::matcher_brute_force, &dmsg::matcher_lightglue}) &&
+                      {&dmsg::matcher_brute_force,
+                       is_loma ? &dmsg::matcher_loma : &dmsg::matcher_lightglue}) &&
             learned)
             _sfm_job.matcher = shown;
         ImGui::EndDisabled();
@@ -3321,6 +5338,8 @@ void GuiApp::draw_sfm_advanced() {
                  &_sfm_job.final_per_image_intrinsics);
     ImGui::EndDisabled();
     ui::help_on_hover(dmsg::sfm_per_image_intrinsics_help);
+    ui::Checkbox(dmsg::sfm_final_free_rig, &_sfm_job.final_free_rig);
+    ui::help_on_hover(dmsg::sfm_final_free_rig_help);
 
     ImGui::SetNextItemWidth(px(260.0f));
     ui::InputInt(dmsg::max_features_auto, &_sfm_job.max_features);
@@ -3329,7 +5348,36 @@ void GuiApp::draw_sfm_advanced() {
     ui::InputInt(dmsg::max_image_size_auto, &_sfm_job.max_image_size);
     ui::help_on_hover(dmsg::max_image_size_auto_help);
 
-    ui::Checkbox(dmsg::keep_intermediate, &_sfm_job.keep_intermediate);
+    // ---- what the sensors are allowed to settle ----
+    // A video's own IMU and GPS track, and per photograph the EXIF position
+    // and a drone's recorded attitude. Any one can be all an input has.
+    ImGui::Spacing();
+    ui::SeparatorText(dmsg::section_sensors);
+    ImGui::SetNextItemWidth(px(260.0f));
+    ui::Combo(dmsg::sfm_sensor_gauge, &_sfm_job.sensor_gauge,
+              {&dmsg::sfm_sensor_gauge_off, &dmsg::sfm_sensor_gauge_up,
+               &dmsg::sfm_sensor_gauge_auto});
+    ui::help_on_hover(dmsg::sfm_sensor_gauge_help);
+
+    ImGui::SetNextItemWidth(px(260.0f));
+    ui::Combo(dmsg::sfm_metric_gps, &_sfm_job.metric_gps,
+              {&dmsg::sfm_metric_gps_off, &dmsg::sfm_metric_gps_horizontal,
+               &dmsg::sfm_metric_gps_full});
+    ui::help_on_hover(dmsg::sfm_metric_gps_help);
+
+    ImGui::SetNextItemWidth(px(260.0f));
+    ui::Combo(dmsg::sfm_exif_attitude, &_sfm_job.exif_attitude,
+              {&dmsg::sfm_sensor_gauge_off, &dmsg::sfm_sensor_gauge_up,
+               &dmsg::sfm_exif_attitude_auto});
+    ui::help_on_hover(dmsg::sfm_exif_attitude_help);
+    ImGui::Spacing();
+
+    // Unticking it is what throws the resumable state away, so it asks first
+    // and the answer is remembered; ticking it back needs no ceremony.
+    if (ui::Checkbox(dmsg::keep_intermediate, &_sfm_job.keep_intermediate)) {
+        if (_sfm_job.keep_intermediate) save_settings();
+        else _drop_intermediate_open = true;
+    }
     ui::help_on_hover(dmsg::keep_intermediate_help);
 
     ImGui::SetNextItemWidth(-1);
@@ -3349,6 +5397,12 @@ void GuiApp::draw_sfm_advanced() {
     ui::Checkbox(dmsg::use_python_masking, &_sfm_job.prep.force_external_masking);
     ImGui::EndDisabled();
     ui::help_on_hover(dmsg::use_python_masking_help);
+
+    ui::Checkbox(dmsg::sfm_ba_cpu, &_sfm_job.ba_cpu);
+    ui::help_on_hover(dmsg::sfm_ba_cpu_help);
+
+    ui::Checkbox(dmsg::sfm_subprocess, &_sfm_job.subprocess);
+    ui::help_on_hover(dmsg::sfm_subprocess_help);
 }
 
 // ---------------------------------------------------------------------------
@@ -3472,9 +5526,8 @@ void GuiApp::draw_colmap_options() {
         ImGui::SameLine();
         ImGui::PushID("vt");
         if (ui::Button(dmsg::browse)) {
-            _pick = PickAction::VocabTree;
-            _dialog.open(msg::pick_vocab_tree.get(), FileDialog::Mode::File,
-                         {".bin"});
+            open_pick(PickAction::VocabTree, msg::pick_vocab_tree.get(),
+                      FileDialog::Mode::File, {".bin"});
         }
         ImGui::PopID();
         ImGui::SameLine();
@@ -3492,13 +5545,16 @@ void GuiApp::draw_tool_locations() {
             ch |= ui::InputText(dmsg::colmap_executable, &_colmap_exe);
         }
         ImGui::SetNextItemWidth(px(300.0f));
-        ch |= ui::InputText(dmsg::ffmpeg_executable, &_ffmpeg_exe);
+        const bool ffmpeg_changed =
+            ui::InputText(dmsg::ffmpeg_executable, &_ffmpeg_exe);
+        ch |= ffmpeg_changed;
         ui::help_on_hover(backends().builtin_video
                               ? dmsg::ffmpeg_executable_help_fallback
                               : dmsg::ffmpeg_executable_help_always);
         ImGui::SetNextItemWidth(px(300.0f));
         ch |= ui::InputText(dmsg::python_executable, &_python_exe);
         ui::help_on_hover(dmsg::python_executable_help);
+        if (ffmpeg_changed) mark_source_metadata_dirty();
         if (ch) save_settings();
     }
 }
@@ -3521,7 +5577,7 @@ void GuiApp::draw_dataset_form(float height, bool running) {
     //
     // The inputs and the engine define the run and are the exception: they are
     // fixed the moment it starts.
-    ImGui::BeginDisabled(running);
+    ImGui::BeginDisabled(native_work_busy());
     draw_dataset_source();
 
     // The selector appears only when both engines are usable: a Vulkan user
@@ -3545,7 +5601,26 @@ void GuiApp::draw_dataset_form(float height, bool running) {
     ImGui::EndDisabled();
 
     ImGui::Spacing();
+    ui::SeparatorText(msg::section_preset);
+    // A batch owns these settings while it runs -- each row's come from its
+    // own preset -- so what the running row IS building goes here instead.
+    if (_batch_active) {
+        draw_batch_progress();
+    } else {
+        ImGui::BeginDisabled(running);
+        draw_dataset_preset_picker();
+        ImGui::EndDisabled();
+    }
+
+    ImGui::Spacing();
     ui::SeparatorText(dmsg::section_settings);
+    // The GPU choice sits at the top of the settings it constrains: a preview,
+    // a masking step and the reconstruction all run on it, so it is offered
+    // before any of them can be started.
+#if defined(SS_BUILD_SAM) || defined(SS_TOOL_SFM) || defined(SS_BACKEND_VULKAN)
+    draw_device_picker();
+    ImGui::Spacing();
+#endif
     draw_dataset_basics();
     ImGui::Spacing();
     ImGui::BeginDisabled(dataset_locked(Stage::Masks));
@@ -3574,8 +5649,10 @@ void GuiApp::draw_dataset_form(float height, bool running) {
     const float action_y0 = ImGui::GetCursorPosY();
     ImGui::Spacing();
     if (!running) {
-        bool ready = !_sources.empty() && !_workspace.empty();
-        for (const PrepInput& s : _sources) ready = ready && !s.path.empty();
+        bool input_missing = _sources.empty() || _workspace.empty();
+        for (const PrepInput& s : _sources)
+            input_missing = input_missing || s.path.empty();
+        const bool ready = !input_missing && _source_probes_ready;
         const bool need_mask_model = mask_model_missing();
         const bool need_feat_model = feature_model_missing();
         const bool need_geom_model = geometry_model_missing();
@@ -3583,14 +5660,18 @@ void GuiApp::draw_dataset_form(float height, bool running) {
         // The button names what pressing it does: a folder that already holds
         // a reconstruction is added to, not built.
         const bool adding = workspace_state().model && !_redo_model;
-        ImGui::BeginDisabled(!ready || need_model);
+        ImGui::BeginDisabled(!ready || need_model || native_work_busy() ||
+                             _batch_active);
         if (ui::Button(adding ? dmsg::update_dataset : dmsg::create_dataset,
                        ImVec2(px(200.0f), px(34.0f))))
             start_dataset_job();
         ImGui::EndDisabled();
-        if (!ready) {
+        if (input_missing) {
             ImGui::SameLine();
             ui::TextDisabled(dmsg::pick_input_first);
+        } else if (!_source_probes_ready) {
+            ImGui::SameLine();
+            ui::TextDisabled(dmsg::sensors_reading);
         } else if (need_model) {
             // The options above carry the same buttons, but they are a scroll
             // away by the time somebody is reaching for this one. One missing
@@ -3614,7 +5695,10 @@ void GuiApp::draw_dataset_form(float height, bool running) {
                 else                      request_geometry_download();
             }
         }
-        if (ready) draw_dataset_rerun(workspace_state());
+        if (ready) {
+            draw_dataset_rerun(workspace_state());
+            draw_dataset_reset();
+        }
     } else if (ui::Button(dmsg::cancel, ImVec2(px(200.0f), px(34.0f)))) {
         cancel_dataset_job();
     }
@@ -3623,6 +5707,7 @@ void GuiApp::draw_dataset_form(float height, bool running) {
     struct {
         bool done, failed, cancelled;
         std::string dir, image_dir, mask_dir, err;
+        bool mask_flipped;
     } st{};
     if (effective_engine() == Engine::BuiltIn) {
         st.done = _sfm.state() == SfmRunner::State::Done;
@@ -3631,6 +5716,7 @@ void GuiApp::draw_dataset_form(float height, bool running) {
         st.dir = _sfm.dataset_dir();
         st.image_dir = _sfm.image_dir();
         st.mask_dir = _sfm.mask_dir();
+        st.mask_flipped = _sfm.mask_flipped();
         st.err = _sfm.error();
     } else {
         st.done = _colmap.state() == ColmapRunner::State::Done;
@@ -3639,11 +5725,14 @@ void GuiApp::draw_dataset_form(float height, bool running) {
         st.dir = _colmap.dataset_dir();
         st.image_dir = _colmap.image_dir();
         st.mask_dir = _colmap.mask_dir();
+        st.mask_flipped = _colmap.mask_flipped();
         st.err = _colmap.error();
     }
     if (st.done) {
         if (effective_engine() == Engine::BuiltIn && _sfm.partial())
             ui::TextColoredWrapped(kWarn, dmsg::partial_reconstruction);
+        if (effective_engine() == Engine::BuiltIn && _sfm.not_metric())
+            ui::TextColoredWrapped(kWarn, dmsg::not_metric_reconstruction);
         ui::TextColoredWrapped(kOk, dmsg::done_at, {st.dir});
         if (ui::Button(dmsg::open_in_trainer)) {
             if (training_busy()) {
@@ -3651,7 +5740,7 @@ void GuiApp::draw_dataset_form(float height, bool running) {
                 _pending_path = st.dir;
                 _open_confirm = true;
             } else {
-                open_dataset(st.dir, st.image_dir, st.mask_dir,
+                open_dataset(st.dir, st.image_dir, st.mask_dir, st.mask_flipped,
                              /*keep_log=*/true);
             }
         }
@@ -3666,12 +5755,14 @@ void GuiApp::draw_dataset_form(float height, bool running) {
 void GuiApp::draw_new_dataset() {
     const bool running = dataset_busy();
 
+    ImGui::BeginDisabled(native_work_busy());
     if (ui::Button(msg::back_home)) {
         _screen = Screen::Home;
         // The preview holds GL buffers and a decoding thread for a screen that
         // is no longer up.
-        if (!dataset_busy()) reset_dataset_preview();
+        if (!native_work_busy()) reset_dataset_preview();
     }
+    ImGui::EndDisabled();
     ImGui::SameLine();
     ImGui::SetWindowFontScale(1.2f);
     const bool from_video = !_sources.empty() && _sources[0].is_video;
@@ -3688,8 +5779,6 @@ void GuiApp::draw_new_dataset() {
     // panel that is read across everything, and it is what a run used to be
     // watched entirely through.
     const float log_h = log_height(ImGui::GetContentRegionAvail().y);
-    const float body_h = ImGui::GetContentRegionAvail().y - log_h -
-                         (log_h > 0 ? splitter_extent() : 0);
 
     // Side by side only when there is a preview AND room for both. On a narrow
     // window the preview goes under the form instead, which is worth less but
@@ -3697,7 +5786,7 @@ void GuiApp::draw_new_dataset() {
     const bool wide = ImGui::GetContentRegionAvail().x >= px(1000.0f);
     const bool two_col = preview_has_content() && wide;
 
-    ImGui::BeginChild("##dsbody", ImVec2(0, body_h));
+    ImGui::BeginChild("##dsbody", ImVec2(0, body_height(log_h)));
     if (two_col) {
         const float w = std::clamp(_ds_panel_w * ui_scale(), px(320.0f),
                                    std::max(px(320.0f),
@@ -3741,6 +5830,9 @@ void GuiApp::draw_new_dataset() {
         }
     }
     if (_geometry_panel.is_open()) _geometry_panel.draw(_geometry);
+    draw_clear_project_modal();
+    draw_drop_intermediate_modal();
+    draw_mask_recon_modal();
     draw_license_modal();
 }
 
@@ -3831,8 +5923,8 @@ void GuiApp::draw_train() {
     if (_batch_active) {
         if (ui::Button(msg::batch_show_list)) _screen = Screen::Batch;
         ImGui::SameLine();
-        ui::TextDisabledRaw(_batch_current >= 0 ? _batch[_batch_current].dataset
-                                                : std::string());
+        const BatchRow* row = batch_running_row();
+        ui::TextDisabledRaw(row ? row->dataset : std::string());
     } else {
         ui::TextDisabledRaw(_cfg.data);
     }
@@ -3902,9 +5994,8 @@ void GuiApp::draw_viewer() {
     if (ui::Button(msg::back_home)) request_go_home();
     ImGui::SameLine();
     if (ui::Button(msg::viewer_open_another)) {
-        _pick = PickAction::SplatFile;
-        _dialog.open(msg::viewer_pick_file.get(), FileDialog::Mode::File,
-                     kViewableExtensions);
+        open_pick(PickAction::SplatFile, msg::viewer_pick_file.get(),
+                  FileDialog::Mode::File, kViewableExtensions);
     }
     ImGui::SameLine();
     _compare.set_recents(_model_recents);
@@ -3956,13 +6047,8 @@ bool GuiApp::mesh_dataset_found() {
     _mesh_data_probe_found = false;
     std::error_code ec;
     if (!_mesh_job.data_dir.empty()) {
-        // Exactly the child's test: a folder that is not there is no dataset,
-        // and it meshes without one rather than failing.
         _mesh_data_probe_found = fs::exists(_mesh_job.data_dir, ec);
     } else if (!_mesh_job.checkpoint.empty()) {
-        // Empty field: the child reads `data` out of the run's config.json,
-        // relative to the run directory. Both steps throw on a path that is
-        // not a checkpoint at all, which simply means no dataset.
         try {
             auto [ply, run_dir] = spirula::find_splat_ply(_mesh_job.checkpoint);
             (void)ply;
@@ -3983,7 +6069,19 @@ bool GuiApp::mesh_dataset_found() {
 }
 
 void GuiApp::start_meshing() {
-    if (_mesh_job.checkpoint.empty()) return;
+    if (_mesh_job.checkpoint.empty() || native_work_busy()) return;
+    close_native_previews();
+    close_splat();
+#ifdef SS_BACKEND_VULKAN
+    if (!freeze_native_device()) return;
+#else
+    if (!freeze_cuda_device()) return;
+#endif
+    // Again at dispatch: a mesh preset applied since the freeze replaced the job.
+    _mesh_job.device_uuid = _native_device_uuid;
+#ifndef SS_BACKEND_VULKAN
+    _mesh_job.cuda_device = _cuda_device_index;
+#endif
     close_mesh_preview();
     _mesh.start(_mesh_job);
 }
@@ -3995,14 +6093,17 @@ void GuiApp::close_mesh_preview() {
 }
 
 void GuiApp::open_mesh_preview() {
-    // Whatever else had the engine (a file opened from the viewer screen) has
-    // to let go before the splats take it.
-    close_splat();
     const std::string out = _mesh.output_path();
     if (out.empty()) return;
-    // The model the mesh came from goes FIRST, which puts the surface in the
-    // splats' frame rather than one fitted to itself. Skipped only while a run
-    // is USING the engine -- requiring an IDLE one hid every train-then-mesh.
+    close_native_previews();
+    close_splat();
+#ifdef SS_BACKEND_VULKAN
+    if (!freeze_native_device()) return;
+#else
+    if (!freeze_cuda_device()) return;
+#endif
+    // Whatever else had the engine (a file opened from the viewer screen) has
+    // to let go before the splats take it.
     if (!training_busy()) {
         detach_session_views();
         _runner.note_engine_taken();
@@ -4013,6 +6114,10 @@ void GuiApp::open_mesh_preview() {
 }
 
 void GuiApp::draw_mesh_options() {
+    ui::SeparatorText(msg::section_preset);
+    draw_mesh_preset_picker();
+    ImGui::Spacing();
+
     // A path row is [field][...][label]. The field takes what is left after
     // the button and the label, measured rather than guessed -- a fixed
     // reserve pushes the label off the edge in the longer languages.
@@ -4029,14 +6134,13 @@ void GuiApp::draw_mesh_options() {
     }
     ImGui::SameLine();
     if (ui::ButtonRaw("...##meshsrcdir", ImVec2(60, 0))) {
-        _pick = PickAction::MeshSource;
-        _dialog.open(msg::mesh_pick_model.get(), FileDialog::Mode::Folder);
+        open_pick(PickAction::MeshSource, msg::mesh_pick_model.get(),
+                  FileDialog::Mode::Folder);
     }
     ImGui::SameLine();
     if (ui::ButtonRaw(".ply##meshsrcfile", ImVec2(60, 0))) {
-        _pick = PickAction::MeshSource;
-        _dialog.open(msg::mesh_pick_model.get(), FileDialog::Mode::File,
-                     {".ply"});
+        open_pick(PickAction::MeshSource, msg::mesh_pick_model.get(),
+                  FileDialog::Mode::File, {".ply"});
     }
     ui::help_on_hover(msg::mesh_source_help);
     ui::TextDisabled(msg::mesh_drop_hint);
@@ -4056,8 +6160,8 @@ void GuiApp::draw_mesh_options() {
                                  &_mesh_job.data_dir);
         ImGui::SameLine();
         if (ui::ButtonRaw("...##meshdatapick", ImVec2(60, 0))) {
-            _pick = PickAction::MeshPhotos;
-            _dialog.open(msg::mesh_pick_photos.get(), FileDialog::Mode::Folder);
+            open_pick(PickAction::MeshPhotos, msg::mesh_pick_photos.get(),
+                      FileDialog::Mode::Folder);
         }
         ImGui::SameLine();
         ui::TextDisabled(msg::mesh_photos_dir);
@@ -4078,11 +6182,19 @@ void GuiApp::draw_mesh_options() {
     }
 
     // ---- color ----
-    ImGui::SetNextItemWidth(px(220.0f));
-    ui::Combo(msg::mesh_color, &_mesh_job.color,
-              {&msg::mesh_color_none, &msg::mesh_color_vertex,
-               &msg::mesh_color_texture});
-    if (_mesh_job.color == 2) {
+    // A set rather than a choice: one extraction, written in each of them, so
+    // a textured GLB and a plain PLY cost one run between them, not two.
+    ui::SeparatorText(msg::mesh_color);
+    const Msg* color_names[kNumMeshColorModes] = {
+        &msg::mesh_color_none, &msg::mesh_color_vertex, &msg::mesh_color_texture};
+    for (int i = 0; i < kNumMeshColorModes; i++) {
+        if (i) ImGui::SameLine();
+        ImGui::PushID(i);
+        ui::Checkbox(*color_names[i], &_mesh_job.colors[i]);
+        ImGui::PopID();
+    }
+    ui::help_on_hover(msg::mesh_color_help);
+    if (_mesh_job.wants_color(2)) {
         ImGui::Indent();
         static const int kTexSizes[] = {0, 1024, 2048, 4096, 8192};
         int idx = 0;
@@ -4107,14 +6219,14 @@ void GuiApp::draw_mesh_options() {
     }
 
     // ---- formats ----
-    // PLY cannot carry a texture and OBJ has no standard place for vertex
-    // colors; the child refuses those combinations outright, so they are
-    // greyed out here rather than failing the run three minutes in.
+    // The child refuses a format that cannot carry the color asked of it, so
+    // one no ticked color travels in is greyed out rather than failing the run.
     ui::SeparatorText(msg::mesh_formats);
     for (int i = 0; i < kNumMeshFormats; i++) {
         if (i) ImGui::SameLine();
-        const bool ok = !(i == 0 && _mesh_job.color == 2) &&
-                        !(i == 1 && _mesh_job.color == 1);
+        bool ok = false;
+        for (int c = 0; c < kNumMeshColorModes; c++)
+            ok = ok || (_mesh_job.colors[c] && mesh_format_carries(i, c));
         if (!ok) _mesh_job.formats[i] = false;
         ImGui::BeginDisabled(!ok);
         // A file extension is a file extension in every language.
@@ -4123,17 +6235,17 @@ void GuiApp::draw_mesh_options() {
         ImGui::PopID();
         ImGui::EndDisabled();
     }
-    // Every format was ruled out by the color choice: fall back to one that
-    // can carry it, so the Create button is never armed with nothing to write.
-    bool any = false;
-    for (int i = 0; i < kNumMeshFormats; i++) any |= _mesh_job.formats[i];
-    if (!any) _mesh_job.formats[_mesh_job.color == 2 ? 3 : 0] = true;
+    // Nothing left that a requested color and a requested format can both
+    // carry. Said here rather than fixed silently: which of the two to give up
+    // is the user's choice, and the Create button stays disabled until it is.
+    if (mesh_job_writes_nothing(_mesh_job))
+        ui::TextColoredWrapped(kErr, msg::mesh_no_output_warn);
     ImGui::SetNextItemWidth(field_width(msg::mesh_output));
     ui::InputTextRaw("##meshout", &_mesh_job.output);
     ImGui::SameLine();
     if (ui::ButtonRaw("...##meshoutpick", ImVec2(60, 0))) {
-        _pick = PickAction::MeshOutput;
-        _dialog.open(msg::mesh_pick_output.get(), FileDialog::Mode::Folder);
+        open_pick(PickAction::MeshOutput, msg::mesh_pick_output.get(),
+                  FileDialog::Mode::Folder);
     }
     ImGui::SameLine();
     ui::TextDisabled(msg::mesh_output);
@@ -4202,6 +6314,11 @@ void GuiApp::draw_mesh() {
         _compare.draw_toolbar();
         _compare.draw(0.0f);
     } else {
+        // A batch owns the options while it runs; what it IS meshing goes here.
+        if (_batch_active) {
+            draw_batch_progress();
+            ImGui::Spacing();
+        }
         ImGui::BeginDisabled(running);
         draw_mesh_options();
         ImGui::EndDisabled();
@@ -4212,9 +6329,13 @@ void GuiApp::draw_mesh() {
             ui::ProgressBar(p >= 0 ? p : 0.0f, ImVec2(-1, 0), msg::mesh_running);
             const std::string st = _mesh.stage();
             if (!st.empty()) ui::TextDisabledRaw(st);
-            if (ui::Button(msg::mesh_cancel)) _mesh.cancel();
+            if (ui::Button(msg::mesh_cancel)) {
+                if (_batch_active) _batch_stop_after = _batch_stop_now = true;
+                _mesh.cancel();
+            }
         } else {
-            ImGui::BeginDisabled(_mesh_job.checkpoint.empty());
+            ImGui::BeginDisabled(_mesh_job.checkpoint.empty() || _batch_active ||
+                                 mesh_job_writes_nothing(_mesh_job));
             if (ui::Button(msg::mesh_start, ImVec2(220, 34))) start_meshing();
             ImGui::EndDisabled();
             if (_mesh_job.checkpoint.empty()) {
@@ -4237,22 +6358,181 @@ void GuiApp::draw_mesh() {
 // ===========================================================================
 // Batch screen
 //
-// The list, and the two things that can be done to it: check it, and run it.
-// It stays editable and readable while a batch is in flight -- the rows report
-// what became of them -- which is what makes an unattended run something you
-// can come back to rather than something you have to watch.
+// The list stays readable while a batch is in flight, which is what makes an
+// unattended run something you come back to rather than something you watch.
 // ===========================================================================
 
+namespace {
+
+// The one word a row reports: the worst thing that happened to its tasks.
+BatchStatus row_status(const std::vector<BatchTask>& tasks, int row) {
+    bool any = false, all_done = true, failed = false, running = false;
+    bool stopped = false, skipped = false;
+    for (const BatchTask& t : tasks) {
+        if (t.row != row) continue;
+        any = true;
+        running = running || t.status == BatchStatus::Running;
+        failed = failed || t.status == BatchStatus::Failed;
+        stopped = stopped || t.status == BatchStatus::Stopped;
+        skipped = skipped || t.status == BatchStatus::Skipped;
+        all_done = all_done && t.status == BatchStatus::Done;
+    }
+    if (!any) return BatchStatus::Pending;
+    if (running) return BatchStatus::Running;
+    if (failed) return BatchStatus::Failed;
+    if (stopped) return BatchStatus::Stopped;
+    if (all_done) return BatchStatus::Done;
+    if (skipped) return BatchStatus::Skipped;
+    return BatchStatus::Pending;
+}
+
+void draw_status_word(BatchStatus st) {
+    switch (st) {
+        case BatchStatus::Running: ui::TextColored(kWarn, msg::batch_status_running); break;
+        case BatchStatus::Done:    ui::TextColored(kOk, msg::batch_status_done); break;
+        case BatchStatus::Failed:  ui::TextColored(kErr, msg::batch_status_failed); break;
+        case BatchStatus::Skipped: ui::TextColored(kDim, msg::batch_status_skipped); break;
+        case BatchStatus::Stopped: ui::TextColored(kDim, msg::batch_status_stopped); break;
+        default:                   ui::TextColored(kDim, msg::batch_status_pending); break;
+    }
+}
+
+// One built-in row of a preset combo: the name the file and the command line
+// spell, the translated label beside it, and the sentence it hovers to.
+struct BuiltinRow {
+    std::string name, label, help;
+};
+
+std::vector<BuiltinRow> dataset_builtin_rows() {
+    std::vector<BuiltinRow> out;
+    for (const DatasetPresetInfo& p : kDatasetPresets) {
+        const auto* t = i18n::msg::dataset::preset_text(p.name);
+        BuiltinRow r;
+        r.name = p.name;
+        r.label = t ? std::string(t->label->get()) + " (" + p.name + ")" : p.name;
+        r.help = t ? std::string(t->help->get()) : std::string();
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+// What a preset combo came back with. Nothing moved unless `moved`; a
+// built-in is `builtin`, a saved file is `index`, and `from_file` is the row
+// that opens a file dialog.
+struct PresetChoice {
+    bool moved = false;
+    bool from_file = false;
+    std::string builtin;
+    int index = -1;
+};
+
+// The combo every preset picker draws: the built-ins of that kind (or a
+// single stock row for a kind that has none), then the saved files, then the
+// way to a file outside the folder.
+template <class T>
+PresetChoice preset_combo(const char* id, const PresetPicker<T>& pick,
+                          const std::string& file, const std::string& builtin,
+                          const std::vector<BuiltinRow>& builtins,
+                          bool offer_file = false) {
+    PresetChoice out;
+    std::string preview, desc;
+    if (!file.empty()) {
+        // A file outside the saved folder still shows as itself.
+        preview = fs::path(file).stem().string();
+        for (const T& p : pick.items)
+            if (p.path == file) { preview = p.name; desc = p.description; }
+    } else if (builtins.empty()) {
+        preview = msg::batch_preset_stock.get();
+    } else {
+        // Nothing selected (a deleted preset, a fresh session) is the first
+        // built-in, which is that kind's base settings.
+        preview = builtins.front().label;
+        desc = builtins.front().help;
+        for (const BuiltinRow& b : builtins)
+            if (b.name == builtin) { preview = b.label; desc = b.help; }
+    }
+    const bool open = ui::BeginComboRaw(id, preview.c_str());
+    // On the closed combo too: a row shows only a name, and two saved presets
+    // can share one -- the path in the tooltip is what tells them apart.
+    preset_hover(desc, file);
+    if (!open) return out;
+
+    if (builtins.empty()) {
+        if (ui::Selectable(msg::batch_preset_stock, file.empty())) out.moved = true;
+    } else {
+        ui::SeparatorText(msg::preset_builtin_group);
+        for (const BuiltinRow& b : builtins) {
+            const bool sel = file.empty() &&
+                             (b.name == builtin ||
+                              (builtin.empty() && b.name == builtins.front().name));
+            if (ui::SelectableRaw(b.label, sel)) {
+                out.moved = true;
+                out.builtin = b.name;
+            }
+            preset_hover(b.help, {});
+            if (sel) ImGui::SetItemDefaultFocus();
+        }
+    }
+    ui::SeparatorText(msg::preset_user_group);
+    if (pick.items.empty()) ui::TextDisabled(msg::preset_none_saved);
+    for (size_t i = 0; i < pick.items.size(); i++) {
+        const T& p = pick.items[i];
+        ImGui::PushID((int)i);
+        const bool sel = !file.empty() && file == p.path;
+        if (ui::SelectableRaw(p.name, sel)) {
+            out.moved = true;
+            out.index = (int)i;
+        }
+        preset_hover(p.description, p.path);
+        if (sel) ImGui::SetItemDefaultFocus();
+        ImGui::PopID();
+    }
+    if (offer_file) {
+        ImGui::Separator();
+        if (ui::Selectable(msg::batch_preset_from_file)) {
+            out.moved = true;
+            out.from_file = true;
+        }
+    }
+    ImGui::EndCombo();
+    return out;
+}
+
+}  // namespace
+
+
+const Msg& GuiApp::batch_stage_name(BatchStage s) const {
+    switch (s) {
+        case BatchStage::Dataset: return msg::batch_stage_dataset;
+        case BatchStage::Mesh:    return msg::batch_stage_mesh;
+        default:                  return msg::batch_stage_train;
+    }
+}
+
+// What a collapsed row is about: the thing it works on, which is the only
+// part of it worth reading at a glance.
+std::string GuiApp::batch_row_summary(const BatchRow& row) const {
+    if (row.does(BatchStage::Dataset) && !row.sources.empty()) {
+        std::string s = row.sources[0];
+        if (row.sources.size() > 1)
+            s += " (+" + std::to_string(row.sources.size() - 1) + ")";
+        return s;
+    }
+    if (!row.dataset.empty()) return row.dataset;
+    if (!row.model.empty()) return row.model;
+    return {};
+}
+
+
 void GuiApp::draw_batch() {
-    // Keeps the saved presets warm for the rows' pickers and their tooltips
-    // (rate-limited inside, so this is a no-op most frames).
+    // Keeps each kind's saved presets warm for the rows' pickers and their
+    // tooltips (rate-limited inside, so this is a no-op most frames).
     refresh_presets();
+    refresh_dataset_presets();
+    refresh_mesh_presets();
+    check_batch_if_stale();
 
     if (ui::Button(msg::back_home)) request_go_home();
-    if (_batch_active) {
-        ImGui::SameLine();
-        if (ui::Button(msg::batch_show_training)) _screen = Screen::Train;
-    }
     ImGui::SameLine();
     ui::Text(msg::batch_title);
 
@@ -4263,14 +6543,40 @@ void GuiApp::draw_batch() {
     const float log_h = log_height(ImGui::GetContentRegionAvail().y);
     ImGui::BeginChild("##batchlist", ImVec2(0, body_height(log_h)));
 
-    draw_batch_table();
+    if (_batch_active) {
+        draw_batch_progress();
+        ImGui::Spacing();
+    }
+    draw_batch_rows();
 
     ImGui::Spacing();
     ImGui::BeginDisabled(_batch_active);
+    if (ui::Button(msg::batch_add_create)) {
+        _pick_row = -1;
+        open_pick(PickAction::BatchSourceVideo, msg::batch_pick_source.get(),
+                  FileDialog::Mode::File,
+                  std::vector<std::string>(kVideoExtensions,
+                                           kVideoExtensions + kNumVideoExtensions),
+                  "", /*multi=*/true);
+    }
+    ui::help_on_hover(msg::batch_add_create_help);
+    ImGui::SameLine();
+    if (ui::Button(msg::batch_add_photos)) {
+        _pick_row = -1;
+        open_pick(PickAction::BatchSourceImages, msg::batch_pick_photos.get(),
+                  FileDialog::Mode::Folder);
+    }
+    ImGui::SameLine();
     if (ui::Button(msg::batch_add_row)) {
-        _pick = PickAction::BatchDataset;
         _pick_row = -1;   // append
-        _dialog.open(msg::batch_pick_dataset.get(), FileDialog::Mode::Folder);
+        open_pick(PickAction::BatchDataset, msg::batch_pick_dataset.get(),
+                  FileDialog::Mode::Folder);
+    }
+    ImGui::SameLine();
+    if (ui::Button(msg::batch_add_mesh)) {
+        _pick_row = -1;
+        open_pick(PickAction::BatchModel, msg::batch_pick_model.get(),
+                  FileDialog::Mode::Folder);
     }
     ImGui::SameLine();
     // The datasets already opened in the trainer, which is where a queue is
@@ -4289,30 +6595,41 @@ void GuiApp::draw_batch() {
         }
         ImGui::EndPopup();
     }
-    ImGui::SameLine();
+
+    ImGui::Spacing();
+    // A batch's own dataset or meshing task is not something else.
+    const bool busy_elsewhere =
+        !_batch_active && (dataset_busy() || _mesh.busy());
     ImGui::BeginDisabled(_batch.empty());
     if (ui::Button(msg::batch_clear)) {
         _batch.clear();
-        _batch_dirty = true;
-        _batch_checked = false;
+        _batch_tasks.clear();
+        _batch_open_row = -1;
         _batch_msg.clear();
+        batch_edited();
     }
     ImGui::SameLine();
-    if (ui::Button(msg::batch_check)) check_batch();
-    ui::help_on_hover(msg::batch_check_help);
-
-    ImGui::SameLine();
-    if (ui::Button(msg::batch_start, ImVec2(160, 0)))
+    ImGui::BeginDisabled(busy_elsewhere);
+    if (ui::Button(msg::batch_start, ImVec2(px(160.0f), 0)))
         request_start_batch(/*skip_invalid=*/false);
     // The way past a row that cannot be fixed right now. Only offered once a
     // check has actually found one, so it is never the first thing tried.
-    int bad = 0;
+    int bad = 0, live = 0;
     if (_batch_checked)
-        for (const BatchJob& j : _batch) bad += batch_has_error(j) ? 1 : 0;
-    if (bad > 0 && bad < (int)_batch.size()) {
+        for (const BatchRow& r : _batch) {
+            if (!r.enabled) continue;
+            live++;
+            bad += batch_has_error(r.issues) ? 1 : 0;
+        }
+    if (bad > 0 && bad < live) {
         ImGui::SameLine();
         if (ui::Button(msg::batch_start_skip))
             request_start_batch(/*skip_invalid=*/true);
+    }
+    ImGui::EndDisabled();
+    if (busy_elsewhere) {
+        ImGui::SameLine();
+        ui::TextColored(kDim, msg::batch_busy_elsewhere);
     }
     ImGui::EndDisabled();
     ImGui::EndDisabled();
@@ -4321,216 +6638,672 @@ void GuiApp::draw_batch() {
         ui::TextColoredWrappedRaw(_batch_msg_err ? kErr : kOk, _batch_msg);
 
     draw_batch_issues();
+    draw_batch_command();
+    draw_batch_plan();
     ImGui::EndChild();
 
     draw_log_panel(log_h);
 }
 
-void GuiApp::draw_batch_table() {
+
+void GuiApp::draw_batch_rows() {
     if (_batch.empty()) {
         ui::TextDisabled(msg::batch_empty);
         ui::TextDisabled(msg::batch_drop_hint);
         return;
     }
-
-    const ImGuiTableFlags flags = ImGuiTableFlags_Borders |
-                                  ImGuiTableFlags_RowBg |
-                                  ImGuiTableFlags_SizingStretchProp;
-    if (!ImGui::BeginTable("##batch", 8, flags)) return;
-
-    // "#" is a numeral column, not a word.
-    ui::TableSetupColumnRaw("#", ImGuiTableColumnFlags_WidthFixed, 26.0f);
-    ui::TableSetupColumn(msg::batch_col_dataset,
-                         ImGuiTableColumnFlags_WidthStretch, 3.0f);
-    ui::TableSetupColumn(msg::batch_col_preset,
-                         ImGuiTableColumnFlags_WidthStretch, 2.0f);
-    // Wide enough for the longest of the thirteen headings, not just the
-    // English one: a fixed column sized to "Max splats" truncates
-    // "Максимум сплатов" and every CJK heading, whose characters are twice
-    // as wide as they are numerous.
-    ui::TableSetupColumn(msg::batch_col_splats,
-                         ImGuiTableColumnFlags_WidthFixed, 116.0f);
-    ui::TableSetupColumn(msg::batch_col_sh,
-                         ImGuiTableColumnFlags_WidthFixed, 90.0f);
-    ui::TableSetupColumn(msg::batch_col_steps,
-                         ImGuiTableColumnFlags_WidthFixed, 84.0f);
-    ui::TableSetupColumn(msg::batch_col_output,
-                         ImGuiTableColumnFlags_WidthStretch, 3.0f);
-    ui::TableSetupColumn(msg::batch_col_status,
-                         ImGuiTableColumnFlags_WidthFixed, 190.0f);
-    ImGui::TableHeadersRow();
-
-    const float bw = ImGui::GetFrameHeight() + 6.0f;
-    int remove = -1;
+    int remove = -1, move = 0, move_from = -1;
     for (int i = 0; i < (int)_batch.size(); i++) {
-        BatchJob& j = _batch[i];
-        ImGui::PushID(i);
-        ImGui::TableNextRow();
-
-        ImGui::TableNextColumn();
-        ui::TextDisabledRaw(std::to_string(i + 1));
-
-        // A row is frozen while the batch runs: its config has already been
-        // taken, and editing it would describe a run that is not happening.
-        ImGui::BeginDisabled(_batch_active);
-
-        ImGui::TableNextColumn();
-        ImGui::SetNextItemWidth(-bw);
-        if (ui::InputTextWithHintRaw("##ds", msg::batch_dataset_hint,
-                                     &j.dataset)) {
-            _batch_dirty = true;
-            _batch_checked = false;
-        }
-        ImGui::SameLine(0, 2);
-        if (ui::ButtonRaw("...##ds")) {
-            _pick = PickAction::BatchDataset;
-            _pick_row = i;
-            _dialog.open(msg::batch_pick_dataset.get(),
-                         FileDialog::Mode::Folder, {}, j.dataset);
-        }
-
-        ImGui::TableNextColumn();
-        draw_batch_preset_combo(j, i);
-
-        // The three numbers worth changing without making a preset for each
-        // combination. Empty means "whatever the preset says", which is why
-        // these are text boxes and not integer spinners -- 0 is a legal SH
-        // degree, so a spinner has no way to spell "unset".
-        const char* ids[] = {"##cap", "##sh", "##iters"};
-        std::string* fields[] = {&j.cap_max_override, &j.sh_degree_override,
-                                 &j.iterations_override};
-        for (int k = 0; k < 3; k++) {
-            ImGui::TableNextColumn();
-            ImGui::SetNextItemWidth(-FLT_MIN);
-            if (ui::InputTextWithHintRaw(ids[k], msg::batch_override_hint,
-                                         fields[k],
-                                         ImGuiInputTextFlags_CharsDecimal)) {
-                _batch_dirty = true;
-                _batch_checked = false;
-            }
-            ui::help_on_hover(msg::batch_override_help);
-        }
-
-        ImGui::TableNextColumn();
-        ImGui::SetNextItemWidth(-bw);
-        if (ui::InputTextWithHintRaw("##out", msg::batch_output_hint,
-                                     &j.output_dir)) {
-            _batch_dirty = true;
-            _batch_checked = false;
-        }
-        ui::help_on_hover(msg::batch_output_help);
-        ImGui::SameLine(0, 2);
-        if (ui::ButtonRaw("...##out")) {
-            _pick = PickAction::BatchOutput;
-            _pick_row = i;
-            _dialog.open(msg::batch_pick_output.get(), FileDialog::Mode::Folder,
-                         {}, j.output_dir);
-        }
-        ImGui::EndDisabled();
-
-        ImGui::TableNextColumn();
-        switch (j.status) {
-            case BatchJob::Status::Running:
-                ui::TextColored(kWarn, msg::batch_status_running); break;
-            case BatchJob::Status::Done:
-                ui::TextColored(kOk, msg::batch_status_done); break;
-            case BatchJob::Status::Failed:
-                ui::TextColored(kErr, msg::batch_status_failed); break;
-            case BatchJob::Status::Skipped:
-                ui::TextColored(kDim, msg::batch_status_skipped); break;
-            case BatchJob::Status::Stopped:
-                ui::TextColored(kDim, msg::batch_status_stopped); break;
-            default:
-                ui::TextColored(kDim, msg::batch_status_pending); break;
-        }
-        // Where it went, or why it did not: engine text and paths, both raw.
-        const std::string& detail = j.message.empty() ? j.out_dir : j.message;
-        if (!detail.empty()) ui::help_on_hover_raw(detail.c_str());
-        ImGui::SameLine();
-        ImGui::BeginDisabled(_batch_active);
-        // The same word the dataset screen's input list uses for the same job.
-        if (ui::Button(dmsg::remove)) remove = i;
-        ImGui::EndDisabled();
-
-        ImGui::PopID();
+        int one_move = 0;
+        draw_batch_row(_batch[(size_t)i], i, remove, one_move);
+        if (one_move != 0) { move = one_move; move_from = i; }
     }
-    ImGui::EndTable();
-
     if (remove >= 0) {
         _batch.erase(_batch.begin() + remove);
-        _batch_dirty = true;
-        _batch_checked = false;
+        if (_batch_open_row == remove) _batch_open_row = -1;
+        else if (_batch_open_row > remove) _batch_open_row--;
+        // The last run's record is indexed by row; the rows have moved.
+        _batch_tasks.clear();
+        batch_edited();
+    } else if (move != 0 && move_from >= 0) {
+        const int to = move_from + move;
+        if (to >= 0 && to < (int)_batch.size()) {
+            std::swap(_batch[(size_t)move_from], _batch[(size_t)to]);
+            if (_batch_open_row == move_from) _batch_open_row = to;
+            else if (_batch_open_row == to) _batch_open_row = move_from;
+            _batch_tasks.clear();
+            batch_edited();
+        }
     }
 }
 
-void GuiApp::draw_batch_preset_combo(BatchJob& job, int row) {
-    const std::string preview = job.preset_path.empty()
-                                    ? preset_label(job.preset_name)
-                                    : job.preset_name;
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    const bool open = ui::BeginComboRaw("##preset", preview.c_str());
-    // On the closed combo too: a row shows only a name, and two saved presets
-    // can share one -- the path in the tooltip is what tells them apart.
-    // draw_batch() keeps _presets warm, so the description is there as well.
-    std::string desc;
-    if (job.preset_path.empty()) {
-        desc = preset_help(job.preset_name);
-    } else {
-        for (const TrainPreset& p : _presets)
-            if (p.path == job.preset_path) { desc = p.description; break; }
+
+void GuiApp::draw_batch_row(BatchRow& row, int index, int& remove, int& move) {
+    ImGui::PushID(index);
+    const bool open = _batch_open_row == index;
+
+    // ---- the header line ----
+    if (ui::ButtonRaw(open ? "-##expand" : "+##expand",
+                      ImVec2(ImGui::GetFrameHeight(), 0)))
+        _batch_open_row = open ? -1 : index;
+    ui::help_on_hover(msg::batch_row_expand_help);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(_batch_active);
+    if (ui::CheckboxRaw("##en", &row.enabled)) batch_edited();
+    ui::help_on_hover(msg::batch_row_enabled_help);
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ui::TextDisabledRaw(std::to_string(index + 1) + ".");
+
+    // The stages as chips, each its own widget: a row of labels, never a
+    // sentence stitched together out of them.
+    for (int st = 0; st < kNumBatchStages; st++) {
+        if (!row.stages[st]) continue;
+        ImGui::SameLine();
+        ui::TextColored(row.enabled ? kOk : kDim,
+                        batch_stage_name((BatchStage)st));
     }
-    preset_hover(desc, job.preset_path);
-    if (!open) return;
+    if (row.does(BatchStage::Train) && batch_num_runs(row) > 1) {
+        ImGui::SameLine();
+        ui::TextDisabled(msg::batch_runs_count, {(long long)batch_num_runs(row)});
+    }
+    if (const std::string what = batch_row_summary(row); !what.empty()) {
+        ImGui::SameLine();
+        ui::TextDisabledRaw(what);
+    }
+
+    // ---- the right-hand controls ----
+    const float bw = ImGui::GetFrameHeight();
+    const float style_x = ImGui::GetStyle().ItemSpacing.x;
+    ImGui::SameLine(std::max(ImGui::GetContentRegionAvail().x - 3 * bw -
+                                 2 * style_x + ImGui::GetCursorPosX(),
+                             ImGui::GetCursorPosX() + style_x));
+    ImGui::BeginDisabled(_batch_active);
+    if (ui::ButtonRaw("^##up", ImVec2(bw, 0))) move = -1;
+    ui::help_on_hover(msg::batch_move_up);
+    ImGui::SameLine(0, style_x);
+    if (ui::ButtonRaw("v##down", ImVec2(bw, 0))) move = 1;
+    ui::help_on_hover(msg::batch_move_down);
+    ImGui::SameLine(0, style_x);
+    if (ui::ButtonRaw("x##rm", ImVec2(bw, 0))) remove = index;
+    ui::help_on_hover(dmsg::remove);
+    ImGui::EndDisabled();
+
+    // ---- status, and why ----
+    const BatchStatus st = row_status(_batch_tasks, index);
+    if (st != BatchStatus::Pending || _batch_active) {
+        ImGui::Indent(ImGui::GetFrameHeight() * 2.0f);
+        draw_status_word(st);
+        // The newest thing this row has to say: what went wrong if anything
+        // did, and otherwise the last thing it produced.
+        std::string detail;
+        for (const BatchTask& t : _batch_tasks) {
+            if (t.row != index) continue;
+            if (!t.message.empty()) { detail = t.message; break; }
+            if (!t.result.empty()) detail = t.result;
+        }
+        if (!detail.empty()) {
+            ImGui::SameLine();
+            ui::TextDisabledRaw(detail);
+        }
+        ImGui::Unindent(ImGui::GetFrameHeight() * 2.0f);
+    }
+
+    if (open) {
+        ImGui::Indent();
+        ImGui::BeginDisabled(_batch_active);
+        for (int i = 0; i < kNumBatchStages; i++) {
+            if (i) ImGui::SameLine();
+            ImGui::PushID(i);
+            if (ui::Checkbox(batch_stage_name((BatchStage)i), &row.stages[i]))
+                batch_edited();
+            ImGui::PopID();
+        }
+        if (row.does(BatchStage::Dataset) || row.does(BatchStage::Train))
+            draw_batch_row_common_dataset(row, index);
+        if (row.does(BatchStage::Dataset)) draw_batch_row_dataset(row, index);
+        if (row.does(BatchStage::Train)) draw_batch_row_train(row, index);
+        if (row.does(BatchStage::Mesh)) draw_batch_row_mesh(row, index);
+        ImGui::EndDisabled();
+        ImGui::Unindent();
+    }
+    ImGui::Separator();
+    ImGui::PopID();
+}
+
+
+void GuiApp::draw_batch_row_dataset(BatchRow& row, int index) {
+    ui::SeparatorText(msg::batch_stage_dataset);
+    ui::Text(msg::batch_row_inputs);
+    int drop = -1;
+    const float bw = ImGui::GetFrameHeight() + 6.0f;
+    for (size_t i = 0; i < row.sources.size(); i++) {
+        ImGui::PushID((int)i);
+        ImGui::SetNextItemWidth(-bw);
+        if (ui::InputTextRaw("##src", &row.sources[i])) batch_edited();
+        ImGui::SameLine(0, 2);
+        if (ui::ButtonRaw("x##rmsrc")) drop = (int)i;
+        ImGui::PopID();
+    }
+    if (drop >= 0) {
+        row.sources.erase(row.sources.begin() + drop);
+        batch_edited();
+    }
+    if (ui::Button(msg::batch_add_video)) {
+        _pick_row = index;
+        open_pick(PickAction::BatchSourceVideo, msg::batch_pick_source.get(),
+                  FileDialog::Mode::File,
+                  std::vector<std::string>(kVideoExtensions,
+                                           kVideoExtensions + kNumVideoExtensions),
+                  "", /*multi=*/true);
+    }
+    ImGui::SameLine();
+    if (ui::Button(msg::batch_add_photos)) {
+        _pick_row = index;
+        open_pick(PickAction::BatchSourceImages, msg::batch_pick_photos.get(),
+                  FileDialog::Mode::Folder);
+    }
+
+    ui::Text(msg::batch_preset_dataset);
+    ImGui::SetNextItemWidth(px(-8.0f));
+    const PresetChoice picked =
+        preset_combo("##dspreset", _ds_presets, row.dataset_preset.path,
+                     row.dataset_preset.name, dataset_builtin_rows(), true);
+    if (!picked.moved) return;
+    if (picked.from_file) {
+        _pick_row = index;
+        open_pick(PickAction::BatchDatasetPresetFile, msg::preset_pick_file.get(),
+                  FileDialog::Mode::File, {".json"});
+    } else if (picked.index >= 0 && picked.index < (int)_ds_presets.items.size()) {
+        row.dataset_preset.path = _ds_presets.items[(size_t)picked.index].path;
+        row.dataset_preset.name = _ds_presets.items[(size_t)picked.index].name;
+        batch_edited();
+    } else {
+        row.dataset_preset = BatchPreset{"", picked.builtin};
+        batch_edited();
+    }
+}
+
+
+void GuiApp::draw_batch_row_train(BatchRow& row, int index) {
+    ui::SeparatorText(msg::batch_stage_train);
+    ui::Text(msg::batch_runs);
+    const float bw = ImGui::GetFrameHeight() + 6.0f;
+    int drop = -1;
+    for (size_t i = 0; i < row.runs.size(); i++) {
+        ImGui::PushID((int)i);
+        if (draw_batch_run(row.runs[i], index, (int)i, row.does(BatchStage::Mesh)))
+            batch_edited();
+        ImGui::SameLine(0, 2);
+        if (ui::ButtonRaw("x##rmrun")) drop = (int)i;
+        ImGui::PopID();
+    }
+    if (drop >= 0) {
+        row.runs.erase(row.runs.begin() + drop);
+        batch_edited();
+    }
+    if (row.runs.empty()) ui::TextDisabled(msg::batch_runs_default);
+    if (ui::Button(msg::batch_add_run)) {
+        row.runs.push_back(batch_run_on_screen());
+        batch_edited();
+    }
+    ui::help_on_hover(msg::batch_add_run_help);
+
+    ui::Text(msg::batch_col_output);
+    ImGui::SetNextItemWidth(-bw);
+    if (ui::InputTextWithHintRaw("##out", msg::batch_output_hint, &row.output_dir))
+        batch_edited();
+    ui::help_on_hover(msg::batch_output_help);
+    ImGui::SameLine(0, 2);
+    if (ui::ButtonRaw("...##out")) {
+        _pick_row = index;
+        open_pick(PickAction::BatchOutput, msg::batch_pick_output.get(),
+                  FileDialog::Mode::Folder, {}, row.output_dir);
+    }
+}
+
+
+// One training run on one line: which preset, the three numbers worth
+// changing without a preset for each combination, and -- when the row meshes
+// -- whether this is one of the runs it meshes.
+bool GuiApp::draw_batch_run(BatchRun& run, int row, int slot, bool meshing) {
+    bool moved = false;
+    const float num_w = px(84.0f);
+    const float sp = ImGui::GetStyle().ItemSpacing.x;
+    const float bw = ImGui::GetFrameHeight() + 6.0f;
+    const float boxes = 3.0f * (num_w + sp) + (meshing ? bw + sp : 0.0f);
+    ImGui::SetNextItemWidth(std::max(px(120.0f),
+                                     ImGui::GetContentRegionAvail().x - bw - boxes));
+    moved |= draw_batch_train_preset(run.preset, "##trpreset", row, slot);
+
+    // Text boxes rather than spinners because empty means "whatever the preset
+    // says", and 0 is a legal SH degree. The hint is the column name, which is
+    // shown exactly when the box is empty and there is nothing else to say.
+    const Msg* labels[] = {&msg::batch_col_splats, &msg::batch_col_sh,
+                           &msg::batch_col_steps};
+    std::string* fields[] = {&run.cap_max, &run.sh_degree, &run.iterations};
+    for (int k = 0; k < 3; k++) {
+        ImGui::SameLine(0, sp);
+        ImGui::PushID(k);
+        ImGui::SetNextItemWidth(num_w);
+        if (ui::InputTextWithHintRaw("##ovr", *labels[k], fields[k],
+                                     ImGuiInputTextFlags_CharsDecimal))
+            moved = true;
+        ui::help_on_hover(msg::batch_override_help);
+        ImGui::PopID();
+    }
+    if (meshing) {
+        ImGui::SameLine(0, sp);
+        if (ui::CheckboxRaw("##runmesh", &run.mesh)) moved = true;
+        ui::help_on_hover(msg::batch_run_mesh_help);
+    }
+    return moved;
+}
+
+
+void GuiApp::draw_batch_row_mesh(BatchRow& row, int index) {
+    ui::SeparatorText(msg::batch_stage_mesh);
+    ui::Text(msg::batch_mesh_model_label);
+    const float bw = ImGui::GetFrameHeight() + 6.0f;
+    ImGui::SetNextItemWidth(-bw);
+    if (ui::InputTextWithHintRaw("##meshmodel",
+                                 row.does(BatchStage::Train)
+                                     ? msg::batch_mesh_model_hint
+                                     : msg::batch_mesh_model_pick,
+                                 &row.model))
+        batch_edited();
+    ImGui::SameLine(0, 2);
+    if (ui::ButtonRaw("...##meshmodel")) {
+        _pick_row = index;
+        open_pick(PickAction::BatchModel, msg::batch_pick_model.get(),
+                  FileDialog::Mode::Folder, {}, row.model);
+    }
+
+    ui::Text(msg::batch_preset_mesh);
+    ImGui::SetNextItemWidth(px(-8.0f));
+    const PresetChoice picked = preset_combo("##meshpreset", _mesh_presets,
+                                             row.mesh.preset.path, {}, {}, true);
+    if (picked.moved) {
+        if (picked.from_file) {
+            _pick_row = index;
+            open_pick(PickAction::BatchMeshPresetFile, msg::preset_pick_file.get(),
+                      FileDialog::Mode::File, {".json"});
+        } else if (picked.index >= 0 &&
+                   picked.index < (int)_mesh_presets.items.size()) {
+            row.mesh.preset.path = _mesh_presets.items[(size_t)picked.index].path;
+            row.mesh.preset.name = _mesh_presets.items[(size_t)picked.index].name;
+            batch_edited();
+        } else {
+            row.mesh.preset = BatchPreset{"", ""};
+            batch_edited();
+        }
+    }
+    if (draw_batch_mesh_outputs(row.mesh)) batch_edited();
+}
+
+
+// What the row writes, over what its preset says. Nothing ticked in a set is
+// "whatever the preset says" rather than "write nothing", which is why the
+// two sets are ticked rather than selected.
+bool GuiApp::draw_batch_mesh_outputs(BatchMeshOptions& mesh) {
+    bool moved = false;
+    const Msg* color_names[kNumMeshColorModes] = {
+        &msg::mesh_color_none, &msg::mesh_color_vertex, &msg::mesh_color_texture};
+
+    ui::Text(msg::mesh_color);
+    ui::help_on_hover(msg::batch_mesh_override_help);
+    for (int i = 0; i < kNumMeshColorModes; i++) {
+        ImGui::SameLine();
+        ImGui::PushID(i);
+        bool on = (mesh.colors & (1 << i)) != 0;
+        if (ui::Checkbox(*color_names[i], &on)) {
+            mesh.colors = on ? (mesh.colors | (1 << i)) : (mesh.colors & ~(1 << i));
+            moved = true;
+        }
+        ImGui::PopID();
+    }
+
+    ui::Text(msg::mesh_formats);
+    ui::help_on_hover(msg::batch_mesh_override_help);
+    for (int i = 0; i < kNumMeshFormats; i++) {
+        ImGui::SameLine();
+        ImGui::PushID(i);
+        bool on = (mesh.formats & (1 << i)) != 0;
+        // A format no ticked colour can travel in is greyed out; with no
+        // colour ticked at all the preset decides, so all of them are offered.
+        bool ok = mesh.colors == 0;
+        for (int c = 0; c < kNumMeshColorModes && !ok; c++)
+            ok = (mesh.colors & (1 << c)) && mesh_format_carries(i, c);
+        ImGui::BeginDisabled(!ok);
+        if (ui::CheckboxRaw(kMeshFormats[i], &on)) {
+            mesh.formats = on ? (mesh.formats | (1 << i)) : (mesh.formats & ~(1 << i));
+            moved = true;
+        }
+        ImGui::EndDisabled();
+        ImGui::PopID();
+    }
+    return moved;
+}
+
+
+// The dataset folder: written by the Dataset stage, read by the Train stage,
+// so one field serves both and the two cannot point at different places.
+void GuiApp::draw_batch_row_common_dataset(BatchRow& row, int index) {
+    ui::Text(msg::batch_dataset_label);
+    const float bw = ImGui::GetFrameHeight() + 6.0f;
+    ImGui::SetNextItemWidth(-bw);
+    if (ui::InputTextWithHintRaw("##ds",
+                                 row.does(BatchStage::Dataset)
+                                     ? msg::batch_dataset_auto_hint
+                                     : msg::batch_dataset_hint,
+                                 &row.dataset))
+        batch_edited();
+    ImGui::SameLine(0, 2);
+    if (ui::ButtonRaw("...##ds")) {
+        _pick_row = index;
+        open_pick(PickAction::BatchDataset, msg::batch_pick_dataset.get(),
+                  FileDialog::Mode::Folder, {}, row.dataset);
+    }
+    if (row.does(BatchStage::Dataset) && row.dataset.empty()) {
+        const std::string ws = batch_dataset_workspace(row);
+        if (!ws.empty()) ui::TextDisabledRaw(ws);
+    }
+}
+
+
+bool GuiApp::draw_batch_train_preset(BatchPreset& p, const char* id, int row,
+                                     int slot) {
+    bool moved = false;
+    const std::string preview = p.path.empty() ? preset_label(p.name) : p.name;
+    const bool open = ui::BeginComboRaw(id, preview.c_str());
+    std::string desc;
+    if (p.path.empty()) {
+        desc = preset_help(p.name);
+    } else {
+        for (const TrainPreset& t : _train_presets.items)
+            if (t.path == p.path) { desc = t.description; break; }
+    }
+    preset_hover(desc, p.path);
+    if (!open) return moved;
     refresh_presets();
 
     ui::SeparatorText(msg::preset_builtin_group);
-    for (const auto& p : kTrainPresets) {
-        bool sel = job.preset_path.empty() && job.preset_name == p.name;
-        if (ui::SelectableRaw(preset_label(p.name), sel)) {
-            job.preset_path.clear();
-            job.preset_name = p.name;
-            _batch_dirty = true;
-            _batch_checked = false;
+    for (const auto& b : kTrainPresets) {
+        const bool sel = p.path.empty() && p.name == b.name;
+        if (ui::SelectableRaw(preset_label(b.name), sel)) {
+            p.path.clear();
+            p.name = b.name;
+            moved = true;
         }
-        preset_hover(preset_help(p.name), {});
+        preset_hover(preset_help(b.name), {});
         if (sel) ImGui::SetItemDefaultFocus();
     }
 
     ui::SeparatorText(msg::preset_user_group);
-    if (_presets.empty()) ui::TextDisabled(msg::preset_none_saved);
-    for (const auto& p : _presets) {
-        ImGui::PushID(p.path.c_str());
-        bool sel = job.preset_path == p.path;
-        if (ui::SelectableRaw(p.name, sel)) {
-            job.preset_path = p.path;
-            job.preset_name = p.name;
-            _batch_dirty = true;
-            _batch_checked = false;
+    if (_train_presets.items.empty()) ui::TextDisabled(msg::preset_none_saved);
+    for (const auto& t : _train_presets.items) {
+        ImGui::PushID(t.path.c_str());
+        const bool sel = p.path == t.path;
+        if (ui::SelectableRaw(t.name, sel)) {
+            p.path = t.path;
+            p.name = t.name;
+            moved = true;
         }
-        preset_hover(p);
+        preset_hover(t);
         if (sel) ImGui::SetItemDefaultFocus();
         ImGui::PopID();
     }
 
     ImGui::Separator();
     if (ui::Selectable(msg::batch_preset_from_file)) {
-        _pick = PickAction::BatchPresetFile;
         _pick_row = row;
-        _dialog.open(msg::preset_pick_file.get(), FileDialog::Mode::File,
-                     {".json"}, preset_dir());
+        _pick_slot = slot;
+        open_pick(PickAction::BatchPresetFile, msg::preset_pick_file.get(),
+                  FileDialog::Mode::File, {".json"});
     }
     ImGui::EndCombo();
+    return moved;
 }
+
 
 void GuiApp::draw_batch_issues() {
     for (int i = 0; i < (int)_batch.size(); i++) {
-        for (const BatchIssue& issue : _batch[i].issues) {
+        if (!_batch[(size_t)i].enabled) continue;
+        for (const BatchIssue& issue : _batch[(size_t)i].issues) {
             ui::TextColoredWrappedRaw(
                 issue.fatal ? kErr : kWarn,
                 i18n::format(msg::batch_issue_row,
                              {(long long)(i + 1), batch_issue_line(issue)}));
         }
     }
+}
+
+
+// A box that grows with what is in it. A real command is a curl invocation
+// with a JSON body, which nobody writes on one line; the empty state is still
+// one line, because that is what the screen looks like for everyone else.
+static ImVec2 batch_cmd_box_size(const std::string& text, float room) {
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float least = px(560.0f);
+    float widest = 0.0f;
+    int lines = 0;
+    for (size_t at = 0; at <= text.size();) {
+        const size_t nl = text.find('\n', at);
+        const std::string line =
+            text.substr(at, nl == std::string::npos ? nl : nl - at);
+        widest = std::max(widest, ImGui::CalcTextSize(line.c_str()).x);
+        lines++;
+        if (nl == std::string::npos) break;
+        at = nl + 1;
+    }
+    return ImVec2(std::clamp(widest + st.FramePadding.x * 4.0f, least,
+                             std::max(least, room)),
+                  ImGui::GetTextLineHeight() * (float)std::clamp(lines, 1, 12) +
+                      st.FramePadding.y * 2.0f);
+}
+
+// The command a finished queue runs. What {message} means is on the screen
+// rather than behind a hover, because nobody guesses a placeholder.
+void GuiApp::draw_batch_command() {
+    ui::SeparatorText(msg::batch_cmd_title);
+    // Split rather than empty: a field holding only spaces names no program,
+    // and a Test button that does nothing at all is worse than a greyed one.
+    const bool can_test =
+        !split_args(_batch_cmd).empty() && !_batch_cmd_run.busy();
+    const float button_w =
+        ImGui::CalcTextSize(msg::batch_cmd_test.get()).x +
+        ImGui::GetStyle().FramePadding.x * 2.0f;
+    const float room = ImGui::GetContentRegionAvail().x - button_w -
+                       ImGui::GetStyle().ItemSpacing.x - px(8.0f);
+    // The content is a command line: English wherever the interface is.
+    ui::InputTextMultilineRaw("##batchcmd", &_batch_cmd,
+                              batch_cmd_box_size(_batch_cmd, room));
+    if (ImGui::IsItemDeactivatedAfterEdit()) save_settings();
+    if (_batch_cmd.empty())
+        ui::hint_over_last_item_raw("python notify_me.py --message \"{message}\"");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!can_test);
+    if (ui::Button(msg::batch_cmd_test))
+        run_batch_command(msg::batch_cmd_test_message.get());
+    ui::help_on_hover_disabled(msg::batch_cmd_test_help);
+    ImGui::EndDisabled();
+    ui::TextDisabledWrapped(msg::batch_cmd_help);
+}
+
+
+// What a start would actually run, in order. The whole point of the screen is
+// that most of it does not exist yet, so seeing the list beforehand is the
+// only way to tell a five-hour queue from a mistake.
+void GuiApp::draw_batch_plan() {
+    if (_batch.empty()) return;
+    if (!ui::CollapsingHeader(msg::batch_plan_title)) return;
+    const std::vector<BatchTask> plan =
+        _batch_active ? _batch_tasks : batch_plan(_batch);
+    if (plan.empty()) {
+        ui::TextDisabled(msg::batch_plan_empty);
+        return;
+    }
+    for (size_t i = 0; i < plan.size(); i++) {
+        const BatchTask& t = plan[i];
+        if (t.row < 0 || t.row >= (int)_batch.size()) continue;
+        const BatchRow& row = _batch[(size_t)t.row];
+        const long long n = (long long)i + 1;
+        std::string line;
+        switch (t.stage) {
+            case BatchStage::Dataset:
+                line = i18n::format(msg::batch_plan_dataset,
+                                    {n, batch_dataset_workspace(row)});
+                break;
+            case BatchStage::Train: {
+                const BatchPreset p = batch_run_of(row, t.variant).preset;
+                const std::string name =
+                    p.path.empty() ? preset_label(p.name) : p.name;
+                line = row.does(BatchStage::Dataset)
+                           ? i18n::format(msg::batch_plan_train_new, {n, name})
+                           : i18n::format(msg::batch_plan_train,
+                                          {n, row.dataset, name});
+                break;
+            }
+            case BatchStage::Mesh: {
+                if (!row.model.empty()) {
+                    line = i18n::format(msg::batch_plan_mesh, {n, row.model});
+                } else if (batch_num_runs(row) > 1) {
+                    // Which run, once a row meshes some of them and not others.
+                    const BatchPreset p = batch_run_of(row, t.variant).preset;
+                    line = i18n::format(msg::batch_plan_mesh_run,
+                                        {n, p.path.empty() ? preset_label(p.name)
+                                                           : p.name});
+                } else {
+                    line = i18n::format(msg::batch_plan_mesh_new, {n});
+                }
+                break;
+            }
+        }
+        ImVec4 color = kDim;
+        if (_batch_active) {
+            if (t.status == BatchStatus::Done) color = kOk;
+            else if (t.status == BatchStatus::Failed) color = kErr;
+            else if (t.status == BatchStatus::Running) color = kWarn;
+        }
+        ui::TextColoredWrappedRaw(color, line);
+    }
+}
+
+
+// How far through the running task its own runner says it is. Every stage
+// answers in its own terms, which is why this is not one number somewhere.
+float GuiApp::batch_task_fraction() {
+    if (!_batch_active || _batch_current < 0 ||
+        _batch_current >= (int)_batch_tasks.size())
+        return -1.0f;
+    switch (_batch_tasks[(size_t)_batch_current].stage) {
+        case BatchStage::Dataset: {
+            // The steps a dataset run goes through, with the running one's own
+            // fraction inside its slot. Both engines report through that list.
+            RunProgress* p = dataset_steps();
+            const int at = std::clamp((int)p->current(), 0, kNumStages - 1);
+            const StageProgress sp = p->stage((Stage)at);
+            const float inner = sp.fraction >= 0.0f ? sp.fraction : 0.5f;
+            return std::min(1.0f, ((float)at + inner) / (float)kNumStages);
+        }
+        case BatchStage::Train: {
+            const spirula::TrainerProgress pr = _runner.latest_progress();
+            if (pr.total_steps <= 0) return -1.0f;
+            return std::min(1.0f, (float)(pr.step + 1) / (float)pr.total_steps);
+        }
+        case BatchStage::Mesh: return _mesh.progress();
+    }
+    return -1.0f;
+}
+
+double GuiApp::batch_task_elapsed() const {
+    if (!_batch_active || _batch_current < 0 ||
+        _batch_current >= (int)_batch_tasks.size())
+        return 0.0;
+    return std::max(0.0, ImGui::GetTime() -
+                             _batch_tasks[(size_t)_batch_current].started_at);
+}
+
+const BatchRow* GuiApp::batch_running_row() const {
+    if (!_batch_active || _batch_current < 0 ||
+        _batch_current >= (int)_batch_tasks.size())
+        return nullptr;
+    const int row = _batch_tasks[(size_t)_batch_current].row;
+    if (row < 0 || row >= (int)_batch.size()) return nullptr;
+    return &_batch[(size_t)row];
+}
+
+void GuiApp::draw_batch_stop_buttons() {
+    ImGui::BeginDisabled(_batch_stop_after);
+    if (ui::Button(msg::batch_stop_after, ImVec2(-8, 0)))
+        _batch_stop_after = true;
+    ui::help_on_hover(msg::batch_stop_after_help);
+    ImGui::EndDisabled();
+    if (ui::Button(msg::batch_stop_now, ImVec2(-8, 0))) {
+        _batch_stop_after = true;
+        _batch_stop_now = true;
+        if (_batch_current >= 0 && _batch_current < (int)_batch_tasks.size()) {
+            switch (_batch_tasks[(size_t)_batch_current].stage) {
+                case BatchStage::Dataset: cancel_dataset_job(); break;
+                case BatchStage::Mesh:    _mesh.cancel(); break;
+                default:                  _runner.request_stop(); break;
+            }
+        }
+    }
+    ui::help_on_hover(msg::batch_stop_now_help);
+}
+
+// What is running, on the batch screen and on the work screen that owns the
+// running task: two bars, what each has left, and the ways to stop. The work
+// screen shows the job; this says where in the QUEUE it is.
+void GuiApp::draw_batch_progress() {
+    ui::SeparatorText(msg::batch_title);
+    const float frac = batch_task_fraction();
+    const double elapsed = batch_task_elapsed();
+    const BatchProgress p =
+        batch_progress(_batch_tasks, _batch_current, frac, elapsed);
+
+    ui::Text(msg::batch_running_banner,
+             {(long long)(_batch_current + 1), (long long)_batch_tasks.size()});
+    ui::ProgressBarRaw(p.total > 0 ? (float)p.done / (float)p.total : 0.0f,
+                       ImVec2(-8, 0), nullptr);
+    ui::TextDisabled(msg::batch_eta_total,
+                     {spirula::i18n::format_duration_coarse(p.remaining)});
+
+    if (_batch_current >= 0 && _batch_current < (int)_batch_tasks.size()) {
+        const BatchTask& t = _batch_tasks[(size_t)_batch_current];
+        ImGui::PushTextWrapPos();
+        ui::TextDisabled(batch_stage_name(t.stage));
+        if (t.row >= 0 && t.row < (int)_batch.size()) {
+            const std::string what = batch_row_summary(_batch[(size_t)t.row]);
+            if (!what.empty()) ui::TextDisabledRaw(what);
+        }
+        ImGui::PopTextWrapPos();
+        ui::ProgressBarRaw(frac >= 0.0f ? frac : 0.0f, ImVec2(-8, 0), nullptr);
+        ui::TextDisabled(msg::batch_eta_task,
+                         {spirula::i18n::format_duration_coarse(elapsed),
+                          spirula::i18n::format_duration_coarse(p.task_remaining)});
+    }
+    if (_batch_stop_after) ui::TextColored(kWarn, msg::batch_stopping);
+
+    // One button, whichever way round the two screens are: the list from a
+    // work screen, the running step from the list.
+    if (_screen == Screen::Batch) {
+        if (ui::Button(msg::batch_show_training, ImVec2(-8, 0))) {
+            const BatchStage st =
+                _batch_current >= 0 && _batch_current < (int)_batch_tasks.size()
+                    ? _batch_tasks[(size_t)_batch_current].stage
+                    : BatchStage::Train;
+            switch (st) {
+                case BatchStage::Dataset: _screen = Screen::NewDataset; break;
+                case BatchStage::Mesh:    _screen = Screen::Mesh; break;
+                default:                  _screen = Screen::Train; break;
+            }
+        }
+    } else if (ui::Button(msg::batch_show_list, ImVec2(-8, 0))) {
+        _screen = Screen::Batch;
+    }
+    draw_batch_stop_buttons();
 }
 
 
@@ -4568,18 +7341,21 @@ void GuiApp::draw_train_settings() {
     }
     ImGui::BeginDisabled(busy && ph != TrainRunner::Phase::Loading);
     if (ui::Button(msg::change_dataset)) {
-        _pick = PickAction::OpenDataset;
-        _dialog.open(msg::menu_open_dataset.get(), FileDialog::Mode::Folder);
+        open_pick(PickAction::OpenDataset, msg::menu_open_dataset.get(),
+                  FileDialog::Mode::Folder);
     }
     ImGui::EndDisabled();
 
-    // ---- device ----
+    // Vulkan builds share the native picker with every built-in workflow.
+#ifdef SS_BACKEND_VULKAN
+    draw_device_picker();
+#else
     ui::SeparatorText(msg::section_device);
     {
         int n_dev = backend::device_count();
         int cur = backend::device_current();
         backend::DeviceInfo curd = backend::device_info(cur);
-        ImGui::BeginDisabled(_device_locked || busy || n_dev == 0);
+        ImGui::BeginDisabled(_cuda_device_locked || busy || n_dev == 0);
         ImGui::SetNextItemWidth(px(-8.0f));
         // Device names come from the driver; only the "none found" and
         // "unsupported" notes are ours.
@@ -4601,9 +7377,10 @@ void GuiApp::draw_train_settings() {
             ImGui::EndCombo();
         }
         ImGui::EndDisabled();
-        if (_device_locked)
-            ui::TextColoredWrapped(kDim, msg::device_locked);
+        if (_cuda_device_locked)
+            ui::TextColoredWrapped(kDim, msg::device_cuda_locked);
     }
+#endif
 
     // ---- preset + options ----
     // A batch owns the config while it runs -- each row's comes from its own
@@ -4643,13 +7420,115 @@ void GuiApp::draw_train_settings() {
     draw_metrics();
 }
 
-// The preset picker: the built-in presets and the user's saved ones in one
-// dropdown, plus the two buttons that move settings between the screen and a
-// file. The built-in NAME is the command line's word for it and is not
-// translated -- what the picker shows is the label from i18n/catalog/Train.h
-// with the name kept alongside, so a user who has read the README still
-// recognises the row they want. A saved preset shows the name its author gave
-// it, which is the only name it has.
+// Seed the shared save dialog from what is on screen: a saved preset being
+// adjusted usually wants to be saved back over itself.
+void GuiApp::open_preset_save(PresetKind kind) {
+    _preset_save_kind = kind;
+    switch (kind) {
+        case PresetKind::Dataset:
+            _preset_save_name = _ds_presets.display;
+            _preset_save_desc = _ds_presets.desc;
+            _preset_save_path = _ds_presets.file;
+            break;
+        case PresetKind::Mesh:
+            _preset_save_name = _mesh_presets.display;
+            _preset_save_desc = _mesh_presets.desc;
+            _preset_save_path = _mesh_presets.file;
+            break;
+        default:
+            _preset_save_name = _train_presets.display;
+            _preset_save_desc = _train_presets.desc;
+            _preset_save_path = _train_presets.file;
+            break;
+    }
+    _preset_path_edited = !_preset_save_path.empty();
+    _preset_save_open = true;
+}
+
+
+// The dataset screen's picker. Picking a built-in is a reset as much as a
+// choice: it starts from the settings a freshly picked capture would have had.
+void GuiApp::draw_dataset_preset_picker() {
+    refresh_dataset_presets();
+    ImGui::SetNextItemWidth(px(-8.0f));
+    const PresetChoice picked =
+        preset_combo("##dspreset", _ds_presets, _ds_presets.file,
+                     _ds_presets.builtin, dataset_builtin_rows());
+    if (picked.moved) {
+        if (picked.index >= 0 && picked.index < (int)_ds_presets.items.size())
+            apply_dataset_preset(_ds_presets.items[(size_t)picked.index]);
+        else
+            apply_dataset_builtin(picked.builtin);
+    }
+
+    if (ui::Button(msg::preset_save)) open_preset_save(PresetKind::Dataset);
+    ui::help_on_hover(msg::preset_save_help);
+    ImGui::SameLine();
+    if (ui::Button(msg::preset_load))
+        open_pick(PickAction::DatasetPresetFile, msg::preset_pick_file.get(),
+                  FileDialog::Mode::File, {".json"});
+    ui::help_on_hover(msg::preset_load_help_plain);
+    if (!_ds_presets.file.empty()) {
+        ImGui::SameLine();
+        if (ui::Button(msg::preset_delete)) {
+            _preset_delete_kind = PresetKind::Dataset;
+            _preset_delete_open = true;
+        }
+        ui::help_on_hover(msg::preset_delete_help);
+    }
+    if (!_ds_presets.msg.empty())
+        ui::TextColoredWrappedRaw(_ds_presets.msg_err ? kErr : kOk, _ds_presets.msg);
+    else if (!_ds_presets.desc.empty())
+        ui::TextColoredWrappedRaw(kDim, _ds_presets.desc);
+    else
+        ui::TextColoredWrapped(kDim, msg::preset_drop_hint_plain);
+}
+
+
+void GuiApp::draw_mesh_preset_picker() {
+    refresh_mesh_presets();
+    ImGui::SetNextItemWidth(px(-8.0f));
+    const PresetChoice picked = preset_combo("##meshpreset", _mesh_presets,
+                                             _mesh_presets.file, {}, {});
+    if (picked.moved) {
+        if (picked.index >= 0 && picked.index < (int)_mesh_presets.items.size()) {
+            apply_mesh_preset(_mesh_presets.items[(size_t)picked.index]);
+        } else {
+            MeshPreset stock;
+            apply_mesh_preset(stock);
+            _mesh_presets.file.clear();
+            _mesh_presets.display.clear();
+            _mesh_presets.desc.clear();
+            _mesh_presets.msg.clear();
+        }
+    }
+
+    if (ui::Button(msg::preset_save)) open_preset_save(PresetKind::Mesh);
+    ui::help_on_hover(msg::preset_save_help);
+    ImGui::SameLine();
+    if (ui::Button(msg::preset_load))
+        open_pick(PickAction::MeshPresetFile, msg::preset_pick_file.get(),
+                  FileDialog::Mode::File, {".json"});
+    ui::help_on_hover(msg::preset_load_help_plain);
+    if (!_mesh_presets.file.empty()) {
+        ImGui::SameLine();
+        if (ui::Button(msg::preset_delete)) {
+            _preset_delete_kind = PresetKind::Mesh;
+            _preset_delete_open = true;
+        }
+        ui::help_on_hover(msg::preset_delete_help);
+    }
+    if (!_mesh_presets.msg.empty())
+        ui::TextColoredWrappedRaw(_mesh_presets.msg_err ? kErr : kOk,
+                                  _mesh_presets.msg);
+    else if (!_mesh_presets.desc.empty())
+        ui::TextColoredWrappedRaw(kDim, _mesh_presets.desc);
+}
+
+
+// The built-in NAME is the command line's word for it and is not translated:
+// the picker shows the label from i18n/catalog/Train.h with the name beside
+// it, so a user who read the README still recognises the row they want.
 void GuiApp::draw_preset_picker() {
     static_assert(sizeof(kTrainPresets) / sizeof(kTrainPresets[0]) ==
                       i18n::msg::train::kNumPresetText,
@@ -4657,28 +7536,28 @@ void GuiApp::draw_preset_picker() {
                   "about how many presets there are");
 
     const std::string preview =
-        _preset_file.empty() ? preset_label(_preset) : _preset_display;
+        _train_presets.file.empty() ? preset_label(_preset) : _train_presets.display;
     ImGui::SetNextItemWidth(px(-8.0f));
     const bool combo_open = ui::BeginComboRaw("##preset", preview.c_str());
     // On the closed combo too: two saved presets can share a name, and this
     // is where the one in use says which file it is.
-    preset_hover(_preset_file.empty() ? preset_help(_preset) : _preset_desc,
-                 _preset_file);
+    preset_hover(_train_presets.file.empty() ? preset_help(_preset) : _train_presets.desc,
+                 _train_presets.file);
     if (combo_open) {
         refresh_presets();
         ui::SeparatorText(msg::preset_builtin_group);
         for (const auto& p : kTrainPresets) {
-            bool sel = _preset_file.empty() && _preset == p.name;
+            bool sel = _train_presets.file.empty() && _preset == p.name;
             if (ui::SelectableRaw(preset_label(p.name), sel))
                 apply_preset(p.name);
             preset_hover(preset_help(p.name), {});
             if (sel) ImGui::SetItemDefaultFocus();
         }
         ui::SeparatorText(msg::preset_user_group);
-        if (_presets.empty()) ui::TextDisabled(msg::preset_none_saved);
-        for (const auto& p : _presets) {
+        if (_train_presets.items.empty()) ui::TextDisabled(msg::preset_none_saved);
+        for (const auto& p : _train_presets.items) {
             ImGui::PushID(p.path.c_str());
-            bool sel = _preset_file == p.path;
+            bool sel = _train_presets.file == p.path;
             if (ui::SelectableRaw(p.name, sel)) apply_user_preset(p);
             preset_hover(p);
             if (sel) ImGui::SetItemDefaultFocus();
@@ -4687,35 +7566,29 @@ void GuiApp::draw_preset_picker() {
         ImGui::EndCombo();
     }
     ui::TextColoredWrappedRaw(
-        kDim, _preset_file.empty() ? preset_help(_preset) : _preset_desc);
+        kDim, _train_presets.file.empty() ? preset_help(_preset) : _train_presets.desc);
 
-    if (ui::Button(msg::preset_save)) {
-        // Seed the dialog from what is on screen: a saved preset being
-        // adjusted usually wants to be saved back over itself.
-        _preset_save_name = _preset_display;
-        _preset_save_desc = _preset_desc;
-        _preset_save_path = _preset_file;
-        _preset_path_edited = !_preset_file.empty();
-        _preset_save_open = true;
-    }
+    if (ui::Button(msg::preset_save)) open_preset_save(PresetKind::Train);
     ui::help_on_hover(msg::preset_save_help);
     ImGui::SameLine();
     if (ui::Button(msg::preset_load)) {
-        _pick = PickAction::PresetFile;
-        _dialog.open(msg::preset_pick_file.get(), FileDialog::Mode::File,
-                     {".json"}, preset_dir());
+        open_pick(PickAction::PresetFile, msg::preset_pick_file.get(),
+                  FileDialog::Mode::File, {".json"});
     }
     ui::help_on_hover(msg::preset_load_help);
 
     // Only for a saved preset: there is nothing to delete for a built-in one.
-    if (!_preset_file.empty()) {
+    if (!_train_presets.file.empty()) {
         ImGui::SameLine();
-        if (ui::Button(msg::preset_delete)) _preset_delete_open = true;
+        if (ui::Button(msg::preset_delete)) {
+            _preset_delete_kind = PresetKind::Train;
+            _preset_delete_open = true;
+        }
         ui::help_on_hover(msg::preset_delete_help);
     }
 
-    if (!_preset_msg.empty())
-        ui::TextColoredWrappedRaw(_preset_msg_err ? kErr : kOk, _preset_msg);
+    if (!_train_presets.msg.empty())
+        ui::TextColoredWrappedRaw(_train_presets.msg_err ? kErr : kOk, _train_presets.msg);
     else
         ui::TextColoredWrapped(kDim, msg::preset_drop_hint);
 }
@@ -4736,35 +7609,52 @@ void GuiApp::draw_preset_delete_modal() {
         _preset_delete_shown = false;
         return;
     }
+    // The picker the modal was armed from; every kind deletes the same way.
+    std::string* file = &_train_presets.file;
+    std::string* display = &_train_presets.display;
+    std::string* desc = &_train_presets.desc;
+    std::string* out = &_train_presets.msg;
+    bool* out_err = &_train_presets.msg_err;
+    double* scanned = &_train_presets.scanned_at;
+    if (_preset_delete_kind == PresetKind::Dataset) {
+        file = &_ds_presets.file; display = &_ds_presets.display;
+        desc = &_ds_presets.desc; out = &_ds_presets.msg;
+        out_err = &_ds_presets.msg_err; scanned = &_ds_presets.scanned_at;
+    } else if (_preset_delete_kind == PresetKind::Mesh) {
+        file = &_mesh_presets.file; display = &_mesh_presets.display;
+        desc = &_mesh_presets.desc; out = &_mesh_presets.msg;
+        out_err = &_mesh_presets.msg_err; scanned = &_mesh_presets.scanned_at;
+    }
+
     ImGui::PushTextWrapPos(px(460.0f));
-    ui::Text(msg::preset_delete_confirm, {_preset_display});
-    ui::TextDisabledRaw(_preset_file);
+    ui::Text(msg::preset_delete_confirm, {*display});
+    ui::TextDisabledRaw(*file);
     ImGui::PopTextWrapPos();
     ImGui::Spacing();
 
     if (ui::Button(msg::preset_delete_button, ImVec2(150, 0))) {
-        const std::string path = _preset_file, name = _preset_display;
+        const std::string path = *file, name = *display;
         try {
-            delete_preset(path);
+            delete_preset_file(path, _preset_delete_kind);
             // The options on screen stay exactly as they are -- what went is
-            // the saved copy, not the work. The picker falls back to naming
-            // the built-in this config descends from, the same thing it shows
-            // once any field has been edited by hand.
-            _preset_file.clear();
-            _preset_display.clear();
-            _preset_desc.clear();
-            _preset_msg = i18n::format(msg::preset_deleted, {name});
-            _preset_msg_err = false;
-            _presets_scanned_at = -1.0;
+            // the saved copy, not the work.
+            file->clear();
+            display->clear();
+            desc->clear();
+            *out = i18n::format(msg::preset_deleted, {name});
+            *out_err = false;
+            *scanned = -1.0;
             refresh_presets();
+            refresh_dataset_presets();
+            refresh_mesh_presets();
             // Rows pointing at the file that just went would fail at launch;
             // the next check says so instead.
             _batch_checked = false;
         } catch (const std::exception& e) {
-            _preset_msg = i18n::format(msg::preset_delete_failed, {e.what()});
-            _preset_msg_err = true;
+            *out = i18n::format(msg::preset_delete_failed, {e.what()});
+            *out_err = true;
         }
-        log(_preset_msg);
+        log(*out);
         _preset_delete_shown = false;
         ImGui::CloseCurrentPopup();
     }
@@ -4803,9 +7693,9 @@ void GuiApp::draw_preset_save_modal() {
 
     // The path follows the name until the user takes it over.
     if (!_preset_path_edited)
-        _preset_save_path =
-            (fs::path(preset_dir()) / preset_file_name(_preset_save_name))
-                .string();
+        _preset_save_path = (fs::path(preset_dir(_preset_save_kind)) /
+                             preset_file_name(_preset_save_name))
+                                .string();
 
     ImGui::Spacing();
     ImGui::SetNextItemWidth(fw);
@@ -4814,10 +7704,10 @@ void GuiApp::draw_preset_save_modal() {
         _preset_path_edited = true;
     ImGui::SameLine();
     if (ui::ButtonRaw("...##preset_dir")) {
-        _pick = PickAction::PresetSaveFolder;
         _preset_path_edited = true;
-        _dialog.open(msg::preset_pick_folder.get(), FileDialog::Mode::Folder,
-                     {}, fs::path(_preset_save_path).parent_path().string());
+        open_pick(PickAction::PresetSaveFolder, msg::preset_pick_folder.get(),
+                  FileDialog::Mode::Folder, {},
+                  fs::path(_preset_save_path).parent_path().string());
         // ImGui shows one modal at a time and the dialog is one too, so this
         // one steps aside and is re-armed when the pick comes back. Nothing is
         // lost: the name, the description and the path are all state here.
@@ -4844,29 +7734,67 @@ void GuiApp::draw_preset_save_modal() {
     if (ui::Button(exists ? msg::preset_overwrite_button
                           : msg::preset_save_button,
                    ImVec2(150, 0))) {
-        TrainPreset p;
-        p.name = _preset_save_name;
-        p.description = _preset_save_desc;
-        p.base = _preset;
-        p.cfg = _cfg;
-        p.touched = _cfg_ui.touched;
-        try {
-            save_preset(p, _preset_save_path);
-            p.path = _preset_save_path;
-            // Saving is also selecting: the screen now shows this preset.
-            _preset_file = p.path;
-            _preset_display = p.name;
-            _preset_desc = p.description;
-            _defaults = _cfg;
-            _preset_msg = i18n::format(msg::preset_saved, {_preset_save_path});
-            _preset_msg_err = false;
-            _presets_scanned_at = -1.0;   // the new file must show up at once
-            refresh_presets();
-        } catch (const std::exception& e) {
-            _preset_msg = i18n::format(msg::preset_failed, {e.what()});
-            _preset_msg_err = true;
+        // Whichever screen armed the dialog; the three write the same header
+        // and then their own settings (PresetFile.h).
+        std::string* out = &_train_presets.msg;
+        bool* out_err = &_train_presets.msg_err;
+        if (_preset_save_kind == PresetKind::Dataset) {
+            out = &_ds_presets.msg; out_err = &_ds_presets.msg_err;
+        } else if (_preset_save_kind == PresetKind::Mesh) {
+            out = &_mesh_presets.msg; out_err = &_mesh_presets.msg_err;
         }
-        log(_preset_msg);
+        try {
+            switch (_preset_save_kind) {
+                case PresetKind::Dataset: {
+                    DatasetPreset p{_preset_save_name, _preset_save_desc,
+                                    _preset_save_path, capture_dataset_settings()};
+                    save_dataset_preset(p, _preset_save_path);
+                    _ds_presets.file = _preset_save_path;
+                    _ds_presets.builtin.clear();
+                    _ds_presets.display = p.name;
+                    _ds_presets.desc = p.description;
+                    _ds_presets.scanned_at = -1.0;
+                    break;
+                }
+                case PresetKind::Mesh: {
+                    MeshPreset p;
+                    p.name = _preset_save_name;
+                    p.description = _preset_save_desc;
+                    p.job = _mesh_job;
+                    save_mesh_preset(p, _preset_save_path);
+                    _mesh_presets.file = _preset_save_path;
+                    _mesh_presets.display = p.name;
+                    _mesh_presets.desc = p.description;
+                    _mesh_presets.scanned_at = -1.0;
+                    break;
+                }
+                default: {
+                    TrainPreset p;
+                    p.name = _preset_save_name;
+                    p.description = _preset_save_desc;
+                    p.base = _preset;
+                    p.cfg = _cfg;
+                    p.touched = _cfg_ui.touched;
+                    save_preset(p, _preset_save_path);
+                    // Saving is also selecting: the screen now shows this one.
+                    _train_presets.file = _preset_save_path;
+                    _train_presets.display = p.name;
+                    _train_presets.desc = p.description;
+                    _train_presets.scanned_at = -1.0;
+                    _defaults = _cfg;
+                    break;
+                }
+            }
+            *out = i18n::format(msg::preset_saved, {_preset_save_path});
+            *out_err = false;
+            refresh_presets();
+            refresh_dataset_presets();
+            refresh_mesh_presets();
+        } catch (const std::exception& e) {
+            *out = i18n::format(msg::preset_failed, {e.what()});
+            *out_err = true;
+        }
+        log(*out);
         _preset_save_shown = false;
         ImGui::CloseCurrentPopup();
     }
@@ -4877,37 +7805,6 @@ void GuiApp::draw_preset_save_modal() {
         ImGui::CloseCurrentPopup();
     }
     ImGui::EndPopup();
-}
-
-// What the trainer screen's left panel says while a batch owns it: which row
-// is running, out of how many, and the two ways to stop.
-void GuiApp::draw_batch_progress() {
-    ui::SeparatorText(msg::batch_title);
-    const long long total = (long long)_batch.size();
-    ui::Text(msg::batch_running_banner,
-             {(long long)(_batch_current + 1), total});
-    if (_batch_current >= 0 && _batch_current < (int)_batch.size()) {
-        const BatchJob& j = _batch[_batch_current];
-        ImGui::PushTextWrapPos();
-        ui::TextDisabled(msg::batch_running_dataset, {j.dataset});
-        ui::TextDisabled(msg::batch_running_preset, {j.preset_name});
-        ImGui::PopTextWrapPos();
-    }
-    if (_batch_stop_after) ui::TextColored(kWarn, msg::batch_stopping);
-
-    if (ui::Button(msg::batch_show_list, ImVec2(-8, 0)))
-        _screen = Screen::Batch;
-    ImGui::BeginDisabled(_batch_stop_after);
-    if (ui::Button(msg::batch_stop_after, ImVec2(-8, 0)))
-        _batch_stop_after = true;
-    ui::help_on_hover(msg::batch_stop_after_help);
-    ImGui::EndDisabled();
-    if (ui::Button(msg::batch_stop_now, ImVec2(-8, 0))) {
-        _batch_stop_after = true;
-        _batch_stop_now = true;
-        _runner.request_stop();
-    }
-    ui::help_on_hover(msg::batch_stop_now_help);
 }
 
 // Every edit here records itself in _cfg_ui.touched, the same way the
@@ -4945,9 +7842,8 @@ void GuiApp::draw_basic_options() {
         _cfg_ui.touched.insert("output_dir_prefix");
     ImGui::SameLine();
     if (ui::ButtonRaw("...##outdir")) {
-        _pick = PickAction::OutputPrefix;
-        _dialog.open(msg::pick_output_folder.get(), FileDialog::Mode::Folder,
-                     {}, _cfg.output_dir_prefix);
+        open_pick(PickAction::OutputPrefix, msg::pick_output_folder.get(),
+                  FileDialog::Mode::Folder, {}, _cfg.output_dir_prefix);
     }
     ImGui::SameLine();
     ui::Text(msg::opt_output_folder);
@@ -4992,34 +7888,48 @@ void GuiApp::draw_basic_options() {
             _cfg_ui.touched.insert("primitive");
         }
         ui::help_on_hover(msg::opt_primitive_help);
+        if (_cfg.primitive == "3dgut")
+            ui::TextColoredWrapped(kWarn, msg::opt_primitive_3dgut_warn);
     }
 
-    int ds_idx = _cfg.rescale_camera_to_fit == 2.0f ? 1
-               : _cfg.rescale_camera_to_fit == 4.0f ? 2
-               : _cfg.rescale_camera_to_fit == 8.0f ? 3 : 0;
+    int ds_idx = _cfg.train_resolution_divisor == 2.0f ? 1
+               : _cfg.train_resolution_divisor == 4.0f ? 2
+               : _cfg.train_resolution_divisor == 8.0f ? 3 : 0;
     {
         // "1/2" is a fraction, not a word; only "native" is translated.
         const char* items[] = {msg::opt_resolution_native.get(), "1/2", "1/4", "1/8"};
         ImGui::SetNextItemWidth(w);
         if (ui::ComboRaw(ui::detail::label(msg::opt_resolution), &ds_idx, items, 4)) {
             const float vals[] = {0.0f, 2.0f, 4.0f, 8.0f};
-            _cfg.rescale_camera_to_fit = vals[ds_idx];
-            _cfg_ui.touched.insert("rescale_camera_to_fit");
+            _cfg.train_resolution_divisor = vals[ds_idx];
+            _cfg_ui.touched.insert("train_resolution_divisor");
         }
     }
     ui::help_on_hover(msg::opt_resolution_help);
 
     {
-        int mi = !_cfg.load_masks ? 2 : _cfg.apply_loss_for_mask ? 1 : 0;
+        // Unset, the mode is whatever the parsed dataset resolved it to --
+        // cut out for masks that are only the images' alpha (TrainerCore).
+        bool cut_out = _cfg.apply_loss_for_mask.value_or(false);
+        const TrainRunner::Phase ph = _runner.phase();
+        if (!_cfg.apply_loss_for_mask.has_value() &&
+            (ph == TrainRunner::Phase::Ready || ph == TrainRunner::Phase::Training ||
+             ph == TrainRunner::Phase::Done))
+            if (auto* s = _runner.session())
+                cut_out = s->cfg.apply_loss_for_mask.value_or(false);
+        int mi = !_cfg.load_masks ? 2 : cut_out ? 1 : 0;
         ImGui::SetNextItemWidth(w);
         if (ui::Combo(msg::opt_mask_mode, &mi,
                       {&msg::opt_mask_mode_exclude,
                        &msg::opt_mask_mode_cut_out,
                        &msg::opt_mask_mode_off})) {
             _cfg.load_masks = mi != 2;
-            _cfg.apply_loss_for_mask = mi == 1;
             _cfg_ui.touched.insert("load_masks");
-            _cfg_ui.touched.insert("apply_loss_for_mask");
+            // Off says nothing about what masks mean, so it keeps auto.
+            if (mi != 2) {
+                _cfg.apply_loss_for_mask = mi == 1;
+                _cfg_ui.touched.insert("apply_loss_for_mask");
+            }
         }
         ui::help_on_hover(msg::opt_mask_mode_help);
     }
@@ -5048,6 +7958,8 @@ void GuiApp::draw_basic_options() {
     macro_option("distraction_robustness", _cfg.distraction_robustness,
                  fld::distraction_robustness, fld::distraction_robustness_help,
                  {"off", "mild", "strong"});
+    if (_cfg.distraction_robustness != "off")
+        ui::TextColoredWrapped(kWarn, msg::opt_distraction_warn);
 }
 
 void GuiApp::draw_train_controls() {
@@ -5072,9 +7984,12 @@ void GuiApp::draw_train_controls() {
                     ImGui::PopTextWrapPos();
                 }
             }
-            bool can_start = ph == TrainRunner::Phase::Ready ||
-                             ph == TrainRunner::Phase::Done ||
-                             ph == TrainRunner::Phase::TrainError;
+            // A batch owns the runner between its tasks, so the queue's own
+            // next row is what starts -- never a click here.
+            bool can_start = !_batch_active &&
+                             (ph == TrainRunner::Phase::Ready ||
+                              ph == TrainRunner::Phase::Done ||
+                              ph == TrainRunner::Phase::TrainError);
             ImGui::BeginDisabled(!can_start);
             if (ui::Button(ph == TrainRunner::Phase::Done ? msg::train_again
                                                           : msg::start_training,
@@ -5126,17 +8041,24 @@ void GuiApp::draw_metrics() {
     ui::SeparatorText(msg::section_metrics);
     // Downsample to <= 240 plot points.
     int stride = std::max<size_t>(1, pts.size() / 240);
-    static std::vector<float> psnr, splats;
+    static std::vector<float> steps, psnr, splats;
+    steps.clear();
     psnr.clear();
     splats.clear();
-    for (size_t i = 0; i < pts.size(); i += stride) {
+    auto take = [&](size_t i) {
+        steps.push_back((float)pts[i].step);
         psnr.push_back(pts[i].psnr);
         splats.push_back(pts[i].num_splats);
-    }
+    };
+    size_t last_i = 0;
+    for (size_t i = 0; i < pts.size(); i += stride) { take(i); last_i = i; }
+    // The stride can stop short of the newest point, which on a step axis
+    // leaves the curve ending before the score printed beside it.
+    if (last_i != pts.size() - 1) take(pts.size() - 1);
     const auto& last = pts.back();
     // PSNR / SSIM / loss are the metric names the literature and the logs use;
     // they are not translated, only the numbers change.
-    ui::PlotLinesRaw("##psnr", psnr.data(), (int)psnr.size(), nullptr,
+    ui::PlotLinesRaw(steps.data(), psnr.data(), (int)psnr.size(),
                      ImVec2(-8, px(64.0f)));
     // The score, placed in the plot's own rectangle rather than handed to
     // PlotLines as its overlay: that one is drawn against the TOP of the
@@ -5174,8 +8096,10 @@ void GuiApp::draw_status_strip() {
         float frac = (float)(p.step + 1) / (float)p.total_steps;
         ui::ProgressBar(frac, ImVec2(-8, 0), msg::status_step,
                         {p.step + 1, p.total_steps, (int)(frac * 100.0f)});
+        const double avg = _runner.avg_step_latency();
         char ms[32];
-        std::snprintf(ms, sizeof ms, "%.0f", p.step_latency * 1000.0);
+        std::snprintf(ms, sizeof ms, "%.0f",
+                      (avg >= 0.0 ? avg : p.step_latency) * 1000.0);
         ui::Text(_runner.paused() ? msg::status_rate_paused : msg::status_rate,
                  {ms, format_duration(_runner.elapsed_seconds()),
                   format_duration(_runner.eta_seconds()),
@@ -5298,7 +8222,11 @@ float GuiApp::log_height(float avail) const {
 }
 
 float GuiApp::body_height(float log_h) {
-    return log_h > 0.0f ? -(log_h + splitter_extent()) : 0.0f;
+    // ItemSpacing twice: once above the splitter's grab and once below it.
+    // Counting it once left the body a spacing too tall, which the host window
+    // answered by becoming scrollable by exactly that much.
+    if (log_h <= 0.0f) return 0.0f;
+    return -(log_h + splitter_extent() + ImGui::GetStyle().ItemSpacing.y);
 }
 
 void GuiApp::draw_log_panel(float height) {
@@ -5371,11 +8299,7 @@ void GuiApp::draw_log_panel(float height) {
             for (const auto& e : _log) { all += e.text; all += '\n'; }
             ImGui::SetClipboardText(all.c_str());
         }
-        if (ui::MenuItem(msg::log_clear)) {
-            _log.clear();
-            _log_dropped = 0;
-            _log_shown_dirty = true;
-        }
+        if (ui::MenuItem(msg::log_clear)) clear_log();
         ImGui::EndPopup();
     }
     ImGui::EndChild();

@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "core/SourcePath.h"
+#include "core/VulkanDeviceSelection.h"
 
 namespace nn {
 namespace vk {
@@ -41,17 +42,21 @@ struct DeviceInfo {
     uint64_t    vram_bytes = 0;
     bool        usable = false;   // meets the Vulkan 1.2 baseline
     std::string unusable_reason;
+    std::string uuid;             // canonical "uuid:<32 hex>", "" if unreported
 };
 
 // Side-effect free: does not create or touch the process Context.
 std::vector<DeviceInfo> enumerate_devices();
 
 struct ContextOptions {
-    // -1 = auto (discrete > integrated > cpu, VRAM tie-break). Overridden by
-    // $SS_VK_DEVICE, which accepts an index or a case-insensitive substring of
-    // the device name.
+    // -1 = auto (discrete > integrated > virtual > cpu, VRAM tie-break).
     int         device_index = -1;
     std::string device_match;
+    // A selector from core/VulkanDeviceSelection.h: "auto", an ordinal, a name
+    // substring or "uuid:<32 hex>". An explicit value wins over the
+    // environment; an empty one leaves the environment in charge.
+    std::string device_selector;
+    bool        selector_set = false;  // device_selector is authoritative
     bool        validation = false;   // or $SS_VK_VALIDATION=1
     bool        profile = false;      // or $SS_PROFILE=1
     bool        want_video = false;   // request the video-decode queue family
@@ -66,6 +71,20 @@ public:
     // Releases the device. Every buffer, pipeline and pool must already be
     // gone; call only at shutdown.
     static void     shutdown();
+    // Registers the device request without creating a logical device. Re-
+    // configuring the same identity is a no-op; a different one after
+    // initialization throws -- the device cannot change under live resources.
+    static void     configure(const ContextOptions& opts);
+    // Side-effect-free resolution with status, for preflight/UI diagnostics.
+    static spirula::vkselect::Resolution resolveSelector(
+        const spirula::vkselect::Request& req);
+    // Configured identity: the canonical selector, or "" while Auto and nothing
+    // has been resolved yet. Survives shutdown(); each context generation
+    // re-resolves it in its own instance.
+    static std::string configured_selector();
+    // Identity of the live context, "" before initialization. A live context is
+    // the only thing that can report the device it actually chose.
+    static std::string current_selector();
     // 0 before the first get(), then bumped on every context creation.
     // shutdown() is not the end of the process -- the GUI hands the GPU back
     // between jobs and creates a second context later -- so anything that
@@ -103,6 +122,10 @@ public:
     bool               hasCoopMat()    const { return coopmat_; }
     const std::string& coopMatReason() const { return coopmat_reason_; }
 
+    // 64-bit integer arithmetic, which only the `*_wide` shader modules use --
+    // to address past 4 GiB. Contained the same way the coop-matrix module is.
+    bool               hasInt64()      const { return int64_; }
+
     // Video decode support, resolved at device creation. `videoQueueFamily()`
     // is UINT32_MAX when unavailable; `videoUnavailableReason()` then explains
     // why, for the error video/VideoDecoder.cpp raises.
@@ -124,6 +147,12 @@ private:
     ~Context();
     Context(const Context&) = delete;
     Context& operator=(const Context&) = delete;
+
+    // The destructor is private, so publication in get() needs an owner whose
+    // deleter is a member of this class.
+    struct Deleter {
+        void operator()(Context* c) const { delete c; }
+    };
 
     void init(const ContextOptions& opts);
     void pickPhysicalDevice(const ContextOptions& opts);
@@ -149,6 +178,7 @@ private:
     uint32_t preferred_subgroup_ = 32;
     bool     profiling_ = false;
 
+    bool        int64_ = false;
     bool        coopmat_ = false;
     std::string coopmat_reason_ = "not probed";
 };

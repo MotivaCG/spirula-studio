@@ -109,6 +109,21 @@ void set_training_data_warped(
 
 // --- Forward ---
 
+// Binning tile edge in pixels for subsequent forwards: a power of two in
+// [8, 128], or 0 to choose from the splat footprint each forward measures.
+// Sticky; throws on a size that is not a supported power of two.
+void engine_set_bin_tile_size(int pixels);
+
+// One training step's fwd+bwd wall time, which the automatic binning search
+// compares between granularities. Training only -- a viewport render must not
+// feed it. No-op when a size is forced.
+void engine_bin_tile_observe(double step_seconds);
+
+// Binning granularity the next forward at the current camera size will use.
+// Anything sized against the tile grid before the forward -- the live-tile
+// map -- has to ask, or it builds a grid the intersect then indexes wrongly.
+int engine_bin_macro_log2();
+
 void forward_3dgs(
     std::string primitive,
     int sh_degree,
@@ -150,6 +165,8 @@ std::map<std::string, float> engine_compute_loss_backward(
     float loss_map_power,
     // DensifyAccumMode as an int (see LossConfig::loss_map_accum_mode).
     int loss_map_accum_mode,
+    // Clipped-highlight cutoff (see LossConfig::saturation_threshold).
+    float saturation_threshold,
     // Image-space overexposure regularization weight (see LossConfig).
     // Zero (default) disables the kernel launch entirely.
     float overexposure_reg_weight = 0.0f,
@@ -212,16 +229,18 @@ void engine_bilagrid_forward(TorchTensorView cam_indices);
 // Adam step + optional TV-loss regularization for each enabled bilagrid type.
 void engine_bilagrid_optim_step(int step, const BilagridStepConfig& cfg);
 
-// --- PPISP (RGB only, applied AFTER bilagrid). ---
-// Table seeded with the param_type's defaults; exposure_init optionally seeds
-// params[:, 0] with [n_grids] log2 gains. use_adagrad: AdaGrad over Adam.
+// --- PPISP (RGB only; PpispStepConfig picks where in the chain it runs) ---
+// ppisp_param_spec (kernels/pixelwise/PixelWise.cuh) owns the param_type list.
+
+// exposure_init optionally seeds params[:, 0] with [n_grids] log2 gains;
+// exposure_arithmetic_mean regularizes log2(mean gain), else mean(log2 gain).
 void engine_init_ppisp(int n_grids, std::string param_type, bool use_adagrad,
+                       bool exposure_arithmetic_mean,
                        const std::vector<float>& exposure_init = {});
 
 // Apply PPISP forward in place on the current rendered RGB; saves a pre-PPISP
-// copy used by backward. cam_indices: [C_batch] int32, or null/empty for
-// identity. Must be called after forward_3dgs (and after engine_bilagrid_forward
-// when bilagrid is also enabled).
+// copy used by backward. cam_indices: [C_batch] int32, null/empty for identity.
+// After forward_3dgs -- the before-color-space order runs inside it instead.
 void engine_ppisp_forward(TorchTensorView cam_indices);
 
 // Optimizer step over the PPISP parameter table (Adam or AdaGrad depending on
@@ -231,31 +250,40 @@ void engine_ppisp_forward(TorchTensorView cam_indices);
 void engine_ppisp_optim_step(int step, const PpispStepConfig& cfg);
 
 // --- Background blending (applied BEFORE bilagrid/PPISP) ---
-//
-// Two modes -- exactly one of these init calls activates background blending:
-//   Noise: random per-pixel color, warmup-weighted via cfg.background.randomize_weight.
-//   SH:    skybox = SH(world ray dir), DC (slot 0) seeds the "background_color"
-//          plus higher-order bands; both updated by Adam when train_color=true.
-//
-// dc_color is the linear-space DC color used at SH init time (set slot 0).
-void engine_init_background_noise(bool splat_color_is_linear);
-void engine_init_background_sh(
-    int sh_degree, bool splat_color_is_linear);
+// Exactly one of these init calls activates it; `--background-mode` picks.
 
-// Per-iter (seed, randomize_weight) for the next forward_3dgs background blend.
-// Training calls this each step; the viewer/eval path can ignore it and reuse
-// the last-stashed values (the engine defaults of 0/0 produce a uniform
-// half-gray noise blend, avoiding per-frame flicker in noise-mode viewer renders).
-void engine_set_background_step_params(uint32_t seed, float randomize_weight);
+// Random color per pixel, warmup-weighted via cfg.background.randomize_weight.
+void engine_init_background_noise(int splat_transfer, bool splat_is_linear);
+// Same blend, but the draw is one of the 8 RGB cube corners per tile instead
+// of per-pixel noise: the extremes cost residual transparency the most, and a
+// tile survives the SSIM window that averages per-pixel noise back to grey.
+void engine_init_background_pseudorandom(int splat_transfer, bool splat_is_linear);
+// Same blend again over one cell covering the whole frame: a flat color that
+// changes every step, warmup-weighted like the other two.
+void engine_init_background_random(int splat_transfer, bool splat_is_linear);
+// `color` is display-referred RGB in [0, 1]; the engine converts it once, and
+// all-black turns the background OFF instead of blending a no-op.
+void engine_init_background_color(const float color[3], int splat_transfer,
+                                  bool splat_is_linear);
+// Skybox = SH(world ray dir); slot 0 is the DC color, and Adam updates the
+// whole table.
+void engine_init_background_sh(
+    int sh_degree, int splat_transfer, bool splat_is_linear);
+
+// Per-iter values for the next forward_3dgs blend. The loss scale pair is the
+// LossConfig's, because the randomized backgrounds size their cells over the
+// same pyramid. All-zero is the flicker-free viewer/eval default.
+void engine_set_background_step_params(uint32_t seed, float randomize_weight,
+                                       int num_loss_scales,
+                                       int loss_scale_min_pixels);
 
 // Adam step over the SH coefficient table. No-op for Noise mode or when SH
 // training was not enabled at init.
 void engine_background_optim_step(int step, const BackgroundStepConfig& cfg);
 
-// Copy the engine's background image for the current camera setup to a host
-// (..., H, W, 3) float buffer. SH mode: returns the skybox rendered by the
-// most recent forward_3dgs. Noise mode: returns a uniform mean-color image.
-// Returns 1 on success, 0 if no engine background is active.
+// Copy the engine's background for the current cameras into a host
+// (..., H, W, 3) float buffer: SH gives the last forward's skybox, Color and
+// the randomized modes a flat fill. 0 when no background is active.
 int engine_copy_background_to_host(TorchTensorView out_image);
 
 // --- Linear / wide-gamut color space ---
@@ -269,9 +297,11 @@ int engine_copy_background_to_host(TorchTensorView out_image);
 // matrices when the corresponding side is not enabled.
 void engine_init_color_space(
     bool splat_enabled,
-    bool splat_is_linear,
+    int splat_transfer,                       // colorspace::Transfer
+    bool splat_is_linear,                     // splats store linear light
     std::vector<float> splat_color_matrix,    // [9], row-major
     bool image_enabled,
+    int image_transfer,
     bool image_is_linear,
     std::vector<float> image_color_matrix     // [9], row-major
 );
@@ -533,20 +563,10 @@ void engine_copy_grads_to_host(
 );
 
 // --- Viewer ---
-//
-// engine_viewer_init: lazy one-shot upload of the dataset-wide POST-split
-// camera arrays (intrins / dist_coeffs + tier / c2w / camera_models / W / H)
-// and allocation of the device-side per-camera thumbnail cache + done-mask.
-// After this, every set_training_data / set_training_data_warped also runs
-// the thumbnail-fill kernel for any new post-camera ids in the batch (cheap
-// kernel; gated on host counter once all cams have a thumbnail). Idempotent;
-// safe to call multiple times (re-uploads + resets thumbnail state).
-//
-// camera_models / intrins / dist_coeffs / distortions / camera_to_worlds /
-// widths / heights are at POST-split layout (length N_post == sum over input
-// cameras of K), matching the DataManager's post-split arrays.
-//
-// camera_size: the visualization-frustum scale (knn-style), in world units.
+
+// One-shot upload of the POST-split camera table (N_post rows, the
+// DataManager's layout) and the thumbnail cache set_training_data fills.
+// Idempotent (re-upload resets thumbnails). camera_size: frustum scale, world units.
 void engine_viewer_init(
     TorchTensorView camera_models,   // [N_post]   int32
     TorchTensorView intrins,         // [N_post,4] float32
@@ -627,7 +647,8 @@ void engine_scene_set_data_3dgs(
 // The model's own colour space, applied by engine_scene_activate. Two models
 // trained in different spaces are converted each its own way, which is the
 // whole point of carrying it here rather than in the engine's one slot.
-void engine_scene_set_color_space(int slot, bool enabled, bool is_linear,
+void engine_scene_set_color_space(int slot, bool enabled, int transfer,
+                                  bool is_linear,
                                   std::vector<float> color_matrix);
 
 // Bind `slot` to the world buffers. Throws when the slot holds nothing.
@@ -643,6 +664,14 @@ std::vector<std::tuple<std::string, size_t, size_t>> engine_get_pool_breakdown()
 std::vector<std::tuple<std::string, std::string, size_t, size_t>>
 engine_get_pool_breakdown_categorized();
 size_t engine_get_scratch_bytes();
+
+// Formatted per-category pool report (SS_PROFILE). Reads the pool's
+// high-water capacities, so it is a peak, not an instantaneous figure.
+std::string engine_vram_report();
+// Hand that report to the profiler, which prints it at process exit -- by
+// which time the pool this reads is already destroyed. No-op unless
+// SS_PROFILE is set.
+void engine_profile_capture_vram();
 
 // --- Checkpoint save ---
 //

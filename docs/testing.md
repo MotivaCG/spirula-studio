@@ -5,11 +5,17 @@ describe is gone -- see §3 for what it covered and what now does not.
 
 ## 1. Native cross-backend parity tests (the important ones)
 
-`src/backend/tests/*.cpp` — currently 18 tools covering projection (fwd, bwd,
+`src/backend/tests/*.cpp` — currently 20 tools covering projection (fwd, bwd,
 quant-grad), rasterization bwd, tile intersect, warp, FPBO, optimizer (general
 + geometry), densify, per-pixel train, PPISP, bilagrid, multi-scale loss
-(`mask_loss_semantics` is self-checking rather than dump-then-compare: it pins
-what an image mask means in the loss, in both mask modes and with none),
+(`mask_loss_semantics`, `reg_loss_underflow` and `fpbo_split_parity` are
+self-checking rather than dump-then-compare: the first pins what an image mask
+means in the loss, in both mask modes and with none; the second sweeps log
+scales past every exp(scales) underflow threshold, down to -inf, and fails if
+the per-splat regularizers hand the optimizer a NaN or push a splat below
+kMinLogScale; the third steps FPBO and the non-fused optimizer path from the
+same state and fails if they disagree, which is how the two update laws for
+linear splat colour are held together),
 meshing (activation, LBVH, occupancy/bisection/color, moment raster, the
 per-camera samplers and the visibility cull), plus
 `backend/tests/engine/` which drives the *real* engine end to end
@@ -29,12 +35,36 @@ is dump-then-compare:
 # on the CUDA machine
 ./build_cuda/projection_parity dump ref.bin
 # on the target machine / device
-./build/projection_parity compare ref.bin
+./build_vulkan/projection_parity compare ref.bin
 ```
 
 Inputs are deterministic, and comparison is tolerance-based — fast-math
 exp/sqrt chains legitimately differ across compilers, and borderline-cull
 flips change whole rows, so a small allowance for those is built in.
+
+Two tests carry a **relative-RMS gate** alongside the per-element one, for the
+same reason: they contain discrete per-pixel or per-splat decisions that flip
+wherever an architecture's rounding differs from the reference's, so a handful
+of large outliers is expected while the vector as a whole must still agree.
+`msloss_parity`'s NMS / quantile / clip modes put an RX 7800 XT at 0.21% of
+tight elements out of tolerance (max_abs 4.19) against 0% on NVIDIA Vulkan --
+but 3.8e-4 relative RMS against 1.8e-7. A permuted or biased reference sits
+orders of magnitude above that, which is what the RMS gate is there to catch.
+
+`engine_train_parity` has two gates rather than one, because per-element
+agreement is not something any implementation can hold across 12 optimizer
+steps. The threshold-crossing kernels -- median depth, masked-tile skip, the
+rasterize-bwd survivor batching -- flip a handful of pixels per step wherever
+an architecture's rounding differs from the reference's, and Adam turns a
+flipped gradient sign into a full-size parameter step, so the trajectories
+separate. Measured against a CUDA reference (2026-08-25): NVIDIA Vulkan lands
+0.003% of elements out of tolerance at 4.8e-7 relative RMS, while an RX 7800 XT
+lands 4.4% at 1.4e-4 -- identically on amdvlk and RADV, and unchanged by
+`RADV_PERFTEST=wave32`, so it is not a wave-size effect. The divergence starts
+in `depth_loss` and `normal_loss` (discrete median-depth selection); `rgb_loss`,
+`ssim` and `psnr` stay at 1e-7. An indexing or layout break, by contrast, puts
+30%+ of elements out of tolerance at a relative RMS above 1. The RMS gate is
+what keeps the test sharp; the element gate is loose enough to absorb the drift.
 
 `msloss_parity` splits its reference into two channels. **Tight**: per-pixel
 gradients (deterministic given the raw-loss sums, which enter them only through
@@ -59,12 +89,13 @@ of guessing.
 
 ```bash
 # CUDA branch: opt-in
-bash build_develop.bash -B build_cuda -DSS_BACKEND=cuda -DSS_BUILD_BACKEND_TESTS=ON
+bash build_develop.bash -DSS_BACKEND=cuda -DSS_BUILD_BACKEND_TESTS=ON
 # Vulkan branch: built unconditionally
 bash build_develop.bash -DSS_BACKEND=vulkan
 ```
 
-Each `.cpp` becomes an executable of the same base name in the build dir.
+Each `.cpp` becomes an executable of the same base name in that backend's
+build tree -- `build_cuda/` or `build_vulkan/` (`build/` on macOS).
 
 ### Cross-machine / cross-vendor runs
 
@@ -155,7 +186,11 @@ expectation, one executable. Neither exists yet.
 | training-loop logic | `TrainerCore.cpp` — `build_step_config()` is the only place it lives |
 | build system | every mode in [build.md](build.md) |
 | a comment you wrote | `python3 tools/check_comment_length.py` — the build runs it anyway ([lints](build.md#lints)) |
-| `SS_FILE` or `SS_SOURCE_ROOT` | `./build/source_path` on each toolchain — MSVC, GCC and nvcc spell `__FILE__` differently |
+| `SS_FILE` or `SS_SOURCE_ROOT` | `source_path` on each toolchain — MSVC, GCC and nvcc spell `__FILE__` differently |
+| a mesh format, or which colors it carries | `mesh_format_roundtrip` — writes every format and reads it back through the other implementation |
+| a preset field, or a batch row's shape | `preset_roundtrip_test` |
+| what a typed-in command line becomes, or what a message may carry into it | `command_argv_test` — the message stays one argument and stays JSON-safe |
+| a per-cell optimizer launcher (Vulkan) | `SS_OPTIM_SLICE_CELLS=2048` on `optim_parity` / `optimgeo_parity`, which forces the multi-slice path only an SH buffer past ~24M splats would otherwise take ([SH layouts](notes/sh-quant-layout.md)) |
 | anything | one short training run per backend on a public scene |
 
 ## Profiling
@@ -164,3 +199,32 @@ expectation, one executable. Neither exists yet.
 (H2D / D2H / D2D / memset / device / host). Header-only, works on both
 backends — the right first tool when a backend is unexpectedly slow rather
 than wrong.
+
+Above that table both backends print **GPU time by kernel**, so the two are
+directly comparable without a profiler. Vulkan brackets each dispatch with
+timestamp queries; CUDA does the same with a CUDA event pair, injected by
+`-Wl,--wrap=cudaLaunchKernel` (`backend/cuda/KernelProfilerCuda.cu`) so no
+launch site is instrumented by hand and CUB's kernels are covered too. Rows
+aggregate over template arguments / specialization constants, which is what
+makes a CUDA row and a Vulkan row the same thing.
+
+Two caveats on reading those numbers against each other. The intervals
+include the gap before each kernel starts, so their sum runs a little over
+the device-wait total. And a training run is **not** reproducible: atomic
+order moves the trajectory, and the rasterization and sort kernels then see a
+different scene — `rasterize_fwd` has been seen to move 70% between two runs
+of the same binary. The image-sized kernels (losses, bilagrid, PPISP, FPBO)
+hold to ~1%, so they can be A/B'd from a training run directly; for the rest
+use the benchmark tools, which fix the workload:
+
+```bash
+./build_vulkan/raster_bench [num_splats] [iters] [macro_log2]   # raster fwd/bwd, binning
+./build_vulkan/fpbo_bench   [num_splats] [iters]                # fused projection bwd + optimizer
+```
+
+A run that trains also prints a VRAM breakdown after the timing table: pool
+capacity per `VramCategory` (`src/core/PoolSlots.h`), the scratch buffer, the
+driver's process figure, and the twelve largest buffers. The pool never
+shrinks, so those are training peaks, not the numbers at exit. Both front
+ends emit it — the CLI at the end of the process, the GUI when its window
+closes.

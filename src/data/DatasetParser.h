@@ -11,6 +11,8 @@
 // that to the POST-split arrays engine_setup_data_manager consumes: identity
 // at K=1, or the pinhole faces camhost::plan_split_faces cuts a wide camera into.
 
+#include "data/SceneCenter.h"
+
 #include <array>
 #include <cstdint>
 #include <limits>
@@ -33,8 +35,7 @@ struct ColmapCamera {
 
 // What a COLMAP camera record means to the renderer: which model, which
 // distortion tier, and its coefficients. Exposed for a caller that only wants
-// to DRAW the camera -- the live SfM preview, whose model is not on disk yet --
-// so it needs neither the images nor the re-distort fit the parser runs.
+// to DRAW the camera -- the live SfM preview, whose model is not on disk yet.
 struct PreviewIntrins {
     float fx = 0, fy = 0, cx = 0, cy = 0;
     int32_t model = 0;         // CameraModelType
@@ -45,10 +46,9 @@ struct PreviewIntrins {
     std::array<float, 8> dist{};
 };
 
-// False for a model id this reader does not know, a parameter count that does
-// not match it, or a source model no tier represents exactly -- the last of
-// which the parser answers by fitting and resampling, which is more than a
-// frustum needs.
+// False for a model id this reader does not know or a parameter count that
+// does not match it. A lens no tier represents is FITTED here, exactly as the
+// loader fits it, which costs ~25 ms -- cache on the camera record.
 bool colmap_preview_intrins(int model_id, int width, int height,
                             const std::vector<double>& params,
                             PreviewIntrins& out);
@@ -61,8 +61,10 @@ struct ColmapImage {
     std::string            name;      // path relative to the image dir
 };
 
+// xyz stays double: a geo-referenced model puts the cloud millions of units
+// from the origin, where float has a resolution of a metre.
 struct ColmapPoints3D {
-    std::vector<float>    xyz;        // [N, 3] flat
+    std::vector<double>   xyz;        // [N, 3] flat
     std::vector<uint8_t>  rgb;        // [N, 3] flat
     int64_t num() const { return (int64_t)xyz.size() / 3; }
 };
@@ -78,7 +80,8 @@ std::map<int32_t, ColmapImage>  read_images_text(const std::string& recon_dir);
 ColmapPoints3D                  read_points3D_text(const std::string& recon_dir);
 
 // PLY point-cloud reader (ascii + binary_little_endian; x/y/z of any float
-// or double type, red/green/blue uchar or float). NerfstudioParser.cpp.
+// or double type, red/green/blue uchar or float). NerfstudioParser.cpp. A
+// vertex element of zero rows reads as an empty cloud.
 ColmapPoints3D read_ply_points(const std::string& path);
 
 
@@ -140,10 +143,19 @@ struct DatasetParserConfig {
     // the geometric median of all camera positions. inf = off (default).
     float outlier_threshold = std::numeric_limits<float>::infinity();
 
-    // Divide stored intrinsics by this factor (Mip-NeRF 360 images_2/_4
-    // style). 0 = off. TODO: an auto-detect mode that probes the first
-    // image's actual resolution.
-    float       rescale_camera_to_fit = 0.0f;
+    // Which point of the raw frame becomes the training frame's origin: a
+    // dsparse::CenterMode name. Computed over ALL post-outlier frames and every
+    // seed point, in double, before anything is narrowed to float.
+    std::string center_mode = "none";
+
+    // Pixel size of an image file (data/ImageProbe.h). Set: every camera trains
+    // at its own image's resolution. Null: a caller with no decoders -- the
+    // WebAssembly viewer, given a dataset's cameras but never its pixels.
+    bool (*probe_image_size)(const char* path, int* w, int* h) = nullptr;
+
+    // Divide the training resolution by this factor, on top of that fit. 0 or
+    // 1 trains at the images' own size.
+    float       train_resolution_divisor = 0.0f;
     std::string downscale_rounding_mode = "floor";   // floor | ceil | round
 
     // Metashape inputs (parse_metashape_dataset). Relative paths resolve
@@ -153,6 +165,11 @@ struct DatasetParserConfig {
     std::string metashape_xml;
     std::string metashape_ply;
     std::string metashape_psx;
+
+    // What each image's EXIF Orientation is worth: "none", "orient" (the scene
+    // is levelled by it, pixels untouched) or "apply" (images are loaded turned
+    // and the reconstruction already describes that frame). docs/datasets.md.
+    std::string exif_orientation = "none";
 
     // Which <component> group to use when a Metashape export contains several.
     // -1 (default) keeps the historical behavior: train on the largest group.
@@ -200,8 +217,15 @@ struct ParsedDataset {
     std::vector<int32_t>     train_indices;
     std::vector<int32_t>     val_indices;
 
-    // Seed point cloud in the training frame.
+    // Seed point cloud in the training frame. Empty when the dataset has
+    // none, which is the trainer's cue to draw one (--random-init).
     ColmapPoints3D           points;
+
+    // p_train = p_raw - center, where p_raw is the frame the files came in
+    // (COLMAP's own, or nerfstudio's with applied_transform undone). Zero
+    // unless DatasetParserConfig::center_mode asked for one.
+    std::array<double, 3>    center{0.0, 0.0, 0.0};
+    std::string              center_mode = "none";
 
     // 1 / scale_factor of the would-be normalized frame. Computed over ALL
     // frames, before the eval_mode subset is dropped.
@@ -213,6 +237,21 @@ struct ParsedDataset {
     // through this before rendering (RenderWorker.cpp). Row-major 4x4;
     // identity when train_frame_scale == 1.
     std::array<float, 16>    train_to_normalized{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+
+    // The up->+Z rotation inside train_to_normalized, row-major 3x3, so a
+    // viewer can undo just that and leave any axis convention the file came
+    // with (applied_transform) alone. Identity when none was applied.
+    std::array<float, 9>     normalized_rotation{1,0,0, 0,1,0, 0,0,1};
+
+    // Quarter turns clockwise each image is loaded with, under
+    // exif_orientation="apply". Empty when no image asks for one.
+    std::vector<uint8_t>     exif_quarter_turns;
+
+    // What the model's own frame is worth, from the gauge.txt a reconstruction
+    // leaves beside it (sfm/Pipeline.h ModelGauge). Both false when there is no
+    // such file, which is every dataset that did not come from this tool.
+    bool                     gauge_oriented = false;   // +Z is up, measured
+    bool                     gauge_metric = false;     // one unit is one metre
 };
 
 ParsedDataset parse_colmap_dataset(const std::string& dataset_dir,
@@ -294,7 +333,8 @@ struct PostSplitCameras {
 PostSplitCameras bake_post_split(const ParsedDataset& ds,
                                  bool warp_to_pinhole,
                                  bool warp_spherical_to_pinhole,
-                                 WarpFaceFit fit = WarpFaceFit::Uniform);
+                                 WarpFaceFit fit = WarpFaceFit::Uniform,
+                                 bool back_face = false);
 
 
 // ===========================================================================
@@ -303,20 +343,27 @@ PostSplitCameras bake_post_split(const ParsedDataset& ds,
 // ===========================================================================
 namespace dsparse {
 
-// Normalized-frame scale factor over c2w [N,3,4] (orient="up",
-// center="poses", auto-scale). Only the scalar matters for
-// train_frame="points". Returns 1/max_abs.
-double compute_normalized_scale_factor(const std::vector<float>& c2w, int64_t n);
+// T_n_from_camera = scale * [R_align | -R_align @ center] (row-major 4x4)
+// over c2w [N,3,4], orient="up" / center="poses"; returns scale_factor. The
+// viewer remap is inv(that @ applied); `R_out` is R_align alone.
+double compute_normalized_transform(const double* c2w, int64_t n,
+                                    double T_out[16], double R_out[9] = nullptr,
+                                    // [N]: level by the up each image's EXIF
+                                    // names, not by the image's own.
+                                    const uint8_t* exif_orientation = nullptr);
 
-// Full normalized-frame similarity: writes the row-major 4x4
-// T_n_from_camera = scale * [R_align | -R_align @ center], and returns
-// scale_factor. The viewer remap transform is
-// inv(T_n_from_camera @ applied_transform).
-double compute_normalized_transform(const std::vector<float>& c2w, int64_t n,
-                                    double T_out[16]);
+// Each image's EXIF Orientation, 1 where the file carries none. Empty when
+// `mode` is "none" or nothing in the set asks for a turn, which is the test
+// every caller makes.
+std::vector<uint8_t> read_exif_orientations(const std::string& mode,
+                                            const std::vector<std::string>& paths);
 
 // inv([A|b; 0 1]) for a general invertible 3x3 A (row-major 4x4 in/out).
 void invert_affine4x4(const double in[16], double out[16]);
+
+// Every centering mode over a parsed dataset, in its NORMALIZED frame --
+// which is what both viewers navigate.
+CenterTable scene_centers(const ParsedDataset& ds);
 
 // eval_mode subset over N sorted frames, honouring cfg.split; identity for
 // "all". `names` are image filenames (used by eval_mode="filename").
@@ -334,5 +381,14 @@ std::string find_aux_file(const std::string& aux_dir, const std::string& rel_nam
 // keep-flags, all-true when threshold is inf. positions = [N, 3].
 std::vector<char> outlier_keep_mask(const std::vector<double>& positions,
                                     int64_t n, float threshold);
+
+// The resolution one camera trains at: its image file's size when cfg probes
+// for one, divided by train_resolution_divisor. W/H and the intrinsics come in
+// as the reconstruction's and leave scaled to that; `src` (may be null) too.
+void fit_camera_resolution(const DatasetParserConfig& cfg,
+                           const std::string& image_path,
+                           double& W, double& H,
+                           double& fx, double& fy, double& cx, double& cy,
+                           RedistortSource* src, int turns_cw = 0);
 
 }  // namespace dsparse

@@ -19,9 +19,11 @@
 // finished one in the same process (the GUI's "train again" path).
 
 #include "engine/Engine.h"
+#include "core/ColorSpace.h"
 #include "data/DatasetParser.h"
 #include "app/webviewer/RenderWorker.h"
 #include "config/TrainConfig.h"
+#include "i18n/TimeFormat.h"
 
 #include <array>
 #include <atomic>
@@ -49,9 +51,24 @@ Mat3f invert3x3(const Mat3f& m);
 struct ColorResolution {
     std::string splat_gamut;   // "" = Rec.709 / none
     std::string image_gamut;
+    // Storage encoding and output curve are independent: `*_linear` says
+    // whether the buffer holds linear light, `*_transfer` is the curve out of
+    // it. See docs/notes/color-transfer.md.
     bool splat_linear  = false;
     bool image_linear  = false;
+    colorspace::Transfer splat_transfer = colorspace::Transfer::Srgb;
+    colorspace::Transfer image_transfer = colorspace::Transfer::Srgb;
     bool convert_seed  = false;  // convert_initial_point_cloud_color resolved
+
+    // Whether the render needs the conversion pass at all.
+    bool splat_on() const {
+        return splat_linear || splat_transfer != colorspace::Transfer::Srgb ||
+               !splat_gamut.empty();
+    }
+    bool image_on() const {
+        return image_linear || image_transfer != colorspace::Transfer::Srgb ||
+               !image_gamut.empty();
+    }
 };
 
 ColorResolution resolve_color(const TrainConfig& c);
@@ -121,6 +138,10 @@ EngineStepConfig build_step_config(const TrainConfig& c, const RunState& st,
 // Flat config.json dump, one key per flag (config/TrainConfigJson.h).
 void save_config_json(const TrainConfig& c, const std::filesystem::path& out_dir,
                       const std::string& preset);
+// scene_transform.json: the similarity from the dataset's own frame to the
+// one the splats are trained in (data/SceneTransform.h).
+void save_scene_transform_json(const ParsedDataset& ds, const TrainConfig& c,
+                               const std::filesystem::path& out_dir);
 
 // "" when this config is runnable, else the sentence naming the flag that is
 // not implemented -- exactly what TrainerSession::check_config() throws. A
@@ -133,13 +154,17 @@ std::string train_config_unsupported(const TrainConfig& c);
 // TrainerSession
 // ===========================================================================
 
-// "m:ss", or "h:mm:ss" past an hour; negative (not known yet) is "--:--".
-std::string format_duration(double seconds);
+// The one duration format: i18n/TimeFormat.h, which the SfM summary uses too.
+inline std::string format_duration(double seconds) {
+    return i18n::format_duration(seconds);
+}
 
 struct TrainerProgress {
     int step = 0;              // 0-based step that just finished
     int total_steps = 0;
-    double step_latency = 0.0; // seconds, this step
+    // Wall seconds, including any wait for a viewer render this step stood
+    // aside for -- what the run costs, not what the kernels cost.
+    double step_latency = 0.0;
     int64_t num_splats = 0;
     std::map<std::string, float> losses;
 };
@@ -176,6 +201,8 @@ public:
     bool has_mask = false;
     bool has_depth = false;
     bool has_normal = false;
+    // probe_alpha_masks over `ds`: [N] flags, empty when no image is a cut-out.
+    std::vector<uint8_t> alpha_images;
 
     // Filled by setup_engine().
     std::filesystem::path out_dir;
@@ -266,6 +293,11 @@ public:
     void log(const std::string& msg);
 
 private:
+    // ds.points drawn at random when --random-init asks for it.
+    void seed_at_random();
+    void set_alpha_config(DataManagerConfig& dm,
+                          const std::vector<uint8_t>& alpha) const;
+
     // Bracket the train loop's pause gate so paused time stays out of
     // elapsed_seconds().
     void pause_clock_start();
@@ -281,6 +313,7 @@ private:
     double _paused_s = 0.0;
     mutable std::mutex _progress_mutex;    // guards the latency window
     std::deque<double> _step_latencies;    // last 100, seconds
+    bool _diverged_loss_reported = false;
 };
 
 }  // namespace spirula

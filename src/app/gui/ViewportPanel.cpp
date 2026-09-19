@@ -8,6 +8,7 @@
 #include "app/gui/Ui.h"
 
 #include "i18n/catalog/Gui.h"
+#include "i18n/catalog/TrainFields.h"
 #include "app/gui/GlLoader.h"   // GL types + 1.1 entry points
 
 #include "imgui.h"
@@ -61,18 +62,42 @@ void fov_to_intrinsics(float fov_deg, int w, int h, const char* model,
 // ---------------------------------------------------------------------------
 
 void ViewportPanel::reset_pose(float radius) {
-    // Match the web viewer's cam.reset() exactly: target = client-frame
-    // origin (the normalized frame is centered on the CAMERA POSES via
-    // center_method="poses", i.e. the captured object for object-centric
-    // datasets -- NOT the point-cloud centroid, which distant background
-    // points drag far away), pos = [0,0,1], then orbit(0, -250).
-    _cam.pos[0] = 0; _cam.pos[1] = 0; _cam.pos[2] = 1;
+    // The web viewer's cam.reset() about the chosen centre: target = centre,
+    // pos = centre + [0,0,1], then orbit(0, -250).
+    float c[3];
+    center_shared(c);
+    _cam.pos[0] = c[0]; _cam.pos[1] = c[1]; _cam.pos[2] = c[2] + 1.0f;
     _cam.rot[0] = _cam.rot[1] = _cam.rot[2] = 0; _cam.rot[3] = 1;
-    _cam.target[0] = _cam.target[1] = _cam.target[2] = 0;
+    _cam.target[0] = c[0]; _cam.target[1] = c[1]; _cam.target[2] = c[2];
     _cam.orbit(0, -250);
     _home = _cam;
     _home_dist = radius;
     _dirty = true;
+}
+
+void ViewportPanel::set_centers(const dsparse::CenterTable* centers, bool has_cameras) {
+    _centers_known = centers != nullptr;
+    _center_has_cameras = has_cameras;
+    if (centers) _centers = *centers;
+}
+
+int ViewportPanel::effective_center_mode() const {
+    using M = dsparse::CenterMode;
+    if (_center_has_cameras) return _center_mode;
+    switch ((M)_center_mode) {
+        case M::CameraMedian: return (int)M::PointMedian;
+        case M::CameraMean:
+        case M::CameraFocus:  return (int)M::PointMean;
+        default:              return _center_mode;
+    }
+}
+
+void ViewportPanel::center_shared(float out[3]) const {
+    if (!_centers_known) {
+        out[0] = out[1] = out[2] = 0.0f;
+        return;
+    }
+    shared_point(_centers[_center_mode].data(), out);
 }
 
 void ViewportPanel::compute_framing(const spirula::TrainerSession& session) {
@@ -99,14 +124,17 @@ void ViewportPanel::compute_framing(const spirula::TrainerSession& session) {
     _dirty = true;
 }
 
-void ViewportPanel::maybe_frame(const spirula::TrainerSession& session) {
+bool ViewportPanel::maybe_frame(const spirula::TrainerSession& session) {
     std::string key = session.cfg.data + ":" +
         std::to_string(session.ds.num_cameras) + ":" +
         std::to_string(session.ds.points.num());
-    if (key == _framed_key) return;   // same dataset: keep the current pose
+    if (key == _framed_key) return false;   // same dataset: keep the pose
     _framed_key = key;
+    const dsparse::CenterTable centers = dsparse::scene_centers(session.ds);
+    set_centers(&centers, session.ds.num_cameras > 0);
     compute_framing(session);
     _show_cams = true;   // default on for a fresh dataset preview
+    return true;
 }
 
 void ViewportPanel::reset_view() {
@@ -162,13 +190,58 @@ float ViewportPanel::nav_dist() const {
 void ViewportPanel::set_model_transform(const float a[12]) {
     // Called every frame by the owner; a render costs too much to submit one
     // for a placement that has not moved.
-    if (std::memcmp(_m2s, a, sizeof _m2s) == 0) return;
-    for (int i = 0; i < 12; i++) _m2s[i] = a[i];
-    _m2s_scale = std::sqrt(a[0]*a[0] + a[4]*a[4] + a[8]*a[8]);
+    if (std::memcmp(_m2s_owner, a, sizeof _m2s_owner) == 0) return;
+    for (int i = 0; i < 12; i++) _m2s_owner[i] = a[i];
+    rebuild_m2s();
+    _dirty = true;
+}
+
+// owner placement composed with the levelling correction, which is R_align
+// transposed when the parsers' up guess is switched off and nothing otherwise.
+void ViewportPanel::rebuild_m2s() {
+    const float* o = _m2s_owner;
+    _m2s_scale = std::sqrt(o[0]*o[0] + o[4]*o[4] + o[8]*o[8]);
     if (!(_m2s_scale > 1e-20f)) _m2s_scale = 1.0f;
+    const bool corr = !_level_cameras && !_align_identity;
+    for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 3; c++) {
+            float v = 0.0f;
+            if (corr)
+                for (int k = 0; k < 3; k++) v += o[r*4+k] * _align[c*3+k];
+            else
+                v = o[r*4+c];
+            _m2s[r*4+c] = v;
+        }
+        _m2s[r*4+3] = o[r*4+3];
+    }
     static const float kI[12] = {1,0,0,0, 0,1,0,0, 0,0,1,0};
     _m2s_identity = std::memcmp(_m2s, kI, sizeof kI) == 0;
+}
+
+void ViewportPanel::adopt_gauge(const ParsedDataset& ds, bool first) {
+    for (int k = 0; k < 9; k++) _align[k] = ds.normalized_rotation[k];
+    _align_identity = true;
+    for (int r = 0; r < 3 && _align_identity; r++)
+        for (int c = 0; c < 3; c++)
+            if (std::fabs(_align[r*3+c] - (r == c ? 1.0f : 0.0f)) > 1e-6f) {
+                _align_identity = false;
+                break;
+            }
+    _gauge_metric = ds.gauge_metric;
+    _scene_scale = ds.train_frame_scale > 0 ? ds.train_frame_scale : 1.0f;
+    // A model whose orientation was measured does not want the guess on top
+    // of it; one that has only the guess keeps it.
+    if (first) _level_cameras = !ds.gauge_oriented;
+    rebuild_m2s();
     _dirty = true;
+}
+
+// Both backends pick the cell from the same rule: a power of ten a little
+// under the view distance, measured in model units (PreviewRenderer.cpp
+// ensure_grid, Visualizer.cu _viewer_build_grid).
+float ViewportPanel::grid_cell() const {
+    const float d = nav_dist() / _m2s_scale * _scene_scale;
+    return std::pow(10.0f, std::floor(std::log10(std::max(d, 1e-6f) * 0.5f)));
 }
 
 // Shared -> model: R^T (x - t) / s, with the 3x3 written as s*R.
@@ -232,6 +305,31 @@ void ViewportPanel::build_request(ViewRequest& q, int W, int H) const {
     q.cam_size_scale = _frustum_scale;
 }
 
+// One line under the image's top-left corner. `line` is which row it is, so
+// the point count and the grid legend stack without measuring the font twice.
+void ViewportPanel::draw_grid_overlay(float x, float y, int line) const {
+    if (!_show_grid) return;
+    const float c = grid_cell();
+    char buf[32];
+    if (_gauge_metric) {
+        // Symbols, not words: km/m/cm/mm read the same in every language.
+        const char* unit = c >= 1000.0f ? "km" : c >= 1.0f ? "m"
+                           : c >= 0.01f ? "cm" : "mm";
+        const float mul = c >= 1000.0f ? 1e-3f : c >= 1.0f ? 1.0f
+                          : c >= 0.01f ? 100.0f : 1000.0f;
+        snprintf(buf, sizeof buf, "%g %s", (double)(c * mul), unit);
+    } else {
+        snprintf(buf, sizeof buf, "%g", (double)c);
+    }
+    const std::string t = spirula::i18n::format(
+        _gauge_metric ? spirula::i18n::msg::gui::overlay_grid_metric
+                      : spirula::i18n::msg::gui::overlay_grid_relative,
+        {std::string(buf)});
+    ImGui::GetWindowDrawList()->AddText(
+        ImVec2(x, y + line * ImGui::GetTextLineHeight()),
+        IM_COL32(200, 200, 200, 180), t.c_str());
+}
+
 // Row-major world-to-view for the GL preview (inverse of the camera c2w).
 void ViewportPanel::view_matrix(float out[16]) const {
     float m[12];
@@ -259,7 +357,7 @@ void ViewportPanel::attach_preview(spirula::TrainerSession& session) {
         _last_error = "preview renderer unavailable (OpenGL 3.2 required)";
         return;
     }
-    maybe_frame(session);
+    adopt_gauge(session.ds, maybe_frame(session));
     _last_error.clear();
     _mode = Mode::Preview;
 }
@@ -279,18 +377,23 @@ void ViewportPanel::attach_preview_data(const ParsedDataset& ds,
         _last_error = "preview renderer unavailable (OpenGL 3.2 required)";
         return;
     }
+    {
+        const dsparse::CenterTable centers = dsparse::scene_centers(ds);
+        set_centers(&centers, ds.num_cameras > 0);
+    }
     if (first) {
         _framed_key = key;
         reset_pose(radius);
     }
+    adopt_gauge(ds, first);
     _last_error.clear();
     _mode = Mode::Preview;
 }
 
 void ViewportPanel::enable_scene_options(
     const std::string& primitive, int sh_degree_max,
-    const std::string& gamut, bool linear,
-    std::function<void(const char*, bool)> apply_color_space,
+    const std::string& gamut, int transfer, bool linear,
+    std::function<void(const char*, int, bool)> apply_color_space,
     std::function<void()> on_primitive_changed) {
     _scene_options = true;
     _primitive_idx = 0;
@@ -303,6 +406,7 @@ void ViewportPanel::enable_scene_options(
     _gamut_idx = 0;
     for (int i = 0; i < kNumViewerGamuts; i++)
         if (gamut == kViewerGamuts[i]) _gamut_idx = i;
+    _transfer_idx = transfer;
     _linear_color = linear;
     _apply_color_space = std::move(apply_color_space);
     _on_primitive_changed = std::move(on_primitive_changed);
@@ -318,6 +422,14 @@ void ViewportPanel::attach_preview_mesh(const meshing::MeshData& mesh,
         _last_error = "preview renderer unavailable (OpenGL 3.2 required)";
         return;
     }
+    {
+        double A[12];
+        for (int i = 0; i < 12; i++) A[i] = to_normalized ? to_normalized[i] : (i % 5 == 0);
+        const dsparse::CenterTable centers = dsparse::scene_centers(
+            nullptr, 0, mesh.V.empty() ? nullptr : mesh.V[0].data(),
+            (int64_t)mesh.V.size(), 3, A);
+        set_centers(&centers, false);
+    }
     if (key != _framed_key) {
         _framed_key = key;
         reset_pose(radius);
@@ -332,7 +444,7 @@ void ViewportPanel::attach(spirula::TrainerSession& session) {
     _buffer_keys = _worker.buffer_keys();
     _buffer_idx = std::min<int>(_buffer_idx, (int)_buffer_keys.size() - 1);
     _has_cameras = session.ds.num_cameras > 0;
-    maybe_frame(session);
+    adopt_gauge(session.ds, maybe_frame(session));
     _pending = 0;
     _last_error.clear();
     _mode = Mode::Engine;
@@ -347,10 +459,17 @@ void ViewportPanel::attach_scene(const ViewerRenderConfig& cfg,
     _buffer_idx = std::min<int>(_buffer_idx, (int)_buffer_keys.size() - 1);
     _has_cameras = false;
     _show_cams = false;
+    set_centers(&cfg.centers, cfg.center_cameras);
     if (key != _framed_key) {
         _framed_key = key;
         reset_pose(radius);
     }
+    // A file, not a dataset: nothing rotated it and nothing says what a unit
+    // is, but its own scale still sets what the grid's cell measures.
+    _align_identity = true;
+    _gauge_metric = false;
+    _scene_scale = cfg.train_frame_scale > 0 ? cfg.train_frame_scale : 1.0f;
+    rebuild_m2s();
     _pending = 0;
     _last_error.clear();
     _mode = Mode::Engine;
@@ -475,6 +594,14 @@ void ViewportPanel::handle_input(float /*item_h*/) {
         k.d = ImGui::IsKeyDown(ImGuiKey_D);
         k.e = ImGui::IsKeyDown(ImGuiKey_E);
         k.q = ImGui::IsKeyDown(ImGuiKey_Q);
+        // The claim is what the Shortcut() calls are for: an unclaimed arrow is
+        // ALSO read by imgui's nav, which walks the focus along the toolbar.
+        // IsKeyDown still reads it -- ownership only filters the owner-aware.
+        const ImGuiInputFlags route = ImGuiInputFlags_RouteFocused |
+                                      ImGuiInputFlags_RouteFromRootWindow;
+        const ImGuiKey arrows[] = {ImGuiKey_UpArrow, ImGuiKey_DownArrow,
+                                   ImGuiKey_LeftArrow, ImGuiKey_RightArrow};
+        for (ImGuiKey key : arrows) ImGui::Shortcut(key, route);
         k.up = ImGui::IsKeyDown(ImGuiKey_UpArrow);
         k.down = ImGui::IsKeyDown(ImGuiKey_DownArrow);
         k.left = ImGui::IsKeyDown(ImGuiKey_LeftArrow);
@@ -573,14 +700,62 @@ void ViewportPanel::draw_controls(bool engine) {
     place(check_w(msg::viewport_grid));
     if (ui::Checkbox(msg::viewport_grid, &_show_grid)) _dirty = true;
     ui::help_on_hover(msg::viewport_cameras_help);
+    // Only where there is a guess to switch off. Turntable and first-person
+    // orbit about the navigated frame's +Z, so this is what they turn about.
+    if (!_align_identity) {
+        place(check_w(msg::viewport_level_cameras));
+        if (ui::Checkbox(msg::viewport_level_cameras, &_level_cameras)) {
+            rebuild_m2s();
+            _dirty = true;
+        }
+        ui::help_on_hover(msg::viewport_level_cameras_help);
+    }
+    if (_centers_known) {
+        namespace fld = spirula::i18n::msg::field;
+        auto center_label = [](int mode) -> const char* {
+            const spirula::i18n::Msg* m =
+                fld::choice_label("scene_center", dsparse::kCenterModeNames[mode]);
+            return m ? m->get() : dsparse::kCenterModeNames[mode];
+        };
+        auto is_camera_mode = [](int mode) {
+            using M = dsparse::CenterMode;
+            return mode == (int)M::CameraMedian || mode == (int)M::CameraMean ||
+                   mode == (int)M::CameraFocus;
+        };
+        place(px(170.0f) + st.ItemInnerSpacing.x + text_w(msg::viewport_center.get()));
+        ImGui::SetNextItemWidth(px(170.0f));
+        if (ui::BeginComboRaw(ui::detail::label(msg::viewport_center),
+                              center_label(effective_center_mode()))) {
+            for (int i = 0; i < dsparse::kNumCenterModes; i++) {
+                if (!_center_has_cameras && is_camera_mode(i)) continue;
+                if (ui::SelectableRaw(center_label(i), i == _center_mode) &&
+                    i != _center_mode) {
+                    _center_mode = i;
+                    // The model stays where it is; the pivot moves to the new
+                    // centre, and so does the pose Reset view returns to.
+                    float c[3];
+                    center_shared(c);
+                    recenter_at(c);
+                    const NavCamera live = _cam;
+                    reset_pose(_home_dist);
+                    _cam = live;
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ui::help_on_hover(msg::viewport_center_help);
+    }
     if (engine) {
-        place(px(66.0f));
+        place(px(66.0f) + st.ItemInnerSpacing.x +
+              text_w(msg::viewport_scale.get()));
         ImGui::SetNextItemWidth(px(66.0f));
         // Only the first entry is a word; the rest are numbers, and a
         // percentage is a percentage in every language.
         const char* scales[] = {msg::viewport_scale_auto.get(),
                                 "50%", "75%", "100%"};
-        if (ui::ComboRaw("##scale", &_scale_idx, scales, 4)) _dirty = true;
+        if (ui::ComboRaw(ui::detail::label(msg::viewport_scale), &_scale_idx,
+                         scales, 4))
+            _dirty = true;
         ui::help_on_hover(msg::viewport_scale_help);
         // "Live" is about keeping up with training; a file does not move.
         if (_has_cameras) {
@@ -613,9 +788,9 @@ void ViewportPanel::draw_controls(bool engine) {
     // A training session renders what it is training; only a file being
     // LOOKED at can be drawn a different way than it was made.
     if (engine && _scene_options) {
-        float w_group = px(80.0f) + px(120.0f) +
+        float w_group = px(80.0f) + px(120.0f) + px(120.0f) +
                         check_w(msg::viewport_linear_color) +
-                        2.0f * st.ItemSpacing.x;
+                        3.0f * st.ItemSpacing.x;
         if (_sh_degree_max > 0) w_group += px(kShW) + st.ItemSpacing.x;
         place_group(w_group);
         place(px(80.0f));
@@ -646,19 +821,25 @@ void ViewportPanel::draw_controls(bool engine) {
         const char* gamuts[kNumViewerGamuts];
         gamuts[0] = msg::viewport_gamut_none.get();
         for (int i = 1; i < kNumViewerGamuts; i++) gamuts[i] = kViewerGamuts[i];
-        if (ui::ComboRaw("##gamut", &_gamut_idx, gamuts, kNumViewerGamuts)) {
+        auto apply = [&] {
             if (_apply_color_space)
-                _apply_color_space(kViewerGamuts[_gamut_idx], _linear_color);
+                _apply_color_space(kViewerGamuts[_gamut_idx], _transfer_idx,
+                                   _linear_color);
             _dirty = true;
-        }
+        };
+        if (ui::ComboRaw("##gamut", &_gamut_idx, gamuts, kNumViewerGamuts))
+            apply();
         ui::help_on_hover(msg::viewport_gamut_help);
         place(check_w(msg::viewport_linear_color));
-        if (ui::Checkbox(msg::viewport_linear_color, &_linear_color)) {
-            if (_apply_color_space)
-                _apply_color_space(kViewerGamuts[_gamut_idx], _linear_color);
-            _dirty = true;
-        }
-        ui::help_on_hover(msg::viewport_gamut_help);
+        if (ui::Checkbox(msg::viewport_linear_color, &_linear_color)) apply();
+        ui::help_on_hover(msg::viewport_linear_help);
+        place(px(120.0f));
+        ImGui::SetNextItemWidth(px(120.0f));
+        // Transfer names are the identifiers --splat-color-transfer takes.
+        if (ui::ComboRaw("##transfer", &_transfer_idx, colorspace::kTransfers,
+                         kNumViewerTransfers))
+            apply();
+        ui::help_on_hover(msg::viewport_transfer_help);
     }
 
     if (_nav_controls) draw_nav_controls();
@@ -839,6 +1020,7 @@ void ViewportPanel::draw_preview(const ImVec2& avail) {
     ImGui::GetWindowDrawList()->AddText(ImVec2(p.x + 8, p.y + 6),
                                         IM_COL32(200, 200, 200, 180),
                                         info.c_str());
+    draw_grid_overlay(p.x + 8, p.y + 6, 1);
 }
 
 // Adaptive render scale (`Auto`, the default).
@@ -1025,6 +1207,8 @@ void ViewportPanel::draw_engine(bool training, const ImVec2& avail, int step) {
         ImGui::SetCursorPos(ImVec2(ImGui::GetCursorPosX() + pad.x,
                                    ImGui::GetCursorPosY() + pad.y));
         ImGui::Image((ImTextureID)(intptr_t)_tex, size);
+        const ImVec2 tl = ImGui::GetItemRectMin();
+        draw_grid_overlay(tl.x + 8, tl.y + 6, 0);
         handle_input(size.y);
     } else {
         ImGui::Dummy(ImVec2(avail.x, avail.y * 0.4f));

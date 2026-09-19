@@ -109,7 +109,8 @@ inline int train_tier_rank(const char* tier) {
     X(std::string, image_dir, "images", "dataset", "basic", "")              \
     X(std::string, mask_dir, "masks", "dataset", "basic", "")                \
     X(bool, load_masks, true, "dataset", "basic", "")                        \
-    X(bool, apply_loss_for_mask, false, "dataset", "basic", "")              \
+    X(std::optional<bool>, apply_loss_for_mask, std::nullopt, "dataset", "basic", "") \
+    X(bool, flip_mask, false, "dataset", "basic", "")                        \
     X(float, mask_boundary_offset, 0.0f, "dataset", "advanced", "")          \
     X(std::string, depth_dir, "depths", "dataset", "basic", "")              \
     X(std::string, normal_dir, "normals", "dataset", "basic", "")            \
@@ -120,7 +121,7 @@ inline int train_tier_rank(const char* tier) {
     X(std::string, metashape_xml, "", "dataset", "advanced", "none")         \
     X(std::string, metashape_ply, "", "dataset", "advanced", "none")         \
     X(std::string, metashape_psx, "", "dataset", "advanced", "none")         \
-    X(float, rescale_camera_to_fit, 0.0f, "dataset", "advanced", "")         \
+    X(float, train_resolution_divisor, 0.0f, "dataset", "basic", "")         \
     X(std::string, downscale_rounding_mode, "floor", "dataset", "advanced", "floor|ceil|round") \
     X(std::string, eval_mode, "all", "dataset", "advanced", "fraction|filename|interval|all") \
     X(int, eval_interval, 8, "dataset", "advanced", "")                      \
@@ -129,13 +130,16 @@ inline int train_tier_rank(const char* tier) {
     X(bool, warp_to_pinhole, false, "dataset", "advanced", "")               \
     X(bool, warp_spherical_to_pinhole, true, "dataset", "advanced", "")      \
     X(std::string, warp_face_fit, "uniform", "dataset", "advanced", "uniform|per-face") \
+    X(bool, warp_back_face, false, "dataset", "expert", "")                  \
     X(bool, deblur_training_images, false, "dataset", "stub", "")            \
                                                                              \
     /* ==== scene -- how the capture is placed, oriented and scaled ==== */  \
+    X(std::string, exif_orientation, "orient", "scene", "advanced", "none|orient|apply") \
     X(std::string, orientation_method, "up", "scene", "expert", "pca|up|vertical|none|gsplat") \
     X(std::string, center_method, "poses", "scene", "expert", "poses|focus|none|gsplat") \
     X(bool, auto_scale_poses, true, "scene", "expert", "")                   \
     X(float, outlier_threshold, kTrainInf, "scene", "basic", "")             \
+    X(std::string, scene_center, "none", "scene", "basic", "none|point-median|camera-median|camera-focus|point-mean|camera-mean") \
     X(std::optional<float>, relative_scale, std::nullopt, "scene", "expert", "") \
     X(std::string, train_frame, "points", "scene", "expert", "normalized|camera|points") \
                                                                              \
@@ -143,15 +147,23 @@ inline int train_tier_rank(const char* tier) {
     X(std::string, primitive, "3dgs", "splats", "basic", "3dgs|mip|3dgut")   \
     X(int, sh_degree, 3, "splats", "basic", "")                              \
     X(int, sh_degree_warmup_every, 1000, "splats", "expert", "")             \
-    X(std::string, background_mode, "black", "splats", "basic", "black|noise|sh") \
+    X(std::string, background_mode, "color", "splats", "basic", "color|noise|pseudorandom|random|sh") \
+    X(TrainVec3f, background_color, train_v3f(0.0f, 0.0f, 0.0f), "splats", "basic", "") \
     X(int, background_sh_degree, 4, "splats", "basic", "")                   \
     X(int, background_noise_warmup, 2000, "splats", "expert", "")            \
     X(float, background_noise_pre_warmup, 0.25f, "splats", "expert", "")     \
+    X(bool, background_match_luminance, false, "splats", "advanced", "")     \
     X(std::string, init_ply, "", "splats", "advanced", "none")               \
     X(bool, init_ply_add_points, false, "splats", "advanced", "")            \
     X(std::optional<float>, scale_init, std::nullopt, "splats", "advanced", "") \
     X(std::optional<float>, opacity_init, std::nullopt, "splats", "advanced", "") \
     X(bool, suppress_initial_scales, false, "splats", "expert", "")          \
+    X(std::string, random_init, "auto", "splats", "advanced", "never|auto|always") \
+    X(float, random_init_fraction, 0.1f, "splats", "advanced", "")          \
+    X(std::string, random_init_distribution, "isotropic-gaussian", "splats", "expert", "isotropic-gaussian|anisotropic-gaussian|ellipsoid|box") \
+    X(std::string, random_init_center, "camera-median", "splats", "expert", "camera-median|camera-focus|camera-mean|origin") \
+    X(std::string, random_init_spread, "median", "splats", "expert", "median|mean") \
+    X(float, random_init_std, 1.0f, "splats", "expert", "")                  \
     X(bool, use_camera_optimizer, false, "splats", "stub", "")               \
                                                                              \
     /* ==== detail -- how many splats there are and where they go ==== */    \
@@ -163,8 +175,8 @@ inline int train_tier_rank(const char* tier) {
     X(float, min_opacity, 0.005f, "detail", "advanced", "")                  \
     X(int, refine_every, 100, "detail", "advanced", "")                      \
     X(int, refine_start_iter, 500, "detail", "expert", "")                   \
-    X(int, refine_stop_num_iter, 5000, "detail", "advanced", "")             \
-    X(int, refine_stop_iter, 25000, "detail", "advanced", "")                \
+    X(int, refine_stop_num_iter, 2500, "detail", "advanced", "")             \
+    X(int, refine_stop_iter, 14000, "detail", "advanced", "")                \
     X(float, noise_lr, 80.0f, "detail", "expert", "")                        \
     X(float, noise_lr_final, 0.8f, "detail", "expert", "")                   \
     X(bool, use_revised_densification, true, "detail", "expert", "")         \
@@ -180,10 +192,13 @@ inline int train_tier_rank(const char* tier) {
     X(float, densify_score_power, 0.4f, "detail", "advanced", "")            \
     X(float, densify_score_clip_quantile, 1.0f, "detail", "advanced", "")    \
     X(float, densify_final_score_power, 1.0f, "detail", "advanced", "")      \
+    X(float, densify_oversize_split_fraction, 0.15f, "detail", "advanced", "") \
+    X(float, densify_oversize_score_blend, 1.0f, "detail", "advanced", "")   \
     X(bool, use_long_axis_split, true, "detail", "expert", "")               \
-    X(TrainVec3f, long_axis_split_opacity_k, train_v3f(0.5f, 0.6f, 8000.0f), "detail", "basic", "") \
+    X(TrainVec3f, long_axis_split_opacity_k, train_v3f(0.5f, 0.6f, 15000.0f), "detail", "basic", "") \
     X(float, max_screen_size, 0.3f, "detail", "basic", "")                   \
     X(float, max_screen_size_clip_hardness, 1.5f, "detail", "basic", "")     \
+    X(float, max_screen_size_penalty, 1.0f, "detail", "basic", "")           \
     X(float, max_world_size, kTrainInf, "detail", "expert", "")              \
                                                                              \
     /* ==== loss -- how the render is compared against the photo ==== */     \
@@ -198,6 +213,8 @@ inline int train_tier_rank(const char* tier) {
     X(int, num_loss_scales, 0, "loss", "advanced", "")                       \
     X(float, alpha_loss_weight, 0.1f, "loss", "basic", "")                   \
     X(float, alpha_loss_weight_under, 0.0f, "loss", "basic", "")             \
+    X(float, loss_saturation_threshold, -1.0f, "loss", "advanced", "")       \
+    X(float, loss_luminance_normalization, 0.0f, "loss", "advanced", "")     \
                                                                              \
     /* ==== geometry -- how crisp the surfaces come out, and depth/normal guidance ==== */ \
     X(std::string, floater_suppression, "off", "geometry", "basic", "off|mild|strong") \
@@ -221,14 +238,17 @@ inline int train_tier_rank(const char* tier) {
     X(int, median_warmup, 6000, "geometry", "expert", "")                    \
                                                                              \
     /* ==== shape -- keeping individual splats compact and well behaved ==== */ \
-    X(float, opacity_reg, 0.01f, "shape", "basic", "")                       \
+    X(float, opacity_reg, 0.005f, "shape", "basic", "")                      \
     X(float, scale_reg, 0.01f, "shape", "basic", "")                         \
+    X(float, opacity_reg_decay_power, 1.0f, "shape", "expert", "")           \
+    X(float, scale_reg_decay_power, 0.4f, "shape", "expert", "")             \
     X(float, opacity_decay, 0.0f, "shape", "basic", "")                      \
     X(float, scale_decay, 0.0f, "shape", "basic", "")                        \
-    X(float, erank_reg, 0.0f, "shape", "basic", "")                          \
+    X(float, erank_reg, 0.001f, "shape", "basic", "")                        \
     X(float, erank_reg_s3, 0.0f, "shape", "advanced", "")                    \
     X(float, scale_regularization_weight, 0.0f, "shape", "advanced", "")     \
     X(float, max_gauss_ratio, 10.0f, "shape", "advanced", "")                \
+    X(float, dc_reg, 0.001f, "shape", "basic", "")                           \
     X(float, sh_reg, 0.001f, "shape", "basic", "")                           \
     X(float, overexposure_reg, 0.0f, "shape", "advanced", "")                \
     X(float, quat_norm_reg, 0.01f, "shape", "advanced", "")                  \
@@ -245,9 +265,11 @@ inline int train_tier_rank(const char* tier) {
     X(float, bilagrid_tv_loss_weight_geometry, 10.0f, "correction", "advanced", "") \
     X(bool, use_adagrad_bilagrid_optim, true, "correction", "advanced", "")  \
     X(bool, use_ppisp, true, "correction", "basic", "")                      \
-    X(std::string, ppisp_param_type, "no_crf", "correction", "basic", "original|rqs|no_crf") \
+    X(std::string, ppisp_param_type, "no_crf_no_vig", "correction", "basic", "original|rqs|no_crf|no_crf_clamp|no_crf_no_vig|no_crf_no_vig_clamp") \
     X(bool, ppisp_exposure_from_exif, false, "correction", "basic", "")      \
+    X(bool, ppisp_exposure_arithmetic_mean, true, "correction", "expert", "") \
     X(bool, apply_ppisp_before_bilagrid, true, "correction", "advanced", "") \
+    X(bool, apply_ppisp_before_color_space, false, "correction", "advanced", "") \
     X(bool, use_adagrad_ppisp_optim, true, "correction", "advanced", "")     \
     X(float, ppisp_reg_exposure_mean, 1.0f, "correction", "advanced", "")    \
     X(float, ppisp_reg_color_mean, 1.0f, "correction", "advanced", "")       \
@@ -274,8 +296,10 @@ inline int train_tier_rank(const char* tier) {
                                                                              \
     /* ==== colorspace -- linear vs display encoding, and which gamut ==== */\
     X(std::optional<bool>, image_color_is_linear, std::nullopt, "colorspace", "basic", "") \
+    X(std::string, image_color_transfer, "", "colorspace", "advanced", "srgb|srgb-clamped|aces|filmic|uncharted2|none") \
     X(std::string, image_color_gamut, "", "colorspace", "basic", "Rec.709|ACES2065-1|ACEScg|Rec.2020|AdobeRGB|DCI-P3|none") \
     X(std::optional<bool>, splat_color_is_linear, std::nullopt, "colorspace", "basic", "") \
+    X(std::string, splat_color_transfer, "", "colorspace", "advanced", "srgb|srgb-clamped|aces|filmic|uncharted2|none") \
     X(std::string, splat_color_gamut, "", "colorspace", "basic", "Rec.709|ACES2065-1|ACEScg|Rec.2020|AdobeRGB|DCI-P3|none") \
     X(std::optional<bool>, convert_initial_point_cloud_color, std::nullopt, "colorspace", "basic", "") \
                                                                              \
@@ -286,6 +310,7 @@ inline int train_tier_rank(const char* tier) {
     X(bool, use_fused_proj_bwd_optim, true, "perf", "advanced", "")          \
     X(bool, packed, true, "perf", "advanced", "")                            \
     X(int, quantization_level, 1, "perf", "advanced", "")                    \
+    X(int, bin_tile_size, 0, "perf", "expert", "")                           \
     X(bool, preallocate_splat_tensors, true, "perf", "expert", "")           \
     X(std::string, optimizer_offload, "", "perf", "stub", "sh|all|none")     \
     X(bool, use_bvh, false, "perf", "stub", "")                              \
@@ -333,13 +358,16 @@ struct TrainConfig {
 #define SS_DATASET_PARSE_FIELDS(X) \
     X(data) X(data_format) X(colmap_recon_dir) X(image_dir) X(mask_dir) \
     X(depth_dir) X(normal_dir) X(metashape_xml) X(metashape_ply) \
-    X(metashape_psx) X(rescale_camera_to_fit) X(downscale_rounding_mode) \
-    X(orientation_method) X(center_method) X(auto_scale_poses) \
-    X(outlier_threshold) X(train_frame) X(eval_mode) X(train_split_fraction) \
+    X(metashape_psx) X(train_resolution_divisor) X(downscale_rounding_mode) \
+    X(exif_orientation) X(orientation_method) X(center_method) X(auto_scale_poses) \
+    X(outlier_threshold) X(scene_center) X(train_frame) X(eval_mode) X(train_split_fraction) \
     X(eval_interval) X(depth_unit_scale_factor) X(validation_fraction) \
     X(warp_to_pinhole) X(warp_spherical_to_pinhole) X(warp_face_fit) \
+    X(warp_back_face) \
     X(load_masks) \
     X(load_depths) X(load_normals) X(relative_scale) \
+    X(cap_max) X(random_init) X(random_init_fraction) X(random_init_distribution) \
+    X(random_init_center) X(random_init_spread) X(random_init_std) \
     /* end */
 
 
@@ -359,7 +387,8 @@ inline constexpr TrainPresetInfo kTrainPresets[] = {
     {"3dgs"},
     {"360-camera"},
     {"in-the-wild"},
-    {"linear-color"},
+    {"centered-object"},
+    {"hdr"},
     {"synthetic"},
     {"meshing"},
     // {"academic-baseline"},  // hidden by default, uncomment to enable
@@ -372,8 +401,9 @@ inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
     }
     if (name == "360-camera") {
         c.warp_to_pinhole = true;
-        c.mask_boundary_offset = -0.025f;
-        c.primitive = "mip";
+        c.mask_boundary_offset = -0.005f;
+        // c.primitive = "mip";
+        c.erank_reg = 0.01f;
         c.long_axis_split_opacity_k = {0.5f, 0.6f, 15000.0f};
         return true;
     }
@@ -382,9 +412,9 @@ inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
         c.outlier_threshold = 10.0f;
         c.load_depths = true;
         c.load_normals = true;
-        c.mask_boundary_offset = -0.025f;
+        c.mask_boundary_offset = -0.005f;
         // c.floater_suppression= "strong";
-        c.distraction_robustness = "strong";
+        // c.distraction_robustness = "strong";
         c.sh_degree_warmup_every = 0;
         c.long_axis_split_opacity_k = {0.5f, 0.6f, 30000.0f};
         c.noise_lr = 10.0f;
@@ -394,14 +424,35 @@ inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
         c.means_lr_final = 1e-07f;
         return true;
     }
-    if (name == "linear-color") {
+    if (name == "centered-object") {
+        c.cap_max = 200000;
+        c.apply_loss_for_mask = true;
+        c.center_method = "focus";
+        c.background_mode = "sh";
+        c.depth_distortion_reg = 0.01f;
+        c.rgb_distortion_reg = 0.01f;
+        c.erank_reg = 0.05f;
+        return true;
+    }
+    if (name == "hdr") {
         c.splat_color_gamut = "ACEScg";
         c.splat_color_is_linear = true;
-        c.image_color_gamut = "Rec.2020";
+        c.image_color_gamut = "Rec.709";
         c.image_color_is_linear = false;
-        c.background_mode = "noise";
-        c.features_dc_lr = 0.0015f;
-        c.features_sh_lr = 0.000075f;
+        // c.image_color_transfer = "srgb-clamped";
+        // c.apply_ppisp_before_color_space = true;
+        // c.ppisp_adagrad_lr = 0.25f;
+        c.ppisp_exposure_from_exif = true;
+        c.background_mode = "random";
+        c.background_match_luminance = true;
+        // c.depth_distortion_reg = 0.01f;
+        c.loss_saturation_threshold = 0.98f;
+        // c.loss_luminance_normalization = 0.5f;
+        c.dc_reg = 0.0f;
+        c.max_screen_size = 0.15f;
+        // c.features_dc_lr = 0.0015f;
+        c.features_sh_lr = 0.0001f;
+        c.ssim_lambda = 0.1f;
         return true;
     }
     if (name == "synthetic") {
@@ -413,8 +464,9 @@ inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
         return true;
     }
     if (name == "meshing") {
-        c.primitive = "3dgut";
+        c.primitive = "mip";
         c.sh_degree = 0;
+        c.dc_reg = 10.0f;
         c.sh_reg = 10.0f;
         c.overexposure_reg = 10.0f;
         c.background_mode = "noise";
@@ -460,6 +512,7 @@ inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
         c.erank_reg = 0.0f;
         c.erank_reg_s3 = 0.0f;
         c.quat_norm_reg = 0.0f;
+        c.dc_reg = 0.0f;
         c.sh_reg = 0.0f;
         c.normal_supervision_weight = 0.0f;
         c.opacity_reg = 0.01f;

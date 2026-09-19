@@ -1,25 +1,18 @@
 // Backend parity tool for the PPISP image-transform + regularization launch
-// APIs (kernels/pixelwise/PixelWise.cuh PPISP subset), across all three param types
-// (original / rqs / no_crf) and cam_indices on/off. The SAME source builds
-// under both backends:
-//
-//   CUDA build:   ./ppisp_parity dump ref.bin
-//   Vulkan build: ./ppisp_parity compare ref.bin   (per device)
-//
+// APIs, across every param type and cam_indices on/off. One source, both
+// backends: `./ppisp_parity dump ref.bin`, then `compare ref.bin` per device.
 // Ref format: [nf tight floats] [nl loose floats].
 //
-// Both backends run the same canonical shaders/ppisp.slang math (CUDA via the
-// 2026.2.1 emission, Vulkan via SPIR-V), so per-pixel outputs and per-image
-// gradients differ only by fast-math rounding -> tight channel. Atomically
-// accumulated buffers (v_ppisp_params from the pixel backward, the summed
-// raw-loss tail row and everything derived from it) -> loose channel. The
-// regularization BACKWARD is fed synthetic host-side raw_losses/v_losses so
-// its outputs stay deterministic (tight).
+// Both backends run the same shaders/ppisp.slang math, so per-pixel outputs
+// and per-image gradients differ only by fast-math rounding -> tight channel;
+// atomically accumulated buffers -> loose. The regularization BACKWARD is fed
+// synthetic host-side raw_losses/v_losses so it stays deterministic (tight).
 
 #include <kernels/pixelwise/PixelWise.cuh>
 #include <engine/EngineInternal.h>
 #include <core/Tensor.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -95,12 +88,16 @@ int main(int argc, char** argv) {
     }
     const bool dumping = std::strcmp(argv[1], "dump") == 0;
 
-    Rng r(260719u);
+    Rng r(260719u), r_arith(260914u);
 
-    const TypeInfo types[3] = {
+    const TypeInfo types[6] = {
         {"original", 36, (int)RawPPISPRegLossIndex::length},
         {"rqs", 39, (int)RawPPISPRegLossIndexRQS::length},
         {"no_crf", 24, (int)RawPPISPRegLossIndexNoCRF::length},
+        {"no_crf_clamp", 24, (int)RawPPISPRegLossIndexNoCRF::length},
+        {"no_crf_no_vig", 9, (int)RawPPISPRegLossIndexNoCRFNoVig::length},
+        {"no_crf_no_vig_clamp", 9,
+         (int)RawPPISPRegLossIndexNoCRFNoVig::length},
     };
 
     const int64_t B = 3, H = 22, W = 26, N_cam = 5;
@@ -151,35 +148,244 @@ int main(int argc, char** argv) {
         // Regularization forward: per-image raw rows are deterministic
         // (tight); the summed tail row and the weighted losses derived from
         // it are atomic-order dependent (loose).
-        {
+        for (int arith = 0; arith < 2; arith++) {
+            // Own stream for the added mode, so every later block keeps its data.
+            Rng& rr = arith ? r_arith : r;
             const int64_t Bp = 6;
-            float* params = upload(r.vec(Bp * t.n_params, -0.5f, 0.5f));
+            std::vector<float> params_h = rr.vec(Bp * t.n_params, -0.5f, 0.5f);
+            float* params = upload(params_h);
             std::array<float, (int)PPISPRegLossIndex::length> weights{};
-            for (auto& w : weights) w = r.uf(0.1f, 2.0f);
+            for (auto& w : weights) w = rr.uf(0.1f, 2.0f);
             float* losses = alloc_zero<float>((int)PPISPRegLossIndex::length);
             float* raw_losses = alloc_zero<float>((Bp + 1) * t.n_raw);
             compute_ppsip_regularization_forward(
-                ttv(params, {Bp, t.n_params}), weights, t.name,
+                ttv(params, {Bp, t.n_params}), weights, t.name, arith != 0,
                 ttv(losses, {(int)PPISPRegLossIndex::length}),
                 ttv(raw_losses, {Bp + 1, t.n_raw}));
+            size_t raw_at = g_tight.size(), loss_at = g_loose.size() + t.n_raw;
             readback_f(g_tight, raw_losses, Bp * t.n_raw);
             readback_f(g_loose, raw_losses + Bp * t.n_raw, t.n_raw);
             readback_f(g_loose, losses, (int)PPISPRegLossIndex::length);
 
             // Backward with synthetic (host-fixed) summed raw losses so the
-            // whole chain stays deterministic.
-            std::vector<float> raw_h = r.vec((Bp + 1) * t.n_raw, -1.0f, 1.0f);
+            // whole chain stays deterministic. log2 needs a positive gain sum.
+            std::vector<float> raw_h = rr.vec((Bp + 1) * t.n_raw, -1.0f, 1.0f);
+            if (arith) raw_h[Bp * t.n_raw] = rr.uf(0.5f, 2.0f) * (float)Bp;
             float* raw_fixed = upload(raw_h);
-            float* v_losses =
-                upload(r.vec((int)PPISPRegLossIndex::length, -1.0f, 1.0f));
+            std::vector<float> vl_h =
+                rr.vec((int)PPISPRegLossIndex::length, -1.0f, 1.0f);
+            float* v_losses = upload(vl_h);
             float* v_params = alloc_zero<float>(Bp * t.n_params);
             compute_ppsip_regularization_backward(
                 ttv(params, {Bp, t.n_params}), weights,
                 ttv(raw_fixed, {Bp + 1, t.n_raw}),
                 ttv(v_losses, {(int)PPISPRegLossIndex::length}), t.name,
-                ttv(v_params, {Bp, t.n_params}));
+                arith != 0, ttv(v_params, {Bp, t.n_params}));
+            size_t vp_at = g_tight.size();
             readback_f(g_tight, v_params, Bp * t.n_params);
+            if (!arith) continue;
+
+            // Closed form of the exposure terms, which touch nothing else.
+            auto dsl1 = [](double x) {
+                return std::fabs(x) < 0.1 ? x / 0.1 : (x > 0 ? 1.0 : -1.0);
+            };
+            auto sl1 = [](double x) {
+                return std::fabs(x) < 0.1 ? 0.5 * x * x / 0.1 : std::fabs(x) - 0.05;
+            };
+            auto off = [](double got, double want) {
+                return std::fabs(got - want) > 1e-4 + 1e-4 * std::fabs(want);
+            };
+            double gain_sum = 0.0;
+            for (int64_t b = 0; b < Bp; b++) {
+                double gain = std::exp2((double)params_h[b * t.n_params]);
+                gain_sum += gain;
+                if (off(g_tight[raw_at + b * t.n_raw], gain)) {
+                    std::fprintf(stderr, "ppisp_parity: %s raw gain[%lld] = %g, "
+                                 "expected %g\n", t.name, (long long)b,
+                                 g_tight[raw_at + b * t.n_raw], gain);
+                    return 1;
+                }
+            }
+            double want_loss = weights[0] * sl1(std::log2(gain_sum / Bp));
+            if (off(g_loose[loss_at], want_loss)) {
+                std::fprintf(stderr, "ppisp_parity: %s exposure mean loss = %g, "
+                             "expected %g\n", t.name, g_loose[loss_at], want_loss);
+                return 1;
+            }
+            double S = raw_h[Bp * t.n_raw];
+            double v_sum = vl_h[0] * weights[0] *
+                           dsl1(std::log2(S / Bp)) / (S * std::log(2.0));
+            for (int64_t b = 0; b < Bp; b++) {
+                double p0 = params_h[b * t.n_params];
+                double want = v_sum * std::exp2(p0) * std::log(2.0);
+                if (off(g_tight[vp_at + b * t.n_params], want)) {
+                    std::fprintf(stderr, "ppisp_parity: %s v_exposure[%lld] = %g, "
+                                 "expected %g\n", t.name, (long long)b,
+                                 g_tight[vp_at + b * t.n_params], want);
+                    return 1;
+                }
+            }
         }
+    }
+
+    // Negative-intensity pixels, exposure and vignetting neutralized so the
+    // colour stage stands alone: ~half of them sit below the RGI denominator
+    // floor, which is the only thing holding intensity through that branch.
+    {
+        const int64_t Bx = 2, np = Bx * H * W;
+        const int n_params = 24;  // no_crf: exposure(1) + vignetting(15) + colour(8)
+        std::vector<float> ph(Bx * n_params, 0.0f);
+        for (int64_t b = 0; b < Bx; b++)
+            for (int i = 16; i < n_params; i++)
+                ph[b * n_params + i] = r.uf(-0.4f, 0.4f);
+        float* params = upload(ph);
+        std::vector<float> intr_h;
+        for (int64_t b = 0; b < Bx; b++) {
+            intr_h.push_back(80.0f);
+            intr_h.push_back(80.0f);
+            intr_h.push_back(52.0f);
+            intr_h.push_back(44.0f);
+        }
+        float* intrins = upload(intr_h);
+        std::vector<float> in_h = r.vec(3 * np, -1.0f, 1.0f);
+        float* in_image = upload(in_h);
+        float* out_image = alloc_zero<float>(3 * np);
+        ppisp_forward(dt3(in_image, Bx, H, W), ttv(params, {Bx, n_params}),
+                      ttv(intrins, {Bx, 4}), aw, ah, "no_crf", ttv_null(),
+                      dt3(out_image, Bx, H, W));
+
+        std::vector<float> out_h(3 * np);
+        backend::memcpy_sync(out_h.data(), out_image,
+                             3 * np * sizeof(float), MemcpyKind::DeviceToHost);
+        double worst_di = 0.0, worst_mag = 0.0;
+        for (int64_t i = 0; i < np; i++) {
+            double si = (double)in_h[3 * i] + in_h[3 * i + 1] + in_h[3 * i + 2];
+            double so = (double)out_h[3 * i] + out_h[3 * i + 1] + out_h[3 * i + 2];
+            worst_di = std::max(worst_di, std::fabs(so - si));
+            for (int c = 0; c < 3; c++)
+                worst_mag = std::max(worst_mag, std::fabs((double)out_h[3 * i + c]));
+        }
+        std::printf("ppisp_parity: negative-intensity block, "
+                    "max |sum(out) - sum(in)| %.3g, max |out| %.3g\n",
+                    worst_di, worst_mag);
+        // Two-sided: unfloored these leave at |out| ~ 3 (H is near identity),
+        // floored they cap near 20x that, and without the floor at all the old
+        // 1e-5 denominator sent them past 1e5.
+        if (!(worst_di < 1e-3) || !(worst_mag > 10.0) || !(worst_mag < 1e3)) {
+            std::fprintf(stderr, "ppisp_parity: colour stage lost intensity, or "
+                                 "the denominator floor never bound / blew up\n");
+            return 1;
+        }
+        readback_f(g_tight, out_image, 3 * np);
+
+        float* v_out = upload(r.vec(3 * np, -0.3f, 0.3f));
+        float* v_in = alloc_zero<float>(3 * np);
+        float* v_params = alloc_zero<float>(Bx * n_params);
+        ppisp_backward(dt3(in_image, Bx, H, W), ttv(params, {Bx, n_params}),
+                       ttv(intrins, {Bx, 4}), aw, ah, dt3(v_out, Bx, H, W),
+                       "no_crf", ttv_null(), dt3(v_in, Bx, H, W),
+                       ttv(v_params, {Bx, n_params}));
+        readback_f(g_tight, v_in, 3 * np);
+        readback_f(g_loose, v_params, Bx * n_params);
+    }
+
+    // The clamp axis against the unclamped mode it shares a table with. The
+    // exposure seed is what pushes a good share of the pixels out of [0, 1];
+    // without it the whole check passes on an identity.
+    {
+        const int64_t Bc = 2, np = Bc * H * W;
+        const int n_params = 24;
+        std::vector<float> ph(Bc * n_params, 0.0f);
+        for (int64_t b = 0; b < Bc; b++) {
+            ph[b * n_params] = 0.8f;                       // exposure
+            for (int i = 16; i < n_params; i++)
+                ph[b * n_params + i] = r.uf(-0.3f, 0.3f);  // colour
+        }
+        float* params = upload(ph);
+        std::vector<float> intr_h;
+        for (int64_t b = 0; b < Bc; b++) {
+            intr_h.push_back(80.0f);
+            intr_h.push_back(80.0f);
+            intr_h.push_back(52.0f);
+            intr_h.push_back(44.0f);
+        }
+        float* intrins = upload(intr_h);
+        float* in_image = upload(r.vec(3 * np, 0.0f, 1.0f));
+        float* plain = alloc_zero<float>(3 * np);
+        float* clamped = alloc_zero<float>(3 * np);
+        for (int c = 0; c < 2; c++)
+            ppisp_forward(dt3(in_image, Bc, H, W),
+                          ttv(params, {Bc, n_params}), ttv(intrins, {Bc, 4}),
+                          aw, ah, c ? "no_crf_clamp" : "no_crf", ttv_null(),
+                          dt3(c ? clamped : plain, Bc, H, W));
+
+        std::vector<float> hp(3 * np), hc(3 * np);
+        backend::memcpy_sync(hp.data(), plain, 3 * np * sizeof(float),
+                             MemcpyKind::DeviceToHost);
+        backend::memcpy_sync(hc.data(), clamped, 3 * np * sizeof(float),
+                             MemcpyKind::DeviceToHost);
+        int64_t clipped = 0;
+        for (int64_t i = 0; i < 3 * np; i++) {
+            float want = std::min(std::max(hp[i], 0.0f), 1.0f);
+            if (want != hp[i]) clipped++;
+            if (hc[i] != want) {
+                std::fprintf(stderr,
+                             "ppisp_parity: no_crf_clamp[%lld] = %g, expected "
+                             "clamp(%g) = %g\n",
+                             (long long)i, hc[i], hp[i], want);
+                return 1;
+            }
+        }
+        if (clipped < 3 * np / 20) {
+            std::fprintf(stderr,
+                         "ppisp_parity: only %lld of %lld channels clipped -- "
+                         "the clamp path is not being exercised\n",
+                         (long long)clipped, (long long)(3 * np));
+            return 1;
+        }
+        std::printf("ppisp_parity: clamp block, %lld / %lld channels clipped\n",
+                    (long long)clipped, (long long)(3 * np));
+
+        // Gradient: zero wherever the clip bound.
+        std::vector<float> vo_h = r.vec(3 * np, -0.3f, 0.3f);
+        float* v_out = upload(vo_h);
+        float* v_in_plain = alloc_zero<float>(3 * np);
+        float* v_in_clamp = alloc_zero<float>(3 * np);
+        float* v_params_plain = alloc_zero<float>(Bc * n_params);
+        float* v_params_clamp = alloc_zero<float>(Bc * n_params);
+        for (int c = 0; c < 2; c++)
+            ppisp_backward(dt3(in_image, Bc, H, W),
+                           ttv(params, {Bc, n_params}), ttv(intrins, {Bc, 4}),
+                           aw, ah, dt3(v_out, Bc, H, W),
+                           c ? "no_crf_clamp" : "no_crf", ttv_null(),
+                           dt3(c ? v_in_clamp : v_in_plain, Bc, H, W),
+                           ttv(c ? v_params_clamp : v_params_plain,
+                               {Bc, n_params}));
+        std::vector<float> hvc(3 * np);
+        backend::memcpy_sync(hvc.data(), v_in_clamp, 3 * np * sizeof(float),
+                             MemcpyKind::DeviceToHost);
+        // A pixel is clipped per channel, but the colour stage mixes the three,
+        // so only an all-clipped pixel has a strictly zero input gradient.
+        for (int64_t i = 0; i < np; i++) {
+            bool all_clipped = true;
+            for (int c = 0; c < 3; c++) {
+                float v = hp[3 * i + c];
+                if (v >= 0.0f && v <= 1.0f) all_clipped = false;
+            }
+            if (!all_clipped) continue;
+            for (int c = 0; c < 3; c++) {
+                if (hvc[3 * i + c] != 0.0f) {
+                    std::fprintf(stderr,
+                                 "ppisp_parity: clipped pixel %lld kept "
+                                 "gradient %g\n",
+                                 (long long)i, hvc[3 * i + c]);
+                    return 1;
+                }
+            }
+        }
+        readback_f(g_tight, clamped, 3 * np);
+        readback_f(g_tight, v_in_clamp, 3 * np);
+        readback_f(g_loose, v_params_clamp, Bc * n_params);
     }
 
     auto write_all = [&](const char* path) {

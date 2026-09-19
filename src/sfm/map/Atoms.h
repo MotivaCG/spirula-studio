@@ -33,16 +33,19 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <exception>
 #include <map>
 #include <mutex>
 #include <thread>
 #include <vector>
 
+#include "sfm/core/Events.h"
 #include "sfm/core/Features.h"
 #include "sfm/core/Matches.h"
 #include "sfm/core/Model.h"
 #include "sfm/map/Mapper.h"
 #include "sfm/vk/VkContext.h"
+#include "sfm/core/Log.h"
 
 namespace sfm {
 
@@ -100,6 +103,7 @@ struct SubDatabase {
     std::vector<FeatureSet> feats;
     std::vector<uint32_t> cam_ids;   // per local image, the *global* camera id
     std::vector<uint32_t> to_global; // local id -> database id
+    RigTable rigs;                   // the run's rigs over the local ids
 };
 
 // `adj[i]` = indices into db.pairs of every pair image i takes part in. Built
@@ -129,7 +133,7 @@ inline SubDatabase carveAtom(const MatchesDatabase& db, const std::vector<Featur
                              const std::vector<uint32_t>& cam_ids,
                              const std::vector<std::vector<uint32_t>>& adj,
                              const std::vector<uint32_t>& images,
-                             std::vector<uint32_t>& local) {
+                             std::vector<uint32_t>& local, const RigTable* rigs = nullptr) {
     SubDatabase s;
     s.to_global = images;
     std::sort(s.to_global.begin(), s.to_global.end());
@@ -171,6 +175,7 @@ inline SubDatabase carveAtom(const MatchesDatabase& db, const std::vector<Featur
             s.db.pairs.back().image2 = local[p.image2];
         }
     }
+    if (rigs) s.rigs = rigs->subset(local, s.to_global.size());
     for (uint32_t g : s.to_global) local[g] = UINT32_MAX;
     return s;
 }
@@ -200,13 +205,18 @@ inline std::vector<Reconstruction> reconstructAtoms(
     const MatchesDatabase& db, const std::vector<FeatureSet>& feats,
     const MapperOptions& base, const std::vector<uint32_t>& cam_ids,
     const std::map<uint32_t, Camera>& start_cams,
-    const std::vector<std::vector<uint32_t>>& atoms, const AtomOptions& opt, AtomStats& st) {
+    const std::vector<std::vector<uint32_t>>& atoms, const AtomOptions& opt, AtomStats& st,
+    const RigTable* rigs = nullptr) {
     const auto t0 = std::chrono::steady_clock::now();
     st.atoms = atoms.size();
 
     MapperOptions mo = base;
     mo.verbose = false;
     mo.threads = 1;  // the parallelism is over atoms; nesting only oversubscribes
+    // An atom is not the capture: it numbers its images within itself and its
+    // model is one of hundreds. The loop below reports it in database ids once
+    // it is done, and a snapshot from here would show one atom as "the model".
+    mo.report_progress = false;
     mo.ba_growth_ratio = std::max(1.0 + 1e-9, opt.ba_growth);
     mo.ba_final_tight = opt.tight_final_ba;
     // Every solve an atom runs is a coarse one (nothing here is the final
@@ -239,31 +249,45 @@ inline std::vector<Reconstruction> reconstructAtoms(
     std::atomic<size_t> next{0};
     std::mutex log_mu;
     std::atomic<size_t> done{0};
+    // A worker whose device fails has to report itself: an exception crossing
+    // a thread boundary is std::terminate, and a terminate handler is a worse
+    // way to learn about a lost device than the message the failure carries.
+    std::mutex err_mu;
+    std::exception_ptr first_error;
 
     auto worker = [&] {
-        // One context for every atom this worker builds. Creating a Vulkan
-        // device takes longer than reconstructing an atom, and it cannot be
-        // shared with another thread.
-        VkContext ctx;
-        std::vector<uint32_t> local(db.images.size(), UINT32_MAX);
-        for (size_t i = next++; i < atoms.size(); i = next++) {
-            detail::SubDatabase sub =
-                detail::carveAtom(db, feats, cam_ids, adj, atoms[i], local);
-            Mapper m(sub.db, sub.feats, mo, sub.cam_ids);
-            m.useBaContext(&ctx);
-            uint32_t reg = 0;
-            for (Reconstruction& r : m.run()) {
-                if (r.numRegistered() < 2) continue;
-                detail::toGlobalIds(r, sub.to_global);
-                reg += r.numRegistered();
-                per_atom[i].push_back(std::move(r));
+        try {
+            // One context for every atom this worker builds. Creating a Vulkan
+            // device takes longer than reconstructing an atom, and it cannot be
+            // shared with another thread.
+            VkContext ctx;
+            std::vector<uint32_t> local(db.images.size(), UINT32_MAX);
+            for (size_t i = next++; i < atoms.size(); i = next++) {
+                detail::SubDatabase sub =
+                    detail::carveAtom(db, feats, cam_ids, adj, atoms[i], local, rigs);
+                Mapper m(sub.db, sub.feats, mo, sub.cam_ids, rigs ? &sub.rigs : nullptr);
+                m.useBaContext(&ctx);
+                uint32_t reg = 0;
+                for (Reconstruction& r : m.run()) {
+                    if (r.numRegistered() < 2) continue;
+                    detail::toGlobalIds(r, sub.to_global);
+                    reg += r.numRegistered();
+                    for (const auto& kv : r.images)
+                        if (kv.second.registered) events::map_placed(kv.first);
+                    per_atom[i].push_back(std::move(r));
+                }
+                if (opt.verbose) {
+                    const size_t n = ++done;
+                    std::lock_guard<std::mutex> lk(log_mu);
+                    slog::diag(slog::Tag::Map,
+                               "[bup] atom %zu/%zu: %zu images -> %zu model(s), %u registered",
+                               n, atoms.size(), atoms[i].size(), per_atom[i].size(), reg);
+                }
             }
-            if (opt.verbose) {
-                const size_t n = ++done;
-                std::lock_guard<std::mutex> lk(log_mu);
-                fprintf(stderr, "[bup] atom %zu/%zu: %zu images -> %zu model(s), %u registered\n",
-                        n, atoms.size(), atoms[i].size(), per_atom[i].size(), reg);
-            }
+        } catch (...) {
+            std::lock_guard<std::mutex> lk(err_mu);
+            if (!first_error) first_error = std::current_exception();
+            next = atoms.size();  // nothing left for the others to claim
         }
     };
     if (nt == 1) {
@@ -274,6 +298,7 @@ inline std::vector<Reconstruction> reconstructAtoms(
         for (int t = 0; t < nt; t++) pool.emplace_back(worker);
         for (std::thread& t : pool) t.join();
     }
+    if (first_error) std::rethrow_exception(first_error);
 
     std::vector<Reconstruction> models;
     for (std::vector<Reconstruction>& v : per_atom) {

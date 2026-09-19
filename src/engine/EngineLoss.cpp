@@ -224,6 +224,7 @@ static void _engine_raster_proj_backward(
             (uint32_t)engine().camera.height,
             engine().fwd.tile_offsets,
             engine().fwd.flatten_ids,
+            engine().fwd.macro_log2,
             engine().fwd.render_Ts,
             engine().fwd.last_ids,
             engine().fwd.renders,
@@ -260,6 +261,7 @@ static void _engine_raster_proj_backward(
             (uint32_t)engine().camera.height,
             engine().fwd.tile_offsets,
             engine().fwd.flatten_ids,
+            engine().fwd.macro_log2,
             engine().fwd.render_Ts,
             engine().fwd.last_ids,
             engine().fwd.renders,
@@ -310,7 +312,7 @@ static void _engine_raster_proj_backward(
             };
             if (engine().world.features_sh_quant8_fpbo.initialized()) {
                 pick(engine().world.features_sh_quant8_fpbo);
-                sh_bounds_stride = (int64_t)256 * 3 * (int64_t)num_sh_buffer;
+                sh_bounds_stride = 0;  // FPBO layout
             } else {
                 pick(engine().world.features_sh_quant8);
                 sh_bounds_stride = 256;
@@ -323,7 +325,7 @@ static void _engine_raster_proj_backward(
             };
             if (engine().world.features_sh_quant16_fpbo.initialized()) {
                 pick(engine().world.features_sh_quant16_fpbo);
-                sh_bounds_stride = (int64_t)256 * 3 * (int64_t)num_sh_buffer;
+                sh_bounds_stride = 0;  // FPBO layout
             } else {
                 pick(engine().world.features_sh_quant16);
                 sh_bounds_stride = 256;
@@ -433,6 +435,24 @@ void engine_backward_from_render_grad(
 }
 
 
+// loss_scale_min_pixels > 0 overrides num_loss_scales so the smallest image
+// dimension halves down toward (not below) that count -- 2000 makes min dim
+// 1999 one scale, 2000 two, 8000 four. Per step, so mixed resolutions adapt.
+int engine_resolve_num_loss_scales(int num_loss_scales,
+                                   int loss_scale_min_pixels,
+                                   int64_t H, int64_t W) {
+    if (loss_scale_min_pixels <= 0) return num_loss_scales;
+    int64_t min_dim = std::min(H, W);
+    int auto_scales = 1;
+    if (min_dim >= (int64_t)loss_scale_min_pixels)
+        auto_scales = (int)std::floor(
+            std::log2((double)min_dim / (double)loss_scale_min_pixels)) + 2;
+    // Clamp to the kernel's MAX_SCALES (see PerPixelLoss.cu) so extreme
+    // resolutions saturate the scale count rather than throwing.
+    return std::min(auto_scales, 4);
+}
+
+
 // Shared by engine_compute_loss_backward and engine_preview_loss_map: a valid
 // `map_out` stops after the per-pixel loss and copies the loss map there,
 // before anything that mutates a gradient or an optimizer moment.
@@ -449,6 +469,7 @@ static std::map<std::string, float> _engine_loss(
     float loss_map_clip_quantile,
     float loss_map_power,
     int loss_map_accum_mode,
+    float saturation_threshold,
     float overexposure_reg_weight,
     float color_shift_reg_weight,
     float color_shift_reg_beta,
@@ -468,22 +489,8 @@ static std::map<std::string, float> _engine_loss(
     int64_t H = engine().camera.height;
     int64_t W = engine().camera.width;
 
-    // Resolution-adaptive multi-scale loss: when loss_scale_min_pixels > 0 it
-    // overrides num_loss_scales based on this step's render resolution, so that
-    // the smallest image dimension is halved down toward (but not below) the
-    // requested pixel count. e.g. loss_scale_min_pixels=2000 -> min dim 1999
-    // gives 1 scale, 2000 gives 2, 4000 gives 3, 8000 gives 4. Adapts per step,
-    // so mixed-resolution datasets pick the right count per image automatically.
-    if (loss_scale_min_pixels > 0) {
-        int64_t min_dim = std::min(H, W);
-        int auto_scales = 1;
-        if (min_dim >= (int64_t)loss_scale_min_pixels)
-            auto_scales = (int)std::floor(
-                std::log2((double)min_dim / (double)loss_scale_min_pixels)) + 2;
-        // Clamp to the kernel's MAX_SCALES (see PerPixelLoss.cu) so extreme
-        // resolutions saturate the scale count rather than throwing.
-        num_loss_scales = std::min(auto_scales, 4);
-    }
+    num_loss_scales = engine_resolve_num_loss_scales(
+        num_loss_scales, loss_scale_min_pixels, H, W);
 
     // Pool-allocate intermediates for loss computation
     TorchTensorView loss_map_buf = compute_loss_map ?
@@ -659,6 +666,7 @@ static std::map<std::string, float> _engine_loss(
         engine().gt.has_mask,
         loss_weights,
         w_ssim,
+        saturation_threshold,
         v_losses_buf,
         needs_input_grad,
         -1,  // num_train_images: -1 means use batch size
@@ -696,14 +704,15 @@ static std::map<std::string, float> _engine_loss(
         const bool bg_rgb_on = engine().bilagrid_rgb.enabled;
         const bool ppisp_on  = engine().ppisp.enabled;
         if (color_shift_reg_weight > 0.0f && (bg_rgb_on || ppisp_on)) {
-            // Identify the "pre" buffer = input to the FIRST forward transform.
-            // Forward order (set in EngineTrainStep.cpp):
-            //   run_before_bilagrid=false -> bilagrid -> PPISP : pre = bilagrid_rgb.fwd_pre
-            //   run_before_bilagrid=true  -> PPISP    -> bilagrid : pre = ppisp.fwd_pre
-            // When only one of the two is on, that one's fwd_pre is the splat
-            // output regardless of the flag.
+            // "pre" is the input to the first forward transform that runs in
+            // DISPLAY space, `post` being there too. With PPISP ahead of the
+            // encode only the bilagrid qualifies; with neither, skip.
             const float* pre_ptr = nullptr;
-            if (bg_rgb_on && ppisp_on) {
+            if (engine().ppisp.cur_run_before_color_space) {
+                pre_ptr = bg_rgb_on
+                    ? (const float*)engine().bilagrid_rgb.fwd_pre.data_ptr()
+                    : nullptr;
+            } else if (bg_rgb_on && ppisp_on) {
                 pre_ptr = engine().ppisp.cur_run_before_bilagrid
                     ? (const float*)engine().ppisp.fwd_pre.data_ptr()
                     : (const float*)engine().bilagrid_rgb.fwd_pre.data_ptr();
@@ -742,15 +751,9 @@ static std::map<std::string, float> _engine_loss(
         }
     }
 
-    // --- PPISP / Bilagrid backward hooks ---
-    // Backward order is the inverse of forward (set in EngineTrainStep.cpp
-    // and stashed on engine().ppisp.cur_run_before_bilagrid):
-    //   forward bilagrid->PPISP  =>  backward PPISP first, then bilagrid.
-    //   forward PPISP->bilagrid  =>  backward bilagrid first, then PPISP.
-    // Each hook rewrites v_render_rgb (post-<self> -> pre-<self>) and
-    // accumulates parameter grads into its own buffer; the next hook then
-    // consumes the rewritten v_render_rgb. Depth/normal grids are GT-side
-    // and live entirely inside the bilagrid hook regardless of order.
+    // Backward hooks, in the inverse of the forward order: each rewrites
+    // v_render_rgb (post-<self> -> pre-<self>) so the next consumes the
+    // rewrite. Depth/normal grids are GT-side, inside the bilagrid hook.
     auto _ppisp_bwd = [&]() {
         if (engine().ppisp.enabled) {
             _ensure_ppisp_optim_state();
@@ -767,45 +770,47 @@ static std::map<std::string, float> _engine_loss(
                 pixel_grads.v_ref_normal);
         }
     };
-    if (engine().ppisp.cur_run_before_bilagrid) {
+    // --- Color space backward hook ---
+    // Forward is render -> bg -> [PPISP] -> display encode -> bilagrid ->
+    // [PPISP] -> loss, so it sits either after both hooks or between them.
+    auto _color_space_bwd = [&]() {
+        if (engine().color_space.splat_enabled)
+            _engine_color_space_backward_hook(pixel_grads.v_render_rgb);
+    };
+    if (engine().ppisp.cur_run_before_color_space) {
+        _bilagrid_bwd();
+        _color_space_bwd();
+        _ppisp_bwd();
+    } else if (engine().ppisp.cur_run_before_bilagrid) {
         _bilagrid_bwd();
         _ppisp_bwd();
+        _color_space_bwd();
     } else {
         _ppisp_bwd();
         _bilagrid_bwd();
-    }
-
-    // --- Color space backward hook ---
-    // Forward order is render -> bg -> rgb_to_srgb -> {bilagrid, PPISP} ->
-    // loss (bilagrid/PPISP ordered per cfg.ppisp.run_before_bilagrid). Color
-    // space sits BEFORE both, so the bwd hook runs AFTER both bilagrid and
-    // PPISP bwd, regardless of their relative order. It rewrites v_render_rgb
-    // (sRGB -> linear/wide-gamut) and restores engine().fwd.renders.rgb to
-    // the pre-conversion values so the background bwd consumes the right rgb.
-    // No-op when disabled.
-    if (engine().color_space.splat_enabled) {
-        _engine_color_space_backward_hook(pixel_grads.v_render_rgb);
+        _color_space_bwd();
     }
 
     // --- Image-space overexposure regularization ---
-    // Skipped under a blend: that clamped this buffer to [0,1], so the penalty
-    // would be identically zero -- the blend backward applies it instead.
+    // Skipped under a blend: the blend backward applies it instead, on the
+    // composite rather than on this pre-blend buffer.
     if (overexposure_reg_weight != 0.0f && !engine().background.enabled) {
-        // Both buffers are in the splat working color space here: cs.fwd_pre
-        // is the pre-conversion render when color space is on (its bwd hook
-        // does not re-point fwd.renders.rgb), render_rgb itself when off.
-        DeviceTensor3D<float3> rgb_t = engine().color_space.splat_enabled
-            ? engine().color_space.fwd_pre
-            : DeviceTensor3D<float3>(render_rgb);
+        // Both buffers are in the splat working color space here. Whose
+        // values v_render_rgb is the gradient OF is what picks between them:
+        // the color-space bwd hook does not re-point fwd.renders.rgb.
+        DeviceTensor3D<float3> rgb_t =
+            engine().ppisp.cur_run_before_color_space
+                ? engine().ppisp.fwd_pre
+            : engine().color_space.splat_enabled
+                ? engine().color_space.fwd_pre
+                : DeviceTensor3D<float3>(render_rgb);
         DeviceTensor3D<float3> v_rgb_t(pixel_grads.v_render_rgb);
         overexposure_grad_add(rgb_t, overexposure_reg_weight, v_rgb_t);
     }
 
     // --- Background blend backward hook ---
-    // Forward order is render -> background -> rgb_to_srgb -> bilagrid ->
-    // PPISP -> loss, so background backward runs after the color-space hook.
-    // It rewrites v_render_rgb (post-blend -> pre-blend) and ADDS the blend's
-    // transmittance gradient into v_render_Ts before raster bwd consumes it.
+    // After the color-space hook, per the forward order above. It ADDS the
+    // blend's transmittance gradient into v_render_Ts, not overwrite.
     if (engine().background.enabled) {
         _engine_background_backward_hook(
             pixel_grads.v_render_rgb,
@@ -910,6 +915,7 @@ std::map<std::string, float> engine_compute_loss_backward(
     float loss_map_clip_quantile,
     float loss_map_power,
     int loss_map_accum_mode,
+    float saturation_threshold,
     float overexposure_reg_weight,
     float color_shift_reg_weight,
     float color_shift_reg_beta
@@ -919,7 +925,7 @@ std::map<std::string, float> engine_compute_loss_backward(
                         robust_edge_aware_quantile, nms_falloff,
                         loss_map_normalize,
                         loss_map_clip_quantile, loss_map_power,
-                        loss_map_accum_mode,
+                        loss_map_accum_mode, saturation_threshold,
                         overexposure_reg_weight,
                         color_shift_reg_weight, color_shift_reg_beta,
                         _tv_null());
@@ -938,7 +944,7 @@ bool engine_preview_loss_map(const LossConfig& loss, TorchTensorView out) {
                  loss.robust_edge_aware_quantile, loss.nms_falloff,
                  loss.loss_map_normalize,
                  loss.loss_map_clip_quantile, loss.loss_map_power,
-                 loss.loss_map_accum_mode,
+                 loss.loss_map_accum_mode, loss.saturation_threshold,
                  0.0f, 0.0f, 0.0f, out);
     return true;
 }

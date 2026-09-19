@@ -37,6 +37,8 @@
 #include "sfm/geometry/AbsolutePose.h"
 #include "sfm/geometry/Triangulation.h"
 #include "sfm/geometry/TwoView.h"
+#include "sfm/core/Cancel.h"
+#include "sfm/core/Events.h"
 #include "sfm/core/Log.h"
 #include "sfm/map/Bundle.h"
 #include "i18n/catalog/Sfm.h"
@@ -324,22 +326,40 @@ struct MapperOptions {
     // 87.1. Not just noisier -- worse on average, by 2.7 and 1.4 points.
     std::string ba_real_coarse = "double";
     int device = -1;
+    // Canonical uuid:<hex>; every BA this mapper runs carries it. "" = shared
+    // precedence.
+    std::string device_selector;
     // Host worker threads for the passes that fan out over points
     // (filterPoints) and for a bundle adjustment that runs on the host.
     // 0 = hardware_concurrency.
     int threads = 0;
     bool verbose = true;
+    // Whether this mapper speaks for the run: it writes the snapshot a front
+    // end draws and counts its registrations towards the bar. False for an
+    // atom's private mapper, which is neither (sfm/map/Atoms.h).
+    bool report_progress = true;
+    // Rigs (sfm/core/Rig.h). `use_rigs` off ignores the table entirely;
+    // `refine_rigs` off holds every member extrinsic at its calibration.
+    bool use_rigs = true;
+    bool refine_rigs = true;
+    // Register a rig-mate on the rig's word alone when it has too few 2D-3D
+    // correspondences to be judged: a lens on the sky or the operator gets its
+    // pose from the frame, which is the coverage a rig is for.
+    bool rig_complete_blind = true;
+    RigCalibOptions rig_calib;
 };
 
 class Mapper {
 public:
-    // `camera_ids[i]` is the (1-based) camera image i belongs to; images sharing
-    // an id share intrinsics and one BA parameter group. Empty = one shared
-    // camera for everything, the old behaviour. The CLI builds this from
-    // --camera-mode (D17).
+    // `camera_ids[i]` is the (1-based) camera image i belongs to (empty = one
+    // shared camera, D17). `rigs` (sfm/core/Rig.h) is optional, must outlive
+    // the mapper, and numbers images as this database does.
     Mapper(const MatchesDatabase& db, const std::vector<FeatureSet>& feats, MapperOptions opt,
-           std::vector<uint32_t> camera_ids = {})
-        : db_(db), feats_(feats), opt_(opt), cam_ids_(std::move(camera_ids)) {}
+           std::vector<uint32_t> camera_ids = {}, const RigTable* rigs = nullptr)
+        : db_(db), feats_(feats), opt_(opt), cam_ids_(std::move(camera_ids)),
+          rigs_(rigs && !rigs->empty() && opt.use_rigs ? rigs : nullptr) {}
+
+    const RigTable* rigs() const { return rigs_; }
 
     // All reconstructions the dataset supports, largest first (by 3D point
     // count -- COLMAP's ReconstructionManager::Write ordering, so models[0] is
@@ -372,6 +392,7 @@ public:
         size_t seed_from = 0;
         seeded_.clear();  // seed blocking is a device of this loop alone (D58)
         for (int attempt = 0; attempt < std::max(1, opt_.max_init_trials); attempt++) {
+            cancel::check();
             resetModel();
             bool seeded;
             {
@@ -421,7 +442,7 @@ public:
             std::string why;
             if (i > 0 && !admitModel(attempts[i], why)) {
                 if (opt_.verbose)
-                    fprintf(stderr, "[map] seed attempt discarded: %s\n", why.c_str());
+                    slog::diag(slog::Tag::Map, "[map] seed attempt discarded: %s", why.c_str());
                 continue;
             }
             claimImages(attempts[i]);
@@ -750,8 +771,9 @@ public:
         } catch (const BAOverBudget& e) {
             ba_over_budget_throws_ = false;
             if (opt_.verbose)
-                fprintf(stderr, "[map] a %u-image refinement needs %.0f MB against a %.0f MB "
-                        "budget; declining it\n", m.numRegistered(), e.need_mb, e.budget_mb);
+                slog::diag(slog::Tag::Map,
+                           "[map] a %u-image refinement needs %.0f MB against a %.0f MB "
+                           "budget; declining it", m.numRegistered(), e.need_mb, e.budget_mb);
             return false;
         }
         ba_over_budget_throws_ = false;
@@ -762,9 +784,13 @@ public:
     // mapper held now released: the principal point (D51) and the distortion
     // coefficients (D72). See src/sfm/README.md, "The finishing passes".
     Reconstruction polish(const Reconstruction& m, bool free_pp = true, bool free_extra = false) {
+        // This run's grouping, not the model's ids: a model read back from disk
+        // carries one camera per frame size (splitCamerasBySize).
         std::set<uint32_t> groups;
         for (const auto& kv : m.images)
-            if (kv.second.registered) groups.insert(kv.second.camera_id);
+            if (kv.second.registered)
+                groups.insert(kv.first < cam_ids_.size() ? cam_ids_[kv.first]
+                                                        : kv.second.camera_id);
         // Two groups or more and each principal point drifts its own way; the
         // difference is a real error in their relative orientation, which on a
         // dual-fisheye rig cost 21 points of AUC (D51).
@@ -791,9 +817,9 @@ public:
                 const Vec2& b = before[kv.first];
                 const double d = std::hypot(kv.second.cx - b.x, kv.second.cy - b.y);
                 if (d > 1e-9)
-                    fprintf(stderr,
-                            "[map] camera %u principal point %.1f,%.1f -> %.1f,%.1f (%.1f px)\n",
-                            kv.first, b.x, b.y, kv.second.cx, kv.second.cy, d);
+                    slog::diag(slog::Tag::Map,
+                               "[map] camera %u principal point %.1f,%.1f -> %.1f,%.1f (%.1f px)",
+                               kv.first, b.x, b.y, kv.second.cx, kv.second.cy, d);
             }
         return snapshotModel();
     }
@@ -810,6 +836,21 @@ public:
         if (!splitCamerasPerImage()) return m;
         final_.extra = free_extra;
         final_.no_sanitize = true;
+        globalRefine(true);
+        final_ = FinalRelease{};
+        return snapshotModel();
+    }
+
+    // One tight refinement of a finished model with every image on its own
+    // pose, the rig calibration set aside: a lens that fired late, or a mount
+    // that flexed, gets to settle where its own observations say.
+    Reconstruction releaseRigs(const Reconstruction& m) {
+        if (!rigs_ || m.numRegistered() < 2) return m;
+        ensureSetup();
+        resetModel();
+        adopt(m);
+        rebuildScores();
+        final_.no_rig = true;
         globalRefine(true);
         final_ = FinalRelease{};
         return snapshotModel();
@@ -901,8 +942,9 @@ public:
         ProfTimer audit_pt(g_map_prof.audit_fix);
         if (!repairs.empty()) {
             if (opt_.verbose)
-                fprintf(stderr, "[map] audit: %u/%u image(s) sit where the rest of the model "
-                        "contradicts them; moving\n", st.unsupported, st.checked);
+                slog::diag(slog::Tag::Map,
+                           "[map] audit: %u/%u image(s) sit where the rest of the model "
+                           "contradicts them; moving", st.unsupported, st.checked);
             // Detach first, all of them: their old observations are evidence
             // for the old pose and must not survive it.
             for (const auto& r : repairs) deregisterImage(r.first);
@@ -957,9 +999,10 @@ public:
                unclaimedImages() >= need) {
             if (++trials > std::max(1, opt_.max_model_trials)) {
                 if (opt_.verbose)
-                    fprintf(stderr, "[map] sub-model search hit its %d-attempt budget with %zu "
-                            "image(s) unaccounted for\n", opt_.max_model_trials,
-                            unclaimedImages());
+                    slog::diag(slog::Tag::Map,
+                               "[map] sub-model search hit its %d-attempt budget with %zu "
+                               "image(s) unaccounted for", opt_.max_model_trials,
+                               unclaimedImages());
                 break;
             }
             resetModel();
@@ -979,7 +1022,7 @@ public:
                 // would only starve later passes. Leave them for the next seed;
                 // `used_seeds_` stops this pair being tried again.
                 if (opt_.verbose)
-                    fprintf(stderr, "[map] sub-model discarded: %s\n", why.c_str());
+                    slog::diag(slog::Tag::Map, "[map] sub-model discarded: %s", why.c_str());
                 continue;
             }
             const uint32_t reg = sub.numRegistered();
@@ -987,8 +1030,10 @@ public:
             claimImages(models.back());
             recordCameras(models.back());
             if (opt_.verbose)
-                fprintf(stderr, "[map] sub-model %zu: %u images, %zu points (%zu images left)\n",
-                        models.size() - 1, reg, models.back().points3D.size(), unclaimedImages());
+                slog::diag(slog::Tag::Map,
+                           "[map] sub-model %zu: %u images, %zu points (%zu images left)",
+                           models.size() - 1, reg, models.back().points3D.size(),
+                           unclaimedImages());
         }
     }
 
@@ -1254,6 +1299,7 @@ public:
         BundleOptions bo;
         bo.real = baReal(coarse);
         bo.device = opt_.device;
+        bo.device_selector = opt_.device_selector;
         bo.threads = opt_.threads;
         bo.verbose = false;
         bo.loss = opt_.ba_loss;
@@ -1268,6 +1314,9 @@ public:
         }
         bo.shared_ctx = &baContext(coarse);
         bo.over_budget_throws = true;
+        bo.rigs = rigs_;
+        bo.refine_rigs = opt_.refine_rigs;
+        for (Reconstruction& m : models) calibrateRigs(m);
         // One problem if it fits, and the device decides whether it does. A
         // capture cut into hundreds of atoms puts every atom's images in the
         // solve at once -- 5356 images arrive as 11564 image-instances at 2.2x
@@ -1289,9 +1338,9 @@ public:
                     std::max(batches + 1, (int)std::ceil(e.need_mb / e.budget_mb * batches));
                 if (want > 64) throw;
                 if (opt_.verbose)
-                    fprintf(stderr,
-                            "[map] the joint solve needs %.0f MB against a %.0f MB budget: "
-                            "splitting it %d ways\n", e.need_mb, e.budget_mb, want);
+                    slog::diag(slog::Tag::Map,
+                               "[map] the joint solve needs %.0f MB against a %.0f MB budget: "
+                               "splitting it %d ways", e.need_mb, e.budget_mb, want);
                 batches = want;
             }
         }
@@ -1452,8 +1501,9 @@ public:
         // largest line in the finishing bill on every large capture.
         if (n <= (int)(opt_.audit_alternative_factor * cur) || n < opt_.audit_min_alternative) {
             if (audit_dump_)
-                fprintf(stderr, "[audit] %s: pool %d, current %d -> ok (no alternative can win)\n",
-                        db_.images[img].name.c_str(), n, cur);
+                slog::diag(slog::Tag::Map,
+                           "[audit] %s: pool %d, current %d -> ok (no alternative can win)",
+                           db_.images[img].name.c_str(), n, cur);
             return false;
         }
 
@@ -1484,11 +1534,11 @@ public:
             if (contradicted) alternative = r.pose;
         }
         if (audit_dump_)
-            fprintf(stderr,
-                    "[audit] %s: pool %d, current %d, alternative %d, rot %.1f deg, shift %.4f "
-                    "-> %s\n", db_.images[img].name.c_str(), n, cur,
-                    r.success ? r.num_inliers : 0, rot_deg, shift,
-                    contradicted ? "CONTRADICTED" : "ok");
+            slog::diag(slog::Tag::Map,
+                       "[audit] %s: pool %d, current %d, alternative %d, rot %.1f deg, shift %.4f "
+                       "-> %s", db_.images[img].name.c_str(), n, cur,
+                       r.success ? r.num_inliers : 0, rot_deg, shift,
+                       contradicted ? "CONTRADICTED" : "ok");
         return contradicted;
     }
 
@@ -1590,26 +1640,41 @@ private:
     // are then facts, not guesses), and its points re-added as fresh tracks.
     // Images the model does not hold keep the cleared state resetModel() left.
     void adopt(const Reconstruction& m) {
-        size_t cam_mismatch = 0, missing = 0, name_mismatch = 0, count_mismatch = 0;
+        size_t missing = 0, name_mismatch = 0, count_mismatch = 0;
+        if (rigs_) {
+            rec_.rigs = m.rigs;
+            rec_.rig_detached = m.rig_detached;
+            initRigCalib(rec_);
+        }
         // point2D_idx is an index into this run's feature arrays, so a model
         // whose image holds a different number of keypoints indexes different
         // features -- what --compact-unused-features does on one side only.
         std::set<uint32_t> reindexed;
-        for (const auto& kv : m.cameras) {
-            rec_.cameras[kv.first] = kv.second;
-            // cameras.bin cannot carry pixel_scale (it says nothing about the
-            // lens), so an adopted model arrives with 1.0. Restore what the
-            // features say, or every threshold silently reverts to source
-            // pixels on --resume (D47).
-            auto d = default_cams_.find(kv.first);
-            if (d != default_cams_.end()) rec_.cameras[kv.first].pixel_scale = d->second.pixel_scale;
-            focal_known_.insert(kv.first);
+        // The file holds one camera per frame size; this run's grouping says what
+        // shares intrinsics, so the parameters land on the camera it gives the
+        // image. Frame and pixel_scale stay -- cameras.bin carries neither (D47).
+        std::set<uint32_t> adopted;
+        for (const auto& kv : m.images) {
+            if (!kv.second.registered) continue;
+            auto im = rec_.images.find(kv.first);
+            if (im == rec_.images.end()) continue;
+            auto mc = m.cameras.find(kv.second.camera_id);
+            auto cur = rec_.cameras.find(im->second.camera_id);
+            if (mc == m.cameras.end() || cur == rec_.cameras.end()) continue;
+            if (!adopted.insert(cur->first).second) continue;
+            const int w = cur->second.width, h = cur->second.height;
+            const double ps = cur->second.pixel_scale;
+            cur->second = mc->second;
+            cur->second.id = cur->first;
+            cur->second.width = w;
+            cur->second.height = h;
+            cur->second.pixel_scale = ps;
+            focal_known_.insert(cur->first);
         }
         for (const auto& kv : m.images) {
             if (!kv.second.registered) continue;
             auto it = rec_.images.find(kv.first);
             if (it == rec_.images.end()) { missing++; continue; }
-            if (it->second.camera_id != kv.second.camera_id) cam_mismatch++;
             // Image ids are positions in this database. A model from a
             // *different* database would adopt cleanly and silently reconstruct
             // nonsense, so the names are checked (the model's carry an
@@ -1647,21 +1712,21 @@ private:
             }
         }
         if (name_mismatch)
-            fprintf(stderr,
-                    "[map] WARNING: %zu adopted image(s) have a different name than the database "
-                    "entry with the same id -- the model was probably built from other matches, "
-                    "and adopting it will produce nonsense\n", name_mismatch);
+            slog::diag(slog::Tag::Map,
+                       "[map] WARNING: %zu adopted image(s) have a different name than "
+                       "the database entry with the same id -- the model was probably "
+                       "built from other matches, "
+                       "and adopting it will produce nonsense", name_mismatch);
         if (count_mismatch)
-            fprintf(stderr,
-                    "[map] WARNING: %zu adopted image(s) hold a different keypoint count than "
-                    "this run's features -- their observations index other keypoints and were "
-                    "dropped, poses kept. Feature compaction on one side only does this; "
-                    "--compact-unused-features has to match the run that wrote the model\n",
-                    count_mismatch);
-        if ((missing || cam_mismatch) && opt_.verbose)
-            fprintf(stderr,
-                    "[map] adopted model: %zu image(s) not in this database, %zu with a "
-                    "different camera group\n", missing, cam_mismatch);
+            slog::diag(slog::Tag::Map,
+                       "[map] WARNING: %zu adopted image(s) hold a different keypoint count than "
+                       "this run's features -- their observations index other keypoints and were "
+                       "dropped, poses kept. Feature compaction on one side only does this; "
+                       "--compact-unused-features has to match the run that wrote the model",
+                       count_mismatch);
+        if (missing && opt_.verbose)
+            slog::diag(slog::Tag::Map, "[map] adopted model: %zu image(s) not in this database",
+                       missing);
     }
 
     // Sort, report and return. Split out only because run() has two exits.
@@ -1692,16 +1757,19 @@ private:
             // fixes -- too few 2D-3D candidates is a matching or coverage
             // problem, a low inlier *ratio* is usually the image being
             // genuinely somewhere else -- so they are worth separating.
+            if (rigs_)
+                slog::out(slog::Tag::Map, spirula::i18n::msg::sfm::map_rig_summary,
+                         {(long long)reg_by_rig_, (long long)reg_rig_word_});
             if (covered.size() < db_.images.size())
-                fprintf(stderr,
-                        "[map] registration attempts that failed: %u too few candidates, "
-                        "%u too few PnP inliers, %u inlier ratio below %.2f, %u lost on refit "
-                        "(%u came in on absolute support with the ratio failed, %u more were "
-                        "refused for a rival pose fitting the leftovers; %u correspondence(s) "
-                        "were left out of the ratio as unseeable)\n",
-                        reg_fail_.few_corr, reg_fail_.few_inliers, reg_fail_.low_ratio,
-                        opt_.min_pnp_inlier_ratio, reg_fail_.refined_out, reg_fail_.strong,
-                        reg_fail_.ambiguous, reg_fail_.occluded);
+                slog::diag(slog::Tag::Map,
+                           "[map] registration attempts that failed: %u too few candidates, "
+                           "%u too few PnP inliers, %u inlier ratio below %.2f, %u lost on refit "
+                           "(%u came in on absolute support with the ratio failed, %u more were "
+                           "refused for a rival pose fitting the leftovers; %u correspondence(s) "
+                           "were left out of the ratio as unseeable)",
+                           reg_fail_.few_corr, reg_fail_.few_inliers, reg_fail_.low_ratio,
+                           opt_.min_pnp_inlier_ratio, reg_fail_.refined_out, reg_fail_.strong,
+                           reg_fail_.ambiguous, reg_fail_.occluded);
         }
         g_map_prof.report(std::chrono::duration<double>(
                               std::chrono::steady_clock::now() - prof_start).count());
@@ -1861,6 +1929,7 @@ private:
         // would otherwise be over budget before it registered anything.
         const size_t shared_at_entry = sharedRegistered();
         while (true) {
+            cancel::check();
             if (max_reg && rec_.numRegistered() >= max_reg) break;
             // Both counts are of *this* pass, and both can be nudged by a
             // de-registration mid-pass, so neither subtraction may wrap.
@@ -1869,8 +1938,9 @@ private:
             const size_t fresh_here = registered_here > shared_here ? registered_here - shared_here : 0;
             if (shared_here > overlapBudget(fresh_here)) {
                 if (opt_.verbose)
-                    fprintf(stderr, "[map] growth took %zu image(s) an earlier model holds "
-                            "against %zu of its own; stopping it\n", shared_here, fresh_here);
+                    slog::diag(slog::Tag::Map,
+                               "[map] growth took %zu image(s) an earlier model holds "
+                               "against %zu of its own; stopping it", shared_here, fresh_here);
                 break;
             }
             // COLMAP's shape: rank all candidates, try them in order until one
@@ -1897,9 +1967,13 @@ private:
                     g_map_prof.n_reg_ok++;
                     registered = true;
                     registered_here++;
-                    ProfTimer pt(g_map_prof.tri);
-                    triangulateForImage(img);
+                    {
+                        ProfTimer pt(g_map_prof.tri);
+                        triangulateForImage(img);
+                    }
                     recent_regs_.push_back(img);
+                    registered_here += completeFrameOf(img) + frame_regs_;
+                    frame_regs_ = 0;
                     break;
                 }
             }
@@ -1911,6 +1985,7 @@ private:
                 // retriangulation, de-registration, possibly a snapshot
                 // restore), so the incremental score cache starts over.
                 rebuildScores();
+                registered_here += completeRigFrames();
                 // De-registration may have shrunk the model; the next trigger
                 // is always relative to what actually survived.
                 next_ba = std::ceil(rec_.numRegistered() * opt_.ba_growth_ratio);
@@ -1939,6 +2014,8 @@ private:
         uint64_t next_point3D_id = 1;
         std::vector<std::pair<uint32_t, Image>> images;  // registered only
         std::set<uint32_t> focal_known;
+        std::vector<RigCalib> rigs;
+        std::set<uint32_t> rig_detached;
     };
 
     Snapshot takeSnapshot() const {
@@ -1947,6 +2024,8 @@ private:
         s.points3D = rec_.points3D;
         s.next_point3D_id = rec_.next_point3D_id;
         s.focal_known = focal_known_;
+        s.rigs = rec_.rigs;
+        s.rig_detached = rec_.rig_detached;
         for (const auto& kv : rec_.images)
             if (kv.second.registered) s.images.emplace_back(kv.first, kv.second);
         return s;
@@ -1957,6 +2036,8 @@ private:
         rec_.points3D = std::move(s.points3D);
         rec_.next_point3D_id = s.next_point3D_id;
         focal_known_ = std::move(s.focal_known);
+        rec_.rigs = std::move(s.rigs);
+        rec_.rig_detached = std::move(s.rig_detached);
         std::set<uint32_t> was;
         for (const auto& kv : s.images) was.insert(kv.first);
         // Refinement only ever de-registers, so this loop is normally empty;
@@ -1986,10 +2067,10 @@ private:
         bool collapsed = 2 * rec_.numRegistered() < reg_before;
         if (collapsed && !recent_regs_.empty()) {
             if (opt_.verbose)
-                fprintf(stderr,
-                        "[map] refinement collapsed the model (%u -> %u images); undoing %zu "
-                        "recent registration(s)\n", reg_before, rec_.numRegistered(),
-                        recent_regs_.size());
+                slog::diag(slog::Tag::Map,
+                           "[map] refinement collapsed the model (%u -> %u images); undoing %zu "
+                           "recent registration(s)", reg_before, rec_.numRegistered(),
+                           recent_regs_.size());
             restoreSnapshot(snap);
             for (uint32_t img : recent_regs_) deregisterImage(img);
             resetOrphanCameras();
@@ -2196,6 +2277,7 @@ private:
             im.id = i;
             im.camera_id = cam_ids_[i];
             im.name = db_.images[i].name;  // feature stem; CLI resolves the real filename
+            im.exif_orientation = feats_[i].exif_orientation;
             im.points2D.resize(feats_[i].count());
             im.point3D_ids.assign(feats_[i].count(), kInvalidPoint3D);
             for (uint32_t f = 0; f < feats_[i].count(); f++) im.points2D[f] = kp(i, f);
@@ -2207,6 +2289,7 @@ private:
             return nf;
         }());
         reg_trials_.assign(db_.images.size(), 0);
+        if (rigs_) initRigCalib(rec_);
         // Size the score bookkeeping now: attachObservation can run before the
         // first grow() (the post-seed globalRefine retriangulates), and must
         // never index unallocated rows. Values there are throwaway -- grow()
@@ -2218,8 +2301,14 @@ private:
     // from the same state setup() left behind.
     void resetModel() {
         scale_cache_ = 0;
+        rig_refined_at_ = 0;
         rec_.points3D.clear();
         rec_.cameras.clear();
+        if (rigs_) {
+            rec_.rigs.clear();
+            rec_.rig_detached.clear();
+            initRigCalib(rec_);
+        }
         focal_known_ = opt_.known_focal_cameras;
         for (uint32_t i = 0; i < db_.images.size(); i++) {
             uint32_t cid = cam_ids_[i];
@@ -2260,18 +2349,18 @@ private:
 
     void reportInitFailure() const {
         const InitTally& t = init_tally_;
-        fprintf(stderr, "[map] initialization failed: %zu candidate pair(s) tried; "
-                "rejected %zu no pose, %zu wrong config, %zu too few inliers, "
-                "%zu forward motion, %zu too few points, %zu low angle\n",
-                t.candidates, t.no_pose, t.config, t.few_inliers, t.forward, t.few_points,
-                t.low_angle);
+        slog::diag(slog::Tag::Map, "[map] initialization failed: %zu candidate pair(s) tried; "
+                   "rejected %zu no pose, %zu wrong config, %zu too few inliers, "
+                   "%zu forward motion, %zu too few points, %zu low angle",
+                   t.candidates, t.no_pose, t.config, t.few_inliers, t.forward, t.few_points,
+                   t.low_angle);
         if (t.candidates) {
-            fprintf(stderr, "[map]   best median triangulation angle %.2f deg, "
-                    "most sideways baseline %.3f (cap %.2f)\n",
-                    t.best_angle, t.best_forward, opt_.init_max_forward_motion);
+            slog::diag(slog::Tag::Map, "[map]   best median triangulation angle %.2f deg, "
+                       "most sideways baseline %.3f (cap %.2f)",
+                       t.best_angle, t.best_forward, opt_.init_max_forward_motion);
             if (t.best_angle < opt_.init_min_tri_angle_deg / 8)
-                fprintf(stderr, "[map]   no pair has enough parallax to triangulate on: "
-                        "the capture may be a pure rotation, or too small a sweep\n");
+                slog::diag(slog::Tag::Map, "[map]   no pair has enough parallax to triangulate on: "
+                           "the capture may be a pure rotation, or too small a sweep");
         }
     }
 
@@ -2390,6 +2479,21 @@ private:
         if (opt_.focal_trials <= 0) return;
         std::vector<uint32_t> cams = guessedFocalCameras();
         if (cams.empty()) return;
+        // The trials are thrown away, but the bar counts the capture: a probe
+        // registering `focal_model_size` images jumped it to 30% of a 70-image
+        // capture and froze. A fifth of the stage there, hence a stage to name.
+        struct SeedPhase {
+            bool& report;
+            const bool was;
+            explicit SeedPhase(bool& f) : report(f), was(f) {
+                if (was) events::stage_begin(Stage::Seed);
+                f = false;
+            }
+            ~SeedPhase() {
+                report = was;
+                if (was) events::stage_end(Stage::Seed);
+            }
+        } phase(opt_.report_progress);
         // One camera group only. With several, a single scalar hypothesis would
         // be applied to lenses that need different answers, and the score
         // cannot say which one was wrong -- exactly the reason bootstrapFocal
@@ -2416,11 +2520,12 @@ private:
         base.observations = countObservations();
         base.rot_spread = rotationSpreadDeg();
         if (opt_.verbose)
-            fprintf(stderr, "[map] focal probe at %.0f: %u image(s), %zu observation(s), "
-                    "orientations span %.1f deg%s\n", f0, base.registered, base.observations,
-                    base.rot_spread,
-                    base.rot_spread <= opt_.focal_max_rot_spread_deg
-                        ? " (too little to determine the focal)" : "");
+            slog::diag(slog::Tag::Map,
+                       "[map] focal probe at %.0f: %u image(s), %zu observation(s), "
+                       "orientations span %.1f deg%s", f0, base.registered, base.observations,
+                       base.rot_spread,
+                       base.rot_spread <= opt_.focal_max_rot_spread_deg
+                       ? " (too little to determine the focal)" : "");
 
         FocalTrial best = base;
         bool moved = false;
@@ -2431,8 +2536,9 @@ private:
         // more images.
         if (opt_.measured_focal_cameras.count(cams[0])) {
             if (opt_.verbose)
-                fprintf(stderr, "[map] focal %.0f -> %.0f (probe refinement of a measured "
-                        "focal)\n", f0, best.focal);
+                slog::diag(slog::Tag::Map,
+                           "[map] focal %.0f -> %.0f (probe refinement of a measured "
+                           "focal)", f0, best.focal);
             restoreAfterBootstrap(best.focal, cams, f0);
             return;
         }
@@ -2450,9 +2556,10 @@ private:
             const bool better = t.ok && (double)t.observations >
                                         (1.0 + opt_.focal_min_gain) * (double)best.observations;
             if (opt_.verbose)
-                fprintf(stderr, "[map]   focal %.0f -> %.0f: %u image(s), %zu observation(s)%s\n",
-                        f, t.focal, t.registered, t.observations,
-                        !t.ok ? " (failed)" : better ? " (better)" : " (no better, stopping)");
+                slog::diag(slog::Tag::Map,
+                           "[map]   focal %.0f -> %.0f: %u image(s), %zu observation(s)%s",
+                           f, t.focal, t.registered, t.observations,
+                           !t.ok ? " (failed)" : better ? " (better)" : " (no better, stopping)");
             if (!better) break;
             best = t;
             moved = true;
@@ -2464,9 +2571,10 @@ private:
             const bool better = t.ok && (double)t.observations >
                                         (1.0 + opt_.focal_min_gain) * (double)base.observations;
             if (opt_.verbose)
-                fprintf(stderr, "[map]   focal %.0f -> %.0f: %u image(s), %zu observation(s)%s\n",
-                        f0 * 1.6, t.focal, t.registered, t.observations,
-                        !t.ok ? " (failed)" : better ? " (better)" : " (no better)");
+                slog::diag(slog::Tag::Map,
+                           "[map]   focal %.0f -> %.0f: %u image(s), %zu observation(s)%s",
+                           f0 * 1.6, t.focal, t.registered, t.observations,
+                           !t.ok ? " (failed)" : better ? " (better)" : " (no better)");
             if (better) { best = t; moved = true; }
         }
         // Either way the probe's *refined* focal is what carries forward, not the
@@ -2474,10 +2582,11 @@ private:
         // bundle adjustment has already had a say. That matters where the guess
         // is far out but the descent finds no decisive gain.
         if (opt_.verbose)
-            fprintf(stderr, "[map] focal %.0f -> %.0f (%s; %zu observations vs %zu at the "
-                    "guess)\n", f0, best.focal,
-                    moved ? "trial reconstruction" : "probe refinement only",
-                    best.observations, base.observations);
+            slog::diag(slog::Tag::Map,
+                       "[map] focal %.0f -> %.0f (%s; %zu observations vs %zu at the "
+                       "guess)", f0, best.focal,
+                       moved ? "trial reconstruction" : "probe refinement only",
+                       best.observations, base.observations);
         restoreAfterBootstrap(best.focal, cams, f0);
     }
 
@@ -2796,8 +2905,17 @@ private:
             // BA; do not let a later focal search overwrite that.
             focal_known_.insert(rec_.images[a].camera_id);
             focal_known_.insert(rec_.images[b].camera_id);
+            // Only now: a rolled-back candidate is not progress, and the scan
+            // tries dozens. Counting each one that merely had a pose put 120 of
+            // a 120-image capture on the bar before the model existed.
+            if (opt_.report_progress) {
+                events::map_placed(a);
+                events::map_placed(b);
+            }
             seed_pair_ = &pm;
             seed_forward_ = fwd;
+            completeFrameOf(a);
+            completeFrameOf(b);
             if (opt_.verbose)
                 slog::out(slog::Tag::Map, spirula::i18n::msg::sfm::map_init_pair,
                          {(long long)a, (long long)b, (long long)created, slog::num(medAng, 1),
@@ -2931,10 +3049,11 @@ private:
             if (reg_trials_[i] >= opt_.max_reg_trials || !allowed(i)) continue;
             int s = score_cache_[i];
             if (score_check && s != score(i)) {
-                fprintf(stderr, "[map] SCORE MISMATCH image %u: cache %d, reference %d\n",
-                        i, s, score(i));
+                slog::diag(slog::Tag::Map, "[map] SCORE MISMATCH image %u: cache %d, reference %d",
+                           i, s, score(i));
                 abort();
             }
+            s = frameScore(i);
             if (s < opt_.min_num_pnp_inliers) continue;
             // Off: the raw correspondence count, every candidate in one bucket.
             // On: COLMAP's policy -- spread-based rank, and an image that has
@@ -2955,7 +3074,82 @@ private:
         return out;
     }
 
+    // The 2D-3D correspondences an unregistered image has to the model (one
+    // 3D point per feature: the first seen).
+    void gatherCorrespondences(uint32_t img, std::vector<Vec3>& X, std::vector<Vec3>& br,
+                               std::vector<uint32_t>& feat, std::vector<uint64_t>& pid) const {
+        for (uint32_t f = 0; f < feats_[img].count(); f++) {
+            uint64_t chosen = kInvalidPoint3D;
+            for (const Correspondence& c : graph_.at(img, f)) {
+                const Image& oi = rec_.images.at(c.image_id);
+                if (oi.registered && oi.point3D_ids[c.feature_idx] != kInvalidPoint3D) {
+                    chosen = oi.point3D_ids[c.feature_idx];
+                    break;
+                }
+            }
+            if (chosen == kInvalidPoint3D) continue;
+            X.push_back(rec_.points3D.at(chosen).xyz);
+            br.push_back(bearing(img, f));
+            feat.push_back(f);
+            pid.push_back(chosen);
+        }
+    }
+
+    // Commit a pose: register, continue the tracks its inliers belong to, and
+    // report. Shared by PnP and by the rig completion.
+    void commitPose(uint32_t img, const Pose& pose, const std::vector<uint32_t>& feat,
+                    const std::vector<uint64_t>& pid, const std::vector<char>& inlier,
+                    int num_inliers, size_t pool) {
+        rec_.images[img].pose = pose;
+        rec_.images[img].registered = true;
+        for (size_t k = 0; k < feat.size(); k++) {
+            if (!inlier[k]) continue;
+            uint32_t f = feat[k];
+            if (rec_.images[img].point3D_ids[f] != kInvalidPoint3D) continue;
+            Point3D& pt = rec_.points3D[pid[k]];
+            if (reprojErr(img, f, pt.xyz) > errPx(img)) continue;
+            pt.track.push_back({img, f});
+            rec_.images[img].point3D_ids[f] = pid[k];
+            attachObservation(img, f);
+        }
+        if (opt_.verbose)
+            slog::out(slog::Tag::Map, spirula::i18n::msg::sfm::map_registered,
+                     {(long long)img, (long long)num_inliers, (long long)pool,
+                      (long long)rec_.numRegistered()});
+        // Rate-limited inside, and a no-op without --progress-dir: this is the
+        // one point at which the model visibly grows. The colouring is a
+        // callback so it runs only over the points a snapshot writes.
+        if (opt_.report_progress) {
+            progress::model(rec_, false,
+                            [this](const Point3D& p, uint8_t rgb[3]) {
+                                pointColor(p, rgb);
+                            });
+            Event ev;
+            ev.kind = Event::Kind::ModelUpdated;
+            ev.stage = Stage::Map;
+            ev.registered = rec_.numRegistered();
+            ev.images = (int64_t)db_.images.size();
+            ev.points = (int64_t)rec_.points3D.size();
+            events::emit(ev);
+            // The bar, which counts the capture and not this attempt: a seed
+            // retry resets the model, so `numRegistered` falls back to nothing.
+            events::map_placed(img);
+        }
+    }
+
     bool registerImage(uint32_t img) {
+        // A frame another lens already placed says where this one is; a frame
+        // with no lens placed yet registers as one thing.
+        Pose rig_pose;
+        if (rigPredictedPose(img, rig_pose)) {
+            // The rest of the frame comes with it, and is placed on the same
+            // pose rather than a lens at a time.
+            const uint32_t placed = completeFrame(rigs_->slot(img), img);
+            const bool self = rec_.images.at(img).registered;
+            frame_regs_ += placed - (self ? 1 : 0);
+            return self;
+        }
+        if (registerFrame(img)) return true;
         // Gather 2D-3D correspondences (one 3D point per feature: the first seen).
         std::vector<Vec3> X;
         std::vector<Vec3> br;   // observed unit bearings
@@ -3072,33 +3266,451 @@ private:
         if (pool < X.size()) reg_fail_.occluded += (uint32_t)(X.size() - pool);
         focal_known_.insert(cid);
 
-        rec_.images[img].pose = r.pose;
-        rec_.images[img].registered = true;
-
-        // Track continuation: attach inlier features to their 3D points.
-        for (size_t k = 0; k < feat.size(); k++) {
-            if (!r.inlier_mask[k]) continue;
-            uint32_t f = feat[k];
-            if (rec_.images[img].point3D_ids[f] != kInvalidPoint3D) continue;
-            Point3D& pt = rec_.points3D[pid[k]];
-            if (reprojErr(img, f, pt.xyz) > errPx(img)) continue;
-            pt.track.push_back({img, f});
-            rec_.images[img].point3D_ids[f] = pid[k];
-            attachObservation(img, f);
-        }
-        if (opt_.verbose)
-            slog::out(slog::Tag::Map, spirula::i18n::msg::sfm::map_registered,
-                     {(long long)img, (long long)r.num_inliers, (long long)X.size(),
-                      (long long)rec_.numRegistered()});
-        // Rate-limited inside, and a no-op without --progress-dir: this is the
-        // one point at which the model visibly grows. The colouring runs only
-        // over the points a snapshot writes, which is why it is a callback and
-        // not an assignColors pass per registration.
-        progress::model(rec_, false,
-                        [this](const Point3D& p, uint8_t rgb[3]) {
-                            pointColor(p, rgb);
-                        });
+        commitPose(img, r.pose, feat, pid, r.inlier_mask, r.num_inliers, X.size());
         return true;
+    }
+
+    // ---- rigs -------------------------------------------------------------
+
+    // The calibration a model starts from: nothing established, or the user's
+    // extrinsics where the definition carries them (rotation always; a
+    // translation as given when it is zero, otherwise once its scale is known).
+    void initRigCalib(Reconstruction& rec) const {
+        rec.rigs.resize(rigs_->rigs.size());
+        for (size_t r = 0; r < rigs_->rigs.size(); r++) {
+            const RigSpec& spec = rigs_->rigs[r];
+            RigCalib& c = rec.rigs[r];
+            if (c.cam_from_rig.size() == spec.members.size()) continue;
+            c = RigCalib{};
+            c.resize(spec.members.size());
+            if (!spec.anyKnownExt()) continue;
+            bool zero_t = true;
+            for (const RigMemberDef& m : spec.members) zero_t = zero_t && m.ext.t.norm() == 0.0;
+            c.ref = 0;
+            const Pose base = invertPose(spec.members[0].ext);
+            for (size_t m = 0; m < spec.members.size(); m++) {
+                c.cam_from_rig[m] = composePose(spec.members[m].ext, base);
+                if (zero_t) {
+                    c.established[m] = 1;
+                    c.fixed[m] = spec.members[m].ext_fixed ? 1 : 0;
+                } else {
+                    c.cam_from_rig[m].t = {0, 0, 0};
+                }
+            }
+        }
+    }
+
+    // Estimate the members nothing has established yet, from the frames whose
+    // images the model registered independently. Returns how many were.
+    size_t calibrateRigs(Reconstruction& rec) const {
+        if (!rigs_) return 0;
+        initRigCalib(rec);
+        size_t newly = 0;
+        for (size_t r = 0; r < rigs_->rigs.size(); r++) {
+            const RigSpec& spec = rigs_->rigs[r];
+            RigCalib& c = rec.rigs[r];
+            const size_t nm = spec.members.size();
+            auto regd = [&](uint32_t img) {
+                if (img == kNoImage || rec.rig_detached.count(img)) return false;
+                auto it = rec.images.find(img);
+                return it != rec.images.end() && it->second.registered;
+            };
+            if (c.ref < 0) {
+                // The reference: the member registered in the most frames
+                // alongside another member, so every other extrinsic has the
+                // most frames to be estimated from.
+                std::vector<size_t> co(nm, 0);
+                for (const auto& fr : spec.frames) {
+                    size_t n = 0;
+                    for (uint32_t img : fr) n += regd(img) ? 1 : 0;
+                    if (n < 2) continue;
+                    for (size_t m = 0; m < nm; m++) co[m] += regd(fr[m]) ? 1 : 0;
+                }
+                size_t best = 0;
+                for (size_t m = 1; m < nm; m++)
+                    if (co[m] > co[best]) best = m;
+                if ((int)co[best] < opt_.rig_calib.min_frames) continue;
+                c.ref = (int)best;
+                c.cam_from_rig[best] = {mat3Identity(), {0, 0, 0}};
+                c.established[best] = 1;
+                c.support[best] = (uint32_t)co[best];
+                newly++;
+            }
+            const uint32_t ref = (uint32_t)c.ref;
+            for (uint32_t m = 0; m < nm; m++) {
+                if (m == ref || c.established[m]) continue;
+                std::vector<Pose> rel;
+                for (const auto& fr : spec.frames)
+                    if (regd(fr[ref]) && regd(fr[m]))
+                        rel.push_back(relativePose(rec.images.at(fr[ref]).pose,
+                                                   rec.images.at(fr[m]).pose));
+                if ((int)rel.size() < opt_.rig_calib.min_frames) continue;
+                Pose avg;
+                double spread = 0;
+                const Mat3* fixed_R = spec.members[m].has_ext ? &c.cam_from_rig[m].R : nullptr;
+                const int inl = averageRelativePoses(rel, opt_.rig_calib, avg, spread, fixed_R);
+                c.support[m] = (uint32_t)inl;
+                c.spread_deg[m] = spread;
+                if (inl < opt_.rig_calib.min_frames ||
+                    (double)inl < opt_.rig_calib.min_inlier_frac * (double)rel.size() ||
+                    spread > opt_.rig_calib.max_spread_deg) {
+                    // Said once, then again each time the evidence doubles.
+                    if (opt_.verbose && (int)rel.size() >= opt_.rig_calib.min_frames &&
+                        rel.size() >= 2 * (size_t)c.declined_at[m]) {
+                        c.declined_at[m] = (uint32_t)rel.size();
+                        slog::out(slog::Tag::Map, spirula::i18n::msg::sfm::map_rig_declined,
+                                 {spec.name, spec.members[m].prefix, (long long)inl,
+                                  (long long)rel.size(), slog::num(spread, 2)});
+                    }
+                    continue;
+                }
+                c.cam_from_rig[m] = avg;
+                c.established[m] = 1;
+                newly++;
+                if (opt_.verbose)
+                    slog::out(slog::Tag::Map, spirula::i18n::msg::sfm::map_rig_calibrated,
+                             {spec.name, spec.members[m].prefix, spec.members[ref].prefix,
+                              (long long)inl, (long long)rel.size(), slog::num(spread, 2)});
+            }
+        }
+        return newly;
+    }
+
+    // Where the rig puts the whole frame, from a registered member whose
+    // extrinsic is calibrated (the one with the most points, when several are).
+    bool rigPredictedFrame(const RigSlot& sl, Pose& out,
+                           uint32_t exclude = UINT32_MAX) const {
+        if (!rigs_ || !sl.valid() || sl.rig >= rec_.rigs.size()) return false;
+        const RigCalib& c = rec_.rigs[sl.rig];
+        const std::vector<uint32_t>& fr = rigs_->frameOf(sl);
+        int best = -1;
+        uint32_t best_pts = 0;
+        for (uint32_t m = 0; m < fr.size(); m++) {
+            if (m == exclude || fr[m] == kNoImage || !c.usable(m)) continue;
+            if (rec_.rig_detached.count(fr[m])) continue;
+            auto it = rec_.images.find(fr[m]);
+            if (it == rec_.images.end() || !it->second.registered) continue;
+            const uint32_t n = it->second.numPoint3D();
+            if (best < 0 || n > best_pts) { best = (int)m; best_pts = n; }
+        }
+        if (best < 0) return false;
+        out = c.rigFromWorld((uint32_t)best, rec_.images.at(fr[best]).pose);
+        return true;
+    }
+
+    // ... and where that puts one of its lenses.
+    bool rigPredictedPose(uint32_t img, Pose& out) const {
+        if (!rigs_ || rec_.rig_detached.count(img)) return false;
+        const RigSlot sl = rigs_->slot(img);
+        if (!sl.valid() || sl.rig >= rec_.rigs.size()) return false;
+        const RigCalib& c = rec_.rigs[sl.rig];
+        if (!c.usable(sl.member)) return false;
+        Pose frame;
+        if (!rigPredictedFrame(sl, frame, sl.member)) return false;
+        out = c.camFromWorld(sl.member, frame);
+        return true;
+    }
+
+    // A frame none of whose lenses is placed yet, registered as one thing:
+    // ransacRigPnP draws its sample from every member's correspondences and
+    // scores it on all of them, so lenses too weak alone still place it (D78).
+    bool registerFrame(uint32_t img) {
+        if (!rigs_ || rec_.rig_detached.count(img)) return false;
+        const RigSlot sl = rigs_->slot(img);
+        if (!sl.valid() || sl.rig >= rec_.rigs.size()) return false;
+        const RigCalib& c = rec_.rigs[sl.rig];
+        if (!c.usable(sl.member)) return false;
+        struct Member {
+            uint32_t img = 0, m = 0;
+            std::vector<Vec3> X, br;
+            std::vector<uint32_t> feat;
+            std::vector<uint64_t> pid;
+            std::vector<char> inl;
+            int n = 0;
+            size_t pool = 0;
+        };
+        std::vector<Member> ms;
+        size_t total = 0;
+        for (uint32_t m = 0; m < rigs_->frameOf(sl).size(); m++) {
+            const uint32_t j = rigs_->frameOf(sl)[m];
+            if (j == kNoImage || !c.usable(m) || rec_.rig_detached.count(j) || !allowed(j))
+                continue;
+            if (rec_.images.at(j).registered) return false;
+            Member e;
+            e.img = j;
+            e.m = m;
+            gatherCorrespondences(j, e.X, e.br, e.feat, e.pid);
+            e.inl.assign(e.X.size(), 0);
+            total += e.X.size();
+            ms.push_back(std::move(e));
+        }
+        if (ms.size() < 2 || (int)total < opt_.min_num_pnp_inliers) return false;
+        auto consensus = [&](const Pose& F) {
+            int n = 0;
+            for (Member& e : ms) {
+                const Pose p = c.camFromWorld(e.m, F);
+                const double t = camOf(e.img).errRad(opt_.max_reproj_error);
+                e.n = 0;
+                for (size_t k = 0; k < e.X.size(); k++)
+                    e.n += (e.inl[k] = pnpResidualSq(p, e.X[k], e.br[k]) < t * t) ? 1 : 0;
+                n += e.n;
+            }
+            return n;
+        };
+        std::vector<RigPnPMember> gm;
+        gm.reserve(ms.size());
+        for (Member& e : ms)
+            gm.push_back({&e.X, &e.br, c.cam_from_rig[e.m],
+                          camOf(e.img).errRad(opt_.max_reproj_error)});
+        const RigPnPResult r = ransacRigPnP(gm);
+        if (!r.success || r.num_inliers < opt_.min_num_pnp_inliers) return false;
+        Pose best = r.rig_from_world;
+        const int n = consensus(best);
+        size_t pool = 0;
+        for (Member& e : ms) {
+            e.pool = visiblePool(e.img, e.X, e.br, c.camFromWorld(e.m, best));
+            pool += e.pool;
+        }
+        const bool ok = n >= opt_.min_num_pnp_inliers && ratioOk(n, pool);
+        if (rig_dump_) {
+            std::string per;
+            for (Member& e : ms)
+                per += (per.empty() ? "" : " ") + std::to_string(e.n) + "/" +
+                       std::to_string(e.X.size());
+            slog::diag(slog::Tag::Map,
+                       "[rig] frame of %s: %zu members, %d/%zu inliers (%zu visible) [%s] -> %s",
+                       db_.images[img].name.c_str(), ms.size(), n, total, pool, per.c_str(),
+                       ok ? "placed together" : "REFUSED");
+        }
+        if (!ok) return false;
+        for (Member& e : ms) {
+            if (e.X.empty() && !opt_.rig_complete_blind) continue;
+            focal_known_.insert(rec_.images[e.img].camera_id);
+            commitPose(e.img, c.camFromWorld(e.m, best), e.feat, e.pid, e.inl, e.n, e.pool);
+            reg_by_rig_++;
+            if (e.n == 0) reg_rig_word_++;
+            if (e.img == img) continue;
+            {
+                ProfTimer pt(g_map_prof.tri);
+                triangulateForImage(e.img);
+            }
+            recent_regs_.push_back(e.img);
+            frame_regs_++;
+        }
+        return true;
+    }
+
+    // What a candidate is worth to try: its own correspondences, or its
+    // frame's when the rig can place the frame as one thing.
+    int frameScore(uint32_t img) const {
+        const int s = score_cache_[img];
+        if (!rigs_ || rec_.rig_detached.count(img)) return s;
+        const RigSlot sl = rigs_->slot(img);
+        if (!sl.valid() || sl.rig >= rec_.rigs.size()) return s;
+        const RigCalib& c = rec_.rigs[sl.rig];
+        if (!c.usable(sl.member)) return s;
+        int sum = 0;
+        for (uint32_t m = 0; m < rigs_->frameOf(sl).size(); m++) {
+            const uint32_t j = rigs_->frameOf(sl)[m];
+            if (j == kNoImage || !c.usable(m) || rec_.rig_detached.count(j)) continue;
+            if (rec_.images.at(j).registered) return s;
+            sum += score_cache_[j];
+        }
+        return std::max(s, sum);
+    }
+
+    // Every lens of a frame the rig reaches and nothing has placed, put down
+    // together: one frame pose refined on all their correspondences at once,
+    // then a bounded correction for a lens with enough of its own (D78).
+    uint32_t completeFrame(const RigSlot& sl, uint32_t caller_triangulates) {
+        if (!rigs_ || !sl.valid() || sl.rig >= rec_.rigs.size()) return 0;
+        const RigCalib& c = rec_.rigs[sl.rig];
+        Pose pred;
+        if (!rigPredictedFrame(sl, pred)) return 0;
+
+        struct Pending {
+            uint32_t img = 0, m = 0;
+            std::vector<Vec3> X, br;
+            std::vector<uint32_t> feat;
+            std::vector<uint64_t> pid;
+            std::vector<char> inl;
+            double thr = 0;
+            int n = 0;
+            size_t pool = 0;
+        };
+        std::vector<Pending> ps;
+        size_t total = 0;
+        for (uint32_t m = 0; m < rigs_->frameOf(sl).size(); m++) {
+            const uint32_t j = rigs_->frameOf(sl)[m];
+            if (j == kNoImage || !c.usable(m) || rec_.rig_detached.count(j) || !allowed(j))
+                continue;
+            if (rec_.images.at(j).registered) continue;
+            Pending e;
+            e.img = j;
+            e.m = m;
+            e.thr = camOf(j).errRad(opt_.max_reproj_error);
+            gatherCorrespondences(j, e.X, e.br, e.feat, e.pid);
+            if ((int)e.X.size() < opt_.min_num_pnp_inliers && !opt_.rig_complete_blind) {
+                reg_fail_.few_corr++;
+                continue;
+            }
+            e.inl.assign(e.X.size(), 0);
+            total += e.X.size();
+            ps.push_back(std::move(e));
+        }
+        if (ps.empty()) return 0;
+
+        // `scale` widens every lens's radius by the same factor, which is how
+        // the prediction is judged: it carries the placed lens's error plus the
+        // calibration's, and that is more than a lens's own inlier radius.
+        auto consensus = [&](const Pose& F, double scale) {
+            int sum = 0;
+            for (Pending& e : ps) {
+                const Pose p = c.camFromWorld(e.m, F);
+                const double t = scale * e.thr;
+                e.n = 0;
+                for (size_t k = 0; k < e.X.size(); k++)
+                    e.n += (e.inl[k] = pnpResidualSq(p, e.X[k], e.br[k]) < t * t) ? 1 : 0;
+                sum += e.n;
+            }
+            return sum;
+        };
+        auto visible = [&](const Pose& F) {
+            size_t sum = 0;
+            for (Pending& e : ps) {
+                e.pool = visiblePool(e.img, e.X, e.br, c.camFromWorld(e.m, F));
+                sum += e.pool;
+            }
+            return sum;
+        };
+
+        Pose frame = pred;
+        bool own = false;
+        int inl = 0;
+        size_t vis = 0;
+        double moved = 0;
+        if (consensus(pred, 3.0) >= opt_.min_num_pnp_inliers) {
+            Pose refined = pred;
+            std::vector<FrameMember> fm;
+            for (Pending& e : ps)
+                fm.push_back({&e.X, &e.br, &e.inl, c.cam_from_rig[e.m], 1.0 / e.thr});
+            if (refineFramePose(fm, refined)) {
+                inl = consensus(refined, 1.0);
+                vis = visible(refined);
+                moved = rotationAngleDeg(mul(refined.R, transpose(pred.R)));
+                double tol = 0;
+                for (const Pending& e : ps) tol = std::max(tol, rigMoveTolDeg(e.img));
+                own = inl >= opt_.min_num_pnp_inliers && ratioOk(inl, vis) && moved <= tol;
+                if (own) frame = refined;
+            }
+        }
+        if (!own) {
+            inl = consensus(pred, 1.0);
+            vis = visible(pred);
+        }
+        if (rig_dump_)
+            slog::diag(slog::Tag::Map,
+                       "[rig] frame of %s: %zu lens(es) to place, predicted pose refined by "
+                       "%.2f deg, %d/%zu inliers (%zu visible) -> %s",
+                       db_.images[ps.front().img].name.c_str(), ps.size(), moved, inl, total,
+                       vis, own ? "refined" : "the rig's word");
+
+        uint32_t placed = 0;
+        for (Pending& e : ps) {
+            Pose pose = c.camFromWorld(e.m, frame);
+            // A lens with enough of its own refines on top of the frame's pose,
+            // bounded by what the calibration is worth: the extrinsics are
+            // estimated, and a lens that sees better than they know may say so.
+            std::vector<char> mask(e.X.size(), 0);
+            int wide = 0;
+            for (size_t k = 0; k < e.X.size(); k++)
+                wide += (mask[k] = pnpResidualSq(pose, e.X[k], e.br[k]) <
+                                   9.0 * e.thr * e.thr) ? 1 : 0;
+            if (wide >= opt_.min_num_pnp_inliers) {
+                Pose alone = pose;
+                if (refinePose(e.X, e.br, mask, alone)) {
+                    int n = 0;
+                    for (size_t k = 0; k < e.X.size(); k++)
+                        n += (mask[k] = pnpResidualSq(alone, e.X[k], e.br[k]) <
+                                        e.thr * e.thr) ? 1 : 0;
+                    const size_t v = visiblePool(e.img, e.X, e.br, alone);
+                    const double mv = rotationAngleDeg(mul(alone.R, transpose(pose.R)));
+                    if (n > e.n && ratioOk(n, v) && mv <= rigMoveTolDeg(e.img)) {
+                        pose = alone;
+                        e.n = n;
+                        e.pool = v;
+                        e.inl.swap(mask);
+                    }
+                }
+            }
+            if (e.n == 0) reg_rig_word_++;
+            focal_known_.insert(rec_.images[e.img].camera_id);
+            commitPose(e.img, pose, e.feat, e.pid, e.inl, e.n, e.pool);
+            reg_by_rig_++;
+            placed++;
+            if (e.img == caller_triangulates) continue;
+            {
+                ProfTimer pt(g_map_prof.tri);
+                triangulateForImage(e.img);
+            }
+            recent_regs_.push_back(e.img);
+        }
+        return placed;
+    }
+
+    // How far a refined pose may move from the rig's prediction and still be
+    // the same pose: the calibration's own spread, with a floor, in degrees.
+    double rigMoveTolDeg(uint32_t img) const {
+        const RigSlot sl = rigs_->slot(img);
+        const RigCalib& c = rec_.rigs[sl.rig];
+        double spread = 0;
+        if (sl.member < c.spread_deg.size()) spread = c.spread_deg[sl.member];
+        return std::max(1.0, 3.0 * spread);
+    }
+
+    // Register the unregistered rig-mates of `img`'s frame. Returns how many.
+    uint32_t completeFrameOf(uint32_t img) {
+        return rigs_ ? completeFrame(rigs_->slot(img), kNoImage) : 0;
+    }
+
+    // ... of every registered frame, once a calibration is there to do it with.
+    uint32_t completeRigFrames() {
+        if (!rigs_) return 0;
+        uint32_t n = 0;
+        std::vector<uint32_t> regd;
+        for (const auto& kv : rec_.images)
+            if (kv.second.registered && rigs_->slot(kv.first).valid()) regd.push_back(kv.first);
+        for (uint32_t img : regd) n += completeFrameOf(img);
+        return n;
+    }
+
+    // The registered images of `img`'s frame that the rig ties to it, `img`
+    // included; just `img` when nothing does.
+    std::vector<uint32_t> frameMates(uint32_t img) const {
+        std::vector<uint32_t> out{img};
+        if (!rigs_ || rec_.rig_detached.count(img)) return out;
+        const RigSlot sl = rigs_->slot(img);
+        if (!sl.valid() || sl.rig >= rec_.rigs.size() || !rec_.rigs[sl.rig].usable(sl.member))
+            return out;
+        for (uint32_t m = 0; m < rigs_->frameOf(sl).size(); m++) {
+            const uint32_t j = rigs_->frameOf(sl)[m];
+            if (m == sl.member || j == kNoImage || !rec_.rigs[sl.rig].usable(m)) continue;
+            if (rec_.rig_detached.count(j)) continue;
+            auto it = rec_.images.find(j);
+            if (it != rec_.images.end() && it->second.registered) out.push_back(j);
+        }
+        return out;
+    }
+
+    // Poses of the registered rig images a bundle adjustment left out (no
+    // observations), from a rig-mate it solved.
+    void snapRigFrames() {
+        if (!rigs_) return;
+        for (auto& kv : rec_.images) {
+            if (!kv.second.registered || kv.second.numPoint3D() > 0) continue;
+            Pose pose;
+            if (rigPredictedPose(kv.first, pose)) kv.second.pose = pose;
+        }
     }
 
     // Join this image's features to 3D points the model already has, wherever
@@ -3226,6 +3838,7 @@ private:
             BundleOptions bo;
             bo.real = realCfgFromName(opt_.ba_real);
             bo.device = opt_.device;
+            bo.device_selector = opt_.device_selector;
             bo.threads = opt_.threads;
             bo.verbose = false;
             bo.loss = opt_.ba_loss;
@@ -3260,7 +3873,12 @@ private:
             bo.real = baReal(loose);
             bo.shared_ctx = &baContext(loose);
             bo.over_budget_throws = ba_over_budget_throws_;
+            bo.rigs = rigs_;
+            bo.use_rigs = !final_.no_rig;
+            bo.refine_rigs = opt_.refine_rigs && rigRefineDue(tight && i == 0);
+            if (rigs_ && !final_.no_rig) calibrateRigs(rec_);
             double cost = runGlobalBA(rec_, bo);
+            if (rigs_ && !final_.no_rig) snapRigFrames();
             ProfTimer pt(g_map_prof.filter);
             // Runs after every mapping BA, and it is load-bearing: without it
             // a capture whose distortion terms drift lands in a self-consistent
@@ -3288,8 +3906,10 @@ private:
             dropped = filterImages();
         }
         if (dropped && opt_.verbose)
-            fprintf(stderr, "[map] de-registered %d image(s) (few points or bogus camera), "
-                    "%u remain\n", dropped, rec_.numRegistered());
+            slog::diag(slog::Tag::Map,
+                       "[map] de-registered %d image(s) (few points or bogus camera), "
+                       "%u remain", dropped, rec_.numRegistered());
+        if (rigs_ && !final_.no_rig) completeRigFrames();
     }
 
     // Fuse two 3D points that a correspondence says are the same feature
@@ -3641,11 +4261,19 @@ private:
     // collapsed under filtering.
     int filterImages() {
         if (rec_.numRegistered() <= 2) return 0;
+        // A rig frame is judged, and dropped, as one thing.
         std::vector<uint32_t> drop;
+        std::set<uint32_t> seen;
         for (auto& kv : rec_.images) {
-            Image& im = kv.second;
-            if (!im.registered) continue;
-            if ((int)im.numPoint3D() < opt_.min_image_points) drop.push_back(kv.first);
+            if (!kv.second.registered || seen.count(kv.first)) continue;
+            const std::vector<uint32_t> frame = frameMates(kv.first);
+            size_t points = 0;
+            for (uint32_t j : frame) {
+                seen.insert(j);
+                points += rec_.images.at(j).numPoint3D();
+            }
+            if ((int)points < opt_.min_image_points)
+                drop.insert(drop.end(), frame.begin(), frame.end());
         }
         for (uint32_t id : drop) deregisterImage(id);
         if (!drop.empty()) resetOrphanCameras();
@@ -3706,6 +4334,7 @@ private:
         bool pp = false;           // the principal point (D51)
         bool extra = false;        // the distortion coefficients (D72)
         bool no_sanitize = false;  // per-image intrinsics: no group to clamp to (D73)
+        bool no_rig = false;       // every image on its own pose (releaseRigs)
     };
     FinalRelease final_;
     std::map<uint32_t, Camera> default_cams_;  // pristine per-group defaults
@@ -3716,6 +4345,9 @@ private:
     // SS_SFM_AUDIT_DUMP=1 prints the support ratio of every audited image,
     // which is how the threshold above was chosen against a rig capture.
     const bool audit_dump_ = spirula::env("SFM_AUDIT_DUMP") != nullptr;
+    // SS_SFM_RIG_DUMP=1 prints every rig placement's verdict and by how much
+    // the refinement moved it, which is how the tolerance above was set.
+    const bool rig_dump_ = spirula::env("SFM_RIG_DUMP") != nullptr;
     mutable double scale_cache_ = 0;  // modelScale(), reset by resetModel()
     int init_relax_ = 0;              // reached seed-threshold relaxation level
     InitTally init_tally_;            // why the last initialize() found nothing
@@ -3818,6 +4450,21 @@ private:
         uint32_t ambiguous = 0;  // ... refused instead because a rival pose fit the leftovers
         uint32_t occluded = 0;   // correspondences the accepted pose could not see at all
     } reg_fail_;
+    const RigTable* rigs_ = nullptr;  // null = no rigs, or --no-use-rigs
+    uint32_t reg_by_rig_ = 0;         // registrations the rig placed, summed over the run
+    uint32_t reg_rig_word_ = 0;       // ... of them with no inlier of their own
+    uint32_t frame_regs_ = 0;         // rig-mates placed beside the candidate
+    uint32_t rig_refined_at_ = 0;     // model size at the last extrinsic refinement
+
+    // A refined member costs every one of its observations six more columns,
+    // so growth refines hold the extrinsics and let them move only each time
+    // the model has doubled; a tight pass refines them in its first round.
+    bool rigRefineDue(bool tight) {
+        const uint32_t n = rec_.numRegistered();
+        if (!tight && n < 2 * rig_refined_at_) return false;
+        rig_refined_at_ = n;
+        return true;
+    }
     std::vector<uint8_t> allow_;      // restrictTo(); empty = every image
     size_t allow_count_ = 0;          // ... and how many are set
     std::vector<uint32_t> model_count_;

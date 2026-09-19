@@ -11,24 +11,18 @@
 //   DatasetPrep  (frames, sharpest-frame selection, .insv track split, masks)
 //   spirula sfm auto  ->  <workspace>/sparse/0/{cameras,images,points3D}.bin
 //
-// The reconstruction runs as a child process rather than in this one. That is
-// a deliberate choice for now, not a shortcut left over from the COLMAP days:
-//
-//   * the SfM module is still a CLI at heart -- it prints to stdout and has no
-//     cancellation token (docs/notes/sfm-port-plan.md phase 3), so in-process
-//     it could neither be stopped nor reported on;
-//   * global bundle adjustment on a large model and a live trainer must not
-//     share a VRAM budget, and a child process gives that separation for free
-//     -- every byte it held is gone when it exits;
-//   * it keeps one Vulkan device live in the GUI process instead of two
-//     (the port plan's own §10 risk).
-//
-// The child is this same executable run again (AppPaths::exe_path), so there
-// is nothing to install and nothing to find: `spirula sfm` is one of the
-// subcommands the binary already answers to. When phase 3 lands, only the
-// run() body here changes.
+// The reconstruction runs in this process (app/gui/SfmInProcess.h). `subprocess`
+// runs it as a child of this same executable instead -- the escape hatch for a
+// driver that resets under a long solve. Either way the screen reads the same
+// typed status, from the event stream or from the snapshot the child writes.
 
 #include "app/gui/DatasetPrep.h"
+#include "core/Env.h"
+#include "app/gui/SfmProgress.h"
+#ifdef SS_TOOL_SFM
+// Reaches the Vulkan headers, which a build without the module may not have.
+#include "sfm/core/Manifest.h"
+#endif
 #include "app/gui/FilmReel.h"
 #include "app/gui/GeometryRunner.h"
 #include "app/gui/PrepProgress.h"
@@ -43,14 +37,9 @@
 
 namespace gui {
 
-// The camera models `spirula-sfm --camera-model` accepts that the dataset
-// parser and renderer can also consume -- which now includes EQUIRECTANGULAR:
-// the mapper could always write it, and ColmapParser reads model 17 (it also
-// checks the 2:1 aspect a full sphere has to have).
-//
-// A capture can mix them. `--camera-model PREFIX=MODEL` sets one input's
-// model, which is what lets a rig of a 360 camera and a phone reconstruct as
-// one scene -- see append_camera_overrides().
+// The camera models the dataset parser and renderer can also consume,
+// EQUIRECTANGULAR included (ColmapParser reads model 17, 2:1 aspect checked).
+// A capture can mix them: the manifest gives one input its own -- build_manifest().
 inline const char* kSfmCameraModels[] = {
     "opencv", "pinhole", "simple-pinhole", "radial",
     "full-opencv", "opencv-fisheye", "thin-prism-fisheye", "equirectangular",
@@ -61,7 +50,7 @@ inline constexpr int kNumSfmCameraModels = 8;
 inline std::vector<const spirula::i18n::Msg*> sfm_camera_model_labels() {
     namespace m = spirula::i18n::msg::dataset;
     return {&m::lens_opencv, &m::lens_pinhole, &m::lens_simple_pinhole,
-            &m::lens_radial, &m::lens_full_opencv, &m::lens_fisheye_kb,
+            &m::lens_radial, &m::lens_full_opencv, &m::lens_fisheye_opencv,
             &m::lens_fisheye_thin_prism, &m::lens_equirectangular};
 }
 
@@ -73,13 +62,19 @@ inline std::vector<const spirula::i18n::Msg*> sfm_camera_model_helps() {
     namespace m = spirula::i18n::msg::dataset;
     return {&m::lens_opencv_help, &m::lens_pinhole_help,
             &m::lens_simple_pinhole_help, &m::lens_radial_help,
-            &m::lens_full_opencv_help, &m::lens_fisheye_kb_help,
+            &m::lens_full_opencv_help, &m::lens_fisheye_opencv_help,
             &m::lens_fisheye_thin_prism_help, &m::lens_equirectangular_help};
 }
 
 // Does this model describe a fisheye circle rather than a rectilinear frame?
 inline bool sfm_model_is_fisheye(const std::string& m) {
     return m == "opencv-fisheye" || m == "thin-prism-fisheye";
+}
+
+// SS_SFM_SUBPROCESS=1 starts a session with the escape hatch below on.
+inline bool sfm_subprocess_default() {
+    const char* v = spirula::env("SFM_SUBPROCESS");
+    return v && *v && *v != '0';
 }
 
 struct SfmJob {
@@ -93,6 +88,14 @@ struct SfmJob {
     // Replace the model in the output folder. A run left to itself REUSES one,
     // which is how a finished dataset gets masks and geometry without a rebuild.
     bool redo_model = false;
+    // Did these settings write the stamp beside that model (ReconStamp.h)?
+    // Only then does a difference from it mean the user asked for a different
+    // model; a panel pointed at a dataset it did not build is at its defaults.
+    bool settings_built_model = false;
+    // Keep feature detection out of the masked areas too, not only training.
+    // Off still writes the masks -- worth it where what they cover holds still
+    // and carries the finer detail the cameras converge on.
+    bool mask_features = true;
     int quality = 2;                  // 0 low, 1 medium, 2 high, 3 extreme
     int data_type = 0;                // 0 individual photos, 1 video, 2 internet
     std::string camera_model = "opencv";
@@ -113,6 +116,8 @@ struct SfmJob {
     // One more bundle adjustment at the very end with every image on its own
     // intrinsics, whatever the camera sharing above says.
     bool final_per_image_intrinsics = false;
+    // ... and one with the rigs released, every image on its own pose.
+    bool final_free_rig = false;
     int max_features = 0;             // 0 = the quality preset's
     int max_image_size = 0;           // 0 = the quality preset's
     // 0 flat, 1 bottom-up. Flat for every capture, whatever its size: there is
@@ -127,7 +132,32 @@ struct SfmJob {
     // an order of magnitude slower per pair -- the panel greys it out for SIFT
     // and the CLI refuses the combination outright.
     int matcher = 0;
-    bool keep_intermediate = false;   // keep features/ and matches.bin
+    // Scale and heading from the photographs' EXIF GPS: 0 off, 1 (the default)
+    // latitude and longitude, 2 with altitude. 1 leaves the tilt to the
+    // cameras, which a city capture's altitude is too biased to give.
+    int metric_gps = 1;
+    // The video's own IMU and GPS track: 0 off, 1 orientation only, 2 (the
+    // default) orientation and whatever metric scale passes its own checks.
+    int sensor_gauge = 2;
+    // The camera attitude a drone writes into each photo: 0 off, 1 orientation
+    // only, 2 (the default) orientation and north.
+    int exif_attitude = 2;
+    // Keep features/, matches.bin and .resume/ after a finished run. On by
+    // default and remembered between sessions: they are what makes a cancelled
+    // or failed reconstruction resumable (sfm/core/Resume.h).
+    bool keep_intermediate = true;
+    // Bundle adjustment on the host from the start. The escape hatch for a
+    // driver that resets under a long solve: a run falls back by itself when
+    // the device fails, but only after paying for the failure.
+    bool ba_cpu = false;
+    // Reconstruct in a child process instead of this one: the escape hatch for
+    // a driver that resets under a long solve. SS_SFM_SUBPROCESS=1 starts a
+    // session with it on.
+    bool subprocess = sfm_subprocess_default();
+
+    // Canonical UUID passed to in-process and child runs; empty uses shared
+    // precedence.
+    std::string device_selector;
 
     // What colour space the photographs are in. Everything that reads pixels --
     // SfM, AI masking, depth and normals -- converts to sRGB first, which is
@@ -181,12 +211,19 @@ public:
     // masks. Usually "masks" (the parser default); an absolute path when the
     // masks were only read, which is what photos used where they are do.
     std::string mask_dir();
+    // Are those masks white where the image is REMOVED? Only ones the run
+    // handed on untouched can be; what it wrote is the usual way round.
+    bool mask_flipped() const;
     // 0..1 within the current stage, or -1 when it cannot be estimated.
     float progress() const;
     // Where the child is writing its snapshots, and the two folders the screen
     // reads alongside them. Set once the run has decided its workspace; empty
     // before that and for a run that produced neither.
     std::string progress_dir();
+    // The extractor's downscaled copies, for a screen drawing the frames.
+    std::string thumbs_dir();
+    // The matches the verification stage has produced so far.
+    std::string live_matches_path();
     std::string features_dir();
     std::string matches_path();
     // The two folders the reconstruction is reading, absolute: what the
@@ -205,6 +242,9 @@ public:
     // Done, but under half the images registered (or a high reprojection
     // error). The dataset is usable; the user should know it has gaps.
     bool partial() const { return _partial.load(); }
+    // Done, but the metric frame asked for could not be fitted: the model is
+    // in its own units, not metres.
+    bool not_metric() const { return _not_metric.load(); }
 
 private:
     void run(SfmJob job);
@@ -217,21 +257,34 @@ private:
     // Stage changes driven by the child's output, which repeats a
     // stage's lines many times over.
     void set_stage_if_new(Stage st, const char* s);
-    // Reads one spirula-sfm output line for a progress fraction.
-    void note_progress(const std::string& line);
-    // Per-input `--camera-model DIR=MODEL` / `--focal DIR=PX`, resolved against
-    // the frames that now exist.
-    void append_camera_overrides(const SfmJob& job, const PrepResult& prep,
-                                 std::vector<std::string>& argv);
+    // Where the run is: polled from the child's status.bin, or handed over
+    // by the in-process run. apply_status is what both feed.
+    void poll_status();
+    void apply_status(const RunStatus& st);
+#ifdef SS_TOOL_SFM
+    // The panel's per-input lens and focal rows, as the file the run reads.
+    sfm::Manifest build_manifest(const SfmJob& job, const PrepResult& prep);
+    static std::vector<sfm::RigDef> build_rigs(const PrepJob& prep);
+#endif
+    std::vector<std::string> recon_args(const SfmJob& job,
+                                        const PrepResult& prep);
+    // Model flags shared by the workspace stamp and both launch paths. The
+    // frozen execution selector is appended only when launching, so changing
+    // GPUs does not invalidate a completed model.
 
     std::thread _worker;
     std::atomic<State> _state{State::Idle};
     std::atomic<bool> _cancel{false};
     std::atomic<bool> _partial{false};
+    std::atomic<bool> _not_metric{false};
+    // The child said how it ended, so the exit code need not be interpreted.
+    bool _have_status = false;
+    int64_t _status_mtime = 0;
     RunProgress _prog;
     RunFilms _films;
     std::mutex _mu;
     std::string _error, _dataset_dir, _image_dir, _mask_dir;
+    std::atomic<bool> _mask_flipped{false};
     // Absolute; what the screen polls while the run is going.
     std::string _progress_dir, _features_dir, _matches_path;
     std::string _sfm_image_dir, _sfm_mask_dir;

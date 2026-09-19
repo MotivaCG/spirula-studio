@@ -15,6 +15,8 @@
 // the session it renders from is destroyed.
 
 #include "app/webviewer/RenderWorker.h"
+#include "core/ColorSpace.h"
+#include "data/DatasetParser.h"
 #include "app/gui/NavCamera.h"
 #include "app/gui/PreviewRenderer.h"
 
@@ -40,6 +42,10 @@ inline const char* kViewerGamuts[] = {"", "DCI-P3", "Rec.2020", "AdobeRGB",
                                       "ACEScg", "ACES2065-1"};
 inline constexpr int kNumViewerGamuts = 6;
 
+// Output transfers, in combo order and in colorspace::Transfer order. Like
+// the gamuts these are the identifiers --*-color-transfer takes.
+inline constexpr int kNumViewerTransfers = colorspace::kNumTransfers;
+
 class ViewportPanel {
 public:
     // Dataset preview (needs load_dataset() done; no GPU engine).
@@ -59,28 +65,19 @@ public:
                              const std::string& key, float radius = 1.0f);
     // Engine renderer (needs engine_ready).
     void attach(spirula::TrainerSession& session);
-    // Engine renderer over something that is not a training session -- a splat
-    // file opened in the viewer (SplatViewer). `key` identifies the scene, so
-    // reopening the same file keeps the pose; `radius` is the scene radius in
-    // the client's normalized frame, which is 1 for anything normalized.
-    // There are no training cameras behind this, so the frustum controls are
-    // not offered.
+    // Engine renderer over a file (SplatViewer): `key` keeps the pose across
+    // a reopen and `radius` is the scene radius in the client frame; the
+    // centering menu comes from cfg.centers.
     void attach_scene(const ViewerRenderConfig& cfg, const ViewerHooks& hooks,
                       const std::string& key, float radius = 1.0f);
-    // Offer the render-option controls a VIEWER gets (primitive, SH degree,
-    // color space) on top of attach_scene. `sh_degree_max` is what the file
-    // actually carries, and caps the SH slider -- bands that are not there
-    // cannot be drawn -- while `apply_color_space` is called when the gamut or
-    // the linear toggle changes, because that is an engine call and only the
-    // owner knows how to take the engine lock.
-    // `on_primitive_changed` is called after the user picks a different
-    // primitive, so the owner can hand the previous one's screen buffers
-    // back -- the two layouts share pool slots but not shapes, and keeping
-    // both resident is VRAM for nothing.
+    // The render-option controls a VIEWER gets, on top of attach_scene. The
+    // two callbacks are the owner's because both are engine calls; only it
+    // holds the engine lock. `sh_degree_max` caps the SH slider.
     void enable_scene_options(
         const std::string& primitive, int sh_degree_max,
-        const std::string& gamut, bool linear,
-        std::function<void(const char* gamut, bool linear)> apply_color_space,
+        const std::string& gamut, int transfer, bool linear,
+        std::function<void(const char* gamut, int transfer, bool linear)>
+            apply_color_space,
         std::function<void()> on_primitive_changed);
     void detach();
     bool attached() const { return _mode == Mode::Engine; }
@@ -101,6 +98,11 @@ public:
     // (row-major 3x4 similarity, scale*R | t; identity by default). Applied to
     // the CAMERA, not the geometry, so moving a model costs nothing.
     void set_model_transform(const float a[12]);
+
+    // What the dataset says about its own frame, so the panel can offer to
+    // skip the parsers' up->+Z guess (DatasetParser.h). `first` picks the
+    // checkbox's default; a refresh of the same scene must not.
+    void adopt_gauge(const ParsedDataset& ds, bool first);
 
     // Side-by-side: adopt `src`'s navigation pose, camera model and FOV, so
     // two panels showing the same scene stay locked to one view. `moved()`
@@ -128,12 +130,21 @@ private:
     enum class Mode { None, Preview, Engine };
 
     void compute_framing(const spirula::TrainerSession& session);
-    // The client-frame default pose (web viewer cam.reset() + orbit(0,-250)).
+    // The client-frame default pose (web viewer cam.reset() + orbit(0,-250)),
+    // about the chosen centre.
     void reset_pose(float radius);
+    // The centering choices, in the model frame. `has_cameras` says whether
+    // the camera statistics are real or fell back to the point ones.
+    void set_centers(const dsparse::CenterTable* centers, bool has_cameras);
+    // The chosen centre in the shared frame; the origin when none is known.
+    void center_shared(float out[3]) const;
+    // The mode the menu shows: the point statistic a camera one fell back to
+    // when there are no cameras.
+    int effective_center_mode() const;
     // Frame the scene only when a different dataset arrives; a preview ->
     // engine transition on the same dataset keeps the navigated pose and
     // intrinsics (no jump when training starts).
-    void maybe_frame(const spirula::TrainerSession& session);
+    bool maybe_frame(const spirula::TrainerSession& session);
     void reset_view();
     // Update _moving / _last_move from the camera pose. Runs every frame in
     // every scale mode: what it feeds is no longer only the adaptive scale.
@@ -196,10 +207,33 @@ private:
     bool _has_cameras = true;
 
     // Model frame -> shared navigation frame (see set_model_transform), and
-    // its scale, cached because every render divides by it.
+    // its scale, cached because every render divides by it. `_m2s` is the
+    // owner's placement composed with the levelling correction below.
+    float _m2s_owner[12] = {1,0,0,0, 0,1,0,0, 0,0,1,0};
     float _m2s[12] = {1,0,0,0, 0,1,0,0, 0,0,1,0};
     float _m2s_scale = 1.0f;
     bool _m2s_identity = true;
+    void rebuild_m2s();
+
+    // The parsers rotate every dataset so the mean camera up axis becomes +Z,
+    // a guess, and a bad one on a tilted 360 capture. `_align` is that
+    // rotation; unchecking `_level_cameras` undoes it and nothing else.
+    float _align[9] = {1,0,0, 0,1,0, 0,0,1};
+    bool _align_identity = true;
+    bool _level_cameras = true;
+    bool _gauge_metric = false;
+    // What the view orbits about and Reset view frames (dsparse::CenterMode),
+    // a point per mode in the model frame. Moves only the camera.
+    int _center_mode = (int)dsparse::CenterMode::CameraMedian;
+    dsparse::CenterTable _centers{};
+    bool _centers_known = false;
+    bool _center_has_cameras = false;
+    // Model units per unit of the navigated frame: what turns the grid's cell
+    // size into a length (ParsedDataset::train_frame_scale).
+    float _scene_scale = 1.0f;
+    // The grid's cell in model units, from the same rule both backends use.
+    float grid_cell() const;
+    void draw_grid_overlay(float x, float y, int line) const;
     bool _nav_controls = true;
     float _controls_h = 0.0f;
     float _controls_pad = 0.0f;
@@ -212,11 +246,13 @@ private:
     int _sh_degree = -1;          // < 0 = every band the file carries
     int _sh_degree_max = 0;       // what the file carries (the slider's top)
     int _gamut_idx = 0;           // index into kViewerGamuts
+    int _transfer_idx = 0;        // colorspace::Transfer
     bool _linear_color = false;
-    // Applying a gamut / linear change is an ENGINE call, not a render flag,
+    // Applying a gamut / transfer change is an ENGINE call, not a render flag,
     // so it is done by the owner (SplatViewer, which holds the engine lock)
     // rather than here.
-    std::function<void(const char* gamut, bool linear)> _apply_color_space;
+    std::function<void(const char* gamut, int transfer, bool linear)>
+        _apply_color_space;
     std::function<void()> _on_primitive_changed;
 
     // Mesh display switches (preview mode over a mesh).

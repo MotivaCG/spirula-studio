@@ -5,8 +5,11 @@
 #include "metric3d/model/Fetch.h"
 #include "moge/Moge.h"
 #include "moge/model/Fetch.h"
+#include "nn/Device.h"
 #include "nn/core/Error.h"
 #include "nn/io/Onnx.h"
+
+#include <algorithm>
 
 namespace app {
 namespace {
@@ -42,6 +45,32 @@ GeometryRequest face_request(const GeometryWarp& warp, int k, int num_tokens) {
     return r;
 }
 
+GeometryRequest turn_request(const GeometryRequest& r, const sfm::ExifTransform& t) {
+    GeometryRequest out = r;
+    if (t.identity()) return out;
+    double w = r.width, h = r.height, fx = r.fx, fy = r.fy, cx = r.cx, cy = r.cy;
+    const bool centred = cx >= 0.0 && cy >= 0.0;
+    for (int q = 0; q < (t.turns_cw & 3); q++) {
+        // One clockwise quarter turn, matching core/ImageOrient.h's mapping of
+        // the pixel grid: (x, y) -> (h - 1 - y, x).
+        const double ncx = (h - 1.0) - cy;
+        cy = cx;
+        cx = ncx;
+        std::swap(fx, fy);
+        std::swap(w, h);
+    }
+    if (t.mirror) cx = (w - 1.0) - cx;
+    out.width = (int)w;
+    out.height = (int)h;
+    out.fx = fx;
+    out.fy = fy;
+    if (centred) {
+        out.cx = cx;
+        out.cy = cy;
+    }
+    return out;
+}
+
 struct GeometryModel::Impl {
     moge::Predictor      moge;
     metric3d::Predictor  metric3d;
@@ -51,7 +80,10 @@ struct GeometryModel::Impl {
 GeometryModel::GeometryModel() : impl_(new Impl) {}
 GeometryModel::~GeometryModel() { delete impl_; }
 
-void GeometryModel::load(const std::string& id_or_path) {
+void GeometryModel::load(const std::string& id_or_path, const std::string& selector) {
+    // Freeze before model allocation; empty uses SS_VK_DEVICE then Auto.
+    if (!selector.empty()) nn::configure_device(selector);
+
     if (moge::find_model_source(id_or_path)) impl_->is_moge = true;
     else if (metric3d::find_model_source(id_or_path)) impl_->is_moge = false;
     else impl_->is_moge = file_is_moge(id_or_path);

@@ -51,27 +51,25 @@ struct MatchesDatabase {
     std::vector<Camera> cameras;         // one per distinct camera id
     std::vector<uint32_t> camera_ids;    // per image, parallel to `images`
     std::vector<uint8_t> focal_prior;    // parallel to `cameras`; 1 = not a guess
+    // 1 where THIS stage measured the focal rather than being told it. Kept
+    // apart from `focal_prior` because the mapper treats the two differently:
+    // it re-refines a measured focal and leaves a given one alone (D45).
+    std::vector<uint8_t> focal_measured;
     bool hasCameras() const {
         return !cameras.empty() && camera_ids.size() == images.size();
     }
 };
 
-// ---- matches.bin --------------------------------------------------------
-// Header: char[4] "VKMT", u32 version=3, u32 num_images.
-//   per image: u32 name_len, char[name_len], u32 num_features
-// Then u32 num_pairs, per pair:
-//   u32 image1, u32 image2, i32 config, u32 num_matches,
-//   then num_matches*(u32 idx1, u32 idx2)
-// Then (v3) the camera section: u32 num_cameras, per camera
-//   u32 id, i32 width, i32 height, i32 colmap_model_id, u8 focal_prior,
-//   f64 pixel_scale, u32 num_params, f64 params[num_params]
-// followed by u32 num_camera_ids and that many u32 (one per image). A v2 file
-// stops after the pairs and reads back with no cameras.
+// ---------------------------------------------------------------------------
+// matches.bin -- "VKMT", u32 version=4; the layout is writeMatches below, and
+// an older file reads back as what it carried: v2 stops after the pairs and has
+// no cameras, v3 has cameras but no per-camera `focal_measured` byte.
+// ---------------------------------------------------------------------------
 
 inline void writeMatches(const std::string& path, const MatchesDatabase& db) {
     std::ofstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("cannot write " + path);
-    uint32_t version = 3, nimg = (uint32_t)db.images.size();
+    uint32_t version = 4, nimg = (uint32_t)db.images.size();
     f.write("VKMT", 4);
     f.write((const char*)&version, 4);
     f.write((const char*)&nimg, 4);
@@ -116,6 +114,10 @@ inline void writeMatches(const std::string& path, const MatchesDatabase& db) {
         uint32_t nid = (uint32_t)db.camera_ids.size();
         f.write((const char*)&nid, 4);
         f.write((const char*)db.camera_ids.data(), (std::streamsize)nid * 4);
+        for (uint32_t c = 0; c < ncam; c++) {
+            uint8_t m = c < db.focal_measured.size() ? db.focal_measured[c] : 0;
+            f.write((const char*)&m, 1);
+        }
     }
 }
 
@@ -185,10 +187,16 @@ inline MatchesDatabase readMatches(const std::string& path) {
                 f.read((char*)db.camera_ids.data(), (std::streamsize)nid * 4);
             }
         }
+        if (ncam && version >= 4) {
+            std::vector<uint8_t> measured(ncam);
+            f.read((char*)measured.data(), (std::streamsize)ncam);
+            if (f.gcount() == (std::streamsize)ncam) db.focal_measured = std::move(measured);
+        }
         if (!db.hasCameras()) {   // truncated section: no cameras, not bad ones
             db.cameras.clear();
             db.camera_ids.clear();
             db.focal_prior.clear();
+            db.focal_measured.clear();
         }
     }
     return db;
@@ -200,6 +208,10 @@ inline MatchesDatabase readMatches(const std::string& path) {
 // draw one pair out of a file whose match arrays are most of a gigabyte. The
 // GUI's match map is the caller: it needs every pair's size to draw, and one
 // pair's contents only when the cursor is over it.
+
+// A pair count of this means "pairs until the end of the file": the writer was
+// still appending when the file was made (sfm/core/Progress.h, live_matches.bin).
+inline constexpr uint32_t kStreamingPairs = 0xFFFFFFFFu;
 
 struct MatchesIndex {
     struct Entry {
@@ -237,20 +249,28 @@ inline bool indexMatches(const std::string& path, MatchesIndex& out) {
     }
     uint32_t npairs = 0;
     f.read((char*)&npairs, 4);
-    if (!f || (uint64_t)npairs * 16 > bytes) return false;
-    idx.pairs.reserve(npairs);
-    for (uint32_t i = 0; i < npairs; i++) {
+    const bool streaming = npairs == kStreamingPairs;
+    if (!f || (!streaming && (uint64_t)npairs * 16 > bytes)) return false;
+    if (!streaming) idx.pairs.reserve(npairs);
+    for (uint32_t i = 0; streaming || i < npairs; i++) {
         MatchesIndex::Entry e;
         int32_t config = 0;
         f.read((char*)&e.image1, 4);
         f.read((char*)&e.image2, 4);
         f.read((char*)&config, 4);
         f.read((char*)&e.count, 4);
-        if (!f) return false;
+        // Streaming stops at the tail the writer has not finished; a fixed
+        // count that runs out is a truncated file and stays an error.
+        if (!f) return streaming ? (out = std::move(idx), true) : false;
         e.offset = (uint64_t)f.tellg();
+        // seekg past the end does not fail until something is read, so the
+        // bound is checked here for both shapes: a short streaming file is a
+        // tail the writer has not finished, a short fixed one is truncated.
+        if (e.offset + (uint64_t)e.count * 8 > bytes)
+            return streaming ? (out = std::move(idx), true) : false;
         idx.pairs.push_back(e);
         f.seekg((std::streamoff)e.count * 8, std::ios::cur);
-        if (!f) return false;
+        if (!f) return streaming ? (out = std::move(idx), true) : false;
     }
     out = std::move(idx);
     return true;

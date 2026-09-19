@@ -160,6 +160,9 @@ static void _ensure_optim_state(int sh_optim_bits, int sh_value_bits,
     //   per block, and the kernel writes one bounds slot per block. So same
     //   packed-cell count, but 3*K x fewer bounds slots.
     int64_t sh_cells = (int64_t)N * K * 3;
+    // The FPBO layout addresses whole 256-splat blocks of whole u32 words, so
+    // it needs the rounded-up cell count (docs/notes/sh-quant-layout.md).
+    int64_t sh_cells_fpbo = sh_fpbo_cells(N, (uint32_t)K);
     if (quantize_sh && !fused) {
         constexpr int64_t BLOCK_SIZE = QuantizedAdamState<8, 256>::kBlockSize;
         int64_t sh_bounds = (sh_cells + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -167,7 +170,7 @@ static void _ensure_optim_state(int sh_optim_bits, int sh_value_bits,
         engine().optim.sh_quant_state_fpbo = QuantizedAdamState<8, 256>();
     } else if (quantize_sh && fused) {
         int64_t sh_bounds = (N + kFpboBlock - 1) / kFpboBlock;
-        engine().optim.sh_quant_state_fpbo.resize(PoolSlot::EngShQuantFpbo, sh_cells, sh_bounds);
+        engine().optim.sh_quant_state_fpbo.resize(PoolSlot::EngShQuantFpbo, sh_cells_fpbo, sh_bounds);
         engine().optim.sh_quant_state = QuantizedAdamState<8, 256>();
     } else {
         engine().optim.sh_quant_state      = QuantizedAdamState<8, 256>();
@@ -193,7 +196,7 @@ static void _ensure_optim_state(int sh_optim_bits, int sh_value_bits,
             engine().world.features_sh_quant8_fpbo  = QuantizedTensor<8,  256>();
             engine().world.features_sh_quant16_fpbo = QuantizedTensor<16, 256>();
         } else if (quantize_sh_value && sh_value_bits == 8 && fused) {
-            engine().world.features_sh_quant8_fpbo.resize(PoolSlot::EngWorldShVq8Fpbo, sh_cells, v_bounds_fpbo);
+            engine().world.features_sh_quant8_fpbo.resize(PoolSlot::EngWorldShVq8Fpbo, sh_cells_fpbo, v_bounds_fpbo);
             engine().world.features_sh_quant16 = QuantizedTensor<16, 256>();
             engine().world.features_sh_quant8  = QuantizedTensor<8,  256>();
             engine().world.features_sh_quant16_fpbo = QuantizedTensor<16, 256>();
@@ -203,7 +206,7 @@ static void _ensure_optim_state(int sh_optim_bits, int sh_value_bits,
             engine().world.features_sh_quant8_fpbo  = QuantizedTensor<8,  256>();
             engine().world.features_sh_quant16_fpbo = QuantizedTensor<16, 256>();
         } else if (quantize_sh_value && sh_value_bits == 16 && fused) {
-            engine().world.features_sh_quant16_fpbo.resize(PoolSlot::EngWorldShVq16Fpbo, sh_cells, v_bounds_fpbo);
+            engine().world.features_sh_quant16_fpbo.resize(PoolSlot::EngWorldShVq16Fpbo, sh_cells_fpbo, v_bounds_fpbo);
             engine().world.features_sh_quant8  = QuantizedTensor<8,  256>();
             engine().world.features_sh_quant16 = QuantizedTensor<16, 256>();
             engine().world.features_sh_quant8_fpbo  = QuantizedTensor<8,  256>();
@@ -378,7 +381,7 @@ void engine_fused_proj_bwd_optim_step(int step, const OptimConfig& cfg) {
     // engine's mutable world params, which the fused kernel updates in place.
     auto& splats_w = engine().fwd.splats_w;
 
-    auto aabb_nd = DeviceTensorFloatND(engine().fwd.aabb);
+    auto& aabb_q = engine().fwd.aabb;
 
     // Dispatch on primitive. Pass engine().sh_degree (= sh_degree_to_use) so
     // the kernel-template SH degree matches the forward pass during warmup --
@@ -448,7 +451,7 @@ void engine_fused_proj_bwd_optim_step(int step, const OptimConfig& cfg) {
             _dt2d_tv(engine().camera.dist_coeffs),
             engine().fwd.camera_ids,
             engine().fwd.gaussian_ids,
-            aabb_nd,
+            aabb_q,
             v_splats_w,
             engine().fwd.v_splats_s,
             g1, g2,
@@ -462,11 +465,11 @@ void engine_fused_proj_bwd_optim_step(int step, const OptimConfig& cfg) {
             cfg.max_gauss_ratio, cfg.scale_regularization_weight,
             cfg.mcmc_opacity_reg_weight, cfg.mcmc_scale_reg_weight,
             cfg.erank_reg_weight, cfg.erank_reg_weight_s3,
-            cfg.quat_norm_reg_weight, cfg.sh_reg_weight,
+            cfg.quat_norm_reg_weight, cfg.dc_reg_weight, cfg.sh_reg_weight,
+            cfg.max_screen_size, cfg.max_screen_size_penalty,
             cfg.use_scale_agnostic_mean,
-            // The two flags are tied to the same Python source
-            // (splat_color_is_linear); collapse to one to halve the FPBO
-            // color-space instantiation axis.
+            // Both are set from the same resolved flag (a linear splat
+            // working space); collapse to one to halve the FPBO axis.
             cfg.use_color_trust_region || cfg.color_is_linear,
             cfg.eps_tr,
             step_arg,
@@ -512,6 +515,14 @@ void engine_optim_step(int step, const OptimConfig& cfg) {
     // defaults (1.0f, false) and the kernels behave exactly as before.
     const float grad_scale = engine().optim.grad_scale;
     const bool  zero_grad  = engine().optim.zero_grad_in_optim;
+
+    // Same collapse of the two flags FPBO makes, so the DC/SH kernels below
+    // move colour exactly the way the fused path does.
+    ColorTrustState color_trust;
+    color_trust.enabled     = cfg.use_color_trust_region || cfg.color_is_linear;
+    color_trust.eps_tr      = cfg.eps_tr;
+    color_trust.features_dc = (const float*)engine().world.features_dc.data_ptr();
+    color_trust.opacities   = engine().world.opacities.data_ptr();
 
     // Non-SH Adam-state quant bundle. Same struct as FPBO consumes; when
     // enabled, the geometry kernel reads/writes the 5 non-SH attrs (means,
@@ -576,8 +587,10 @@ void engine_optim_step(int step, const OptimConfig& cfg) {
         cfg.max_gauss_ratio, cfg.scale_regularization_weight,
         cfg.mcmc_opacity_reg_weight, cfg.mcmc_scale_reg_weight,
         cfg.erank_reg_weight, cfg.erank_reg_weight_s3, cfg.quat_norm_reg_weight,
-        cfg.sh_reg_weight,
+        cfg.dc_reg_weight, cfg.sh_reg_weight,
+        cfg.max_screen_size, cfg.max_screen_size_penalty,
         cfg.use_scale_agnostic_mean,
+        color_trust,
         non_sh_optim,
         grad_q,
         step + 1, per_splat_steps,
@@ -599,7 +612,8 @@ void engine_optim_step(int step, const OptimConfig& cfg) {
                 _dv_tv(engine().optim.g2_features_dc),
                 _dv_tv(engine().world.opacities),
                 cfg.lr_features_dc,
-                beta1, beta2, eps, cfg.eps_tr, s1,
+                beta1, beta2, eps, cfg.eps_tr,
+                cfg.dc_reg_weight, cfg.sh_reg_weight, s1,
                 grad_scale, zero_grad
             );
         } else {
@@ -609,7 +623,9 @@ void engine_optim_step(int step, const OptimConfig& cfg) {
                 DeviceTensorFloatND(engine().optim.g1_features_dc),
                 DeviceTensorFloatND(engine().optim.g2_features_dc),
                 cfg.lr_features_dc, step + 1, per_splat_steps,
-                cfg.sh_reg_weight, 0.5f / 0.28209479177387814f,
+                // fused_adam_step divides l2_reg by the parameter count;
+                // FPBO applies 2*dc_reg/3 per splat, so pre-multiply by N.
+                cfg.dc_reg_weight * (float)N, 0.5f / 0.28209479177387814f,
                 grad_scale, zero_grad);
         }
     }
@@ -650,7 +666,7 @@ void engine_optim_step(int step, const OptimConfig& cfg) {
             engine().world.features_sh_quant8.bounds_ptr(),
             cfg.lr_features_sh, step + 1, per_splat_steps,
             cfg.sh_reg_weight, 0.0f,
-            cfg.sh_optim_bits, /*value_bits=*/8,
+            cfg.sh_optim_bits, /*value_bits=*/8, color_trust,
             grad_scale, zero_grad);
     } else if (cfg.sh_value_bits != 32
                && engine().world.features_sh_quant16.initialized()) {
@@ -666,7 +682,7 @@ void engine_optim_step(int step, const OptimConfig& cfg) {
             engine().world.features_sh_quant16.bounds_ptr(),
             cfg.lr_features_sh, step + 1, per_splat_steps,
             cfg.sh_reg_weight, 0.0f,
-            cfg.sh_optim_bits, /*value_bits=*/16,
+            cfg.sh_optim_bits, /*value_bits=*/16, color_trust,
             grad_scale, zero_grad);
     } else if (cfg.sh_optim_bits != 32 && engine().optim.sh_quant_state.initialized()) {
         // SH-quant (optim) only -- fp32 SH values. Plain quantized Adam kernel.
@@ -679,7 +695,7 @@ void engine_optim_step(int step, const OptimConfig& cfg) {
             engine().optim.sh_quant_state.bounds_ptr(),
             cfg.lr_features_sh, step + 1, per_splat_steps,
             cfg.sh_reg_weight, 0.0f,
-            cfg.sh_optim_bits,
+            cfg.sh_optim_bits, color_trust,
             grad_scale, zero_grad);
     } else if (cfg.use_color_trust_region) {
         const int s1 = step + 1;
@@ -692,7 +708,7 @@ void engine_optim_step(int step, const OptimConfig& cfg) {
             _dv_tv(engine().world.features_dc),
             _dv_tv(engine().world.opacities),
             cfg.lr_features_sh,
-            beta1, beta2, eps, cfg.eps_tr, s1,
+            beta1, beta2, eps, cfg.eps_tr, cfg.sh_reg_weight, s1,
             grad_scale, zero_grad
         );
     } else {

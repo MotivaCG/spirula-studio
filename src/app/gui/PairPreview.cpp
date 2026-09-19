@@ -89,15 +89,18 @@ PairPreview::~PairPreview() { stop(); }
 void PairPreview::configure(const std::string& image_dir,
                             const std::string& mask_dir,
                             const std::string& features_dir,
-                            const std::string& matches_path) {
+                            const std::string& matches_path,
+                            const std::string& live_matches) {
     std::lock_guard<std::mutex> lk(_mu);
     if (_image_dir == image_dir && _mask_dir == mask_dir &&
-        _features_dir == features_dir && _matches_path == matches_path)
+        _features_dir == features_dir && _matches_path == matches_path &&
+        _live_matches == live_matches)
         return;
     _image_dir = image_dir;
     _mask_dir = mask_dir;
     _features_dir = features_dir;
     _matches_path = matches_path;
+    _live_matches = live_matches;
 }
 
 void PairPreview::show(uint32_t a, uint32_t b) {
@@ -181,13 +184,14 @@ void PairPreview::load(uint32_t a, uint32_t b, Shot& out) {
     out.b = b;
     out.loaded = true;
 
-    std::string image_dir, mask_dir, features_dir, matches_path;
+    std::string image_dir, mask_dir, features_dir, matches_path, live_matches;
     {
         std::lock_guard<std::mutex> lk(_mu);
         image_dir = _image_dir;
         mask_dir = _mask_dir;
         features_dir = _features_dir;
         matches_path = _matches_path;
+        live_matches = _live_matches;
     }
     if (features_dir != _w_features_dir || matches_path != _w_matches_path) {
         _stems.clear();
@@ -244,11 +248,23 @@ void PairPreview::load(uint32_t a, uint32_t b, Shot& out) {
 
 #ifdef SS_TOOL_SFM
     if (matches_path.empty() || kp[0].empty() || kp[1].empty()) return;
-    const auto stamp = fs::last_write_time(matches_path, ec);
+    // While matching runs there is no matches.bin yet, only the file the stage
+    // is appending to; hovering a cell then still draws the pair's matches
+    // rather than nothing (sfm/core/Progress.h, live_matches.bin).
+    std::string src = matches_path;
+    if (!fs::exists(src, ec) && !live_matches.empty() &&
+        fs::exists(live_matches, ec))
+        src = live_matches;
+    const auto stamp = fs::last_write_time(src, ec);
     if (ec) return;
+    if (src != _pairs_src) {
+        _pairs.clear();
+        _pairs_mtime = 0;
+        _pairs_src = src;
+    }
     if (_pairs.empty() || stamp.time_since_epoch().count() != _pairs_mtime) {
         sfm::MatchesIndex idx;
-        if (!sfm::indexMatches(matches_path, idx)) return;
+        if (!sfm::indexMatches(src, idx)) return;
         _pairs_mtime = stamp.time_since_epoch().count();
         _pairs.clear();
         _pairs.reserve(idx.pairs.size());
@@ -270,8 +286,7 @@ void PairPreview::load(uint32_t a, uint32_t b, Shot& out) {
     flipped = it->a != a;
 
     std::vector<sfm::FeatureMatch> m;
-    if (!sfm::readPairMatches(matches_path, {it->a, it->b, it->count, it->offset},
-                              m))
+    if (!sfm::readPairMatches(src, {it->a, it->b, it->count, it->offset}, m))
         return;
     out.matches = m.size();
     const size_t step = m.size() / kMaxLines + 1;

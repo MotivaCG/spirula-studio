@@ -27,6 +27,24 @@ struct LightGlueOptions {
     // COLMAP's LightGlueONNXMatchingOptions default.
     double min_score = 0.1;
     int    device = -1;
+    // Canonical uuid:<hex>; committed to the shared NN before LightGlue's
+    // weights load. "" leaves NN's own precedence in charge.
+    std::string device_selector;
+    bool   verbose = true;
+};
+
+// LoMa's matcher. Five released variants, all nine layers; they differ in the
+// embedding width and in which descriptor they were trained against, and both
+// are read off the checkpoint rather than spelled here.
+struct LomaMatchOptions {
+    // "loma-b", "loma-b128", "loma-r", "loma-l", "loma-g" (fetched and cached)
+    // or a path to an .onnx file. Empty means "whatever --matcher named".
+    std::string model;
+    // COLMAP's LomaMatchingOptions default, and LoMa's own filter threshold.
+    double min_score = 0.1;
+    int    device = -1;
+    // Canonical uuid:<hex>; see LightGlueOptions::device_selector.
+    std::string device_selector;
     bool   verbose = true;
 };
 
@@ -36,6 +54,7 @@ bool isLearnedMatcher(const std::string& type);
 // learned and this binary has no inference layer.
 std::unique_ptr<IFeatureMatcher> createFeatureMatcher(const std::string& type,
                                                       const MatchOptions& match,
-                                                      const LightGlueOptions& lightglue);
+                                                      const LightGlueOptions& lightglue,
+                                                      const LomaMatchOptions& loma);
 
 }  // namespace sfm

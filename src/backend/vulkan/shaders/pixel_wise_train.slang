@@ -15,10 +15,12 @@
 #include "atomic_float.slang"
 #include "dist_spec.slang"
 
-// Shared boolean variant flag (noise blend: is_linear; srgb:
-// is_input_linear), same convention as pixel_wise_render.slang.
+// colorspace::Transfer and the working space's linearity, same convention as
+// pixel_wise_render.slang.
 [SpecializationConstant]
-const int kFlagLinear = 0;
+const int kTransfer = 0;
+[SpecializationConstant]
+const int kIsLinear = 0;
 
 [ForceInline]
 bool _pwt_finitef(float v) {
@@ -91,19 +93,69 @@ uint _pwt_hash_uint3(uint a, uint b, uint c) {
     return hash;
 }
 
-struct BlendBgNoiseBwdParams {  // 64 bytes: pushed directly
+// Murmur-style finalizer. The whole background is computed, never stored.
+[ForceInline]
+uint _bg_mix(uint x) {
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+// The unit sample the background is built from, twin of
+// kernels/pixelwise/ImageColorOps.cu. `blocky` draws a cube corner per cell --
+// the extremes -- and `block_px` is the cell side, 0 being one cell per image.
+[ForceInline]
+float3 _bg_sample(uint blocky, uint block_px, uint seed, uint gid, uint bid,
+                  uint W) {
+    uint cx = 0u, cy = 0u, cells_w = 1u;
+    if (block_px != 0u) {
+        // The cell grid shifts every step, so no pixel keeps its colour and
+        // the pattern cannot be baked into the splats.
+        cx = ((gid % W) + _bg_mix(seed * 2u + 1u) % block_px) / block_px;
+        cy = ((gid / W) + _bg_mix(seed * 2u + 7u) % block_px) / block_px;
+        cells_w = W / block_px + 2u;
+    }
+    if (blocky != 0u) {
+        uint h = _bg_mix(cx * 2654435761u ^ cy * 40503u
+                         ^ (seed + bid * 0x9e3779b9u));
+        return float3((h & 1u) != 0u ? 1.0f : -1.0f,
+                      (h & 2u) != 0u ? 1.0f : -1.0f,
+                      (h & 4u) != 0u ? 1.0f : -1.0f);
+    }
+    uint cid = cy * cells_w + cx;
+    // 2u-1: without it the plain path lands in [0.5, 0.5+w/2) instead of
+    // straddling 0.5, so every channel sits in the same bright half.
+    return float3(float(_pwt_hash_uint3(seed + 0, cid, bid)) * exp2(-31.0f) - 1.0f,
+                  float(_pwt_hash_uint3(seed + 1, cid, bid)) * exp2(-31.0f) - 1.0f,
+                  float(_pwt_hash_uint3(seed + 2, cid, bid)) * exp2(-31.0f) - 1.0f);
+}
+
+struct BlendBgNoiseBwdParams {  // 96 bytes: pushed directly
     float* rgb;            // PRE-blend
     float* transmittance;
     float* v_out_rgb;
     float* v_rgb;
     float* v_transmittance;
+    float* exponent_by_cam; // power per camera slot, read when match_luma != 0
+    int* cam_indices;      // [B] slot per image
     float overexposure_scale;
     float randomize_weight;
     uint32_t seed;
     uint32_t HW;
     uint32_t total;
     uint32_t wgs_per_row;
+    uint32_t W;
+    uint32_t blocky;
+    uint32_t block_px;
+    uint32_t match_luma;
 };
+
+// Mirrors _bg_exponent in kernels/pixelwise/ImageColorOps.cu.
+float _pwt_bg_exponent(uint bid, uint match_luma, float* exponent_by_cam,
+                       int* cam_indices) {
+    return match_luma != 0u ? exponent_by_cam[uint(cam_indices[bid])] : 1.0f;
+}
 
 [shader("compute")]
 [numthreads(128, 1, 1)]
@@ -118,16 +170,11 @@ void blend_bg_noise_bwd(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
                         p.rgb[3 * idx + 2]);
     float T = p.transmittance[idx];
 
-    float3 background;
-    background.x = float(_pwt_hash_uint3(p.seed + 0, gid, bid)) * exp2(-32.0f);
-    background.y = float(_pwt_hash_uint3(p.seed + 1, gid, bid)) * exp2(-32.0f);
-    background.z = float(_pwt_hash_uint3(p.seed + 2, gid, bid)) * exp2(-32.0f);
-    background = 0.5f + 0.5f * p.randomize_weight * (2.0f * background - 1.0f);
-    if (kFlagLinear != 0) {
-        background.x = srgb_to_linear_rgb(background.x);
-        background.y = srgb_to_linear_rgb(background.y);
-        background.z = srgb_to_linear_rgb(background.z);
-    }
+    float3 background = _bg_sample(p.blocky, p.block_px, p.seed, gid, bid, p.W);
+    background = 0.5f + 0.5f * p.randomize_weight * background;
+    background = background_apply_exponent(background,
+        _pwt_bg_exponent(bid, p.match_luma, p.exponent_by_cam, p.cam_indices));
+    background = display_to_working3(background, kTransfer, kIsLinear != 0);
 
     float3 v_out = float3(p.v_out_rgb[3 * idx], p.v_out_rgb[3 * idx + 1],
                           p.v_out_rgb[3 * idx + 2]);
@@ -143,7 +190,47 @@ void blend_bg_noise_bwd(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
 }
 
 // ---------------------------------------------------------------------------
-// rgb_to_srgb_backward (kFlagLinear = is_input_linear)
+// blend_background_color_backward
+// ---------------------------------------------------------------------------
+
+// Scalars only, like every other param struct here: a float3 member would
+// carry vector alignment the C++ mirror does not.
+struct BlendBgColorBwdParams {  // 64 bytes: pushed directly
+    float* rgb;            // PRE-blend
+    float* transmittance;
+    float* v_out_rgb;
+    float* v_rgb;
+    float* v_transmittance;
+    float bg_r, bg_g, bg_b;  // working color space
+    float overexposure_scale;
+    uint32_t total;
+    uint32_t wgs_per_row;
+};
+
+[shader("compute")]
+[numthreads(128, 1, 1)]
+void blend_bg_color_bwd(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
+                        uniform BlendBgColorBwdParams p) {
+    uint idx = (wg.y * p.wgs_per_row + wg.x) * 128 + tid;
+    if (idx >= p.total) return;
+    float3 rgb = float3(p.rgb[3 * idx], p.rgb[3 * idx + 1],
+                        p.rgb[3 * idx + 2]);
+    float T = p.transmittance[idx];
+    float3 v_out = float3(p.v_out_rgb[3 * idx], p.v_out_rgb[3 * idx + 1],
+                          p.v_out_rgb[3 * idx + 2]);
+    float3 v_rgb;
+    float v_T;
+    float3 v_bg;
+    blend_background_bwd(rgb, T, float3(p.bg_r, p.bg_g, p.bg_b), v_out,
+                         p.overexposure_scale, v_rgb, v_T, v_bg);
+    p.v_rgb[3 * idx] = v_rgb.x;
+    p.v_rgb[3 * idx + 1] = v_rgb.y;
+    p.v_rgb[3 * idx + 2] = v_rgb.z;
+    p.v_transmittance[idx] = v_T;
+}
+
+// ---------------------------------------------------------------------------
+// working_to_display_backward (kTransfer / kIsLinear = the source encoding)
 // ---------------------------------------------------------------------------
 
 struct RgbToSrgbBwdParams {  // 40 bytes: pushed directly
@@ -157,8 +244,8 @@ struct RgbToSrgbBwdParams {  // 40 bytes: pushed directly
 
 [shader("compute")]
 [numthreads(128, 1, 1)]
-void srgb_bwd(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
-              uniform RgbToSrgbBwdParams p) {
+void working_to_display_bwd_k(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
+                              uniform RgbToSrgbBwdParams p) {
     uint idx = (wg.y * p.wgs_per_row + wg.x) * 128 + tid;
     if (idx >= p.total) return;
     float3 rgb = float3(p.rgb[3 * idx], p.rgb[3 * idx + 1],
@@ -170,8 +257,8 @@ void srgb_bwd(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
                        p.color_matrix[3 * r + 2]);
     float3 v_out = float3(p.v_out_rgb[3 * idx], p.v_out_rgb[3 * idx + 1],
                           p.v_out_rgb[3 * idx + 2]);
-    float3 v_rgb = kFlagLinear != 0 ? linear_rgb_to_srgb_bwd(rgb, cm, v_out)
-                                    : rgb_to_srgb_bwd(rgb, cm, v_out);
+    float3 v_rgb = working_to_display_bwd(rgb, cm, kTransfer, kIsLinear != 0,
+                                          v_out);
     p.v_rgb[3 * idx] = v_rgb.x;
     p.v_rgb[3 * idx + 1] = v_rgb.y;
     p.v_rgb[3 * idx + 2] = v_rgb.z;

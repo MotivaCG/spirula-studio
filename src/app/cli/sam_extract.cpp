@@ -28,6 +28,9 @@
 #include "i18n/catalog/SamHelp.h"
 #include "nn/core/Log.h"
 #include "sam/Masking.h"
+#ifdef SS_TOOL_SFM
+#include "sfm/core/Telemetry.h"
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -79,9 +82,18 @@ void usage() {
     help_row("-n, --max-frames <n>", H::xh_max_frames);
     help_row("-q, --quality <0..100>", H::xh_quality);
     help_row("-r, --rotate <deg>", H::xh_rotate);
+    help_row("    --no-autorotate", H::xh_no_autorotate);
     help_row("    --scale <f>", H::xh_scale);
     help_row("    --track <i>", H::xh_track);
+    help_row("    --sync", H::xh_sync);
+    help_row("    --adaptive", H::xh_adaptive);
+    help_row("    --adaptive-range <f>", H::xh_adaptive_range);
     help_row("    --threads <n>", H::xh_threads);
+
+    std::fprintf(stderr, "\n%s\n", H::xh_360_section.get());
+    help_row("    --360 <mode>", H::xh_360);
+    help_row("    --360-size <n>", H::xh_360_size);
+    help_row("    --360-orient <y,p,r>", H::xh_360_orient);
 
     std::fprintf(stderr, "\n%s\n", H::xh_masking.get());
     help_row("    --model <file>", H::xh_model);
@@ -95,9 +107,11 @@ void usage() {
     help_row("    --max-size <n>", H::xh_max_size);
     help_row("    --threshold <f>", H::xh_threshold);
     help_row("    --nms <f>", H::xh_nms);
+    help_row("    --dilate-ratio <f>", H::mask_dilate);
     help_row("    --overlay", H::xh_overlay);
 
-    std::fprintf(stderr, "\n%s --device <index|name>  --profile  --validate\n",
+    std::fprintf(stderr, "\n%s --device <index|name|auto|-1|uuid:hex>  --profile  "
+                         "--validate\n",
                  H::label_common.get());
 }
 
@@ -106,15 +120,23 @@ struct Options {
     std::string out_dir, mask_dir;
     int    skip = 1, keep = -1, max_frames = 0;
     int    quality = 95, rotate = 0;
+    bool   auto_rotate = true;
     float  scale = 1.0f;
     int    track = -1;
+    bool   sync = false;
+    bool   adaptive = false;
+    float  adaptive_range = 4.0f;
     int    threads = 0;
+
+    std::string pano_mode = "faces";
+    app::Pano360Options pano;
 
     std::string model, text, neg_text, device;
     std::string mask_mode = "video";
     bool   keep_subject = false;
     int    detect_every = 1, memory_frames = 0, max_size = 1600;
     float  threshold = 0.5f, nms = 0.1f;
+    float  dilate_ratio = 0.05f;   // sam::MaskOptions, same default
     bool   overlay = false, profile = false, validate = false;
 };
 
@@ -138,9 +160,28 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "-n" || a == "--max-frames") o.max_frames = std::atoi(next("--max-frames"));
         else if (a == "-q" || a == "--quality") o.quality = std::atoi(next("--quality"));
         else if (a == "-r" || a == "--rotate") o.rotate = std::atoi(next("--rotate"));
+        else if (a == "--no-autorotate") o.auto_rotate = false;
+        else if (a == "--autorotate") o.auto_rotate = true;
         else if (a == "--scale") o.scale = std::strtof(next("--scale"), nullptr);
         else if (a == "--track") o.track = std::atoi(next("--track"));
+        else if (a == "--sync") o.sync = true;
+        else if (a == "--adaptive") o.adaptive = true;
+        else if (a == "--adaptive-range")
+            o.adaptive_range = std::strtof(next("--adaptive-range"), nullptr);
         else if (a == "--threads") o.threads = std::atoi(next("--threads"));
+        else if (a == "--360") o.pano_mode = next("--360");
+        else if (a == "--360-size") o.pano.size = std::atoi(next("--360-size"));
+        else if (a == "--360-orient") {
+            const char* v = next("--360-orient");
+            if (std::sscanf(v, "%f,%f,%f", &o.pano.yaw, &o.pano.pitch,
+                            &o.pano.roll) != 3) {
+                std::fprintf(stderr, "%s\n",
+                             spirula::i18n::format(
+                                 spirula::i18n::msg::cli::sam_flag_needs_value,
+                                 {"--360-orient"}).c_str());
+                return false;
+            }
+        }
         else if (a == "--model") o.model = next("--model");
         else if (a == "--text") o.text = next("--text");
         else if (a == "--neg-text") o.neg_text = next("--neg-text");
@@ -152,6 +193,8 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--max-size") o.max_size = std::atoi(next("--max-size"));
         else if (a == "--threshold") o.threshold = std::strtof(next("--threshold"), nullptr);
         else if (a == "--nms") o.nms = std::strtof(next("--nms"), nullptr);
+        else if (a == "--dilate-ratio")
+            o.dilate_ratio = std::strtof(next("--dilate-ratio"), nullptr);
         else if (a == "--overlay") o.overlay = true;
         else if (a == "--device") o.device = next("--device");
         else if (a == "--profile") o.profile = true;
@@ -195,12 +238,11 @@ int sam_cli_extract(int argc, char** argv) {
         usage();
         return 2;
     }
-    // The decoder and the masker each reach vk::Context::get() on their own,
-    // so the device and the diagnostic switches are handed over the way the
-    // context reads them rather than plumbed through two option structs.
+    // The device is NOT set here: a native selection is explicit in the job
+    // below, which freezes it before the first decode or model load. Writing
+    // SS_VK_DEVICE would leak the choice into unrelated children.
     if (o.validate) set_env("SS_VK_VALIDATION", "1");
     if (o.profile) set_env("SS_PROFILE", "1");
-    if (!o.device.empty()) set_env("SS_VK_DEVICE", o.device.c_str());
 
     const fs::path input(o.input);
     const fs::path base = o.out_dir.empty()
@@ -211,15 +253,46 @@ int sam_cli_extract(int argc, char** argv) {
     job.input = o.input;
     job.image_dir = base.string();
     job.mask_dir = o.mask_dir;
+    // The one device request, from the one flag: the job freezes it before the
+    // decoder probe, so the decoder, the masker and the trackers agree.
+    job.device = o.device;
     job.skip = o.skip;
     job.keep = o.keep;
     job.max_frames = o.max_frames;
     job.quality = o.quality;
     job.rotate = o.rotate;
+    job.auto_rotate = o.auto_rotate;
     job.scale = o.scale;
     job.track = o.track;
+    job.sync_tracks = o.sync;
+    job.adaptive = o.adaptive;
+    job.adaptive_range = o.adaptive_range;
     job.threads = o.threads;
     job.write_overlay = o.overlay;
+    // A 360 file is recognised by its packing, not by its name, and only then
+    // is there anything for --360 to select.
+    if (o.pano_mode != "off") {
+        std::string err;
+        const std::vector<std::pair<int, int>> tracks =
+            app::video_track_sizes(o.input, err);
+        app::Pano360Meta meta;
+#ifdef SS_TOOL_SFM
+        const sfm::VideoProjection pr = sfm::video_projection(o.input);
+        meta = app::Pano360Meta{pr.name, pr.mode};
+#endif
+        if (tracks.size() == 2 && tracks[0] == tracks[1] &&
+            app::pano360_detect(2, tracks[0].first, tracks[0].second, meta,
+                                job.eac)) {
+            o.pano.mode = o.pano_mode == "equirect" ? app::Pano360Mode::Equirect
+                                                    : app::Pano360Mode::Faces;
+            job.views = app::pano360_views(job.eac, o.pano);
+            std::fprintf(stderr, "360: %d x %d tracks -> %zu view(s) of %dx%d\n",
+                         job.eac.track_w, job.eac.track_h, job.views.size(),
+                         job.views[0].width, job.views[0].height);
+        } else {
+            job.eac = app::Pano360Layout{};
+        }
+    }
     if (!o.model.empty()) {
         job.mask.model = o.model;
         job.mask.device = o.device;
@@ -229,6 +302,7 @@ int sam_cli_extract(int argc, char** argv) {
         job.mask.keep_prompted = o.keep_subject;
         job.mask.threshold = o.threshold;
         job.mask.nms = o.nms;
+        job.mask.dilate_ratio = o.dilate_ratio;
         job.mask.detect_every = o.detect_every;
         job.mask.memory_frames = o.memory_frames;
         job.mask.max_size = o.max_size;

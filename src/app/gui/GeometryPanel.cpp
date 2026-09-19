@@ -17,7 +17,9 @@
 #include "app/GeometryWarp.h"
 #include "data/CameraMath.h"
 #include "data/DatasetParser.h"
+#include "data/ImageProbe.h"
 #include "app/GeometryModel.h"
+#include "nn/Device.h"
 #include "nn/core/Log.h"
 #endif
 
@@ -150,6 +152,9 @@ struct GeometryPanel::Job {
 #ifdef SS_TOOL_GEOMETRY
     app::GeometryModel pred;
     std::string loaded_model;
+    // The identity the predictor above was loaded for. A device change forces a
+    // reload, and GeometryModel::load then rejects it until a restart anyway.
+    std::string loaded_device;
     // The dataset's own cameras, when the output folder holds one. Parallel to
     // the frame list the panel offers.
     std::vector<app::GeometryCamera> cams;
@@ -164,10 +169,9 @@ GeometryPanel::~GeometryPanel() {
     if (_worker.joinable()) _worker.join();
 }
 
-void GeometryPanel::open(const std::string& input, bool is_video,
-                         const std::string& dataset, const std::string& lens,
-                         float focal_factor, const std::string& ffmpeg_exe,
-                         bool force_ffmpeg) {
+void GeometryPanel::open(const PreviewSource& src, const std::string& dataset,
+                         const std::string& image_dir, const std::string& lens,
+                         float focal_factor) {
     // A job still running belongs to the old input; only the weights survive.
     _cancel = true;
     if (_worker.joinable()) _worker.join();
@@ -181,12 +185,13 @@ void GeometryPanel::open(const std::string& input, bool is_video,
         _job->dataset_images = 0;
 #endif
     }
-    _src = PreviewSource{};
-    _src.input = input;
-    _src.is_video = is_video;
-    _src.ffmpeg_exe = ffmpeg_exe.empty() ? "ffmpeg" : ffmpeg_exe;
-    _src.builtin_decode = !force_ffmpeg && backends().builtin_video;
+    _src = src;
+    if (_src.ffmpeg_exe.empty()) _src.ffmpeg_exe = "ffmpeg";
+    // Every frame here is warped through a camera, and the camera describes
+    // the stored pixels; the EXIF turn is applied to the FACE instead.
+    _src.photos_as_stored = true;
     _dataset = dataset;
+    _image_dir = image_dir;
     _lens = lens;
     _focal_factor = focal_factor;
     _frame_idx = 0;
@@ -235,6 +240,7 @@ void GeometryPanel::start_job(const GeometryJob& settings) {
     const int idx = _frame_idx;
     const PreviewSource src = _src;
     const std::string dataset = _dataset;
+    const std::string image_dir = _image_dir;
     const std::string lens = _lens;
     const float focal_factor = _focal_factor;
     const bool frame_dirty = _frame_dirty;
@@ -247,8 +253,8 @@ void GeometryPanel::start_job(const GeometryJob& settings) {
         _status = dmsg::preview_working.get();
     }
 
-    _worker = std::thread([this, settings, src, dataset, lens, focal_factor, idx,
-                           frame_dirty] {
+    _worker = std::thread([this, settings, src, dataset, image_dir, lens,
+                           focal_factor, idx, frame_dirty] {
         // Every failure below leaves through `return set_error(...)`, so the
         // flag cannot be cleared at the end of the function.
         struct BusyGuard {
@@ -267,11 +273,14 @@ void GeometryPanel::start_job(const GeometryJob& settings) {
         };
 
 #ifndef SS_TOOL_GEOMETRY
-        (void)settings; (void)src; (void)dataset; (void)lens;
+        (void)settings; (void)src; (void)dataset; (void)image_dir; (void)lens;
         (void)focal_factor; (void)idx; (void)frame_dirty;
         set_error(lmsg::err_no_geometry_module.get());
 #else
         try {
+            // Freeze before video decode or model load; empty uses shared precedence.
+            if (!settings.device_uuid.empty())
+                nn::configure_device(settings.device_uuid);
             if (!_job) _job = std::make_unique<Job>();
             Job& j = *_job;
 
@@ -288,6 +297,8 @@ void GeometryPanel::start_job(const GeometryJob& settings) {
                     try {
                         DatasetParserConfig cfg;
                         cfg.require_image_files = false;
+                        cfg.probe_image_size = probe_image_size;
+                        if (!image_dir.empty()) cfg.image_dir = image_dir;
                         const ParsedDataset ds = parse_dataset(dataset, cfg, "");
                         const int64_t total = ds.num_cameras;
                         const int64_t offers = std::min<int64_t>(total, 12);
@@ -355,8 +366,8 @@ void GeometryPanel::start_job(const GeometryJob& settings) {
                 PreviewSource load_src = j.src;
                 // A dataset frame is a file on disk whatever the input was.
                 if (!frame.path.empty()) load_src.is_video = false;
-                if (!load_preview_frame(load_src, frame, img.w, img.h, img.px, err,
-                                        _cancel)) {
+                if (!load_preview_frame(load_src, frame, /*folder=*/0, img.w,
+                                        img.h, img.px, err, _cancel)) {
                     if (_cancel.load()) return;
                     return set_error(err);
                 }
@@ -376,14 +387,17 @@ void GeometryPanel::start_job(const GeometryJob& settings) {
             // ---- the model ----
             // Before the warp: which input sizes round-trip is a property of
             // the network, and the run loads it in the same order.
-            const bool just_loaded = j.loaded_model != settings.model;
+            const bool just_loaded = j.loaded_model != settings.model ||
+                                     j.loaded_device != settings.device_uuid;
             if (just_loaded && !geometry_model_cached(settings.model))
                 return set_error(lmsg::err_geometry_model_not_downloaded.get());
             if (just_loaded) {
                 set_status(dmsg::preview_loading_model);
                 j.loaded_model.clear();
-                j.pred.load(settings.model);
+                // Carry the frozen UUID through the load; do not re-rank here.
+                j.pred.load(settings.model, settings.device_uuid);
                 j.loaded_model = settings.model;
+                j.loaded_device = settings.device_uuid;
             }
             if (_cancel.load()) return;
 
@@ -421,15 +435,27 @@ void GeometryPanel::start_job(const GeometryJob& settings) {
                 j.pred.predict(face_rgb.data(), warm);
                 if (_cancel.load()) return;
             }
+            // Exactly what the run does with a photo stored sideways: turned
+            // for the forward pass, turned back before the blend.
+            const sfm::ExifTransform turn = app::photo_turn(frame.path);
+            const sfm::ExifTransform back = app::inverse_turn(turn);
             const double t0 = nn::now_ms();
             for (int k = 0; k < warp.faces(); k++) {
                 if (_cancel.load()) return;
                 warp.sampleFace(k, rgb.data(), face_rgb);
-                // Both, whatever the checkboxes say: they decide what the
+                app::GeometryRequest rq = face_request(warp, k, settings.num_tokens);
+                int fw = rq.width, fh = rq.height;
+                app::turn_pixels(turn, 3, face_rgb, fw, fh);
+                // Both maps, whatever the checkboxes say: they decide what the
                 // RUN writes, and a pane that appears without another forward
                 // pass is worth the decoder head.
-                app::GeometryPrediction p = j.pred.predict(
-                    face_rgb.data(), face_request(warp, k, settings.num_tokens));
+                app::GeometryPrediction p =
+                    j.pred.predict(face_rgb.data(), app::turn_request(rq, turn));
+                int dw = p.width, dh = p.height;
+                app::turn_pixels(back, 1, p.depth, dw, dh);
+                dw = p.width;
+                dh = p.height;
+                app::turn_normals(back, p.normal, dw, dh);
                 // One unit across faces before they are blended: Metric3D's
                 // depth is canonical to the face's focal.
                 const float mm = (float)j.pred.depthToMillimetres(warp.faceFocal(k));

@@ -42,6 +42,7 @@
 #include "sfm/map/Merge.h"
 #include "sfm/core/Log.h"
 #include "sfm/map/ModelOps.h"
+#include "i18n/TimeFormat.h"
 #include "i18n/catalog/Sfm.h"
 
 namespace sfm {
@@ -283,8 +284,9 @@ inline size_t bridgeModels(Mapper& mapper, std::vector<Reconstruction>& models,
     std::vector<Mapper::StructureLink> links = mapper.structureLinks(models, min_matches);
     if (links.empty()) return 0;
     if (opt.verbose)
-        fprintf(stderr, "[merge] %zu model pair(s) the correspondence graph joins, strongest "
-                "%zu matched features\n", links.size(), links.front().matches);
+        slog::diag(slog::Tag::Merge,
+                   "[merge] %zu model pair(s) the correspondence graph joins, strongest "
+                   "%zu matched features", links.size(), links.front().matches);
 
     MergeSession s(std::move(models), opt);
     std::vector<char> busy(s.numModels(), 0);
@@ -302,8 +304,9 @@ inline size_t bridgeModels(Mapper& mapper, std::vector<Reconstruction>& models,
         // these a level, and each one is the answer to "why are those two
         // models still apart".
         if (opt.verbose)
-            fprintf(stderr, "[merge] structure link %zu <- %zu (%zu matched features): %s\n", dst,
-                    src, l.matches, al.success ? "aligned" : al.reason.c_str());
+            slog::diag(slog::Tag::Merge,
+                       "[merge] structure link %zu <- %zu (%zu matched features): %s", dst,
+                       src, l.matches, al.success ? "aligned" : al.reason.c_str());
         if (!al.success) {
             refused++;
             if (why) (*why)["shared structure: " + al.reason.substr(0, al.reason.find_first_of(
@@ -371,14 +374,16 @@ inline void mergeUpwards(Mapper& mapper, std::vector<Reconstruction>& models,
         st.merges += merges;
         st.merges_refused += refused;
         if (opt.verbose) {
-            fprintf(stderr, "[%s] level %zu: %zu merge(s), %zu refused, %zu model(s) left\n",
-                    opt.tag, st.rounds, merges, refused, models.size());
+            slog::diag(slog::Tag::Merge,
+                       "[%s] level %zu: %zu merge(s), %zu refused, %zu model(s) left",
+                       opt.tag, st.rounds, merges, refused, models.size());
             // Hundreds of merges a level, so the reasons are summarized by kind
             // rather than printed one by one -- but they have to be visible, or
             // a level that refuses everything looks the same as one with
             // nothing left to merge.
             for (const auto& kv : why)
-                fprintf(stderr, "[%s]   %4zu x %s\n", opt.tag, kv.second, kv.first.c_str());
+                slog::diag(slog::Tag::Merge, "[%s]   %4zu x %s", opt.tag, kv.second,
+                           kv.first.c_str());
         }
         if (models.size() <= 1) break;
 
@@ -400,9 +405,10 @@ inline void mergeUpwards(Mapper& mapper, std::vector<Reconstruction>& models,
                 st.grown_images += reg;
                 if (reg) grow_passes++;
                 if (opt.verbose)
-                    fprintf(stderr, "[%s]   growth: %zu image(s) into %zu of %zu model(s) that "
-                            "did not merge (%zu rejected by the pose check)\n", opt.tag, reg, want,
-                            models.size(), st.grown_rejected);
+                    slog::diag(slog::Tag::Merge,
+                               "[%s]   growth: %zu image(s) into %zu of %zu model(s) that "
+                               "did not merge (%zu rejected by the pose check)", opt.tag, reg, want,
+                               models.size(), st.grown_rejected);
             }
         }
         // A level that merged nothing has exhausted what shared images can do.
@@ -421,10 +427,12 @@ inline void mergeUpwards(Mapper& mapper, std::vector<Reconstruction>& models,
             st.merges += bridged;
             st.bridges += bridged;
             if (opt.verbose && (bridged || !bwhy.empty())) {
-                fprintf(stderr, "[%s]   %zu merge(s) on shared structure alone\n", opt.tag,
-                        bridged);
+                slog::diag(slog::Tag::Merge, "[%s]   %zu merge(s) on shared structure alone",
+                           opt.tag,
+                           bridged);
                 for (const auto& kv : bwhy)
-                    fprintf(stderr, "[%s]   %4zu x %s\n", opt.tag, kv.second, kv.first.c_str());
+                    slog::diag(slog::Tag::Merge, "[%s]   %4zu x %s", opt.tag, kv.second,
+                               kv.first.c_str());
             }
         }
 
@@ -486,8 +494,9 @@ inline void mergeUpwards(Mapper& mapper, std::vector<Reconstruction>& models,
     if (opt.verbose) {
         const ManagerStats& f = st.finish;
         slog::out(slog::Tag::Map, spirula::i18n::msg::sfm::map_assembled,
-                 {slog::num(st.t_merge + st.t_grow + st.t_ba, 2), (long long)st.models_in,
-                  (long long)models.size(), (long long)st.rounds, (long long)st.merges,
+                 {spirula::i18n::format_duration(st.t_merge + st.t_grow + st.t_ba),
+                  (long long)st.models_in, (long long)models.size(),
+                  (long long)st.rounds, (long long)st.merges,
                   (long long)st.merges_refused, (long long)st.grown_images,
                   (long long)f.covered_before, (long long)coveredImages(models).size()});
         // The seam test's own numbers stay English: they are a diagnostic for
@@ -499,17 +508,18 @@ inline void mergeUpwards(Mapper& mapper, std::vector<Reconstruction>& models,
         // is merely out of true. The two want opposite responses, so the report
         // has to separate them.
         if (f.seam_refused)
-            fprintf(stderr, "[%s]   a refused merge explained a median %.0f%% of its cross-seam "
-                    "matches over %zu pair(s), an accepted one %.0f%%, against a %.0f%% bar "
-                    "(the same pairs inside the model: %.0f%%); the rescue's refinement "
-                    "moved a refusal by %+.0f points\n", opt.tag,
-                    100.0 * f.seam_refused_median / (double)f.seam_refused,
-                    f.seam_refused_pairs / f.seam_refused,
-                    f.seam_passed ? 100.0 * f.seam_passed_median / (double)f.seam_passed : 0.0,
-                    f.seam_checked ? 100.0 * f.seam_bar_sum / (double)f.seam_checked : 0.0,
-                    f.seam_checked ? 100.0 * f.seam_reference_sum / (double)f.seam_checked : 0.0,
-                    f.seam_rescue_failed
-                        ? 100.0 * f.seam_rescue_gain / (double)f.seam_rescue_failed : 0.0);
+            slog::diag(slog::Tag::Merge,
+                       "[%s]   a refused merge explained a median %.0f%% of its cross-seam "
+                       "matches over %zu pair(s), an accepted one %.0f%%, against a %.0f%% bar "
+                       "(the same pairs inside the model: %.0f%%); the rescue's refinement "
+                       "moved a refusal by %+.0f points", opt.tag,
+                       100.0 * f.seam_refused_median / (double)f.seam_refused,
+                       f.seam_refused_pairs / f.seam_refused,
+                       f.seam_passed ? 100.0 * f.seam_passed_median / (double)f.seam_passed : 0.0,
+                       f.seam_checked ? 100.0 * f.seam_bar_sum / (double)f.seam_checked : 0.0,
+                       f.seam_checked ? 100.0 * f.seam_reference_sum / (double)f.seam_checked : 0.0,
+                       f.seam_rescue_failed
+                       ? 100.0 * f.seam_rescue_gain / (double)f.seam_rescue_failed : 0.0);
     }
 }
 
@@ -609,8 +619,9 @@ inline std::vector<Reconstruction> finishModels(Mapper& mapper,
             // run, and without counting it the merge below never ran at all.
             if (reg) changed++;
             if (opt.verbose)
-                fprintf(stderr, "[%s] tail growth: %zu of %zu uncovered image(s) registered\n",
-                        opt.tag, reg, missing);
+                slog::diag(slog::Tag::Merge,
+                           "[%s] tail growth: %zu of %zu uncovered image(s) registered",
+                           opt.tag, reg, missing);
         }
         st.t_grow_tail = secs(t0, clk());
     }
@@ -635,8 +646,9 @@ inline std::vector<Reconstruction> finishModels(Mapper& mapper,
             st.finish.reseeded_models += models.size() - before;
             changed += models.size() - before;
             if (opt.verbose && models.size() != before)
-                fprintf(stderr, "[%s] reseeded %zu model(s) among the images nothing reached\n",
-                        opt.tag, models.size() - before);
+                slog::diag(slog::Tag::Merge,
+                           "[%s] reseeded %zu model(s) among the images nothing reached",
+                           opt.tag, models.size() - before);
         }
         st.t_reseed = secs(t0, clk());
     }
@@ -650,8 +662,9 @@ inline std::vector<Reconstruction> finishModels(Mapper& mapper,
         st.merges += merges;
         st.merges_refused += refused;
         if (opt.verbose)
-            fprintf(stderr, "[%s] final level: %zu merge(s), %zu refused, %zu model(s) left\n",
-                    opt.tag, merges, refused, models.size());
+            slog::diag(slog::Tag::Merge,
+                       "[%s] final level: %zu merge(s), %zu refused, %zu model(s) left",
+                       opt.tag, merges, refused, models.size());
         if (merges)
             for (size_t i = 0; i < models.size(); i++)
                 if (!s2[i] && models[i].numRegistered() >= 2)
@@ -681,7 +694,8 @@ inline std::vector<Reconstruction> finishModels(Mapper& mapper,
     st.finish.covered_after = coveredImages(models).size();
     if (opt.verbose)
         slog::out(slog::Tag::Map, spirula::i18n::msg::sfm::map_finishing,
-                 {slog::num(st.finishSecs(), 1), (long long)st.finish.splits,
+                 {spirula::i18n::format_duration(st.finishSecs()),
+                  (long long)st.finish.splits,
                   (long long)st.finish.duplicate_splits,
                   (long long)st.finish.reseeded_models,
                   (long long)st.finish.dropped_redundant,
@@ -715,6 +729,7 @@ inline std::vector<Reconstruction> assembleModels(Mapper& mapper,
     MergeOptions merge_opt = mopt.merge;
     merge_opt.duplicate = mopt.duplicate;
     merge_opt.validate = seamValidator(mapper, mopt, &st.finish);
+    merge_opt.rigs = mapper.rigs();
 
     // A component that fitted its own focal to its own noise cannot align with
     // anything, and on a rig every component is looking at the same physical
@@ -728,8 +743,9 @@ inline std::vector<Reconstruction> assembleModels(Mapper& mapper,
         st.joint_ba++;
         st.t_ba += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         if (opt.verbose)
-            fprintf(stderr, "[%s] the components disagreed about the intrinsics: one joint "
-                    "refinement before the first level\n", opt.tag);
+            slog::diag(slog::Tag::Merge,
+                       "[%s] the components disagreed about the intrinsics: one joint "
+                       "refinement before the first level", opt.tag);
     }
 
     std::vector<char> dirty(models.size(), 0), seamed(models.size(), 0);

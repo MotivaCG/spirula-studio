@@ -28,6 +28,44 @@ namespace data {
 // The two words that qualify a line
 // ===========================================================================
 
+SS_MSG(batch_out_of_memory,
+    EN("Out of memory while staging a training batch. Close other programs to "
+       "free memory, then retry -- or stop, and train at a lower resolution."),
+    JA("学習バッチの準備中にメモリが不足しました。ほかのプログラムを閉じて"
+       "メモリを空けてからやり直すか、停止して解像度を下げて学習してください。"),
+    ZH_HANS("准备训练批次时内存不足。关闭其他程序腾出内存后重试，"
+            "或者停止训练并改用更低的分辨率。"),
+    ZH_HANT("準備訓練批次時記憶體不足。關閉其他程式騰出記憶體後重試，"
+            "或者停止訓練並改用更低的解析度。"),
+    KO("학습 배치를 준비하는 중 메모리가 부족했습니다. 다른 프로그램을 닫아 "
+       "메모리를 확보한 뒤 다시 시도하거나, 중지하고 더 낮은 해상도로 "
+       "학습하세요."),
+    DE("Zu wenig Speicher beim Bereitstellen eines Trainings-Batches. Schließen "
+       "Sie andere Programme, um Speicher freizugeben, und versuchen Sie es "
+       "erneut -- oder halten Sie an und trainieren Sie mit geringerer "
+       "Auflösung."),
+    FR("Mémoire insuffisante lors de la préparation d'un lot d'entraînement. "
+       "Fermez d'autres programmes pour libérer de la mémoire, puis réessayez "
+       "-- ou arrêtez et entraînez à une résolution plus basse."),
+    ES("Sin memoria al preparar un lote de entrenamiento. Cierra otros "
+       "programas para liberar memoria y reinténtalo, o detén el "
+       "entrenamiento y usa una resolución más baja."),
+    PT("Sem memória ao preparar um lote de treinamento. Feche outros programas "
+       "para liberar memória e tente novamente, ou pare e treine com uma "
+       "resolução menor."),
+    IT("Memoria esaurita durante la preparazione di un lotto di addestramento. "
+       "Chiudi altri programmi per liberare memoria e riprova, oppure fermati "
+       "e addestra a una risoluzione più bassa."),
+    NL("Onvoldoende geheugen bij het klaarzetten van een trainingsbatch. Sluit "
+       "andere programma's om geheugen vrij te maken en probeer het opnieuw, "
+       "of stop en train op een lagere resolutie."),
+    RU("Не хватило памяти при подготовке обучающей партии. Закройте другие "
+       "программы, чтобы освободить память, и повторите — или остановитесь и "
+       "обучайте в более низком разрешении."),
+    TR("Bir eğitim yığını hazırlanırken bellek yetersiz kaldı. Bellek açmak "
+       "için diğer programları kapatıp yeniden deneyin ya da durdurup daha "
+       "düşük çözünürlükte eğitin."));
+
 SS_MSG(word_warning,
     EN("WARNING:"),
     JA("警告:"),
@@ -560,6 +598,116 @@ SS_MSG(final_frames,
     TR("tamamlanan veri kümesindeki kare: {0}"));
 
 // ===========================================================================
+// Fitting the cameras to the images
+// ===========================================================================
+
+SS_MSG(camera_fit_to_image,
+    EN("'{0}' is {1}, but its camera says {2}. Training at {3}. Further "
+       "messages for this pair are suppressed."),
+    JA("'{0}' は {1} ですが、カメラは {2} と言っています。{3} で学習します。"
+       "この組み合わせの以降のメッセージは出しません。"),
+    ZH_HANS("'{0}' 是 {1}，但其相机记为 {2}。将以 {3} 训练。"
+            "该组合的后续消息不再输出。"),
+    ZH_HANT("'{0}' 是 {1}，但其相機記為 {2}。將以 {3} 訓練。"
+            "該組合的後續訊息不再輸出。"),
+    KO("'{0}' 은(는) {1} 인데 카메라는 {2} 라고 합니다. {3} 으로 학습합니다. "
+       "이 조합의 이후 메시지는 생략합니다."),
+    DE("'{0}' ist {1}, seine Kamera sagt aber {2}. Training läuft mit {3}. "
+       "Weitere Meldungen für diese Kombination entfallen."),
+    FR("'{0}' fait {1}, mais sa caméra annonce {2}. L'entraînement se fera en "
+       "{3}. Les messages suivants pour cette combinaison sont supprimés."),
+    ES("'{0}' es de {1}, pero su cámara dice {2}. Se entrenará a {3}. Se omiten "
+       "los mensajes siguientes de esta combinación."),
+    PT("'{0}' é {1}, mas a sua câmera diz {2}. O treino será em {3}. As "
+       "mensagens seguintes desta combinação são omitidas."),
+    IT("'{0}' è {1}, ma la sua camera dice {2}. L'addestramento userà {3}. I "
+       "messaggi successivi per questa combinazione sono soppressi."),
+    NL("'{0}' is {1}, maar zijn camera zegt {2}. Er wordt getraind op {3}. "
+       "Verdere meldingen voor deze combinatie vervallen."),
+    RU("'{0}' имеет размер {1}, а его камера говорит {2}. Обучение пойдёт в "
+       "{3}. Дальнейшие сообщения по этой паре подавлены."),
+    TR("'{0}' {1}, ama kamerası {2} diyor. Eğitim {3} çözünürlüğünde "
+       "yapılacak. Bu ikili için sonraki iletiler bastırılıyor."));
+
+SS_MSG(camera_image_transposed,
+    EN("'{0}' is {1} and its camera {2} -- each is the other turned a quarter. "
+       "A reconstruction and the run that reads it must take the photos' EXIF "
+       "orientation the same way; see `--exif-orientation`."),
+    JA("'{0}' は {1}、カメラは {2} で、互いに 90 度回した関係です。復元結果と"
+       "それを読む実行は、写真の EXIF 回転情報を同じように扱う必要があります。"
+       "`--exif-orientation` を確認してください。"),
+    ZH_HANS("'{0}' 是 {1}，其相机是 {2}：二者正好相差 90 度。重建结果与读取它的"
+            "这次运行必须以同样的方式对待照片的 EXIF 方向，参见 "
+            "`--exif-orientation`。"),
+    ZH_HANT("'{0}' 是 {1}，其相機是 {2}：兩者正好相差 90 度。重建結果與讀取它的"
+            "這次執行必須以同樣的方式對待照片的 EXIF 方向，參見 "
+            "`--exif-orientation`。"),
+    KO("'{0}' 은(는) {1}, 카메라는 {2} 로 서로 90도 돌아간 관계입니다. 복원 결과와 "
+       "그것을 읽는 실행은 사진의 EXIF 방향을 같은 방식으로 다뤄야 합니다. "
+       "`--exif-orientation` 을 확인하세요."),
+    DE("'{0}' ist {1}, seine Kamera {2} -- das eine ist das andere um eine "
+       "Vierteldrehung gedreht. Eine Rekonstruktion und der Lauf, der sie "
+       "liest, müssen die EXIF-Ausrichtung der Fotos gleich behandeln; siehe "
+       "`--exif-orientation`."),
+    FR("'{0}' est {1} et sa caméra {2} : l'un est l'autre tourné d'un quart de "
+       "tour. Une reconstruction et le run qui la lit doivent traiter de la "
+       "même façon l'orientation EXIF des photos ; voir `--exif-orientation`."),
+    ES("'{0}' es {1} y su cámara {2}: cada uno es el otro girado un cuarto de "
+       "vuelta. Una reconstrucción y la ejecución que la lee deben tratar igual "
+       "la orientación EXIF de las fotos; vea `--exif-orientation`."),
+    PT("'{0}' é {1} e a sua câmara {2}: um é o outro rodado um quarto de volta. "
+       "Uma reconstrução e a execução que a lê têm de tratar da mesma forma a "
+       "orientação EXIF das fotos; veja `--exif-orientation`."),
+    IT("'{0}' è {1} e la sua camera {2}: l'uno è l'altro ruotato di un quarto. "
+       "Una ricostruzione e l'esecuzione che la legge devono trattare allo "
+       "stesso modo l'orientamento EXIF delle foto; vedi `--exif-orientation`."),
+    NL("'{0}' is {1} en zijn camera {2} -- de een is de ander een kwartslag "
+       "gedraaid. Een reconstructie en de run die hem leest moeten de "
+       "EXIF-oriëntatie van de foto's op dezelfde manier opvatten; zie "
+       "`--exif-orientation`."),
+    RU("'{0}' имеет размер {1}, а его камера {2}: одно есть другое, повёрнутое "
+       "на четверть оборота. Реконструкция и запуск, который её читает, должны "
+       "одинаково понимать ориентацию EXIF снимков; см. `--exif-orientation`."),
+    TR("'{0}' {1}, kamerası {2}: biri diğerinin çeyrek tur döndürülmüş hâli. "
+       "Bir yeniden oluşturma ile onu okuyan çalıştırma, fotoğrafların EXIF "
+       "yönlendirmesini aynı şekilde ele almalı; bkz. `--exif-orientation`."));
+
+SS_MSG(camera_image_aspect,
+    EN("'{0}' is {1} and its camera {2} -- a different shape, not just a "
+       "different size. Check that the images belong to this reconstruction."),
+    JA("'{0}' は {1}、カメラは {2} で、大きさだけでなく縦横比も違います。"
+       "画像がこの復元結果のものか確認してください。"),
+    ZH_HANS("'{0}' 是 {1}，其相机是 {2}：不只是尺寸不同，长宽比也不同。"
+            "请确认这些图像属于该重建结果。"),
+    ZH_HANT("'{0}' 是 {1}，其相機是 {2}：不只是尺寸不同，長寬比也不同。"
+            "請確認這些影像屬於該重建結果。"),
+    KO("'{0}' 은(는) {1}, 카메라는 {2} 입니다. 크기뿐 아니라 가로세로 비율도 "
+       "다릅니다. 이 이미지가 해당 복원 결과의 것인지 확인하세요."),
+    DE("'{0}' ist {1}, seine Kamera {2} -- nicht nur eine andere Größe, "
+       "sondern ein anderes Seitenverhältnis. Prüfen Sie, ob die Bilder zu "
+       "dieser Rekonstruktion gehören."),
+    FR("'{0}' fait {1} et sa caméra {2} : le rapport d'aspect diffère, pas "
+       "seulement la taille. Vérifiez que les images correspondent à cette "
+       "reconstruction."),
+    ES("'{0}' es de {1} y su cámara de {2}: cambia la relación de aspecto, no "
+       "solo el tamaño. Compruebe que las imágenes pertenecen a esta "
+       "reconstrucción."),
+    PT("'{0}' é {1} e a sua câmera {2}: muda a proporção, não apenas o "
+       "tamanho. Verifique se as imagens pertencem a esta reconstrução."),
+    IT("'{0}' è {1} e la sua camera {2}: cambia il rapporto d'aspetto, non "
+       "solo la dimensione. Verifica che le immagini appartengano a questa "
+       "ricostruzione."),
+    NL("'{0}' is {1} en zijn camera {2}: een andere beeldverhouding, niet "
+       "alleen een ander formaat. Controleer of de beelden bij deze "
+       "reconstructie horen."),
+    RU("'{0}' имеет размер {1}, а его камера {2}: отличается не только "
+       "размер, но и соотношение сторон. Проверьте, относятся ли эти "
+       "изображения к данной реконструкции."),
+    TR("'{0}' {1}, kamerası ise {2}: yalnızca boyut değil, en-boy oranı da "
+       "farklı. Görüntülerin bu rekonstrüksiyona ait olduğunu doğrulayın."));
+
+
+// ===========================================================================
 // Loading the images
 // ===========================================================================
 
@@ -700,6 +848,82 @@ SS_MSG(normal_shape_mismatch,
        "büyütülüyor (çift doğrusal). Sonraki normal haritası uyarıları "
        "bastırılıyor."));
 
+SS_MSG(mask_image_aspect,
+    EN("mask '{0}' is {1} and its image {2} -- a different shape, not just a "
+       "different size. It is stretched onto the image; check that it belongs "
+       "to it."),
+    JA("マスク '{0}' は {1}、画像は {2} で、大きさだけでなく縦横比も違います。"
+       "画像に合わせて引き伸ばします。この画像のマスクか確認してください。"),
+    ZH_HANS("蒙版 '{0}' 是 {1}，其图像是 {2}：不只是尺寸不同，长宽比也不同。"
+            "将把它拉伸到图像上；请确认它属于该图像。"),
+    ZH_HANT("遮罩 '{0}' 是 {1}，其影像是 {2}：不只是尺寸不同，長寬比也不同。"
+            "將把它拉伸到影像上；請確認它屬於該影像。"),
+    KO("마스크 '{0}' 은(는) {1}, 이미지는 {2} 입니다. 크기뿐 아니라 가로세로 "
+       "비율도 다릅니다. 이미지에 맞춰 늘립니다. 이 이미지의 마스크인지 "
+       "확인하세요."),
+    DE("Maske '{0}' ist {1}, ihr Bild {2} -- nicht nur eine andere Größe, "
+       "sondern ein anderes Seitenverhältnis. Sie wird auf das Bild gestreckt; "
+       "prüfen Sie, ob sie zu ihm gehört."),
+    FR("le masque '{0}' fait {1} et son image {2} : le rapport d'aspect "
+       "diffère, pas seulement la taille. Il est étiré sur l'image ; vérifiez "
+       "qu'il lui correspond."),
+    ES("la máscara '{0}' es de {1} y su imagen de {2}: cambia la relación de "
+       "aspecto, no solo el tamaño. Se estira sobre la imagen; compruebe que "
+       "le corresponde."),
+    PT("a máscara '{0}' é {1} e a sua imagem {2}: muda a proporção, não apenas "
+       "o tamanho. Ela é esticada sobre a imagem; verifique se pertence a ela."),
+    IT("la maschera '{0}' è {1} e la sua immagine {2}: cambia il rapporto "
+       "d'aspetto, non solo la dimensione. Viene stirata sull'immagine; "
+       "verifica che le appartenga."),
+    NL("masker '{0}' is {1} en zijn beeld {2}: een andere beeldverhouding, "
+       "niet alleen een ander formaat. Het wordt over het beeld uitgerekt; "
+       "controleer of het erbij hoort."),
+    RU("маска '{0}' имеет размер {1}, а её изображение {2}: отличается не "
+       "только размер, но и соотношение сторон. Она растягивается по "
+       "изображению; проверьте, что она к нему относится."),
+    TR("'{0}' maskesi {1}, görüntüsü ise {2}: yalnızca boyut değil, en-boy "
+       "oranı da farklı. Görüntüye uyacak şekilde geriliyor; bu görüntüye ait "
+       "olduğunu doğrulayın."));
+
+SS_MSG(random_init_no_spread,
+    EN("Cannot size the random seed points: the cameras do not spread around "
+       "{0} (--random-init-center). Pick another centre, or give the dataset a "
+       "point cloud."),
+    JA("ランダム初期点の大きさを決められません。カメラが {0}（--random-init-c"
+       "enter）の周りに広がっていません。別の中心を選ぶか、データセットに点群"
+       "を用意してください。"),
+    ZH_HANS("无法确定随机初始点的范围：相机没有分布在 {0}（--random-init-cent"
+            "er）周围。请换一个中心，或为数据集提供点云。"),
+    ZH_HANT("無法決定隨機初始點的範圍：相機沒有分布在 {0}（--random-init-cent"
+            "er）周圍。請換一個中心，或為資料集提供點雲。"),
+    KO("무작위 초기 점의 크기를 정할 수 없습니다. 카메라가 {0}(--random-init-"
+       "center) 주위에 퍼져 있지 않습니다. 다른 중심을 고르거나 데이터셋에 점"
+       "군을 넣으세요."),
+    DE("Die zufälligen Startpunkte lassen sich nicht bemessen: Die Kameras "
+       "streuen nicht um {0} (--random-init-center). Wählen Sie eine andere "
+       "Mitte, oder geben Sie dem Datensatz eine Punktwolke."),
+    FR("Impossible de dimensionner les points de départ aléatoires : les "
+       "caméras ne s'étalent pas autour de {0} (--random-init-center). "
+       "Choisissez un autre centre, ou fournissez un nuage de points."),
+    ES("No se pueden dimensionar los puntos iniciales aleatorios: las cámaras "
+       "no se dispersan en torno a {0} (--random-init-center). Elija otro "
+       "centro o dé al conjunto una nube de puntos."),
+    PT("Não é possível dimensionar os pontos iniciais aleatórios: as câmeras "
+       "não se dispersam em torno de {0} (--random-init-center). Escolha outro "
+       "centro ou dê ao conjunto uma nuvem de pontos."),
+    IT("Impossibile dimensionare i punti iniziali casuali: le camere non si "
+       "disperdono attorno a {0} (--random-init-center). Scegliete un altro "
+       "centro, oppure fornite una nuvola di punti."),
+    NL("De willekeurige beginpunten zijn niet af te meten: de camera's "
+       "spreiden niet rond {0} (--random-init-center). Kies een ander midden, "
+       "of geef de dataset een puntenwolk."),
+    RU("Невозможно задать размер случайных начальных точек: камеры не "
+       "разбросаны вокруг {0} (--random-init-center). Выберите другой центр "
+       "или добавьте в набор облако точек."),
+    TR("Rastgele başlangıç noktaları boyutlandırılamıyor: kameralar {0} "
+       "(--random-init-center) çevresine yayılmıyor. Başka bir merkez seçin ya "
+       "da veri kümesine bir nokta bulutu verin."));
+
 // Redrawn in place on one line, so it stays short.
 SS_MSG(loading_images,
     EN("Loading images {0}/{1}"),
@@ -752,6 +976,36 @@ SS_MSG(xs_measured,
     NL("gemeten beelden"),
     RU("измерено кадров"),
     TR("ölçülen kare"));
+
+SS_MSG(xs_analyzed,
+    EN("frames analyzed for motion"),
+    JA("動きを解析したフレーム"),
+    ZH_HANS("已分析运动的帧"),
+    ZH_HANT("已分析運動的影格"),
+    KO("움직임을 분석한 프레임"),
+    DE("auf Bewegung geprüfte Einzelbilder"),
+    FR("images analysées pour le mouvement"),
+    ES("fotogramas analizados en movimiento"),
+    PT("quadros analisados quanto ao movimento"),
+    IT("fotogrammi analizzati per il movimento"),
+    NL("op beweging geanalyseerde beelden"),
+    RU("кадров проанализировано на движение"),
+    TR("hareket için incelenen kare"));
+
+SS_MSG(xs_motion,
+    EN("motion pass"),
+    JA("動き解析パス"),
+    ZH_HANS("运动分析遍"),
+    ZH_HANT("運動分析階段"),
+    KO("움직임 분석 패스"),
+    DE("Bewegungsdurchlauf"),
+    FR("passe de mouvement"),
+    ES("pasada de movimiento"),
+    PT("passagem de movimento"),
+    IT("passaggio di movimento"),
+    NL("bewegingsdoorloop"),
+    RU("проход по движению"),
+    TR("hareket geçişi"));
 
 SS_MSG(xs_written,
     EN("frames written"),

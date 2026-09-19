@@ -46,6 +46,7 @@
 #include <fstream>
 #include <random>
 #include <vector>
+#include "backend/tests/ScreenRows.h"
 
 using backend::MemcpyKind;
 
@@ -443,12 +444,12 @@ int main(int argc, char** argv) {
             ttv(d_dist + dist_fixture::row_offset(2, NCAM, cam),
                 {1, kCameraDistortionParams}),
             radii, std::nullopt, std::nullopt, 0, 32, 0);
-        DeviceTensorFloatND aabb_nd(aabb_2d), depths_nd(depths_2d);
-        DeviceTensorFloatND proj_conic = splats_s[0];
-        DeviceTensorFloatND proj_opac = splats_s[1];
+        DeviceTensorFloatND depths_nd(depths_2d);
+        int macro_log2 = kMacroLog2Default;
         auto [isect_ids, flatten_ids, tile_offsets] = do_intersect_tile_generic(
-            aabb_nd, depths_nd, nullptr, &proj_conic, &proj_opac, 1,
-            ttv(d_intr + 4 * cam, {1, 4}), W, H, nullptr, /*tile_active=*/nullptr);
+            aabb_2d, depths_nd, ellipse_view(splats_s, true), 1,
+            ttv(d_intr + 4 * cam, {1, 4}), W, H, nullptr, /*tile_active=*/nullptr,
+        macro_log2);
         backend::device_synchronize();
         if (check_error()) return 1;
 
@@ -459,7 +460,8 @@ int main(int argc, char** argv) {
             "PINHOLE", "THIN_PRISM",
             ttv(d_dist + dist_fixture::row_offset(2, NCAM, cam),
                 {1, kCameraDistortionParams}),
-            aabb_2d, W, H, tile_offsets, flatten_ids, d_moments, nullptr);
+            aabb_2d, W, H, tile_offsets, flatten_ids, macro_log2,
+            d_moments, nullptr);
         backend::device_synchronize();
         if (check_error()) return 1;
         readback(lacc, (const float*)d_moments, (int64_t)npix * 3);
@@ -470,7 +472,8 @@ int main(int argc, char** argv) {
             "PINHOLE", "THIN_PRISM",
             ttv(d_dist + dist_fixture::row_offset(2, NCAM, cam),
                 {1, kCameraDistortionParams}),
-            aabb_2d, W, H, tile_offsets, flatten_ids, d_moments, d_rgbimg);
+            aabb_2d, W, H, tile_offsets, flatten_ids, macro_log2,
+            d_moments, d_rgbimg);
         backend::device_synchronize();
         if (check_error()) return 1;
         readback(lacc, (const float*)d_rgbimg, (int64_t)npix * 3);
@@ -512,8 +515,7 @@ int main(int argc, char** argv) {
 
         for (int c = 0; c < NCAM; ++c) {
             const int cm = 0;   // PINHOLE
-            // Thin prism is covered by the projection and the cull.
-            const int td = c == 0 ? 0 : c == 1 ? 1 : 3;
+            const int td = c == 0 ? 0 : c == 1 ? 1 : 2;
             const float* d_dc =
                 d_dist + dist_fixture::row_offset(td, NCAM, c);
             meshing::launch_sample_occ(d_q, NQ, d_vm + 16 * c, d_intr + 4 * c,
@@ -617,12 +619,22 @@ int main(int argc, char** argv) {
         std::vector<int32_t> ws(NCAM, (int32_t)W), hs(NCAM, (int32_t)H);
         int32_t* d_W = upload(ws);
         int32_t* d_H = upload(hs);
+        // Camera 0 over every vertex, then the rest over two vertex ranges:
+        // the accumulation across launches the host driver relies on.
         uint32_t* d_vis = alloc<uint32_t>(NV);
+        backend::memset_sync(d_vis, 0, (size_t)NV * sizeof(uint32_t));
         meshing::launch_cull(
-            d_verts, NV, d_faces, NF, d_vm, d_intr,
+            d_verts, 0, NV, d_faces, NF, d_vm, d_intr,
             d_dist + dist_fixture::row_offset(2, NCAM),
-            d_W, d_H, /*camera_model=*/0, /*distortion=*/2, NCAM, t_leafMin,
+            d_W, d_H, /*camera_model=*/0, /*distortion=*/2, 1, t_leafMin,
             t_leafMax, t_internal, t_nodeAABB, d_vis);
+        for (int v0 : {0, NV / 3})
+            meshing::launch_cull(
+                d_verts, v0, v0 == 0 ? NV / 3 : NV - v0, d_faces, NF,
+                d_vm + 16, d_intr + 4,
+                d_dist + dist_fixture::row_offset(2, NCAM, 1),
+                d_W + 1, d_H + 1, /*camera_model=*/0, /*distortion=*/2,
+                NCAM - 1, t_leafMin, t_leafMax, t_internal, t_nodeAABB, d_vis);
         backend::device_synchronize();
         if (check_error()) return 1;
         readback_i32(codes, (const int32_t*)d_vis, NV);

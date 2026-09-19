@@ -146,6 +146,7 @@ float[RawLossIndex::length] per_pixel_losses(
     float3 median_normal,
     bool ref_alpha,
     no_diff bool has_mask,
+    no_diff float saturation_threshold,
     no_diff float[LossWeightIndex::length] weights
 ) {
     float[RawLossIndex::length] losses;
@@ -158,6 +159,12 @@ float[RawLossIndex::length] per_pixel_losses(
     // gt_normal_valid, spelled out here because core/Interpolation.cuh is
     // CUDA-only. No mask means ref_alpha is false everywhere, not "empty".
     bool mask = has_mask ? ref_alpha : true;
+    // Both images clipped at the same ceiling: nothing about the pixel is
+    // recoverable, so it leaves the loss the way a masked pixel does.
+    if (saturation_threshold > 0.0f &&
+        min(min(render_rgb.x, render_rgb.y), render_rgb.z) > saturation_threshold &&
+        min(min(ref_rgb.x, ref_rgb.y), ref_rgb.z) > saturation_threshold)
+        mask = false;
     bool depth_mask = (ref_depth != 0.0f);
     bool normal_mask = (ref_normal.x + ref_normal.y + ref_normal.z > -2.366f &&
                         dot(ref_normal, ref_normal) > 0.25f);
@@ -279,6 +286,7 @@ void per_pixel_losses_bwd(
     float3 median_normal,
     bool ref_alpha,
     bool has_mask,
+    float saturation_threshold,
     no_diff float[LossWeightIndex::length] weights,
     float[RawLossIndex::length] v_losses,
     out float3 v_render_rgb,
@@ -324,6 +332,7 @@ void per_pixel_losses_bwd(
         dp_median_normal,
         ref_alpha,
         has_mask,
+        saturation_threshold,
         weights,
         v_losses
     );

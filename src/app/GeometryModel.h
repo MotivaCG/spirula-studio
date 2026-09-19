@@ -8,6 +8,8 @@
 // which input sizes round-trip, what a depth means in metres, whether a mask
 // comes back -- is resolved here so the caller only sees depth and normals.
 
+#include "sfm/core/Exif.h"   // ExifTransform
+
 #include <string>
 #include <vector>
 
@@ -39,6 +41,10 @@ class GeometryWarp;
 // by default -- the caller turns off what it is not writing.
 GeometryRequest face_request(const GeometryWarp& warp, int k, int num_tokens);
 
+// The same pinhole face after `t` has been applied to its pixels: on an odd
+// quarter turn the axes swap, and the principal point travels with them.
+GeometryRequest turn_request(const GeometryRequest& r, const sfm::ExifTransform& t);
+
 // One loaded checkpoint. Not thread-safe; both backends share the process-wide
 // inference device.
 class GeometryModel {
@@ -48,9 +54,9 @@ public:
     GeometryModel(const GeometryModel&) = delete;
     GeometryModel& operator=(const GeometryModel&) = delete;
 
-    // `id_or_path` picks the family: a known id by name, a file by what its
-    // graph holds.
-    void load(const std::string& id_or_path);
+    // `selector` is the canonical UUID for the process-wide inference device.
+    // Empty lets the caller's SS_VK_DEVICE/Auto precedence apply.
+    void load(const std::string& id_or_path, const std::string& selector = {});
 
     // The multiple an input side must land on for the prediction to come back
     // at the size that went in: 28 for Metric3D's decoder, 1 for MoGe, which

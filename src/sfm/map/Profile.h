@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include "core/Env.h"
+#include "sfm/core/Log.h"
 
 namespace sfm {
 
@@ -78,24 +79,23 @@ struct MapProf {
         const long n_merged = this->n_merged;
         double ba = ba_build + ba_init + ba_solve + ba_write;
         double accounted = init_seed + choose + reg + tri + retri + filter + snapshot + ba;
-        fprintf(stderr,
-                "[prof] %s total %.2f s, accounted %.2f s (%.0f%%)\n"
-                "[prof]   seed search   %8.2f s  (two-view %.2f s over %ld pair(s), "
-                "focal bootstrap %.2f s)\n"
-                "[prof]   choose-next   %8.2f s  (%ld calls)\n"
-                "[prof]   register      %8.2f s  (%ld tries, %ld ok)\n"
-                "[prof]   triangulate   %8.2f s\n"
-                "[prof]   retriangulate %8.2f s  (of which merge %.2f s, %ld obs absorbed)\n"
-                "[prof]   filter        %8.2f s\n"
-                "[prof]   snapshot      %8.2f s\n"
-                "[prof]   audit         %8.2f s  (check %.2f + repair and refine %.2f)\n"
-                "[prof]   BA            %8.2f s  (%ld calls, %ld LM iters): "
-                "build %.2f + init %.2f + solve %.2f + write %.2f\n",
-                what, total_s, accounted, total_s > 0 ? 100.0 * accounted / total_s : 0.0,
-                init_seed, seed_geom, n_seed_geom, bootstrap, choose, n_choose, reg, n_reg_try,
-                n_reg_ok, tri, retri, merge,
-                n_merged, filter, snapshot, audit_check + audit_fix, audit_check, audit_fix,
-                ba, n_ba, n_ba_iters, ba_build, ba_init, ba_solve, ba_write);
+        slog::diag(slog::Tag::Map, "[prof] %s total %.2f s, accounted %.2f s (%.0f%%)\n"
+                   "[prof]   seed search   %8.2f s  (two-view %.2f s over %ld pair(s), "
+                   "focal bootstrap %.2f s)\n"
+                   "[prof]   choose-next   %8.2f s  (%ld calls)\n"
+                   "[prof]   register      %8.2f s  (%ld tries, %ld ok)\n"
+                   "[prof]   triangulate   %8.2f s\n"
+                   "[prof]   retriangulate %8.2f s  (of which merge %.2f s, %ld obs absorbed)\n"
+                   "[prof]   filter        %8.2f s\n"
+                   "[prof]   snapshot      %8.2f s\n"
+                   "[prof]   audit         %8.2f s  (check %.2f + repair and refine %.2f)\n"
+                   "[prof]   BA            %8.2f s  (%ld calls, %ld LM iters): "
+                   "build %.2f + init %.2f + solve %.2f + write %.2f",
+                   what, total_s, accounted, total_s > 0 ? 100.0 * accounted / total_s : 0.0,
+                   init_seed, seed_geom, n_seed_geom, bootstrap, choose, n_choose, reg, n_reg_try,
+                   n_reg_ok, tri, retri, merge,
+                   n_merged, filter, snapshot, audit_check + audit_fix, audit_check, audit_fix,
+                   ba, n_ba, n_ba_iters, ba_build, ba_init, ba_solve, ba_write);
     }
 };
 

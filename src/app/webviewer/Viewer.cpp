@@ -38,6 +38,8 @@ struct ViewerServer::Impl {
     HttpServer http;
     RenderWorker worker;
     std::vector<std::string> buffer_keys;
+    dsparse::CenterTable centers{};
+    bool center_cameras = false;
     bool started = false;
 
     // ---- endpoint handlers -------------------------------------------------
@@ -169,6 +171,24 @@ struct ViewerServer::Impl {
         body += "]";
         return HttpResponse::json(body);
     }
+
+    // What the client cannot work out for itself: it holds no splats and no
+    // camera table, only the normalized frame both are expressed in.
+    HttpResponse handle_scene() {
+        std::string body = "{\"center_modes\": [";
+        for (int i = 0; i < dsparse::kNumCenterModes; i++) {
+            char one[128];
+            std::snprintf(one, sizeof one,
+                          "%s{\"name\": \"%s\", \"center\": [%.9g, %.9g, %.9g]}",
+                          i ? ", " : "", dsparse::kCenterModeNames[i],
+                          centers[i][0], centers[i][1], centers[i][2]);
+            body += one;
+        }
+        body += "], \"has_cameras\": ";
+        body += center_cameras ? "true" : "false";
+        body += "}";
+        return HttpResponse::json(body);
+    }
 };
 
 
@@ -191,6 +211,8 @@ void ViewerServer::start(const std::string& host, int port,
     cfg.base_camera_size = viewer_upload_cameras(post);
     viewer_upload_grid(post);
 
+    im.centers = cfg.centers;
+    im.center_cameras = cfg.center_cameras;
     im.worker.start(std::move(cfg), std::move(hooks));
     im.buffer_keys = im.worker.buffer_keys();
     im.started = true;
@@ -200,6 +222,7 @@ void ViewerServer::start(const std::string& host, int port,
     im.http.route("/render",     [&im](const HttpRequest& r) { return im.handle_render(r); });
     im.http.route("/pick",       [&im](const HttpRequest& r) { return im.handle_pick(r); });
     im.http.route("/buffers",    [&im](const HttpRequest&) { return im.handle_buffers(); });
+    im.http.route("/scene",      [&im](const HttpRequest&) { return im.handle_scene(); });
     im.http.route("/progress",   [&im](const HttpRequest&) {
         return HttpResponse::json(im.hooks.progress_json ? im.hooks.progress_json()
                                                          : "{}");

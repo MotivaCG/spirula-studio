@@ -2,20 +2,31 @@
 
 #include "app/gui/SfmRunner.h"
 
+#include "app/gui/SfmInProcess.h"
+
+#include "sfm/core/Resume.h"
+
+#include <fstream>
+
+#include "app/gui/ReconStamp.h"
+
 #include "i18n/Locale.h"
 #include "i18n/catalog/Log.h"
 
-#include "app/gui/AppPaths.h"
+#include "app/AppPaths.h"
 #include "app/gui/Subprocess.h"
 #ifdef SS_TOOL_SFM
-// For the stage tags the child prints; a build without the module has no child
-// to read (see availability()).
+// The stage tags the child prints and the manifest it reads; a build without the
+// module has no child to run (see availability()).
 #include "sfm/core/Log.h"
+#include "sfm/core/Manifest.h"
 #include "i18n/catalog/Sfm.h"
 #endif
 
 #if defined(SS_TOOL_SFM) && defined(SS_HAVE_ALIKED) && SS_HAVE_ALIKED
 #include "aliked/model/Fetch.h"
+#include "loma/Loma.h"
+#include "loma/model/Fetch.h"
 #include "nn/io/Fetch.h"
 #endif
 
@@ -50,20 +61,36 @@ const char* kDataType[] = {"individual", "video", "internet"};
 const char* kCameraMode[] = {"single", "folder", "image"};
 const char* kPairs[] = {"auto", "exhaustive", "sequential", "prefilter"};
 const char* kMapper[] = {"flat", "bottom-up"};
-const char* kFeatures[] = {"sift", "aliked-n16rot", "aliked-n32"};
-const char* kMatcher[] = {"bruteforce", "lightglue"};
+const char* kFeatures[] = {"sift", "aliked-n16rot", "aliked-n32", "loma-b128",
+                           "loma-b"};
+const char* kMetricGps[] = {"none", "horizontal", "full"};
+const char* kSensorGauge[] = {"none", "up", "auto"};
+const char* kExifAttitude[] = {"none", "up", "auto"};
 
 template <int N>
 const char* pick(const char* const (&table)[N], int i, int fallback = 0) {
     return table[(i >= 0 && i < N) ? i : fallback];
 }
 
-// Is this line of the child's output worth showing to somebody who is not
-// debugging? Its own [run] block -- what it was asked for and what it got --
-// and anything it flagged. Everything else is the stream behind the bars.
-//
-// Both halves are asked of the same catalog the child printed from, so a
-// `--lang ja` run classifies as well as an English one.
+// The matcher combo is two entries -- brute force, or "the learned matcher for
+// this frontend" -- because a learned matcher only reads the descriptors it
+// was trained on. Which one that is follows --features.
+const char* matcher_for(int features, int matcher) {
+    if (features == 0 || matcher != 1) return "bruteforce";
+    const std::string f = pick(kFeatures, features);
+    return f.rfind("loma", 0) == 0 ? pick(kFeatures, features) : "lightglue";
+}
+
+// A failed Vulkan call is the child's own English diagnostic -- a result name
+// and a source line -- not interface copy, so it is matched as one.
+bool child_line_is_gpu_failure(const std::string& l) {
+    return l.find("VK_ERROR_DEVICE_LOST") != std::string::npos ||
+           l.find("VK_ERROR_OUT_OF_DEVICE_MEMORY") != std::string::npos;
+}
+
+// Worth showing to somebody who is not debugging: the child's own [run] block
+// and anything it flagged. Both halves are asked of the catalog the child
+// printed from, so a `--lang ja` run classifies as well as an English one.
 bool child_line_is_notable(const std::string& l) {
 #ifndef SS_TOOL_SFM
     (void)l;
@@ -95,6 +122,19 @@ void remove_tree(const fs::path& p) {
     std::filesystem::remove_all(p, ec);
 #endif
 }
+void sweep_sfm_intermediates(const std::string& ws) {
+    if (ws.empty()) return;
+    const fs::path dir(ws);
+    remove_tree(dir / ".progress");
+    // Recursive: the feature files MIRROR the image tree, so a capture with
+    // camera folders puts them in features/cam0/... and a single-level sweep
+    // removed nothing and left the directory.
+    remove_tree(dir / "features");
+    remove_tree(dir / sfm::resume::kDir);
+    std::error_code ec;
+    fs::remove(dir / "matches.bin", ec);
+}
+
 
 // The mapper only writes a model when it finishes, so any model on disk is
 // from a completed run.
@@ -111,17 +151,29 @@ bool has_model(const fs::path& sparse) {
 std::vector<PendingDownload> sfm_feature_downloads(int features, int matcher) {
     std::vector<PendingDownload> out;
 #if defined(SS_TOOL_SFM) && defined(SS_HAVE_ALIKED) && SS_HAVE_ALIKED
-    auto want = [&](const char* id) {
-        const aliked::ModelSource* src = aliked::find_model_source(id);
-        if (!src) return;
-        const std::string dest = nn::cached_path(src->onnx);
-        if (!file_is_cached(dest, src->onnx.bytes))
-            out.push_back({src->onnx.url, dest, src->onnx.bytes});
+    auto take = [&](const nn::FetchFile& f) {
+        const std::string dest = nn::cached_path(f);
+        if (!file_is_cached(dest, f.bytes)) out.push_back({f.url, dest, f.bytes});
     };
-    if (features > 0) want(pick(kFeatures, features));
-    // The matcher combo is only read with a learned frontend, which is what
-    // the command line does too (pick(kMatcher, features == 0 ? 0 : matcher)).
-    if (features > 0 && matcher == 1) want("aliked-lightglue");
+    auto want_aliked = [&](const char* id) {
+        if (const aliked::ModelSource* src = aliked::find_model_source(id)) take(src->onnx);
+    };
+    auto want_loma = [&](const std::string& id) {
+        if (const loma::ModelSource* src = loma::find_model_source(id)) take(src->onnx);
+    };
+    if (features <= 0) return out;
+
+    const std::string f = pick(kFeatures, features);
+    if (f.rfind("loma", 0) == 0) {
+        // Three files, not one: the detector is shared, the descriptor follows
+        // the variant, and the matcher is only wanted if it is selected.
+        want_loma("loma-dad");
+        want_loma(loma::descriptor_for_matcher(f));
+        if (matcher == 1) want_loma(f);
+    } else {
+        want_aliked(f.c_str());
+        if (matcher == 1) want_aliked("aliked-lightglue");
+    }
 #else
     (void)features;
     (void)matcher;
@@ -137,7 +189,7 @@ std::string SfmRunner::availability() {
 #ifndef SS_TOOL_SFM
     return lmsg::err_no_sfm_module.get();
 #else
-    if (exe_path().empty())
+    if (app::exe_path().empty())
         return lmsg::err_no_exe_path.get();
     return "";
 #endif
@@ -153,11 +205,15 @@ void SfmRunner::start(const SfmJob& job, RunFilms films) {
     if (_worker.joinable()) _worker.join();
     _cancel = false;
     _partial = false;
+    _not_metric = false;
+    _have_status = false;
+    _status_mtime = 0;
     _films = films;
     _prog.reset();
     if (_films.frames) _films.frames->clear();
     if (_films.masks) _films.masks->clear();
     if (_films.geometry) _films.geometry->clear();
+    std::string sweep;
     {
         std::lock_guard<std::mutex> lk(_mu);
         _error.clear();
@@ -169,11 +225,14 @@ void SfmRunner::start(const SfmJob& job, RunFilms films) {
         _matches_path.clear();
         _sfm_image_dir.clear();
         _sfm_mask_dir.clear();
-        _sweep_dir.clear();
+        sweep.swap(_sweep_dir);
         _live = job;
     }
     _state = State::Running;
-    _worker = std::thread([this, job] { run(job); });
+    _worker = std::thread([this, job, sweep = std::move(sweep)] {
+        sweep_sfm_intermediates(sweep);
+        run(job);
+    });
 }
 
 void SfmRunner::update(const SfmJob& job) {
@@ -194,12 +253,17 @@ void SfmRunner::take_reconstruction(SfmJob& job) {
     job.init_distortion = _live.init_distortion;
     job.distortion_refine = _live.distortion_refine;
     job.final_per_image_intrinsics = _live.final_per_image_intrinsics;
+    job.final_free_rig = _live.final_free_rig;
     job.max_features = _live.max_features;
     job.max_image_size = _live.max_image_size;
     job.mapper = _live.mapper;
     job.features = _live.features;
     job.matcher = _live.matcher;
+    job.metric_gps = _live.metric_gps;
+    job.sensor_gauge = _live.sensor_gauge;
+    job.exif_attitude = _live.exif_attitude;
     job.keep_intermediate = _live.keep_intermediate;
+    job.ba_cpu = _live.ba_cpu;
     job.extra_args = _live.extra_args;
     // The lens is a reconstruction setting that happens to be stored on the
     // input it describes. The list itself cannot change while a run is live.
@@ -223,6 +287,7 @@ void SfmRunner::take_masking(PrepJob& prep) {
     prep.mask_negative_prompt = _live.prep.mask_negative_prompt;
     prep.mask_keep_subject = _live.prep.mask_keep_subject;
     prep.mask_max_image_size = _live.prep.mask_max_image_size;
+    prep.mask_dilate_ratio = _live.prep.mask_dilate_ratio;
     prep.mask_threshold = _live.prep.mask_threshold;
     prep.mask_nms = _live.prep.mask_nms;
     prep.mask_memory = _live.prep.mask_memory;
@@ -232,6 +297,8 @@ void SfmRunner::take_masking(PrepJob& prep) {
     prep.mask_model_path = _live.prep.mask_model_path;
     prep.mask_model_name = _live.prep.mask_model_name;
     prep.force_external_masking = _live.prep.force_external_masking;
+    prep.image_gamut = _live.prep.image_gamut;
+    prep.image_is_linear = _live.prep.image_is_linear;
     prep.python_exe = _live.prep.python_exe;
 }
 
@@ -255,6 +322,8 @@ std::string SfmRunner::image_dir() {
     std::lock_guard<std::mutex> lk(_mu);
     return _image_dir;
 }
+bool SfmRunner::mask_flipped() const { return _mask_flipped.load(); }
+
 std::string SfmRunner::mask_dir() {
     std::lock_guard<std::mutex> lk(_mu);
     return _mask_dir;
@@ -262,6 +331,18 @@ std::string SfmRunner::mask_dir() {
 std::string SfmRunner::progress_dir() {
     std::lock_guard<std::mutex> lk(_mu);
     return _progress_dir;
+}
+
+std::string SfmRunner::thumbs_dir() {
+    std::lock_guard<std::mutex> lk(_mu);
+    return _progress_dir.empty() ? std::string()
+                                : (fs::path(_progress_dir) / "thumbs").string();
+}
+
+std::string SfmRunner::live_matches_path() {
+    std::lock_guard<std::mutex> lk(_mu);
+    return _progress_dir.empty() ? std::string()
+                                : (fs::path(_progress_dir) / "live_matches.bin").string();
 }
 std::string SfmRunner::features_dir() {
     std::lock_guard<std::mutex> lk(_mu);
@@ -287,15 +368,7 @@ void SfmRunner::sweep_intermediates() {
         std::lock_guard<std::mutex> lk(_mu);
         ws.swap(_sweep_dir);
     }
-    if (ws.empty()) return;
-    const fs::path dir(ws);
-    remove_tree(dir / ".progress");
-    // Recursive: the feature files MIRROR the image tree, so a capture with
-    // camera folders puts them in features/cam0/... and a single-level sweep
-    // removed nothing and left the directory.
-    remove_tree(dir / "features");
-    std::error_code ec;
-    fs::remove(dir / "matches.bin", ec);
+    sweep_sfm_intermediates(ws);
 }
 void SfmRunner::log(const std::string& line, bool detail) {
     _prog.note(line, detail);
@@ -314,121 +387,301 @@ void SfmRunner::set_stage(Stage st, const std::string& s) {
     log("==== " + s + " ====", /*detail=*/false);
 }
 
-// spirula-sfm's own progress lines. Reading them is a little grubby, but it is
-// the one thing a child process cannot hand over structurally.
-//
-// What it keys on is the stage TAG, and the tag is translated -- so this asks
-// the same catalog the child printed from (sfm/core/Log.h), rather than
-// matching English text that a `--lang ja` run will never emit. The numbers
-// are the first "a/b" on the line, which every progress message puts there and
-// no other message on those stages has.
-void SfmRunner::note_progress(const std::string& l) {
-#ifdef SS_TOOL_SFM
-    using sfm::slog::Tag;
-    auto tagged = [&l](Tag t) {
-        const std::string p = sfm::slog::prefix(t);
-        return l.compare(0, p.size(), p) == 0;
-    };
-    // First "<digits>/<digits>" anywhere in the line.
-    auto fraction = [&l](unsigned long& a, unsigned long& b) {
-        for (size_t i = 0; i + 2 < l.size(); i++) {
-            if (!std::isdigit((unsigned char)l[i])) continue;
-            if (i && std::isdigit((unsigned char)l[i - 1])) continue;
-            if (std::sscanf(l.c_str() + i, "%lu/%lu", &a, &b) == 2 && b > 0) return true;
-            while (i + 1 < l.size() && std::isdigit((unsigned char)l[i + 1])) i++;
-        }
-        return false;
-    };
-    unsigned long a = 0, b = 0;
-    if (tagged(Tag::Extract)) {
-        if (!fraction(a, b)) return;
-        set_stage_if_new(Stage::Features, lmsg::stage_finding_features.get());
-        _prog.count(Stage::Features, (int64_t)a, (int64_t)b);
-        return;
-    }
-    if (tagged(Tag::Match)) {
-        if (!fraction(a, b)) return;
-        set_stage_if_new(Stage::Matching, lmsg::stage_matching_images.get());
-        _prog.count(Stage::Matching, (int64_t)a, (int64_t)b);
-        return;
-    }
-    if (tagged(Tag::Map) || tagged(Tag::Merge) || tagged(Tag::Orient)) {
-        // The mapper counts registrations rather than working towards a
-        // total, so this is a stage change and a spinner, not a fraction.
-        set_stage_if_new(Stage::Mapping, lmsg::stage_reconstructing.get());
-    }
-#else
-    (void)l;
-#endif
+// Where the run is, from the snapshot the child writes (status.bin) rather
+// than from its translated stdout. Cheap to call per output line: one stat,
+// and a read only when the file actually moved.
+void SfmRunner::poll_status() {
+    RunStatus st;
+    if (read_status(_progress_dir, _status_mtime, st)) apply_status(st);
 }
 
-// A capture shot as several inputs is several cameras, and the lens is a
-// property of the input rather than of the dataset. `spirula sfm` says that with
-// PREFIX=VALUE, where the prefix matches an image name by path prefix -- which
-// is exactly the sub-folder each input's frames went into. A dual-lens video's
-// cam0/ and cam1/ both sit under that folder, so one prefix covers both, and
-// they still group as two cameras because grouping is per folder.
-//
-// The focal length is carried as a fraction of the image width rather than in
-// pixels, because the width is not known until the frames exist (an Insta360
-// X5 is fx = fy ~ 0.269 * width whatever it was shot at). A lone input has no
-// prefix, so its value IS the dataset-wide one -- and an explicit focal typed
-// into the panel wins over a preset-derived one.
-void SfmRunner::append_camera_overrides(const SfmJob& job, const PrepResult& prep,
-                                        std::vector<std::string>& argv) {
-    // One group per row the panel showed: an input, or a camera folder inside
-    // one. `rel` is the group's path under the image directory, which is what
-    // `--camera-model PREFIX=MODEL` matches an image name against; empty means
-    // the whole capture, and only a lone input with no camera folders is that.
-    struct Group {
-        std::string rel;
-        std::string camera_model;
-        float focal_factor = 0.0f;
-    };
-    std::vector<Group> groups;
-    for (const PrepInput& in : job.prep.inputs) {
-        if (in.subcameras.empty()) {
-            groups.push_back({in.subdir, in.camera_model, in.focal_factor});
-            continue;
-        }
-        for (const SubCamera& sc : in.subcameras) {
-            const std::string rel =
-                in.subdir.empty() ? sc.rel
-                                  : (fs::path(in.subdir) / sc.rel).generic_string();
-            groups.push_back({rel, sc.camera_model.empty() ? in.camera_model
-                                                           : sc.camera_model,
-                              sc.focal_factor > 0 ? sc.focal_factor
-                                                  : in.focal_factor});
-        }
+// One consumer for both transports: the child's status.bin and the in-process
+// event fold say the same thing in the same shape.
+void SfmRunner::apply_status(const RunStatus& st) {
+    switch (st.stage) {
+        case 0: set_stage_if_new(Stage::Features, lmsg::stage_finding_features.get());
+                _prog.count(Stage::Features, st.done, st.total); break;
+        // Reading the feature files and choosing which pairs to match are both
+        // matching, and both used to leave the screen on a full features bar
+        // with nothing moving -- minutes of it with a learned frontend.
+        case 6: set_stage_if_new(Stage::Matching, lmsg::stage_reading_features.get());
+                _prog.count(Stage::Matching, st.done, st.total); break;
+        case 7: set_stage_if_new(Stage::Matching, lmsg::stage_selecting_pairs.get());
+                _prog.count(Stage::Matching, st.done, st.total); break;
+        case 1: set_stage_if_new(Stage::Matching, lmsg::stage_matching_images.get());
+                _prog.count(Stage::Matching, st.done, st.total); break;
+        case 2: case 3: case 4:
+                set_stage_if_new(Stage::Mapping, lmsg::stage_reconstructing.get());
+                _prog.count(Stage::Mapping, st.done, st.total);
+                _prog.fraction(Stage::Mapping, mapping_fraction(st.done, st.total));
+                break;
+        // Two stretches of the mapping step place no image, so the bar has
+        // nothing to say and the label has to: choosing a focal and a seed
+        // before the first, and the finishing solves after the last.
+        case 8: set_stage_if_new(Stage::Mapping, lmsg::stage_seeding.get());
+                _prog.fraction(Stage::Mapping, 0.0f);
+                break;
+        case 9: set_stage_if_new(Stage::Mapping, lmsg::stage_refining.get());
+                _prog.fraction(Stage::Mapping, kMappingBarFull);
+                break;
+        default: break;
     }
+    if (st.finished) {
+        _partial = st.partial;
+        _not_metric = !st.metric;
+        _have_status = true;
+    }
+}
 
-    for (const Group& g : groups) {
-        const std::string prefix = g.rel.empty() ? "" : g.rel + "=";
-        // For the whole capture the panel's own "Camera / lens" is the single
-        // source of truth and has already been passed; only a named group adds
-        // one.
-        if (!g.rel.empty() && !g.camera_model.empty()) {
-            argv.push_back("--camera-model");
-            argv.push_back(prefix + g.camera_model);
-        }
-        if (!(g.focal_factor > 0)) continue;
-        if (g.rel.empty() && job.init_focal_px > 0) continue;
-        const std::string dir =
-            (g.rel.empty() ? fs::path(prep.image_dir)
-                           : fs::path(prep.image_dir) / g.rel).string();
-        int W = 0, H = 0;
-        if (!DatasetPrep::first_image_dims(dir, W, H)) {
-            log(fmt(lmsg::sfm_focal_unreadable, {dir}));
-            continue;
-        }
-        char buf[32];
-        std::snprintf(buf, sizeof buf, "%g", (double)g.focal_factor * W);
-        argv.push_back("--focal");
-        argv.push_back(prefix + buf);
-        log(fmt(lmsg::sfm_initial_focal,
-                {g.rel.empty() ? lmsg::sfm_the_capture.get() : g.rel.c_str(),
-                 buf, g.focal_factor, (long long)W}));
+#ifdef SS_TOOL_SFM
+// The panel's per-input rows become the manifest's camera groups, keyed on the
+// sub-folder each input's frames went into. The focal is a fraction of the
+// width up to here: the width is not known until the frames exist.
+sfm::Manifest SfmRunner::build_manifest(const SfmJob& job, const PrepResult& prep) {
+    sfm::Manifest man;
+    man.image_dir = prep.image_dir;
+    // Named here only when the reconstruction is to read them: the manifest is
+    // the other way masks reach it, so leaving it in would undo --no-masks.
+    if (!prep.mask_dir.empty() && job.mask_features) {
+        man.mask_dir = prep.mask_dir;
+        man.has_mask_flipped = true;
+        man.mask_flipped = prep.mask_dir_flipped;
     }
+    // The rows the panel showed, and the model each one resolved to once "same
+    // as above" was followed through the list (camera_group_models).
+    const std::vector<CameraGroup> groups = camera_groups(job.prep.inputs);
+    const std::vector<std::string> models =
+        camera_group_models(job.prep.inputs, groups, job.camera_model);
+
+    for (size_t i = 0; i < groups.size(); i++) {
+        const CameraGroup& g = groups[i];
+        const float focal = group_focal(job.prep.inputs, g);
+        sfm::ManifestCamera c;
+        c.prefix = g.rel;
+        // For the whole capture the panel's own "Camera / lens" is the single
+        // source of truth and is already in the argv; only a named group adds one.
+        if (!g.rel.empty() && !models[i].empty()) c.model = models[i];
+        if (focal > 0 && !(g.rel.empty() && job.init_focal_px > 0)) {
+            const std::string dir =
+                (g.rel.empty() ? fs::path(prep.image_dir)
+                               : fs::path(prep.image_dir) / g.rel).string();
+            int W = 0, H = 0;
+            if (!DatasetPrep::first_image_dims(dir, W, H)) {
+                log(fmt(lmsg::sfm_focal_unreadable, {dir}));
+            } else {
+                c.focal = (double)focal * W;
+                char buf[32];
+                std::snprintf(buf, sizeof buf, "%g", c.focal);
+                log(fmt(lmsg::sfm_initial_focal,
+                        {g.rel.empty() ? lmsg::sfm_the_capture.get() : g.rel.c_str(),
+                         buf, focal, (long long)W}));
+            }
+        }
+        if (!c.model.empty() || c.focal > 0) man.cameras.push_back(std::move(c));
+    }
+    for (const PrepCapture& pc : prep.captures) {
+        sfm::ManifestCapture c;
+        c.prefix = pc.subdir;
+        c.telemetry = pc.path;
+        c.fps = pc.fps;
+        man.captures.push_back(std::move(c));
+    }
+    man.rigs = build_rigs(job.prep);
+    return man;
+}
+
+// The rows' rig choices as definitions (sfm/core/Rig.h): "this input's
+// lenses" is a rig per input; a shared letter joins rows across inputs, as
+// captures of one rig when every input contributes the same lens folders.
+std::vector<sfm::RigDef> SfmRunner::build_rigs(const PrepJob& prep) {
+    std::vector<sfm::RigDef> out;
+    auto join = [](const std::string& a, const std::string& b) {
+        return a.empty() ? b : b.empty() ? a : a + "/" + b;
+    };
+    // Per input, the lens folders under its subdir: the sub-camera rows, or a
+    // video's tracks / views.
+    std::vector<std::vector<std::string>> lenses(prep.inputs.size());
+    for (size_t i = 0; i < prep.inputs.size(); i++) {
+        const PrepInput& in = prep.inputs[i];
+        if (!in.subcameras.empty()) continue;
+        lenses[i] = lens_dirs(prep, in);
+    }
+    // "This input's lenses": one rig per input.
+    for (size_t i = 0; i < prep.inputs.size(); i++) {
+        const PrepInput& in = prep.inputs[i];
+        std::vector<std::string> members;
+        if (in.subcameras.empty()) {
+            if (in.rig == kRigOwn) members = lenses[i];
+        } else {
+            for (const SubCamera& sc : in.subcameras)
+                if (sc.rig == kRigOwn) members.push_back(sc.rel);
+        }
+        if (members.size() < 2) continue;
+        sfm::RigDef d;
+        d.name = in.subdir.empty() ? std::string("rig") : in.subdir;
+        for (const std::string& m : members) {
+            sfm::RigMemberDef md;
+            md.prefix = join(in.subdir, m);
+            d.members.push_back(md);
+        }
+        out.push_back(std::move(d));
+    }
+    // The shared letters.
+    for (int letter = 0; letter < kRigShared; letter++) {
+        const int id = kRigFirstShared + letter;
+        // input -> the lens folders it contributes under this letter
+        std::vector<std::pair<size_t, std::vector<std::string>>> parts;
+        for (size_t i = 0; i < prep.inputs.size(); i++) {
+            const PrepInput& in = prep.inputs[i];
+            std::vector<std::string> mine;
+            if (in.subcameras.empty()) {
+                if (in.rig == id) mine = lenses[i].empty() ? std::vector<std::string>{""} : lenses[i];
+            } else {
+                for (const SubCamera& sc : in.subcameras)
+                    if (sc.rig == id) mine.push_back(sc.rel);
+            }
+            if (!mine.empty()) parts.push_back({i, std::move(mine)});
+        }
+        if (parts.empty()) continue;
+        sfm::RigDef d;
+        d.name = std::string(1, (char)('A' + letter));
+        bool same = parts.size() > 1 && parts[0].second.size() > 1;
+        for (const auto& p : parts) same = same && p.second == parts[0].second;
+        if (same) {
+            // One rig behind several inputs: captures, and members relative
+            // to each.
+            for (const auto& p : parts) d.captures.push_back(prep.inputs[p.first].subdir);
+            for (const std::string& m : parts[0].second) {
+                sfm::RigMemberDef md;
+                md.prefix = m;
+                d.members.push_back(md);
+            }
+        } else {
+            for (const auto& p : parts)
+                for (const std::string& m : p.second) {
+                    sfm::RigMemberDef md;
+                    md.prefix = join(prep.inputs[p.first].subdir, m);
+                    d.members.push_back(md);
+                }
+        }
+        if (d.members.size() < 2) continue;
+        out.push_back(std::move(d));
+    }
+    return out;
+}
+#endif  // SS_TOOL_SFM
+
+// Flags that describe the model rather than the execution device. The same
+// model vector feeds the workspace stamp and the launch settings; the frozen
+// device is appended only when launching.
+std::vector<std::string> SfmRunner::recon_args(const SfmJob& job,
+                                               const PrepResult& prep) {
+    std::vector<std::string> argv = {
+        "--quality", pick(kQuality, job.quality, 2),
+        "--data-type", pick(kDataType, job.data_type),
+        "--camera-model", job.camera_model,
+        "--camera-mode", pick(kCameraMode, job.camera_mode, 1),
+        "--mapper", pick(kMapper, job.mapper),
+        "--features", pick(kFeatures, job.features),
+        // A learned matcher only exists for the learned descriptors; asking
+        // for one with SIFT selected is a usage error.
+        "--matcher", matcher_for(job.features, job.matcher),
+    };
+    if (job.pairs > 0) {
+        argv.push_back("--pairs");
+        argv.push_back(pick(kPairs, job.pairs));
+        if (job.pairs == 2) {
+            argv.push_back("--overlap");
+            argv.push_back(std::to_string(job.overlap));
+        }
+    }
+    // Sequential is what `auto` resolves to for video, so this has to be
+    // passed whenever sequential is reachable, not only when it was named. It
+    // is a no-op under the other pair modes.
+    if (!job.loop_closure) argv.push_back("--no-loop-closure");
+    if (job.init_focal_px > 0) {
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "%g", job.init_focal_px);
+        argv.push_back("--focal");
+        argv.push_back(buf);
+    }
+    if (!job.init_distortion.empty()) {
+        argv.push_back("--distortion");
+        argv.push_back(job.init_distortion);
+    }
+    // Two flags, three states: hold during mapping, and hold in the finishing
+    // pass as well.
+    if (job.distortion_refine >= 1) argv.push_back("--no-refine-extra-params");
+    if (job.distortion_refine >= 2) argv.push_back("--no-final-extra-params");
+    if (job.final_per_image_intrinsics)
+        argv.push_back("--final-per-image-intrinsics");
+    if (job.final_free_rig) argv.push_back("--final-free-rig");
+    if (job.ba_cpu) {
+        argv.push_back("--ba-real");
+        argv.push_back("cpu");
+        argv.push_back("--ba-real-coarse");
+        argv.push_back("cpu");
+    }
+    // Not flags any more: the groups go in the manifest. Its text joins the
+    // stamp so that changing a lens still counts as a different model
+    // (recon_stamp_change), which is the whole point of this list.
+#ifdef SS_TOOL_SFM
+    const std::string manifest = sfm::manifest_write(build_manifest(job, prep));
+    if (!manifest.empty()) {
+        argv.push_back("--manifest");
+        argv.push_back(manifest);
+    }
+#endif
+    if (job.max_features > 0) {
+        // Each frontend has its own count flag: the budgets are not comparable,
+        // a learned detector emitting a few thousand better-localized points
+        // where SIFT wants tens of thousands. One spinner, routed to the live one.
+        argv.push_back(job.features == 0     ? "--max-features"
+                       : job.features >= 3   ? "--loma-max-features"
+                                             : "--aliked-max-features");
+        argv.push_back(std::to_string(job.max_features));
+    }
+    if (job.max_image_size > 0) {
+        argv.push_back("--max-image-size");
+        argv.push_back(std::to_string(job.max_image_size));
+    }
+    if (job.metric_gps > 0) {
+        argv.push_back("--metric-gps");
+        argv.push_back(pick(kMetricGps, job.metric_gps));
+    }
+    if (job.sensor_gauge != 2) {
+        argv.push_back("--sensor-gauge");
+        argv.push_back(pick(kSensorGauge, job.sensor_gauge, 2));
+    }
+    if (job.exif_attitude != 2) {
+        argv.push_back("--exif-attitude");
+        argv.push_back(pick(kExifAttitude, job.exif_attitude, 2));
+    }
+    if (!job.image_gamut.empty()) {
+        argv.push_back("--image-gamut");
+        argv.push_back(job.image_gamut);
+    }
+    if (job.image_is_linear.has_value())
+        argv.push_back(*job.image_is_linear ? "--image-linear"
+                                            : "--no-image-linear");
+    if (job.point_color_in_image_space) {
+        argv.push_back("--point-color");
+        argv.push_back("image");
+    }
+    if (!prep.mask_dir.empty() && job.mask_features) {
+        argv.push_back("--masks");
+        argv.push_back(prep.mask_dir);
+        // Only masks the run handed on untouched are still the other way
+        // round; anything it wrote is in the usual convention.
+        if (prep.mask_dir_flipped) argv.push_back("--flip-mask");
+    } else {
+        // Otherwise `auto` picks up a stale masks/ sitting beside the images
+        // from an earlier run with masking on.
+        argv.push_back("--no-masks");
+    }
+    for (const std::string& a : split_args(job.extra_args))
+        argv.push_back(a);
+    return argv;
 }
 
 void SfmRunner::run(SfmJob job) {
@@ -483,123 +736,140 @@ void SfmRunner::run(SfmJob job) {
             _sfm_image_dir = prep.image_dir;
             _sfm_mask_dir = prep.mask_dir;
         }
+        // Frames this run replaced: features/ and matches.bin describe the old
+        // ones, and the resume signature is made of settings and cannot see it.
+        if (prep.frames_rebuilt) {
+            job.redo_model = true;
+            remove_tree(ws / "features");
+            remove_tree(ws / sfm::resume::kDir);
+            std::error_code fec;
+            fs::remove(ws / "matches.bin", fec);
+        }
         if (prep.per_folder_cameras && job.camera_mode == 0) {
             log(lmsg::one_camera_per_folder.get());
             job.camera_mode = 1;
         }
 
         // ---- 2. reconstruction --------------------------------------------
-        // A model already in the output folder is reused whoever made it, so
-        // a finished dataset can be given masks and geometry instead.
-        const bool reuse_model = prior.model && !job.redo_model;
+        take_reconstruction(job);
+        // The model, as the flags that make it. A copy stays in the workspace
+        // beside it (ReconStamp.h) so that a later run can tell whether the
+        // one already there still answers what the panel is asking for.
+        ReconStamp now;
+        now.present = true;
+        now.engine = "builtin";
+        now.args = recon_args(job, prep);
+        const std::string changed =
+            recon_stamp_change(read_recon_stamp(ws.string()), now);
+
+        // A model already there is reused whoever made it, which is how a
+        // finished dataset gets masks and geometry. The one exception is a
+        // model this panel built and has since been asked to build differently.
+        const bool reuse_model = prior.model && !job.redo_model &&
+                                 (!job.settings_built_model || changed.empty());
         if (reuse_model) {
             log(fmt(lmsg::sfm_reusing_model, {ws.string()}), /*detail=*/false);
         } else {
+            if (prior.model && job.settings_built_model && !changed.empty())
+                log(fmt(lmsg::sfm_settings_changed, {changed}), /*detail=*/false);
             set_stage(Stage::Features, lmsg::stage_reconstructing_features.get());
-            take_reconstruction(job);
-            std::vector<std::string> argv = {
-                // The child is this same executable, so it has the same
-                // thirteen languages -- tell it which one, or its output
-                // lands in the log in whatever the machine's locale is.
-                exe_path(), "--lang", spirula::i18n::code(spirula::i18n::current()),
-                "sfm", "auto", prep.image_dir,
-                "-o", ws.string(),
+            // What features/ and matches.bin are still worth is the run's own
+            // decision, per stage and per file (sfm/core/Resume.h). The
+            // snapshots are not: they describe the run that wrote them.
+            remove_tree(ws / ".progress");
+            // From here the intermediates are this run's, however it ends: a
+            // cancelled run leaves the same ones a finished one does, and the
+            // screen goes on reading both until it is done with them.
+            {
+                std::lock_guard<std::mutex> lk(_mu);
+                _sweep_dir = job.keep_intermediate ? "" : ws.string();
+            }
+            // What the run is asked for, the same list either way. The
+            // manifest travels as TEXT in the stamp, because that is what
+            // defines the model; a run wants a file.
+            std::vector<std::string> settings = {
+                prep.image_dir, "-o", ws.string(),
                 "--progress-dir", (ws / ".progress").string(),
-                "--quality", pick(kQuality, job.quality, 2),
-                "--data-type", pick(kDataType, job.data_type),
-                "--camera-model", job.camera_model,
-                "--camera-mode", pick(kCameraMode, job.camera_mode, 1),
-                "--mapper", pick(kMapper, job.mapper),
-                "--features", pick(kFeatures, job.features),
-                // LightGlue only exists for the learned descriptors; asking
-                // for it with SIFT selected is a usage error, so do not.
-                "--matcher",
-                pick(kMatcher, job.features == 0 ? 0 : job.matcher),
             };
-            if (job.pairs > 0) {
-                argv.push_back("--pairs");
-                argv.push_back(pick(kPairs, job.pairs));
-                if (job.pairs == 2) {
-                    argv.push_back("--overlap");
-                    argv.push_back(std::to_string(job.overlap));
-                }
+            for (size_t k = 0; k < now.args.size(); k++) {
+                settings.push_back(now.args[k]);
+                if (now.args[k] != "--manifest" || k + 1 >= now.args.size()) continue;
+                // Dotted and prefixed, like .spirula_mask.py: the workspace
+                // is the user's, and a plain manifest.yaml there could be theirs.
+                const fs::path mf = ws / ".spirula_manifest.yaml";
+                std::ofstream(mf, std::ios::binary | std::ios::trunc) << now.args[++k];
+                settings.push_back(mf.string());
             }
-            // Sequential is what `auto` resolves to for video, so this has to
-            // be passed whenever sequential is reachable, not only when it was
-            // named. It is a no-op under the other pair modes.
-            if (!job.loop_closure) argv.push_back("--no-loop-closure");
-            if (job.init_focal_px > 0) {
-                char buf[32];
-                std::snprintf(buf, sizeof buf, "%g", job.init_focal_px);
-                argv.push_back("--focal");
-                argv.push_back(buf);
+            // Keep the execution identity out of ReconStamp while making it
+            // explicit for both in-process and self-child runs.
+            if (!job.device_selector.empty()) {
+                settings.push_back("--device");
+                settings.push_back(job.device_selector);
             }
-            if (!job.init_distortion.empty()) {
-                argv.push_back("--distortion");
-                argv.push_back(job.init_distortion);
-            }
-            // Two flags, three states: hold during mapping, and hold in the
-            // finishing pass as well.
-            if (job.distortion_refine >= 1) argv.push_back("--no-refine-extra-params");
-            if (job.distortion_refine >= 2) argv.push_back("--no-final-extra-params");
-            if (job.final_per_image_intrinsics)
-                argv.push_back("--final-per-image-intrinsics");
-            append_camera_overrides(job, prep, argv);
-            if (job.max_features > 0) {
-                // Each frontend has its own count flag, because their budgets
-                // are not comparable -- a learned detector emits a few
-                // thousand better-localized points where SIFT wants tens of
-                // thousands. One spinner, routed to whichever is running.
-                argv.push_back(job.features == 0 ? "--max-features"
-                                                 : "--aliked-max-features");
-                argv.push_back(std::to_string(job.max_features));
-            }
-            if (job.max_image_size > 0) {
-                argv.push_back("--max-image-size");
-                argv.push_back(std::to_string(job.max_image_size));
-            }
-            if (!job.image_gamut.empty()) {
-                argv.push_back("--image-gamut");
-                argv.push_back(job.image_gamut);
-            }
-            if (job.image_is_linear.has_value())
-                argv.push_back(*job.image_is_linear ? "--image-linear"
-                                                    : "--no-image-linear");
-            if (job.point_color_in_image_space) {
-                argv.push_back("--point-color");
-                argv.push_back("image");
-            }
-            if (!prep.mask_dir.empty()) {
-                argv.push_back("--masks");
-                argv.push_back(prep.mask_dir);
-            } else {
-                // Otherwise `auto` picks up a stale masks/ sitting beside the
-                // images from an earlier run with masking on.
-                argv.push_back("--no-masks");
-            }
-            for (const std::string& a : split_args(job.extra_args))
-                argv.push_back(a);
 
-            std::string cmd;
-            for (const auto& a : argv) cmd += (cmd.empty() ? "$ " : " ") + a;
-            log(cmd);
-            const int rc = run_process(argv, "", [this](const std::string& l) {
-                log(l, !child_line_is_notable(l));
-                note_progress(l);
-            }, _cancel);
-            if (rc == kCancelled) return fail(lmsg::err_cancelled.get());
-            if (rc == kSpawnFailed)
-                return fail(fmt(lmsg::err_spawn_recon, {argv[0]}));
-            // `auto` spends exit code 2 on "nothing reconstructed" and 3 on
-            // "reconstructed, but under half the images registered or the
-            // reprojection error is high" (src/sfm/README.md). 3 is a warning
-            // here, not a failure: a partial model still trains, and throwing
-            // it away over a threshold would be worse than saying so.
-            if (rc == 3) {
-                _partial = true;
-                log(lmsg::sfm_partial.get());
+            // What to advise on failure depends on which stage lost the
+            // device: a CPU bundle adjustment is no answer to one lost while
+            // matching.
+            bool mapping = false, gpu_failure = false;
+            auto note_line = [&](const std::string& l) {
+                mapping = mapping || _prog.current() == Stage::Mapping;
+                if (mapping && child_line_is_gpu_failure(l)) gpu_failure = true;
+            };
+            int rc = 0;
+            if (job.subprocess) {
+                std::vector<std::string> argv = {
+                    // The child is this same executable, so it has the same
+                    // thirteen languages -- tell it which one, or its output
+                    // lands in the log in whatever the machine's locale is.
+                    app::exe_path(), "--lang",
+                    spirula::i18n::code(spirula::i18n::current()), "sfm", "auto",
+                };
+                argv.insert(argv.end(), settings.begin(), settings.end());
+                std::string cmd;
+                for (const auto& a : argv) cmd += (cmd.empty() ? "$ " : " ") + a;
+                log(cmd);
+                rc = run_process(argv, "", [&](const std::string& l) {
+                    log(l, !child_line_is_notable(l));
+                    poll_status();
+                    note_line(l);
+                }, _cancel);
+                // The last snapshot the child wrote, which is the one carrying
+                // its verdict; the loop above may have missed it between lines.
+                _status_mtime = 0;
+                poll_status();
+                if (rc == kSpawnFailed)
+                    return fail(fmt(lmsg::err_spawn_recon, {argv[0]}));
+            } else {
+                const InProcessResult r = run_sfm_in_process(
+                    settings,
+                    [&](const std::string& l) {
+                        log(l, !child_line_is_notable(l));
+                        note_line(l);
+                    },
+                    [this](const RunStatus& st) { apply_status(st); }, _cancel);
+                rc = r.exit_code;
+                if (r.cancelled) rc = kCancelled;
+                if (!r.error.empty()) return fail(r.error);
+            }
+            if (rc == kCancelled || _cancel.load())
+                return fail(lmsg::err_cancelled.get());
+            // Neither 3 (under half the images registered, or a high
+            // reprojection error) nor 4 (no metric frame) is a failure here:
+            // the model still trains, and it cost an hour (src/sfm/README.md).
+            if (rc == 3 || rc == 4) {
+                // status.bin reports both facts; the exit code can carry only
+                // one of them, and 3 wins when a run is partial AND unscaled.
+                if (!_have_status) {
+                    _partial = rc == 3;
+                    _not_metric = rc == 4;
+                }
+                if (_partial) log(lmsg::sfm_partial.get());
+                if (_not_metric) log(lmsg::sfm_not_metric.get());
             } else if (rc != 0) {
-                return fail(lmsg::err_recon_failed.get());
+                return fail(gpu_failure
+                                ? fmt(lmsg::err_recon_gpu,
+                                      {spirula::i18n::msg::dataset::sfm_ba_cpu.get()})
+                                : lmsg::err_recon_failed.get());
             }
         }
 
@@ -607,6 +877,7 @@ void SfmRunner::run(SfmJob job) {
         // transforms.json or a Metashape export, which has no sparse/ at all.
         if (!reuse_model && !has_model(ws / "sparse"))
             return fail(lmsg::err_no_reconstruction.get());
+        if (!reuse_model) write_recon_stamp(ws.string(), now);
 
         // ---- 3. depth and normals -------------------------------------------
         take_geometry(job);
@@ -618,14 +889,14 @@ void SfmRunner::run(SfmJob job) {
         }
 
         // ---- 4. tidy up ----------------------------------------------------
-        // Swept by sweep_intermediates(), not here: the screen goes on
-        // reading the snapshots and matches.bin after the run ends.
+        // Swept by sweep_intermediates(), not here: the screen reads them
+        // after the run ends. Only ones this run produced.
         {
             std::lock_guard<std::mutex> lk(_mu);
-            _sweep_dir = job.keep_intermediate ? "" : ws.string();
+            _sweep_dir = job.keep_intermediate || reuse_model ? "" : ws.string();
         }
 
-        if (reads_photos_in_place(job.prep.inputs))
+        if (reads_photos_in_place(job.prep.inputs, job.prep.photo_import))
             log(fmt(lmsg::photos_referenced_in_place, {prep.image_dir_cfg}));
 
         set_stage(Stage::Finishing, lmsg::stage_done.get());
@@ -635,6 +906,7 @@ void SfmRunner::run(SfmJob job) {
             _dataset_dir = ws.string();
             _image_dir = prep.image_dir_cfg;
             _mask_dir = prep.mask_dir_cfg;
+            _mask_flipped = prep.mask_dir_flipped;
         }
         _state = State::Done;
     } catch (const std::exception& e) {

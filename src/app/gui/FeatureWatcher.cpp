@@ -28,18 +28,21 @@ FeatureWatcher::~FeatureWatcher() { stop(); }
 
 void FeatureWatcher::start(const std::string& image_dir,
                            const std::string& mask_dir,
-                           const std::string& features_dir, FilmReel* film) {
+                           const std::string& features_dir, FilmReel* film,
+                           const std::string& thumb_dir) {
     if (_worker.joinable() && _image_dir == image_dir &&
-        _mask_dir == mask_dir && _features_dir == features_dir)
+        _mask_dir == mask_dir && _features_dir == features_dir &&
+        _thumb_dir == thumb_dir)
         return;
     stop();
     if (image_dir.empty() || features_dir.empty() || !film) return;
     _image_dir = image_dir;
     _mask_dir = mask_dir;
     _features_dir = features_dir;
+    _thumb_dir = thumb_dir;
     _stop = false;
-    _worker = std::thread([this, image_dir, mask_dir, features_dir, film] {
-        run(image_dir, mask_dir, features_dir, film);
+    _worker = std::thread([this, image_dir, mask_dir, features_dir, film, thumb_dir] {
+        run(image_dir, mask_dir, features_dir, film, thumb_dir);
     });
 }
 
@@ -49,10 +52,12 @@ void FeatureWatcher::stop() {
     _image_dir.clear();
     _mask_dir.clear();
     _features_dir.clear();
+    _thumb_dir.clear();
 }
 
 void FeatureWatcher::run(std::string image_dir, std::string mask_dir,
-                         std::string features_dir, FilmReel* film) {
+                         std::string features_dir, FilmReel* film,
+                         std::string thumb_dir) {
     std::error_code ec;
     std::vector<fs::path> files;
     for (fs::recursive_directory_iterator
@@ -97,13 +102,31 @@ void FeatureWatcher::run(std::string image_dir, std::string mask_dir,
         // and the rest are read back from these paths if it is dragged to them.
         int w = 0, h = 0;
         std::vector<uint8_t> rgb, mask;
+        // The extractor's own downscaled copy when the run wrote one, so this
+        // does not decode a 24 MP source a second time just to draw it.
+        std::string pic = f.string();
+        if (!thumb_dir.empty()) {
+            const fs::path t = fs::path(thumb_dir) / (rel_stem + ".jpg");
+            if (fs::exists(t, ec)) pic = t.string();
+        }
         // read_keypoints_file was asked for the file's own coordinates above;
         // now that the size is known, ask again so they land on the picture.
-        if (film->wants() && app::load_rgb(f.string(), w, h, rgb) &&
+        if (film->wants() && app::load_rgb(pic, w, h, rgb) &&
             read_keypoints_file(feat, w, h, kp)) {
             int mw = 0, mh = 0;
             if (!frame.mask_path.empty())
                 app::load_stencil(frame.mask_path, mw, mh, mask);
+            // The stencil is at the mask file's own size; nearest-neighbour it
+            // onto the picture, which a thumbnail never matches.
+            if (mask.size() == (size_t)mw * mh && mask.size() != (size_t)w * h &&
+                mw > 0 && mh > 0) {
+                std::vector<uint8_t> m2((size_t)w * h);
+                for (int y = 0; y < h; y++)
+                    for (int x = 0; x < w; x++)
+                        m2[(size_t)y * w + x] =
+                            mask[(size_t)(y * mh / h) * mw + (x * mw / w)];
+                mask.swap(m2);
+            }
             film->add(frame, rgb.data(), w, h,
                       mask.size() == (size_t)w * h ? mask.data() : nullptr,
                       FramePoints{kp.data(), kp.size()});

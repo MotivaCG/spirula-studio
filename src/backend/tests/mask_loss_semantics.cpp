@@ -1,12 +1,14 @@
-// Self-checking test for what an image mask means in the loss. Three
-// contracts, all silent when broken -- the run trains, it just trains the
-// wrong thing. Runs under either backend:
+// Self-checking test for what an image mask -- and the blown-highlight cutoff
+// that drops pixels the same way -- means in the loss. Contracts that are all
+// silent when broken: the run trains, it just trains the wrong thing. Runs
+// under either backend:
 //
 //   ./mask_loss_semantics
 
 #include <kernels/loss/PerPixelLoss.cuh>
 #include <core/Tensor.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -50,6 +52,7 @@ constexpr int64_t B = 1, H = 32, W = 32, NP = B * H * W;
 struct Outcome {
     float alpha_sup;
     float ssim;
+    float rgb_loss;
     std::vector<float> v_render_rgb;
 };
 
@@ -58,11 +61,13 @@ struct Outcome {
 // supervision must not read.
 Outcome run(const std::vector<uint8_t>& mask, bool zero_depth, float w_alpha,
             int64_t Hm = H, int64_t Wm = W, float w_ssim = 0.0f,
-            const std::vector<float>* rgb_in = nullptr, float w_rgb = 1.0f) {
+            const std::vector<float>* rgb_in = nullptr, float w_rgb = 1.0f,
+            float sat = -1.0f, const std::vector<float>* ref_in = nullptr) {
     std::vector<float> rgb((size_t)3 * NP, 0.5f), ref((size_t)3 * NP, 0.25f);
     if (rgb_in) rgb = *rgb_in;
     for (size_t i = 0; i < ref.size(); i++)
         ref[i] = 0.25f + 0.5f * (float)((i * 37) % 17) / 17.0f;
+    if (ref_in) ref = *ref_in;
     std::vector<float> Ts((size_t)NP, 0.5f);
     float* d_rgb = upload(rgb);
     float* d_ref = upload(ref);
@@ -94,7 +99,7 @@ Outcome run(const std::vector<uint8_t>& mask, bool zero_depth, float w_alpha,
             d_mask ? std::make_tuple((uint64_t)d_mask, (uint32_t)1,
                                      std::vector<int64_t>{B, Hm, Wm, 1})
                    : ttv_null(),
-            /*has_mask=*/d_mask != nullptr, weights, w_ssim,
+            /*has_mask=*/d_mask != nullptr, weights, w_ssim, sat,
             ttv(d_v_losses, {(int64_t)LossIndex::length}), needs, B,
             ttv_null(), ttv_null(), (int)DensifyLossMapMode::None, 0.75f,
             0.0f, grads);
@@ -102,7 +107,7 @@ Outcome run(const std::vector<uint8_t>& mask, bool zero_depth, float w_alpha,
     once();  // the loss scalars are read one iteration behind
     LossValues lv = once();
     backend::device_synchronize();
-    return {lv.alpha_sup, lv.ssim,
+    return {lv.alpha_sup, lv.ssim, lv.rgb_loss,
             download((const float*)std::get<0>(grads.v_render_rgb), 3 * NP)};
 }
 
@@ -196,6 +201,71 @@ int main() {
         std::printf("    (central difference %.6g vs gradient sum %.6g)\n", fd, gsum);
         check(std::fabs(fd - gsum) <= 0.05 * std::fabs(gsum),
               "ssim gradient at a mask edge matches the ssim it reports");
+    }
+
+    // Blown highlights: where the render and the photo are both over the cutoff
+    // in every channel, both are clipped and no error there is real, so the
+    // pixel leaves the loss exactly as a masked one does.
+    {
+        const float kSat = 0.98f;
+        std::vector<float> rgb = ramp_image(23), ref = ramp_image(29);
+        for (auto& v : rgb) v *= 0.9f;
+        for (auto& v : ref) v *= 0.9f;
+        // (4..12)^2 is over the cutoff in both; (20..28)^2 only in the render.
+        auto fill = [](std::vector<float>& v, int64_t y0, int64_t x0, float a) {
+            for (int64_t y = y0; y < y0 + 8; y++)
+                for (int64_t x = x0; x < x0 + 8; x++)
+                    for (int c = 0; c < 3; c++)
+                        v[(size_t)(y * W + x) * 3 + c] = a;
+        };
+        fill(rgb, 4, 4, 0.999f);
+        fill(ref, 4, 4, 0.985f);
+        fill(rgb, 20, 20, 0.999f);
+
+        auto block_grad = [](const Outcome& o, int64_t y0, int64_t x0) {
+            double sum = 0.0;
+            for (int64_t y = y0; y < y0 + 8; y++)
+                for (int64_t x = x0; x < x0 + 8; x++)
+                    for (int c = 0; c < 3; c++)
+                        sum += std::fabs(o.v_render_rgb[(size_t)(y * W + x) * 3 + c]);
+            return sum;
+        };
+
+        Outcome off = run({}, false, 0.0f, H, W, 0.0f, &rgb, 1.0f, -1.0f, &ref);
+        Outcome on = run({}, false, 0.0f, H, W, 0.0f, &rgb, 1.0f, kSat, &ref);
+        check(block_grad(off, 4, 4) > 0.0 && block_grad(on, 4, 4) == 0.0,
+              "blown block: colour gradient goes to zero");
+        check(block_grad(on, 20, 20) > 0.0,
+              "bright in the render only: still supervised");
+        check(on.rgb_loss != off.rgb_loss,
+              "blown block: the reported rgb loss changes");
+
+        // The SSIM half of the fused loss takes the same gate.
+        Outcome ssim_on =
+            run({}, false, 0.0f, H, W, 0.2f, &rgb, 0.0f, kSat, &ref);
+        Outcome ssim_off =
+            run({}, false, 0.0f, H, W, 0.2f, &rgb, 0.0f, -1.0f, &ref);
+        check(block_grad(ssim_off, 4, 4) > 0.0 &&
+                  block_grad(ssim_on, 4, 4) == 0.0,
+              "blown block: ssim gradient goes to zero");
+
+        // Nothing over the cutoff: the coverage divide the threshold turns on
+        // must reproduce the untouched path (to the gaussian's own rounding).
+        std::vector<float> dim_rgb = ramp_image(31), dim_ref = ramp_image(37);
+        for (auto& v : dim_rgb) v *= 0.9f;
+        for (auto& v : dim_ref) v *= 0.9f;
+        Outcome inert_on =
+            run({}, false, 0.0f, H, W, 0.2f, &dim_rgb, 1.0f, kSat, &dim_ref);
+        Outcome inert_off =
+            run({}, false, 0.0f, H, W, 0.2f, &dim_rgb, 1.0f, -1.0f, &dim_ref);
+        double worst = 0.0, scale = 0.0;
+        for (size_t i = 0; i < inert_on.v_render_rgb.size(); i++) {
+            worst = std::max(worst, (double)std::fabs(inert_on.v_render_rgb[i] -
+                                                      inert_off.v_render_rgb[i]));
+            scale = std::max(scale, (double)std::fabs(inert_off.v_render_rgb[i]));
+        }
+        check(scale > 0.0 && worst <= 1e-4 * scale,
+              "no pixel over the cutoff: the threshold changes nothing");
     }
 
     std::printf("%s\n", g_failures ? "FAILED" : "all ok");

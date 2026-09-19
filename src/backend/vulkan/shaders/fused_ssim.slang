@@ -8,14 +8,20 @@
 // zero-padded input, so tile size only shifts the atomic ssim scalar's
 // grouping (loose parity channel).
 //
-// Masked pixels are dropped from the window sums and divided back out through
-// mask_w (see FusedSSIM.cu), making the moments conditional on the mask.
+// Masked pixels -- and, with `sat` positive, ones both images clip above --
+// drop out of the window sums, divided back out through mask_w (FusedSSIM.cu).
 
 #include "int8_compat.slang"
 #include "atomic_float.slang"
 
-static const int BX = 16;
-static const int BY = 16;
+// The double halo makes the tile edge expensive: 16 loads 36x36 per 256
+// pixels, 24 (the CUDA block) 44x44 per 576. 24 needs 47712 B of groupshared,
+// so the 32 KB floor keeps llvmpipe at 16 -- PerPixelLoss.cpp picks.
+[SpecializationConstant]
+const int kSsimTile = 16;
+
+static const int BX = kSsimTile;
+static const int BY = kSsimTile;
 static const int HALO = 5;
 static const int SX = BX + 2 * HALO;    // 26
 static const int SY = BY + 2 * HALO;    // 26
@@ -37,6 +43,7 @@ static const uint kSsimHasMask = 1u << 0;
 static const uint kSsimHasVal = 1u << 1;
 static const uint kSsimWriteGrad = 1u << 2;
 static const uint kSsimHasLossMap = 1u << 3;
+static const uint kSsimHasCov = 1u << 4;
 
 struct SsimParams {
     float* img1;      // [B,H,W,3]
@@ -50,6 +57,7 @@ struct SsimParams {
     int Bm, Hm, Wm;
     float dL_dmap;
     float map_weight;
+    float sat;        // clip threshold, or <= 0 to disable
     int mode;         // SsimLossMapMode: 0 skip, 1 LCS, 2 CS, 3 structure
     uint flags;
 };
@@ -79,10 +87,25 @@ bool _fs_mask_at(uint* masks, int Bm, int Hm, int Wm, int H, int W,
     return u8_load(masks, idx) != 0u;
 }
 
+// A pixel both images clip above carries no recoverable error, so it drops out
+// of the window sums the way a masked one does. Out-of-image taps read
+// unclipped, matching _fs_mask_at.
+[ForceInline]
+bool _fs_unclipped(float* img1, float* img2, float sat, int H, int W,
+                   int b, int y, int x) {
+    if (sat <= 0.0f) return true;
+    if (uint(x) >= uint(W) || uint(y) >= uint(H)) return true;
+    int i = (((b * H) + y) * W + x) * 3;
+    return min(min(img1[i], img1[i + 1]), img1[i + 2]) <= sat ||
+           min(min(img2[i], img2[i + 1]), img2[i + 2]) <= sat;
+}
+
 [ForceInline]
 bool _fs_mask(SsimParams p, int b, int y, int x) {
-    if ((p.flags & kSsimHasMask) == 0) return true;
-    return _fs_mask_at(p.masks, p.Bm, p.Hm, p.Wm, p.H, p.W, b, y, x);
+    if ((p.flags & kSsimHasMask) != 0 &&
+            !_fs_mask_at(p.masks, p.Bm, p.Hm, p.Wm, p.H, p.W, b, y, x))
+        return false;
+    return _fs_unclipped(p.img1, p.img2, p.sat, p.H, p.W, b, y, x);
 }
 
 
@@ -93,16 +116,22 @@ static const float kGaussSum = 0.9999999f;
 
 struct SsimCovParams {
     uint* masks;
+    float* img1;
+    float* img2;
     float* tmp;
     float* out;
     int B, H, W;
     int Bm, Hm, Wm;
+    float sat;
+    int _pad0;
 };
 
+// Bm is 0 when there is no mask buffer, which _fs_mask_at reads as unmasked.
 [ForceInline]
 float _fs_cov_mask(SsimCovParams p, int b, int y, int x) {
-    return _fs_mask_at(p.masks, p.Bm, p.Hm, p.Wm, p.H, p.W, b, y, x) ? 1.0f
-                                                                     : 0.0f;
+    bool keep = _fs_mask_at(p.masks, p.Bm, p.Hm, p.Wm, p.H, p.W, b, y, x) &&
+                _fs_unclipped(p.img1, p.img2, p.sat, p.H, p.W, b, y, x);
+    return keep ? 1.0f : 0.0f;
 }
 
 [shader("compute")]
@@ -157,14 +186,9 @@ groupshared float _fs_ssim[BY * BX];                // per-pixel map, then reduc
 [numthreads(256, 1, 1)]
 void ssim_bwd_inplace(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
                       uniform SsimParams p) {
-    int tx = int(tid % 16u);
-    int ty = int(tid / 16u);
     const int bIdx = int(wg.z);
     const int startY = int(wg.y) * BY;
     const int startX = int(wg.x) * BX;
-    const int pix_y = startY + ty;
-    const int pix_x = startX + tx;
-    const int pix_id = pix_y * p.W + pix_x;
     const int num_pix = p.H * p.W;
 
     const bool lm_active = p.mode != 0 && (p.flags & kSsimHasLossMap) != 0;
@@ -260,7 +284,7 @@ void ssim_bwd_inplace(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
             int cy = startY + ly - 2 * HALO;
             int cx = startX + lx - HALO;
             float inv_cov = 1.0f;
-            if ((p.flags & kSsimHasMask) != 0 && uint(cx) < uint(p.W) &&
+            if ((p.flags & kSsimHasCov) != 0 && uint(cx) < uint(p.W) &&
                     uint(cy) < uint(p.H))
                 inv_cov = 1.0f /
                     max(p.mask_w[(bIdx * p.H + cy) * p.W + cx], 1e-6f);
@@ -330,38 +354,37 @@ void ssim_bwd_inplace(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
         GroupMemoryBarrierWithGroupSync();
 
         // (4) Horizontal pass over the derivative maps.
-        {
-            int ly = ty;
-            int lx = tx + HALO;
-            for (int pass = 0; pass < 2; pass++) {
-                int yy = ly + pass * BY;
-                if (yy < CY) {
-                    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
-                    [ForceUnroll]
-                    for (int d = 1; d <= HALO; d++) {
-                        float w = kGauss[HALO - d];
-                        a0 += (sData(0, yy, lx - d) + sData(0, yy, lx + d)) * w;
-                        a1 += (sData(1, yy, lx - d) + sData(1, yy, lx + d)) * w;
-                        a2 += (sData(2, yy, lx - d) + sData(2, yy, lx + d)) * w;
-                    }
-                    {
-                        float wc = kGauss[HALO];
-                        a0 += sData(0, yy, lx) * wc;
-                        a1 += sData(1, yy, lx) * wc;
-                        a2 += sData(2, yy, lx) * wc;
-                    }
-                    sScratch(yy, tx, 0) = a0;
-                    sScratch(yy, tx, 1) = a1;
-                    sScratch(yy, tx, 2) = a2;
-                }
+        for (int l = int(tid); l < CY * BX; l += 256) {
+            int yy = l / BX;
+            int cx = l % BX;
+            int lx = cx + HALO;
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+            [ForceUnroll]
+            for (int d = 1; d <= HALO; d++) {
+                float w = kGauss[HALO - d];
+                a0 += (sData(0, yy, lx - d) + sData(0, yy, lx + d)) * w;
+                a1 += (sData(1, yy, lx - d) + sData(1, yy, lx + d)) * w;
+                a2 += (sData(2, yy, lx - d) + sData(2, yy, lx + d)) * w;
             }
+            {
+                float wc = kGauss[HALO];
+                a0 += sData(0, yy, lx) * wc;
+                a1 += sData(1, yy, lx) * wc;
+                a2 += sData(2, yy, lx) * wc;
+            }
+            sScratch(yy, cx, 0) = a0;
+            sScratch(yy, cx, 1) = a1;
+            sScratch(yy, cx, 2) = a2;
         }
         GroupMemoryBarrierWithGroupSync();
 
         // (5) Vertical pass -> dL/d(img1).
-        if (pix_x < p.W && pix_y < p.H) {
-            int ly = ty + HALO;
-            int lx = tx;
+        for (int l = int(tid); l < BY * BX; l += 256) {
+            int lx = l % BX;
+            int ly = l / BX + HALO;
+            int pix_x = startX + lx;
+            int pix_y = startY + l / BX;
+            if (pix_x >= p.W || pix_y >= p.H) continue;
             float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f;
             [ForceUnroll]
             for (int d = 1; d <= HALO; d++) {
@@ -386,16 +409,21 @@ void ssim_bwd_inplace(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
             if (!mask) dL_dpix = 0.0f;
 
             if ((p.flags & kSsimWriteGrad) != 0) {
-                int out_idx = bIdx * num_pix + pix_id;
+                int out_idx = bIdx * num_pix + pix_y * p.W + pix_x;
                 p.dL_dimg1[out_idx * 3 + ci] += dL_dpix;
             }
         }
     }  // ci
 
-    if (lm_active && pix_x < p.W && pix_y < p.H) {
-        float ssim_v = _fs_ssim[ty * BX + tx] / 3.0f;
-        int out_idx = bIdx * num_pix + pix_id;
-        p.loss_map[out_idx] += p.map_weight * (1.0f - ssim_v);
+    if (lm_active) {
+        for (int l = int(tid); l < BY * BX; l += 256) {
+            int pix_x = startX + l % BX;
+            int pix_y = startY + l / BX;
+            if (pix_x >= p.W || pix_y >= p.H) continue;
+            float ssim_v = _fs_ssim[l] / 3.0f;
+            int out_idx = bIdx * num_pix + pix_y * p.W + pix_x;
+            p.loss_map[out_idx] += p.map_weight * (1.0f - ssim_v);
+        }
     }
 
     if (has_val) {

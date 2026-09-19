@@ -3,6 +3,7 @@
 // Part of the Optimizer family -- see OptimizerCommon.cuh.
 
 #include "kernels/optim/OptimizerCommon.cuh"
+#include "kernels/optim/ScreenSizeHinge.cuh"
 
 // ================
 // Fused geometry optimizer
@@ -55,6 +56,13 @@ struct _OptimNonShQ {
 // Block reduction over a float4 (paired min/max for u and sqrt_g2).
 template<int BLOCK_SIZE>
 __device__ inline float4 _optim_block_reduce_minmax_f4(float4 mm) {
+    // cg::reduce's comparators keep or drop a NaN depending on which side it
+    // lands; one in a block bound decodes all 256 cells to NaN. Vulkan's
+    // _oq_min/_oq_max (optim_quant.slang) drops it the same way.
+    if (!isfinite(mm.x)) mm.x =  1e30f;
+    if (!isfinite(mm.y)) mm.y = -1e30f;
+    if (!isfinite(mm.z)) mm.z =  1e30f;
+    if (!isfinite(mm.w)) mm.w = -1e30f;
     cg::thread_block       block = cg::this_thread_block();
     cg::thread_block_tile<WARP_SIZE> warp = cg::tiled_partition<WARP_SIZE>(block);
     mm.x = cg::reduce(warp, mm.x, cg::less<float>());
@@ -80,7 +88,8 @@ __device__ inline float4 _optim_block_reduce_minmax_f4(float4 mm) {
 }
 
 
-template<bool use_scale_agnostic_mean, bool zero_grad, bool non_sh_quant>
+template<bool use_scale_agnostic_mean, bool zero_grad, bool non_sh_quant,
+         bool color_trust_linear>
 __global__ void fused_optim_3dgs_geometry_kernel(
     float3* __restrict__ means,
     float3* __restrict__ v_means,
@@ -119,8 +128,13 @@ __global__ void fused_optim_3dgs_geometry_kernel(
     const float erank_reg_weight,
     const float erank_reg_weight_s3,
     const float quat_norm_reg_weight,
+    const float dc_reg_weight,
     const float sh_reg_weight,
+    const float max_screen_size,
+    const float max_screen_size_penalty,
     const float grad_scale,
+    // Colour trust region; read only by the features_dc update.
+    [[maybe_unused]] const float eps_tr,
     // Non-SH Adam-state quantization bundle. Only read when non_sh_quant is on.
     const NonShQuantState non_sh,
     // Block-wise QUANTIZED gradient input (non-FPBO grad-quant path). For each
@@ -215,6 +229,10 @@ __global__ void fused_optim_3dgs_geometry_kernel(
             g1_scale = g1_scales[idx];
             g2_scale = g2_scales[idx];
         }
+        if (radii != nullptr)
+            v_scale += screen_size_hinge_grad(
+                radii[idx], max_screen_size, max_screen_size_penalty, scale,
+                sqrtf(g2_scale * inv_bias_correction2) + eps);
         g1_scale = beta1 * g1_scale + (1.f - beta1) * v_scale;
         g2_scale = beta2 * g2_scale + (1.f - beta2) * v_scale*v_scale;
         float3 updated_scale = scale - lr_scales * g1_scale / (sqrtf(g2_scale * inv_bias_correction2) + eps);
@@ -333,22 +351,46 @@ __global__ void fused_optim_3dgs_geometry_kernel(
             float3 v_dc = grad_scale * gd_dc;
             if constexpr (zero_grad)
                 if (!gq.dc_packed) v_features_dc[idx] = make_float3(0.0f);
-            // L1-shrinkage regularization for SH/DC color: matches the
-            // existing fused_adam_step(features_dc) launch's
-            // l2_reg + l2_reg_offset = 0.5/kSh0 (mirror it here so non_sh_quant
-            // doesn't silently drop the DC color reg). reg pushes toward 0
-            // within [-0.5/kSh0, +0.5/kSh0] using a clamped grad.
+            // Mirrors the fused_adam_step(features_dc) launch's hinge
+            // (l2_reg + l2_reg_offset = 0.5/kSh0) so non_sh_quant does not
+            // silently drop the DC color reg.
             const float dc_off = 0.5f / kSh0;
-            v_dc.x += sh_reg_weight * (fmaxf(fdc.x - dc_off, 0.f) + fminf(fdc.x + dc_off, 0.f));
-            v_dc.y += sh_reg_weight * (fmaxf(fdc.y - dc_off, 0.f) + fminf(fdc.y + dc_off, 0.f));
-            v_dc.z += sh_reg_weight * (fmaxf(fdc.z - dc_off, 0.f) + fminf(fdc.z + dc_off, 0.f));
+            const float under_reg_weight = dc_reg_weight + sh_reg_weight;
+            v_dc.x += dc_reg_weight * fmaxf(fdc.x - dc_off, 0.f) + under_reg_weight * fminf(fdc.x + dc_off, 0.f);
+            v_dc.y += dc_reg_weight * fmaxf(fdc.y - dc_off, 0.f) + under_reg_weight * fminf(fdc.y + dc_off, 0.f);
+            v_dc.z += dc_reg_weight * fmaxf(fdc.z - dc_off, 0.f) + under_reg_weight * fminf(fdc.z + dc_off, 0.f);
+
+            // Adam runs on x = splat_dc_encode(dc); carry the gradient there.
+            if constexpr (color_trust_linear) {
+                v_dc.x /= SlangPixelWise::linear_rgb_to_srgb_grad(kSh0 * fdc.x + 0.5f);
+                v_dc.y /= SlangPixelWise::linear_rgb_to_srgb_grad(kSh0 * fdc.y + 0.5f);
+                v_dc.z /= SlangPixelWise::linear_rgb_to_srgb_grad(kSh0 * fdc.z + 0.5f);
+            }
 
             float3 g1_dc, g2_dc;
             _OptimNonShQ<3>::decode(non_sh.features_dc_packed, non_sh.features_dc_bounds, idx,
                                     (float*)&g1_dc, (float*)&g2_dc);
             g1_dc = beta1 * g1_dc + (1.f - beta1) * v_dc;
             g2_dc = beta2 * g2_dc + (1.f - beta2) * v_dc*v_dc;
-            features_dc[idx] = fdc - lr_features_dc * g1_dc / (sqrtf(g2_dc * inv_bias_correction2) + eps);
+            float3 delta_dc = -lr_features_dc * g1_dc / (sqrtf(g2_dc * inv_bias_correction2) + eps);
+            if constexpr (color_trust_linear) {
+                // The encode supplies the brightness scaling, so the rail is a
+                // bare radius; the 2 matches the colour-proportional clip.
+                float clip = kSh0 * sqrtf(2.0f * eps_tr /
+                                          fmaxf(opac_post_sigmoid, 1e-12f));
+                delta_dc.x = fminf(fmaxf(delta_dc.x, -clip), clip);
+                delta_dc.y = fminf(fmaxf(delta_dc.y, -clip), clip);
+                delta_dc.z = fminf(fmaxf(delta_dc.z, -clip), clip);
+                delta_dc.x = isfinite(delta_dc.x) ? delta_dc.x : 0.0f;
+                delta_dc.y = isfinite(delta_dc.y) ? delta_dc.y : 0.0f;
+                delta_dc.z = isfinite(delta_dc.z) ? delta_dc.z : 0.0f;
+                features_dc[idx] = make_float3(
+                    SlangPixelWise::splat_dc_decode(SlangPixelWise::splat_dc_encode(fdc.x) + delta_dc.x),
+                    SlangPixelWise::splat_dc_decode(SlangPixelWise::splat_dc_encode(fdc.y) + delta_dc.y),
+                    SlangPixelWise::splat_dc_decode(SlangPixelWise::splat_dc_encode(fdc.z) + delta_dc.z));
+            } else {
+                features_dc[idx] = fdc + delta_dc;
+            }
             nq_g1_dc = g1_dc;
             nq_g2_dc = g2_dc;
             _OptimNonShQ<3>::accumulate((float*)&g1_dc, (float*)&g2_dc, nq_mm_dc);
@@ -399,8 +441,10 @@ void fused_optim_3dgs_geometry(
     const float max_gauss_ratio, const float scale_regularization_weight,
     const float mcmc_opacity_reg_weight, const float mcmc_scale_reg_weight,
     const float erank_reg_weight, const float erank_reg_weight_s3, const float quat_norm_reg_weight,
-    const float sh_reg_weight,
+    const float dc_reg_weight, const float sh_reg_weight,
+    const float max_screen_size, const float max_screen_size_penalty,
     bool use_scale_agnostic_mean,
+    ColorTrustState color_trust,
     NonShQuantState non_sh,
     GradQuantBuffers gq,
     int32_t step, DeviceVector<int32_t> per_splat_steps,
@@ -409,7 +453,9 @@ void fused_optim_3dgs_geometry(
     if (num_splats == 0)
         return;
 
-    // Dispatch over (use_scale_agnostic_mean, zero_grad, non_sh_quant) -> 8 instantiations.
+    // Dispatch over (use_scale_agnostic_mean, zero_grad, non_sh_quant,
+    // color_trust_linear). Colour trust only reaches the features_dc update,
+    // which only runs under non-SH quant, so 12 kernels rather than 16.
     using KFn = void(*)(
         float3*, float3*, float3*, float3*,
         float4*, float4*, float4*, float4*,
@@ -421,29 +467,26 @@ void fused_optim_3dgs_geometry(
         float, float, float, float, float,
         const float, const float, const float, const float,
         const float, const float, const float, const float,
+        const float, const float, const float, const float,
         const float,
         const NonShQuantState,
         const GradQuantBuffers,
         const int32_t, const int32_t*, const int64_t);
     KFn kfn = nullptr;
     const bool nq = non_sh.enabled;
+    const bool ct = nq && color_trust.enabled;
+    #define _PICK_GEO(SAM, ZG) \
+        kfn = ct ? fused_optim_3dgs_geometry_kernel<SAM, ZG, true,  true> \
+             : nq ? fused_optim_3dgs_geometry_kernel<SAM, ZG, true,  false> \
+                  : fused_optim_3dgs_geometry_kernel<SAM, ZG, false, false>
     if (use_scale_agnostic_mean) {
-        if (zero_grad) {
-            kfn = nq ? fused_optim_3dgs_geometry_kernel<true,  true,  true>
-                     : fused_optim_3dgs_geometry_kernel<true,  true,  false>;
-        } else {
-            kfn = nq ? fused_optim_3dgs_geometry_kernel<true,  false, true>
-                     : fused_optim_3dgs_geometry_kernel<true,  false, false>;
-        }
+        if (zero_grad) _PICK_GEO(true,  true);
+        else           _PICK_GEO(true,  false);
     } else {
-        if (zero_grad) {
-            kfn = nq ? fused_optim_3dgs_geometry_kernel<false, true,  true>
-                     : fused_optim_3dgs_geometry_kernel<false, true,  false>;
-        } else {
-            kfn = nq ? fused_optim_3dgs_geometry_kernel<false, false, true>
-                     : fused_optim_3dgs_geometry_kernel<false, false, false>;
-        }
+        if (zero_grad) _PICK_GEO(false, true);
+        else           _PICK_GEO(false, false);
     }
+    #undef _PICK_GEO
     kfn<<<_LAUNCH_ARGS_1D(num_splats, 256)>>>(
         means.data_ptr(), v_means.data_ptr(), g1_means.data_ptr(), g2_means.data_ptr(),
         quats.data_ptr(), v_quats.data_ptr(), g1_quats.data_ptr(), g2_quats.data_ptr(),
@@ -460,8 +503,11 @@ void fused_optim_3dgs_geometry(
         erank_reg_weight / (float)num_splats,
         erank_reg_weight_s3 / (float)num_splats,
         quat_norm_reg_weight / (float)num_splats,
-        sh_reg_weight,
+        2.0f * dc_reg_weight / 3.0f,
+        2.0f * sh_reg_weight / (float)(3 * num_splats),
+        max_screen_size, max_screen_size_penalty,
         grad_scale,
+        color_trust.eps_tr,
         non_sh,
         gq,
         step, per_splat_steps.data_ptr(), num_splats

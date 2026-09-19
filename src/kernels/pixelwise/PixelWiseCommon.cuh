@@ -117,7 +117,6 @@ struct SlangPixelWiseDist<CameraDistortionType::TIER> {                         
 _SS_DEF_SLANG_PIXEL_WISE(None,      _none)
 _SS_DEF_SLANG_PIXEL_WISE(OpenCV,    _opencv)
 _SS_DEF_SLANG_PIXEL_WISE(ThinPrism, _prism)
-_SS_DEF_SLANG_PIXEL_WISE(Rational,  _rational)
 
 #undef _SS_DEF_SLANG_PIXEL_WISE
 
@@ -125,13 +124,12 @@ _SS_DEF_SLANG_PIXEL_WISE(Rational,  _rational)
 
 
 // Run BODY(tier) for the tier `name` spells; the camera model stays runtime,
-// so all four tiers are reachable for every model.
+// so every tier is reachable for every model.
 #define _SS_DISPATCH_DISTORTION(name, BODY)                                        \
     do { switch (cdt(name)) {                                                      \
         case CameraDistortionType::None:      BODY(CameraDistortionType::None);      break; \
         case CameraDistortionType::OpenCV:    BODY(CameraDistortionType::OpenCV);    break; \
         case CameraDistortionType::ThinPrism: BODY(CameraDistortionType::ThinPrism); break; \
-        case CameraDistortionType::Rational:  BODY(CameraDistortionType::Rational);  break; \
         default: throw std::runtime_error(                                         \
             "Unknown camera distortion: " + std::string(name));                    \
     } } while (0)

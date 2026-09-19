@@ -4,8 +4,12 @@
 
 #include "app/gui/ColmapRunner.h"
 
+#include "app/gui/ReconStamp.h"
+
+#include "core/Env.h"
+
 #include "i18n/catalog/Log.h"
-#include "app/gui/AppPaths.h"
+#include "app/AppPaths.h"
 #include "app/gui/DatasetPrep.h"
 #include "app/gui/Subprocess.h"
 
@@ -19,6 +23,9 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <map>
+#include <set>
 
 namespace fs = std::filesystem;
 namespace lmsg = spirula::i18n::msg::log;
@@ -79,6 +86,35 @@ bool is_fisheye_model(const std::string& m) {
     return m.find("FISHEYE") != std::string::npos;
 }
 
+// The images one camera can cover: the folder --camera-mode asked for, split
+// by frame size, since a principal point is not shared across sizes.
+struct SizeGroup {
+    std::string folder;   // empty under one shared camera
+    int w = 0, h = 0;
+    std::vector<std::string> names;
+};
+
+std::vector<SizeGroup> size_groups(
+        const std::vector<DatasetPrep::ImageSize>& images, bool per_folder) {
+    std::vector<SizeGroup> out;
+    for (const DatasetPrep::ImageSize& im : images) {
+        std::string folder;
+        if (per_folder) {
+            const size_t slash = im.name.find_last_of('/');
+            if (slash != std::string::npos) folder = im.name.substr(0, slash);
+        }
+        SizeGroup* g = nullptr;
+        for (SizeGroup& c : out)
+            if (c.folder == folder && c.w == im.w && c.h == im.h) { g = &c; break; }
+        if (!g) {
+            out.push_back(SizeGroup{folder, im.w, im.h, {}});
+            g = &out.back();
+        }
+        g->names.push_back(im.name);
+    }
+    return out;
+}
+
 // Registered-image count of a COLMAP model dir (uint64 head of images.bin;
 // same trick as ColmapParser's largest-model pick).
 int64_t model_num_images(const fs::path& dir) {
@@ -88,6 +124,84 @@ int64_t model_num_images(const fs::path& dir) {
     size_t got = std::fread(&n, sizeof n, 1, f);
     std::fclose(f);
     return got == 1 ? (int64_t)n : 0;
+}
+
+// Registered image names of every model under sparse/: the union is what the
+// reconstruction covers.
+std::set<std::string> registered_names(const fs::path& ws) {
+    std::set<std::string> names;
+    std::error_code ec;
+    for (fs::directory_iterator it(ws / "sparse", ec), end; !ec && it != end;
+         it.increment(ec)) {
+        if (!it->is_directory()) continue;
+        if (it->path().filename().string().rfind(".", 0) == 0) continue;
+        FILE* f = std::fopen((it->path() / "images.bin").string().c_str(), "rb");
+        if (!f) continue;
+        uint64_t n = 0;
+        if (std::fread(&n, sizeof n, 1, f) != 1) { std::fclose(f); continue; }
+        for (uint64_t i = 0; i < n; i++) {
+            int32_t id, cam;
+            double q[4], t[3];
+            if (std::fread(&id, sizeof id, 1, f) != 1 ||
+                std::fread(q, sizeof(double), 4, f) != 4 ||
+                std::fread(t, sizeof(double), 3, f) != 3 ||
+                std::fread(&cam, sizeof cam, 1, f) != 1)
+                break;
+            std::string name;
+            for (char c; std::fread(&c, 1, 1, f) == 1 && c != '\0';)
+                name.push_back(c);
+            uint64_t np = 0;
+            if (std::fread(&np, sizeof np, 1, f) != 1) break;
+            std::fseek(f, long(np * (2 * sizeof(double) + sizeof(uint64_t))),
+                       SEEK_CUR);
+            names.insert(std::move(name));
+        }
+        std::fclose(f);
+    }
+    return names;
+}
+
+// The unregistered-images data file when SS_UNREG_LOG names one: every image
+// no sparse model took, grouped per folder; same format as the engine's own
+// (sfm/Pipeline.cpp). Full coverage writes nothing.
+void write_unregistered_list(const fs::path& ws, const std::string& images_dir) {
+    const char* path = spirula::env("UNREG_LOG");
+    if (!path || !*path || images_dir.empty()) return;
+    const std::set<std::string> reg = registered_names(ws);
+    std::map<std::string, std::vector<std::string>> missing;
+    size_t total = 0;
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(images_dir, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        if (!it->is_regular_file()) continue;
+        std::string ext = it->path().extension().string();
+        for (char& c : ext) c = char(std::tolower((unsigned char)c));
+        static const char* const exts[] = {".jpg", ".jpeg", ".png",  ".bmp",
+                                           ".tif", ".tiff", ".webp"};
+        bool image = false;
+        for (const char* e : exts) image = image || ext == e;
+        if (!image) continue;
+        const std::string rel =
+            fs::relative(it->path(), images_dir, ec).generic_string();
+        if (ec) continue;
+        total++;
+        if (reg.count(rel)) continue;
+        const size_t slash = rel.find('/');
+        missing[slash == std::string::npos
+                    ? std::string("(root)")
+                    : rel.substr(0, slash)]
+            .push_back(rel);
+    }
+    if (total == 0 || missing.empty()) return;
+    std::ofstream f(path, std::ios::trunc);
+    if (!f) return;
+    size_t unreg = 0;
+    for (const auto& kv : missing) unreg += kv.second.size();
+    f << "unregistered " << unreg << '/' << total << "\n";
+    for (const auto& kv : missing) {
+        f << '\n' << '[' << kv.first << "] " << kv.second.size() << '\n';
+        for (const std::string& n : kv.second) f << n << '\n';
+    }
 }
 
 }  // namespace
@@ -132,12 +246,16 @@ void ColmapRunner::take_reconstruction(ColmapJob& job) {
     const std::string workspace = job.workspace;
     const bool resume = job.resume;
     const float fps = job.video_fps;
+    const bool adaptive = job.adaptive_fps;
+    const float range = job.adaptive_range;
     const int sharp = job.sharp_window, maxf = job.max_frames;
     job = _live;
     job.inputs = inputs;
     job.workspace = workspace;
     job.resume = resume;
     job.video_fps = fps;
+    job.adaptive_fps = adaptive;
+    job.adaptive_range = range;
     job.sharp_window = sharp;
     job.max_frames = maxf;
 }
@@ -154,6 +272,7 @@ void ColmapRunner::take_masking(PrepJob& prep) {
     prep.mask_negative_prompt = _live.mask_negative_prompt;
     prep.mask_keep_subject = _live.mask_keep_subject;
     prep.mask_max_image_size = _live.mask_max_image_size;
+    prep.mask_dilate_ratio = _live.mask_dilate_ratio;
     prep.mask_threshold = _live.mask_threshold;
     prep.mask_nms = _live.mask_nms;
     prep.mask_memory = _live.mask_memory;
@@ -185,6 +304,8 @@ std::string ColmapRunner::image_dir() {
     std::lock_guard<std::mutex> lk(_mu);
     return _image_dir;
 }
+bool ColmapRunner::mask_flipped() const { return _mask_flipped.load(); }
+
 std::string ColmapRunner::mask_dir() {
     std::lock_guard<std::mutex> lk(_mu);
     return _mask_dir;
@@ -245,7 +366,7 @@ std::string ColmapRunner::resolve_vocab_tree(const ColmapJob& job) {
         return "";
     }
     fs::path ws = job.workspace;
-    for (const fs::path& dir : {ws, ws.parent_path(), fs::path(cache_dir())}) {
+    for (const fs::path& dir : {ws, ws.parent_path(), fs::path(app::cache_dir())}) {
         if (!fs::is_directory(dir, ec)) continue;
         for (fs::directory_iterator it(dir, ec), end; !ec && it != end;
              it.increment(ec)) {
@@ -258,7 +379,7 @@ std::string ColmapRunner::resolve_vocab_tree(const ColmapJob& job) {
         }
     }
     // Download into the cache.
-    fs::path dst = fs::path(cache_dir()) / kVocabTreeName;
+    fs::path dst = fs::path(app::cache_dir()) / kVocabTreeName;
     set_stage(Stage::Matching, lmsg::stage_vocab_download.get());
     if (!command_exists("curl")) {
         log("curl not found -- download it manually:");
@@ -293,6 +414,47 @@ double ColmapRunner::model_reproj_error(const ColmapJob& job,
     return err;
 }
 
+// What the model is made of, in a stable order, for the stamp left beside it
+// (ReconStamp.h). Not COLMAP's own command line -- this path spends several of
+// them; what matters is that the same panel produces the same list.
+static std::vector<std::string> colmap_recon_args(const ColmapJob& job) {
+    auto num = [](double v) {
+        char b[32];
+        std::snprintf(b, sizeof b, "%g", v);
+        return std::string(b);
+    };
+    auto flag = [](bool v) { return std::string(v ? "1" : "0"); };
+    return {
+        "--camera-model", job.camera_model,
+        "--camera-mode", std::to_string(job.camera_mode),
+        "--camera-params", job.camera_params,
+        "--focal-factor", num(job.init_focal_factor),
+        "--features", job.feature_type == 1 ? "aliked" : "sift",
+        "--lightglue", flag(job.lightglue),
+        "--quality", std::to_string(job.quality),
+        "--matcher", std::to_string(job.matcher),
+        "--loop-closure", flag(job.seq_loop_closure),
+        "--overlap", std::to_string(job.seq_overlap),
+        "--quadratic-overlap", flag(job.seq_quadratic_overlap),
+        "--max-features", std::to_string(job.max_num_features),
+        "--max-image-size", std::to_string(job.max_image_size),
+        "--affine-shape", flag(job.estimate_affine_shape),
+        "--ba-gpu", flag(job.ba_use_gpu),
+        "--extra-params", std::to_string(job.mapper_extra_params),
+        "--min-matches", std::to_string(job.min_num_matches),
+        "--max-ratio", num(job.match_max_ratio),
+        "--min-inliers", std::to_string(job.min_inliers_per_pair),
+        "--abs-pose-inliers", std::to_string(job.abs_pose_min_num_inliers),
+        "--abs-pose-inlier-ratio", num(job.abs_pose_min_inlier_ratio),
+        "--abs-pose-error", num(job.abs_pose_max_error),
+        "--merge-models", flag(job.merge_models),
+        "--final-ba", flag(job.final_bundle_adjust),
+        "--vocab-tree", job.vocab_tree_path,
+        "--masks", flag(job.mask_enable && job.mask_features),
+        "--mask-prompt", job.mask_enable ? job.mask_prompt : std::string(),
+    };
+}
+
 void ColmapRunner::run(ColmapJob job) {
     auto fail = [&](const std::string& why) {
         _prog.finish(_cancel.load() ? StageStatus::Skipped : StageStatus::Failed);
@@ -308,7 +470,19 @@ void ColmapRunner::run(ColmapJob job) {
         // insisted on; a model already there is reused whoever made it, and the
         // input's own images are not leftovers (see SfmRunner).
         const WorkspaceState prior = probe_workspace(ws.string(), job.inputs);
-        const bool reuse_model = prior.model && !job.redo_model;
+        // The model, as the settings that make it, against the ones the model
+        // already there was made with -- which only answers anything for a
+        // stamp these settings wrote (SfmJob::settings_built_model).
+        ReconStamp now;
+        now.present = true;
+        now.engine = "colmap";
+        now.args = colmap_recon_args(job);
+        const std::string changed =
+            recon_stamp_change(read_recon_stamp(ws.string()), now);
+        const bool rebuild_for_settings = job.settings_built_model && !changed.empty();
+        bool reuse_model = prior.model && !job.redo_model && !rebuild_for_settings;
+        if (prior.model && !job.redo_model && rebuild_for_settings)
+            log(spirula::i18n::format(lmsg::sfm_settings_changed, {changed}));
         if (prior.resumable() && !job.resume)
             return fail("the workspace already contains an unfinished run "
                         "(database.db / extracted frames / masks); enable "
@@ -332,8 +506,16 @@ void ColmapRunner::run(ColmapJob job) {
             pj.resume = job.resume;
             pj.redo_frames = job.redo_frames;
             pj.redo_masks = job.redo_masks;
+            pj.photo_import = job.photo_import;
+            // The one frozen GUI choice, so this run's built-in frame
+            // extraction and masking use the same GPU as everything else.
+            // COLMAP's own device routing is untouched.
+            pj.device = job.device;
             pj.video_fps = job.video_fps;
+            pj.adaptive_fps = job.adaptive_fps;
+            pj.adaptive_range = job.adaptive_range;
             pj.sharp_window = job.sharp_window;
+            pj.pano = job.pano;
             pj.max_frames = job.max_frames;
             pj.ffmpeg_exe = job.ffmpeg_exe;
             pj.force_external_decode = job.force_external_decode;
@@ -342,6 +524,7 @@ void ColmapRunner::run(ColmapJob job) {
             pj.mask_negative_prompt = job.mask_negative_prompt;
             pj.mask_keep_subject = job.mask_keep_subject;
             pj.mask_max_image_size = job.mask_max_image_size;
+            pj.mask_dilate_ratio = job.mask_dilate_ratio;
             pj.mask_threshold = job.mask_threshold;
             pj.mask_nms = job.mask_nms;
             pj.mask_memory = job.mask_memory;
@@ -362,6 +545,15 @@ void ColmapRunner::run(ColmapJob job) {
         const int n_images = prep.n_images;
         const bool have_masks = !prep.mask_dir.empty();
         const std::string mask_dir_cfg = prep.mask_dir_cfg;
+        _mask_flipped = prep.mask_dir_flipped;
+        // Frames this run replaced: the database indexes the old ones by name
+        // and would match a keypoint table against a picture that has changed.
+        if (prep.frames_rebuilt) {
+            job.redo_model = true;
+            reuse_model = false;
+            std::error_code fec;
+            fs::remove(ws / "database.db", fec);
+        }
         if (prep.per_folder_cameras && job.camera_mode == 0) {
             log(lmsg::one_camera_per_folder.get());
             job.camera_mode = 1;
@@ -382,75 +574,128 @@ void ColmapRunner::run(ColmapJob job) {
                           : job.quality == 1 ? 8192 : 16384);
             const std::string db = (ws / "database.db").string();
 
-            // An explicit ImageReader.camera_params wins; otherwise compose
-            // one from the focal factor. A good initial focal length stabilizes
-            // mapper initialization a lot, especially for fisheye lenses.
-            std::string cam_params = job.camera_params;
-            if (cam_params.empty() && job.init_focal_factor > 0) {
-                int W = 0, H = 0;
-                if (DatasetPrep::first_image_dims(images, W, H)) {
-                    cam_params = compose_camera_params(
-                        job.camera_model, (double)job.init_focal_factor * W,
-                        0.5 * W, 0.5 * H);
-                    if (cam_params.empty())
+            // An explicit ImageReader.camera_params wins; otherwise compose one
+            // from the focal factor per frame size -- the factor is a fraction
+            // of the width, so it describes a size and not the run.
+            auto add_camera_params = [&](std::vector<std::string>& fe,
+                                         int W, int H) {
+                std::string p = job.camera_params;
+                if (p.empty() && job.init_focal_factor > 0) {
+                    if (W <= 0) {
+                        log("warning: could not read an image size; skipping "
+                            "the initial focal length");
+                        return;
+                    }
+                    p = compose_camera_params(job.camera_model,
+                                              (double)job.init_focal_factor * W,
+                                              0.5 * W, 0.5 * H);
+                    if (p.empty()) {
                         log("warning: no camera_params template for " +
-                            job.camera_model + "; skipping the initial focal length");
-                    else
-                        log("Initial camera (" + job.camera_model + ", " +
-                            std::to_string(W) + "x" + std::to_string(H) +
-                            "): " + cam_params);
-                } else {
-                    log("warning: could not read an image size; skipping the "
-                        "initial focal length");
+                            job.camera_model +
+                            "; skipping the initial focal length");
+                        return;
+                    }
+                    log("Initial camera (" + job.camera_model + ", " +
+                        std::to_string(W) + "x" + std::to_string(H) + "): " + p);
                 }
+                if (p.empty()) return;
+                fe.push_back("--ImageReader.camera_params");
+                fe.push_back(p);
+            };
+
+            // COLMAP's ImageReader drops every image whose frame size differs
+            // from the first in its camera group -- one warning per image, exit
+            // code 0, half a capture missing. Split by size here instead.
+            std::vector<SizeGroup> groups;
+            size_t folders = 0;
+            if (job.camera_mode == 0 || job.camera_mode == 1) {
+                groups = size_groups(
+                    DatasetPrep::image_sizes(images, prep.mask_dir),
+                    job.camera_mode == 1);
+                std::set<std::string> seen;
+                for (const SizeGroup& g : groups) seen.insert(g.folder);
+                folders = seen.size();
             }
+            const bool split_sizes = groups.size() > folders;
+            if (split_sizes)
+                log(spirula::i18n::format(lmsg::colmap_split_frame_sizes,
+                                          {(long long)groups.size()}));
 
             // ---- 3. feature extraction -----------------------------------------
             take_reconstruction(job);
+            // Live edits and the per-folder camera fix-up land after the reuse
+            // question was asked; the stamp has to record what actually ran.
+            now.args = colmap_recon_args(job);
             set_stage(Stage::Features,
                       aliked ? lmsg::stage_colmap_features_aliked.get()
                              : lmsg::stage_colmap_features.get());
-            std::vector<std::string> fe = {job.colmap_exe, "feature_extractor",
+            std::vector<std::string> shared = {job.colmap_exe, "feature_extractor",
                 "--database_path", db,
                 "--image_path", images,
                 "--ImageReader.camera_model", job.camera_model};
             if (aliked) {
-                fe.push_back("--FeatureExtraction.type");
-                fe.push_back("ALIKED");
-                fe.push_back("--AlikedExtraction.max_num_features");
-                fe.push_back(std::to_string(features));
+                shared.push_back("--FeatureExtraction.type");
+                shared.push_back("ALIKED");
+                shared.push_back("--AlikedExtraction.max_num_features");
+                shared.push_back(std::to_string(features));
             } else {
-                fe.push_back("--SiftExtraction.max_num_features");
-                fe.push_back(std::to_string(features));
-            }
-            if (!cam_params.empty()) {
-                fe.push_back("--ImageReader.camera_params");
-                fe.push_back(cam_params);
-            }
-            if (job.camera_mode == 0) {
-                fe.push_back("--ImageReader.single_camera");
-                fe.push_back("1");
-            } else if (job.camera_mode == 1) {
-                fe.push_back("--ImageReader.single_camera_per_folder");
-                fe.push_back("1");
+                shared.push_back("--SiftExtraction.max_num_features");
+                shared.push_back(std::to_string(features));
             }
             int size_cap = job.max_image_size > 0 ? job.max_image_size
                          : job.quality == 0 ? 2000 : 0;
             if (size_cap > 0) {
-                fe.push_back("--FeatureExtraction.max_image_size");
-                fe.push_back(std::to_string(size_cap));
+                shared.push_back("--FeatureExtraction.max_image_size");
+                shared.push_back(std::to_string(size_cap));
             }
             if (job.estimate_affine_shape && !aliked) {
-                fe.push_back("--SiftExtraction.estimate_affine_shape");
-                fe.push_back("1");
+                shared.push_back("--SiftExtraction.estimate_affine_shape");
+                shared.push_back("1");
             }
-            if (have_masks) {
-                fe.push_back("--ImageReader.mask_path");
-                fe.push_back(prep.mask_dir);
+            if (have_masks && job.mask_features) {
+                shared.push_back("--ImageReader.mask_path");
+                shared.push_back(prep.mask_dir);
             }
-            int rc = exec(fe);
-            if (rc == kCancelled) return fail("cancelled");
-            if (rc != 0) return fail("colmap feature_extractor failed (see log)");
+            int rc = 0;
+            std::vector<std::vector<std::string>> passes;
+            if (!split_sizes) {
+                std::vector<std::string> fe = shared;
+                int W = 0, H = 0;
+                if (job.camera_params.empty() && job.init_focal_factor > 0)
+                    DatasetPrep::first_image_dims(images, W, H);
+                add_camera_params(fe, W, H);
+                if (job.camera_mode == 0) {
+                    fe.push_back("--ImageReader.single_camera");
+                    fe.push_back("1");
+                } else if (job.camera_mode == 1) {
+                    fe.push_back("--ImageReader.single_camera_per_folder");
+                    fe.push_back("1");
+                }
+                passes.push_back(std::move(fe));
+            } else {
+                const fs::path lists = ws / ".camera_groups";
+                fs::create_directories(lists);
+                for (size_t i = 0; i < groups.size(); i++) {
+                    const fs::path lf =
+                        lists / ("group" + std::to_string(i) + ".txt");
+                    std::ofstream f(lf);
+                    for (const std::string& n : groups[i].names) f << n << "\n";
+                    f.close();
+                    if (!f) return fail("could not write " + lf.string());
+                    std::vector<std::string> fe = shared;
+                    add_camera_params(fe, groups[i].w, groups[i].h);
+                    fe.push_back("--ImageReader.single_camera");
+                    fe.push_back("1");
+                    fe.push_back("--image_list_path");
+                    fe.push_back(lf.string());
+                    passes.push_back(std::move(fe));
+                }
+            }
+            for (const std::vector<std::string>& fe : passes) {
+                rc = exec(fe);
+                if (rc == kCancelled) return fail("cancelled");
+                if (rc != 0) return fail("colmap feature_extractor failed (see log)");
+            }
 
             // ---- 4. matching -----------------------------------------------------
             // An explicit choice: the GUI presets sequential for video and
@@ -599,7 +844,7 @@ void ColmapRunner::run(ColmapJob job) {
             // one is from a FINISHED run -- reuse it. An interrupted mapper
             // leaves nothing and simply reruns.
             std::vector<std::pair<int64_t, fs::path>> models;
-            if (job.resume && !job.redo_model &&
+            if (job.resume && !job.redo_model && !rebuild_for_settings &&
                 !(models = enumerate_models()).empty()) {
                 log("Resume: " + std::to_string(models.size()) +
                     " existing model(s) under sparse/; skipping the mapper "
@@ -715,6 +960,10 @@ void ColmapRunner::run(ColmapJob job) {
             }
         }
 
+        write_unregistered_list(ws, images);
+
+        if (!reuse_model) write_recon_stamp(ws.string(), now);
+
         // ---- depth and normals ---------------------------------------------
         take_geometry(job);
         if (job.geometry.enable) {
@@ -728,10 +977,9 @@ void ColmapRunner::run(ColmapJob job) {
         // in-memory for the immediate open; on later re-opens the parser
         // default applies (video datasets use images/ anyway) and photo-in-
         // place datasets need data.image_dir set in the dataparser options.
-        if (reads_photos_in_place(job.inputs))
-            log("Note: images are referenced in place; when re-opening this "
-                "dataset later, set image_dir to " + image_dir_cfg +
-                " under the dataset-parsing options");
+        if (reads_photos_in_place(job.inputs, job.photo_import))
+            log(spirula::i18n::format(lmsg::photos_referenced_in_place,
+                                      {image_dir_cfg}));
 
         set_stage(Stage::Finishing, lmsg::stage_done.get());
         _prog.finish(StageStatus::Done);

@@ -1,7 +1,7 @@
-// Backend parity tool for the PixelWise training kernels (blend/srgb/noise
-// backwards, overexposure grad, depth->normal backward, linear->ray depth,
-// color-shift regularizer) and the background-SH backward. The SAME source
-// builds under both backends:
+// Backend parity tool for the PixelWise training kernels (blend / noise
+// backwards, the display transfer both ways, overexposure grad, depth->normal
+// backward, linear->ray depth, color-shift regularizer) and the background-SH
+// backward. The SAME source builds under both backends:
 //
 //   CUDA build:   ./pwtrain_parity dump ref.bin
 //   Vulkan build: ./pwtrain_parity compare ref.bin   (per device)
@@ -97,29 +97,81 @@ int main(int argc, char** argv) {
         readback_f(acc, d_vb, PIX * 3);
     }
 
-    // ---- blend_background_noise_backward (both linear modes x reg off/on) ----
-    for (int lin = 0; lin < 2; lin++) for (float over : {0.0f, 3.0f}) {
+    // ---- blend_background_noise_backward (every mode x draw x cell x reg) ----
+    // block_px 0 is the whole-frame cell the random-colour background uses.
+    for (int xf = 0; xf < 5; xf++) for (int lin = 0; lin < 2; lin++)
+    for (int blocky = 0; blocky < 2; blocky++)
+    for (unsigned block_px : {0u, 1u, 4u, 64u})
+    for (float over : {0.0f, 3.0f}) {
         float* d_vr = fresh3();
         float* d_vt = fresh1();
-        blend_background_noise_backward(lin != 0, t3(d_rgb), t1(d_T), 0.7f,
-                                        1234u + lin, over, t3(d_vout),
+        blend_background_noise_backward(xf, lin != 0, blocky != 0, block_px,
+                                        t3(d_rgb), t1(d_T), 0.7f,
+                                        1234u + xf, nullptr, nullptr,
+                                        over, t3(d_vout),
                                         t3(d_vr), t1(d_vt));
         backend::device_synchronize();
         readback_f(acc, d_vr, PIX * 3);
         readback_f(acc, d_vt, PIX);
     }
 
-    // ---- rgb_to_srgb_backward (both modes) ----
+    // ---- the luma-matched draw: a per-slot power table and slot indices
+    {
+        const float* d_exp = upload<float>({1.0f, 3.9f, 0.6f, 6.5f});
+        const int32_t* d_cams = upload<int32_t>({3, 1});
+        for (int xf : {0, 4}) for (int lin = 0; lin < 2; lin++)
+        for (int blocky = 0; blocky < 2; blocky++)
+        for (unsigned block_px : {0u, 4u}) {
+            float* d_out = fresh3();
+            blend_background_noise_forward(xf, lin != 0, blocky != 0, block_px,
+                                           t3(d_rgb), t1(d_T), 0.7f, 77u + xf,
+                                           d_exp, d_cams, t3(d_out));
+            float* d_vr = fresh3();
+            float* d_vt = fresh1();
+            blend_background_noise_backward(xf, lin != 0, blocky != 0, block_px,
+                                            t3(d_rgb), t1(d_T), 0.7f, 77u + xf,
+                                            d_exp, d_cams, 0.0f, t3(d_vout),
+                                            t3(d_vr), t1(d_vt));
+            backend::device_synchronize();
+            readback_f(acc, d_out, PIX * 3);
+            readback_f(acc, d_vr, PIX * 3);
+            readback_f(acc, d_vt, PIX);
+        }
+    }
+
+    // ---- blend_background_color_backward (reg off, then the fused one) ----
+    for (float over : {0.0f, 3.0f}) {
+        float* d_vr = fresh3();
+        float* d_vt = fresh1();
+        blend_background_color_backward(t3(d_rgb), t1(d_T),
+                                        make_float3(0.2f, 0.65f, 0.9f), over,
+                                        t3(d_vout), t3(d_vr), t1(d_vt));
+        backend::device_synchronize();
+        readback_f(acc, d_vr, PIX * 3);
+        readback_f(acc, d_vt, PIX);
+    }
+
+    // ---- working_to_display forward + backward (every mode) ----
     {
         std::vector<float> cm = {0.9f, 0.08f, 0.02f, 0.05f, 0.9f,
                                  0.05f, 0.02f, 0.08f, 0.9f};
         float* d_cm = upload(cm);
-        for (int lin = 0; lin < 2; lin++) {
+        // Well above 1.0: the tone curves' shoulder and their clamp only
+        // differ from each other out there.
+        std::vector<float> hdr(PIX * 3);
+        fill(hdr, -0.2f, 14.0f);
+        float* d_hdr = upload(hdr);
+        for (int xf = 0; xf < 5; xf++) for (int lin = 0; lin < 2; lin++) {
+            float* d_out = fresh3();
             float* d_vr = fresh3();
-            rgb_to_srgb_backward(lin != 0, t3(d_rgb),
-                                 DeviceTensor2D<float3>(ttv(d_cm, {3, 1, 3})),
-                                 t3(d_vout), t3(d_vr));
+            working_to_display_forward(xf, lin != 0, t3(d_hdr),
+                                       DeviceTensor2D<float3>(ttv(d_cm, {3, 1, 3})),
+                                       t3(d_out));
+            working_to_display_backward(xf, lin != 0, t3(d_hdr),
+                                        DeviceTensor2D<float3>(ttv(d_cm, {3, 1, 3})),
+                                        t3(d_vout), t3(d_vr));
             backend::device_synchronize();
+            readback_f(acc, d_out, PIX * 3);
             readback_f(acc, d_vr, PIX * 3);
         }
     }
@@ -149,7 +201,7 @@ int main(int argc, char** argv) {
     float* d_depths = upload(depths);
 
     // ---- depth_to_normal_backward (pinhole; every tier x ray/linear) ----
-    for (int tier = 0; tier < 4; tier++)
+    for (int tier = 0; tier < 3; tier++)
         for (int rd = 0; rd < 2; rd++) {
             std::vector<float> vn(PIX * 3);
             fill(vn, -1.f, 1.f);

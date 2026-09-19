@@ -233,8 +233,46 @@ bool draw_value(const char* key, std::optional<T>& v, const char* choices) {
     return changed;
 }
 
+// A vec3 whose flag ends in `_color` is an RGB colour: a swatch and three
+// channel sliders, not three boxes of numbers. A convention, not a field
+// list, so the next colour flag gets it with no GUI work.
+bool is_color_key(const char* key) {
+    size_t n = std::strlen(key);
+    return n > 6 && !std::strcmp(key + n - 6, "_color");
+}
+
+// A swatch that opens ImGui's picker, then absolute sliders. NOT ColorEdit3's
+// own channel fields: those are drags at 1/255 per pixel, so 0 -> 1 costs 255
+// pixels of travel instead of landing where the cursor is.
+bool draw_color3(std::array<float, 3>& v) {
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float gap = st.ItemInnerSpacing.x;
+    const float slider_w =
+        (kFieldWidth + 90 - ImGui::GetFrameHeight() - 3 * gap) / 3.0f;
+    static const char* kChannel[3] = {"R %.3f", "G %.3f", "B %.3f"};
+
+    // Grouped so the row's tooltip and its right-click reset still hang off
+    // the whole control rather than off the last slider.
+    ImGui::BeginGroup();
+    bool changed = ui::ColorEdit3Raw("##v", v.data(),
+                                     ImGuiColorEditFlags_NoInputs |
+                                     ImGuiColorEditFlags_Float);
+    for (int i = 0; i < 3; i++) {
+        ImGui::SameLine(0.0f, gap);
+        ImGui::SetNextItemWidth(slider_w);
+        ImGui::PushID(i);
+        changed |= ui::SliderFloatRaw("##ch", &v[i], 0.0f, 1.0f, kChannel[i]);
+        ImGui::PopID();
+    }
+    ImGui::EndGroup();
+    return changed;
+}
+
 template <size_t N>
-bool draw_value(const char*, std::array<float, N>& v, const char*) {
+bool draw_value(const char* key, std::array<float, N>& v, const char*) {
+    if constexpr (N == 3) {
+        if (is_color_key(key)) return draw_color3(v);
+    }
     ImGui::SetNextItemWidth(kFieldWidth + 90);
     return ImGui::InputScalarN("##v", ImGuiDataType_Float, v.data(), (int)N,
                                nullptr, nullptr, "%g");
@@ -248,23 +286,25 @@ bool draw_value(const char*, std::array<int, N>& v, const char*) {
 
 // ---- one field row -----------------------------------------------------------
 
-// Only a string widget cares what the default is (see draw_value above).
+// Only a string widget cares what the default is, and it wants the BASE one:
+// a preset filling the field in does not stop "none" meaning unset, and the
+// word where "" belongs is what the trainer then has to reject.
 template <typename T>
 bool draw_value_of(const char* key, T& v, const T&, const char* choices) {
     return draw_value(key, v, choices);
 }
 
-bool draw_value_of(const char* key, std::string& v, const std::string& def,
+bool draw_value_of(const char* key, std::string& v, const std::string& base,
                    const char* choices) {
-    return draw_value(key, v, choices, /*blank_none=*/def.empty());
+    return draw_value(key, v, choices, /*blank_none=*/base.empty());
 }
 
 template <typename T>
 bool field_row(const char* cli_key, const Msg& name, const Msg& help,
-               T& v, const T& def, const char* choices) {
+               T& v, const T& def, const T& base, const char* choices) {
     bool modified = !(v == def);
     ImGui::PushID(cli_key);
-    bool changed = draw_value_of(cli_key, v, def, choices);
+    bool changed = draw_value_of(cli_key, v, base, choices);
     bool hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort |
                                         ImGuiHoveredFlags_AllowWhenDisabled);
     ImGui::OpenPopupOnItemClick("ctx", ImGuiPopupFlags_MouseButtonRight);
@@ -406,7 +446,9 @@ bool draw_config_editor(TrainConfig& cfg, const TrainConfig& defaults,
         for (int i = 0; i < kTrainNumSections; i++)
             if (vis[i]) st.open[i] = true;
 
-    // Pass 2: draw.
+    // Pass 2: draw. `base` is the field table's own defaults, before any
+    // preset; only the "none means unset" question reads it.
+    static const TrainConfig base{};
     bool any_changed = false;
     const char* cur_section = "";
     bool section_open = false;
@@ -430,7 +472,7 @@ bool draw_config_editor(TrainConfig& cfg, const TrainConfig& defaults,
         passes(kField_##member, #member, tier,                                 \
                !(cfg.member == defaults.member)) &&                            \
         field_row(#member, fld::member, fld::member##_help,                    \
-                  cfg.member, defaults.member, choices)) {                     \
+                  cfg.member, defaults.member, base.member, choices)) {        \
         any_changed = true;                                                    \
         st.touched.insert(#member);                                            \
         if (searching) st.sticky[cur_index] = 1;                               \

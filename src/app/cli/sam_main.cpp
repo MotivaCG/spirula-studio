@@ -21,6 +21,7 @@
 #include "app/Tools.h"
 #include "i18n/catalog/Cli.h"
 #include "i18n/catalog/SamHelp.h"
+#include "app/FrameLook.h"
 #include "app/FrameMask.h"
 #include "app/WriterPool.h"
 #include "nn/core/Log.h"
@@ -117,6 +118,7 @@ void usage() {
     help_row("--max-frames <n>", H::trk_max_frames);
     help_row("--out <dir>", H::trk_out);
     help_row("--keep-prompted", H::trk_keep_prompted);
+    help_row("--dilate-ratio <f>", H::mask_dilate);
     help_row("--overlay", H::trk_overlay);
     std::fprintf(stderr, "\n");
 
@@ -149,8 +151,8 @@ void usage() {
         std::fprintf(stderr, "        %s\n", l.c_str());
     std::fprintf(stderr, "\n");
 
-    std::fprintf(stderr, "%s --device <index|name>  --vram  --profile  "
-                         "--validate  --img-size <n>\n",
+    std::fprintf(stderr, "%s --device <index|name|auto|uuid:hex>  --vram  "
+                         "--profile  --validate  --img-size <n>\n",
                  H::label_common.get());
     help_row("--max-size <n>", H::common_max_size);
     help_row("--image-gamut <name>", H::common_image_gamut);
@@ -192,6 +194,7 @@ struct Options {
     bool multimask = false, show_vram = false, profile = false, validate = false;
     bool overlay = false, keep_prompted = false;
     float threshold = 0.5f, nms = 0.1f;
+    float dilate_ratio = 0.05f;   // sam::MaskOptions, same default
     int max_frames = 0;
     int img_size = 0;
     int detect_every = 1, memory_frames = 0, max_size = 1600;
@@ -250,6 +253,8 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--device") o.device = next("--device");
         else if (a == "--threshold") o.threshold = std::strtof(next("--threshold"), nullptr);
         else if (a == "--nms") o.nms = std::strtof(next("--nms"), nullptr);
+        else if (a == "--dilate-ratio")
+            o.dilate_ratio = std::strtof(next("--dilate-ratio"), nullptr);
         else if (a == "--max-frames") o.max_frames = std::atoi(next("--max-frames"));
         else if (a == "--img-size") o.img_size = std::atoi(next("--img-size"));
         else if (a == "--shape") o.shape_spec = next("--shape");
@@ -314,20 +319,23 @@ int cmd_devices() {
     const int w_name = std::max(42, display_width(cmsg::sam_col_name.get()));
     const int w_type = std::max(11, display_width(cmsg::sam_col_type.get()));
     const int w_vram = std::max(8, display_width(cmsg::sam_col_vram.get()));
-    std::printf("%s %s %s %s  %s\n",
+    const int w_uuid = std::max(37, display_width(cmsg::device_uuid.get()));
+    std::printf("%s %s %s %s %s  %s\n",
                 pad_to(cmsg::sam_col_index.get(), w_idx).c_str(),
                 pad_to(cmsg::sam_col_name.get(), w_name).c_str(),
                 pad_to(cmsg::sam_col_type.get(), w_type).c_str(),
                 pad_to(cmsg::sam_col_vram.get(), w_vram).c_str(),
+                pad_to(cmsg::device_uuid.get(), w_uuid).c_str(),
                 cmsg::sam_col_status.get());
     for (const auto& d : devices) {
         char vram[32];
         std::snprintf(vram, sizeof vram, "%6.1f G", d.vram_bytes / 1073741824.0);
-        std::printf("%s %s %s %s  %s\n",
+        std::printf("%s %s %s %s %s  %s\n",
                     pad_to(std::to_string(d.index), w_idx).c_str(),
                     pad_to(d.name, w_name).c_str(),
                     pad_to(d.type, w_type).c_str(),
                     pad_to(vram, w_vram).c_str(),
+                    pad_to(d.uuid, w_uuid).c_str(),
                     d.usable ? cmsg::sam_status_ok.get()
                              : d.unusable_reason.c_str());
     }
@@ -369,12 +377,10 @@ bool load_session(const Options& o, sam::Session& session) {
     mp.validation = o.validate;
     mp.profile = o.profile;
     mp.img_size = o.img_size;
-    if (!o.device.empty()) {
-        char* end = nullptr;
-        long idx = std::strtol(o.device.c_str(), &end, 10);
-        if (end && *end == '\0') mp.device_index = (int)idx;
-        else mp.device_match = o.device;
-    }
+    // One spelling, resolved by the shared parser inside loadModel: "auto" or
+    // -1, an ordinal, a name substring, or "uuid:<32 hex>". An ordinal
+    // is an index here, never a substring of a GPU name.
+    mp.device = o.device;
     if (!session.loadModel(mp)) {
         std::fprintf(stderr, "%s\n",
                      format(cmsg::error_line, {session.lastError()}).c_str());
@@ -464,6 +470,7 @@ int cmd_track(const Options& o) {
     mo.keep_prompted = o.keep_prompted;
     mo.threshold = o.threshold;
     mo.nms = o.nms;
+    mo.dilate_ratio = o.dilate_ratio;
     mo.detect_every = o.detect_every;
     mo.memory_frames = o.memory_frames;
     mo.max_size = o.max_size;
@@ -483,11 +490,19 @@ int cmd_track(const Options& o) {
     // Neither reading the next frame nor writing the last mask needs the GPU,
     // and together they are about a third of a frame -- see app/WriterPool.h.
     app::WriterPool writers;
-    std::future<nn::Image> ahead;
+    // The way up the model was trained on, with the turn kept so the mask goes
+    // back in the frame the file stores -- see app/FrameLook.h.
+    struct Loaded {
+        nn::Image img;
+        sfm::ExifTransform turn;
+    };
+    std::future<Loaded> ahead;
     auto load_at = [&](size_t i) {
         return std::async(std::launch::async,
                           [p = files[i], g = o.image_gamut, l = o.image_is_linear] {
-                              return nn::load_image(p, g, l);
+                              Loaded out;
+                              out.img = app::load_upright(p, g, l, out.turn);
+                              return out;
                           });
     };
     if (!files.empty()) ahead = load_at(0);
@@ -496,7 +511,8 @@ int cmd_track(const Options& o) {
     const double t_all = nn::now_ms();
     for (size_t f = 0; f < files.size(); ++f) {
         double t0 = nn::now_ms();
-        nn::Image frame = ahead.get();
+        Loaded loaded = ahead.get();
+        nn::Image frame = std::move(loaded.img);
         if (f + 1 < files.size()) ahead = load_at(f + 1);
         t_load += nn::now_ms() - t0;
         if (frame.empty()) continue;
@@ -533,6 +549,8 @@ int cmd_track(const Options& o) {
             if (o.overlay) {
                 sam::save_overlay_png(frame, r, path);
             } else {
+                app::turn_pixels(app::inverse_turn(loaded.turn), 1, mask.data,
+                                 mask.width, mask.height);
                 app::WriteJob wj;
                 wj.mask = std::move(mask);
                 wj.path = path;
@@ -680,6 +698,14 @@ int cmd_video(const Options& o) {
     std::fprintf(stderr, "%s\n", cmsg::sam_no_video_decoder.get());
     return 1;
 #else
+    // The decoder creates the inference context, so the request is frozen
+    // first: `sam video` honours --device like every other native entry point.
+    std::string dev_error;
+    if (!sam::freeze_device(o.device, dev_error, o.validate, o.profile)) {
+        std::fprintf(stderr, "%s\n",
+                     format(cmsg::error_line, {dev_error}).c_str());
+        return 1;
+    }
     const std::string why = video::VideoReader::availability();
     if (why.empty())
         std::fprintf(stderr, "%s\n", cmsg::sam_video_decode.get());
@@ -743,6 +769,12 @@ int sam_cli_extract(int argc, char** argv);
 
 int spirula_sam_main(int argc, char** argv) {
     app::set_program_name(argc > 0 ? argv[0] : nullptr, "spirula sam");
+    if (argc >= 2 &&
+        (std::strcmp(argv[1], "--help") == 0 ||
+         std::strcmp(argv[1], "-h") == 0)) {
+        usage();
+        return 0;
+    }
     if (argc >= 2 && std::strcmp(argv[1], "extract") == 0) {
 #ifdef SS_HAVE_VIDEO
         int rc = sam_cli_extract(argc - 1, argv + 1);

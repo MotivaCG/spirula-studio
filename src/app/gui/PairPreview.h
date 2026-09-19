@@ -33,9 +33,12 @@ public:
 
     // Where this run's files are. Cheap every frame; a change is what makes it
     // re-read the image list.
+    // `live_matches` is read while matching runs and matches.bin is not
+    // there yet; empty when the run has none.
     void configure(const std::string& image_dir, const std::string& mask_dir,
                    const std::string& features_dir,
-                   const std::string& matches_path);
+                   const std::string& matches_path,
+                   const std::string& live_matches = {});
     // Draw these two images, numbered as the reconstruction numbers them.
     void show(uint32_t a, uint32_t b);
     bool empty() const;
@@ -90,6 +93,7 @@ private:
     bool _stop = false;
 
     std::string _image_dir, _mask_dir, _features_dir, _matches_path;
+    std::string _live_matches;
     bool _paths_dirty = false;
     // The pair asked for, the one the worker is on, and the one that came
     // back. All three are needed because show() is called on every frame the
@@ -108,6 +112,9 @@ private:
     std::vector<PairEntry> _pairs;      // sorted, for a binary search
     int64_t _pairs_mtime = 0;
     std::string _w_features_dir, _w_matches_path;
+    // Which file _pairs was built from, so switching to matches.bin when the
+    // stage finishes rebuilds the index instead of reusing live offsets.
+    std::string _pairs_src;
     // Long edge one side of the pair is drawn at, from the last draw: what the
     // pictures are sized for (Picture.h).
     int _target = 640;

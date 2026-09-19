@@ -9,6 +9,7 @@
 #include "core/CameraModel.h"   // camera_model_from_name (CUDA-free)
 #include "data/DistortionFit.h"
 #include "data/SourceCamera.h"
+#include "sfm/core/Exif.h"
 
 #include <algorithm>
 #include <cctype>
@@ -18,6 +19,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <stdexcept>
 
 namespace fs = std::filesystem;
@@ -101,6 +103,23 @@ int colmap_model_id(const std::string& name) {
 }  // namespace
 
 
+// gauge.txt beside the model (sfm/Pipeline.h): what the frame is worth. Absent
+// for every reconstruction not made here, and then the answer is "nothing".
+void read_gauge(const std::string& recon_dir, ParsedDataset& ds) {
+    std::ifstream f(recon_dir + "/gauge.txt");
+    if (!f) return;
+    // Line at a time, so a comment with an odd number of words cannot shift
+    // every key onto the wrong value.
+    std::string line;
+    while (std::getline(f, line)) {
+        std::istringstream in(line);
+        std::string key, value;
+        if (!(in >> key >> value) || key[0] == '#') continue;
+        if (key == "oriented") ds.gauge_oriented = value == "1";
+        else if (key == "metric") ds.gauge_metric = value == "1";
+    }
+}
+
 std::map<int32_t, ColmapCamera> read_cameras_binary(const std::string& recon_dir) {
     BinReader r(recon_dir + "/cameras.bin");
     std::map<int32_t, ColmapCamera> cameras;
@@ -150,7 +169,7 @@ ColmapPoints3D read_points3D_binary(const std::string& recon_dir) {
     pts.rgb.reserve(n * 3);
     for (uint64_t i = 0; i < n; i++) {
         r.skip(sizeof(uint64_t));                       // point3D_id
-        for (int k = 0; k < 3; k++) pts.xyz.push_back((float)r.read<double>());
+        for (int k = 0; k < 3; k++) pts.xyz.push_back(r.read<double>());
         for (int k = 0; k < 3; k++) pts.rgb.push_back(r.read<uint8_t>());
         r.skip(sizeof(double));                         // reprojection error
         uint64_t track_len = r.read<uint64_t>();
@@ -269,7 +288,7 @@ ColmapPoints3D read_points3D_text(const std::string& recon_dir) {
     while (r.next_line(&s, &e)) {
         char* p;
         fast_strtol(s, &p);                  // point3D_id
-        for (int k = 0; k < 3; k++) pts.xyz.push_back((float)fast_strtod(p, &p));
+        for (int k = 0; k < 3; k++) pts.xyz.push_back(fast_strtod(p, &p));
         for (int k = 0; k < 3; k++) pts.rgb.push_back((uint8_t)fast_strtol(p, &p));
         // reprojection error + track: rest of line, skipped
     }
@@ -280,14 +299,8 @@ ColmapPoints3D read_points3D_text(const std::string& recon_dir) {
 // ===========================================================================
 // COLMAP camera model -> (CameraModelType, CameraDistortionType, coefficients)
 //
-// Every one of COLMAP's 18 models is accepted. Fourteen map exactly onto a
-// tier; the remaining four (FOV, SIMPLE_DIVISION, DIVISION, EUCM) and
-// RAD_TAN_THIN_PRISM_FISHEYE have no exact representation and are fitted, with
-// the source model recorded so the images can be re-distorted to match.
-//
-// COLMAP's parameter ORDER is not ours: it interleaves p1,p2 between k2 and k3
-// (models.h FullOpenCVCameraModel / ThinPrismFisheyeCameraModel), and its
-// FULL_OPENCV k4..k6 are DENOMINATOR terms, not further radial terms.
+// The six with no exact tier are fitted onto one, and COLMAP's parameter ORDER
+// is not ours -- it interleaves p1,p2 between k2 and k3 (models.h).
 // ===========================================================================
 
 namespace {
@@ -344,15 +357,16 @@ BakedIntrins bake_colmap_intrins(const ColmapCamera& cam) {
         o.dist[0] = P(4); o.dist[1] = P(5);     // k1 k2
         o.dist[2] = P(6); o.dist[3] = P(7);     // p1 p2
 
-    // ---- the rational model ----------------------------------------------
-    } else if (cam.model == "FULL_OPENCV") {
-        need(12);
+    // ---- rational with no denominator: a plain polynomial ----------------
+    // FULL_OPENCV's k4..k6 DIVIDE, which no tier carries, so a lens that uses
+    // them is fitted below instead.
+    } else if (cam.model == "FULL_OPENCV" && p.size() >= 12 &&
+               p[9] == 0.0 && p[10] == 0.0 && p[11] == 0.0) {
         o.fx = P(0); o.fy = P(1); o.cx = P(2); o.cy = P(3);
-        o.distortion = CameraDistortionType::Rational;
-        o.dist[0] = P(4);  o.dist[1] = P(5);    // k1 k2   numerator
-        o.dist[2] = P(8);                       // k3      numerator
-        o.dist[3] = P(9);  o.dist[4] = P(10); o.dist[5] = P(11);  // k4 k5 k6 denominator
-        o.dist[6] = P(6);  o.dist[7] = P(7);    // p1 p2
+        o.distortion = CameraDistortionType::ThinPrism;
+        o.dist[0] = P(4); o.dist[1] = P(5);     // k1 k2
+        o.dist[2] = P(8);                       // k3
+        o.dist[4] = P(6); o.dist[5] = P(7);     // p1 p2
 
     // ---- fisheye radial in theta-space -----------------------------------
     } else if (cam.model == "OPENCV_FISHEYE") {
@@ -401,38 +415,6 @@ BakedIntrins bake_colmap_intrins(const ColmapCamera& cam) {
 }
 
 }  // namespace
-
-bool colmap_preview_intrins(int model_id, int width, int height,
-                            const std::vector<double>& params,
-                            PreviewIntrins& out) {
-    const auto& table = colmap_model_table();
-    const auto it = table.find(model_id);
-    if (it == table.end() || (int)params.size() != it->second.num_params)
-        return false;
-    ColmapCamera cam;
-    cam.model = it->second.name;
-    cam.width = (uint64_t)width;
-    cam.height = (uint64_t)height;
-    cam.params = params;
-    BakedIntrins bi;
-    try {
-        bi = bake_colmap_intrins(cam);
-    } catch (const std::exception&) {
-        return false;
-    }
-    // A model with no exact tier comes back asking to be fitted, which needs
-    // the images. The caller draws a plain frustum instead.
-    if (bi.source.source_model >= 0) return false;
-    out.fx = bi.fx;
-    out.fy = bi.fy;
-    out.cx = bi.cx;
-    out.cy = bi.cy;
-    out.model = (int32_t)bi.model;
-    out.distortion = (int32_t)bi.distortion;
-    static_assert(kCameraDistortionParams == 8, "PreviewIntrins::dist width");
-    std::copy(bi.dist.begin(), bi.dist.end(), out.dist.begin());
-    return true;
-}
 
 namespace {
 
@@ -542,25 +524,65 @@ void qvec2rotmat(const std::array<double, 4>& q, double R[3][3]) {
 // COLMAP w2c -> nerfstudio/OpenGL c2w:
 //   c2w[:3,:3] = R^T with columns 1, 2 negated (OpenCV -> OpenGL axis flip)
 //   c2w[:3,3]  = -R^T @ t
-void colmap_to_c2w(const ColmapImage& im, float* out12) {
+void colmap_to_c2w(const ColmapImage& im, double* out12) {
     double R[3][3];
     qvec2rotmat(im.qvec, R);
     static const double flip[3] = {1.0, -1.0, -1.0};
     for (int r = 0; r < 3; r++) {
         for (int c = 0; c < 3; c++)
-            out12[r*4 + c] = (float)(R[c][r] * flip[c]);
+            out12[r*4 + c] = R[c][r] * flip[c];
         double t = 0.0;
         for (int c = 0; c < 3; c++) t -= R[c][r] * im.tvec[c];
-        out12[r*4 + 3] = (float)t;
+        out12[r*4 + 3] = t;
     }
 }
 
 }  // namespace
 
+bool colmap_preview_intrins(int model_id, int width, int height,
+                            const std::vector<double>& params,
+                            PreviewIntrins& out) {
+    const auto& table = colmap_model_table();
+    const auto it = table.find(model_id);
+    if (it == table.end() || (int)params.size() != it->second.num_params)
+        return false;
+    ColmapCamera cam;
+    cam.model = it->second.name;
+    cam.width = (uint64_t)width;
+    cam.height = (uint64_t)height;
+    cam.params = params;
+    BakedIntrins bi;
+    try {
+        bi = bake_colmap_intrins(cam);
+        // A model with no exact tier is fitted the way the loader fits it, so
+        // the frustum is the camera training will use. ~25 ms, so a caller
+        // that draws many images caches on the camera record.
+        if (bi.source.source_model >= 0) {
+            std::map<std::string, FitReport> reports;
+            fit_colmap_source(cam, bi, reports);
+        }
+    } catch (const std::exception&) {
+        return false;
+    }
+    out.fx = bi.fx;
+    out.fy = bi.fy;
+    out.cx = bi.cx;
+    out.cy = bi.cy;
+    out.model = (int32_t)bi.model;
+    out.distortion = (int32_t)bi.distortion;
+    static_assert(kCameraDistortionParams == 8, "PreviewIntrins::dist width");
+    std::copy(bi.dist.begin(), bi.dist.end(), out.dist.begin());
+    return true;
+}
+
 
 // ===========================================================================
 // parse_colmap_dataset
 // ===========================================================================
+
+// Which format each file of a COLMAP model dir is stored in.
+enum class ColmapFmt { None, Bin, Text };
+struct ColmapModelFmt { ColmapFmt cameras{}, images{}, points3D{}; };
 
 // Registered-image count of a COLMAP model dir, without parsing the whole
 // reconstruction: images.bin starts with a uint64 count; images.txt carries
@@ -597,15 +619,27 @@ static std::string join_files(const std::vector<std::string>& v) {
     return s;
 }
 
-// Locate the reconstruction. Returns "" when the
-// dataset dir holds no COLMAP model; `text_format` says which extension
-// matched. `verbose` gates the multi-model note, so the auto-detect probe in
-// parse_dataset can call this silently. On failure `near_miss` (when given)
-// describes the closest partial model found, so the error can say what is
-// missing instead of just "not a dataset".
+// The three files are resolved independently rather than as one all-.bin or
+// all-.txt model: half-converted and hand-assembled reconstructions mix the
+// two, and each file parses on its own. .bin wins when both are present.
+static ColmapFmt colmap_file_fmt(const fs::path& dir, const char* base) {
+    std::error_code ec;
+    if (fs::exists(dir / (std::string(base) + ".bin"), ec)) return ColmapFmt::Bin;
+    if (fs::exists(dir / (std::string(base) + ".txt"), ec)) return ColmapFmt::Text;
+    return ColmapFmt::None;
+}
+
+static ColmapModelFmt colmap_model_fmt(const fs::path& dir) {
+    return {colmap_file_fmt(dir, "cameras"), colmap_file_fmt(dir, "images"),
+            colmap_file_fmt(dir, "points3D")};
+}
+
+// Locate the reconstruction; "" when there is none. `verbose` is off for
+// parse_dataset's auto-detect probe; `near_miss` names the closest partial
+// model, so the error says what is missing rather than "not a dataset".
 static std::string find_colmap_recon(const std::string& dataset_dir,
                                      const DatasetParserConfig& cfg,
-                                     bool* text_format, bool verbose,
+                                     ColmapModelFmt* fmt, bool verbose,
                                      std::string* near_miss = nullptr) {
     std::vector<std::string> probe;
     if (!cfg.recon_dir.empty()) {
@@ -644,40 +678,40 @@ static std::string find_colmap_recon(const std::string& dataset_dir,
             probe.push_back(rel);
     }
 
-    // points3D is required only in strict (trainer) mode; the lenient viewer
-    // accepts a cameras-only reconstruction (poses / frustums). Binary and
-    // text (cameras.txt / images.txt / points3D.txt) formats both count.
-    auto has_recon = [&](const fs::path& d, const char* ext) {
-        return fs::exists(d / (std::string("cameras.") + ext)) &&
-               fs::exists(d / (std::string("images.") + ext)) &&
-               (fs::exists(d / (std::string("points3D.") + ext)) ||
-                !cfg.require_image_files);
+    // points3D is optional: without it the model is poses alone, which the
+    // trainer seeds at random (--random-init) and the viewer draws as frustums.
+    auto has_recon = [&](const ColmapModelFmt& f) {
+        return f.cameras != ColmapFmt::None && f.images != ColmapFmt::None;
     };
-    *text_format = false;
+    *fmt = ColmapModelFmt{};
     for (const auto& rel : probe) {
         fs::path d = fs::path(dataset_dir) / rel;
-        if (has_recon(d, "bin")) return d.string();
-        if (has_recon(d, "txt")) { *text_format = true; return d.string(); }
+        ColmapModelFmt f = colmap_model_fmt(d);
+        if (has_recon(f)) { *fmt = f; return d.string(); }
     }
 
     // Nothing matched: report the first probed dir that holds *some* of the
-    // three files (a recon that lost points3D, say) rather than none.
+    // files (a model that lost images.bin, say) rather than none.
     if (near_miss) {
         for (const auto& rel : probe) {
-            fs::path d = fs::path(dataset_dir) / rel;
-            for (const char* ext : {"bin", "txt"}) {
-                std::vector<std::string> present, missing;
-                for (const char* base : {"cameras", "images", "points3D"}) {
-                    std::string name = std::string(base) + "." + ext;
-                    (fs::exists(d / name) ? present : missing).push_back(name);
-                }
-                if (present.empty() || missing.empty()) continue;
-                *near_miss = (rel.empty() ? std::string("the dataset dir")
-                                          : "'" + rel + "'") +
-                             " has " + join_files(present) + " but no " +
-                             join_files(missing);
-                return {};
+            ColmapModelFmt f = colmap_model_fmt(fs::path(dataset_dir) / rel);
+            const std::pair<const char*, ColmapFmt> files[] = {
+                {"cameras", f.cameras}, {"images", f.images},
+                {"points3D", f.points3D}};
+            std::vector<std::string> present, missing;
+            for (const auto& [base, e] : files) {
+                const std::string name = std::string(base) +
+                    (e == ColmapFmt::Bin  ? ".bin"
+                     : e == ColmapFmt::Text ? ".txt" : ".bin or .txt");
+                if (e != ColmapFmt::None) present.push_back(name);
+                else if (std::string(base) != "points3D") missing.push_back(name);
             }
+            if (present.empty() || missing.empty()) continue;
+            *near_miss = (rel.empty() ? std::string("the dataset dir")
+                                      : "'" + rel + "'") +
+                         " has " + join_files(present) + " but no " +
+                         join_files(missing);
+            return {};
         }
     }
     return {};
@@ -685,20 +719,20 @@ static std::string find_colmap_recon(const std::string& dataset_dir,
 
 ParsedDataset parse_colmap_dataset(const std::string& dataset_dir,
                                    const DatasetParserConfig& cfg) {
-    bool text_format = false;
+    ColmapModelFmt fmt;
     std::string near_miss;
-    std::string recon_dir = find_colmap_recon(dataset_dir, cfg, &text_format,
+    std::string recon_dir = find_colmap_recon(dataset_dir, cfg, &fmt,
                                               /*verbose=*/true, &near_miss);
     if (recon_dir.empty())
         throw std::runtime_error(
-            "ColmapParser: no COLMAP reconstruction (cameras/images/points3D"
+            "ColmapParser: no COLMAP reconstruction (cameras and images"
             " .bin or .txt) found under " + dataset_dir +
             (near_miss.empty() ? "" : " -- " + near_miss));
 
-    auto cameras = text_format ? read_cameras_text(recon_dir)
-                               : read_cameras_binary(recon_dir);
-    auto images  = text_format ? read_images_text(recon_dir)
-                               : read_images_binary(recon_dir);
+    auto cameras = fmt.cameras == ColmapFmt::Text ? read_cameras_text(recon_dir)
+                                                  : read_cameras_binary(recon_dir);
+    auto images  = fmt.images == ColmapFmt::Text ? read_images_text(recon_dir)
+                                                 : read_images_binary(recon_dir);
 
     // EQUIRECTANGULAR sanity, once per camera rather than once per frame.
     for (const auto& [id, cam] : cameras) {
@@ -739,7 +773,7 @@ ParsedDataset parse_colmap_dataset(const std::string& dataset_dir,
 
     // ---- All-frame c2w (needed for outlier filter + train_frame_scale) ----
     int64_t n_all = (int64_t)frames.size();
-    std::vector<float> c2w_all(n_all * 12);
+    std::vector<double> c2w_all(n_all * 12);
     std::vector<double> positions(n_all * 3);
     for (int64_t i = 0; i < n_all; i++) {
         colmap_to_c2w(*frames[i], &c2w_all[i*12]);
@@ -751,7 +785,7 @@ ParsedDataset parse_colmap_dataset(const std::string& dataset_dir,
         std::vector<char> keep = dsparse::outlier_keep_mask(
             positions, n_all, cfg.outlier_threshold);
         std::vector<const ColmapImage*> kept;
-        std::vector<float> kept_c2w;
+        std::vector<double> kept_c2w;
         for (int64_t i = 0; i < n_all; i++) {
             if (!keep[i]) continue;
             kept.push_back(frames[i]);
@@ -762,27 +796,75 @@ ParsedDataset parse_colmap_dataset(const std::string& dataset_dir,
         n_all = (int64_t)frames.size();
     }
 
+    // In lenient (viewer) mode, tolerate a missing points3D file so a
+    // cameras-only reconstruction still yields camera poses / frustums.
+    ColmapPoints3D points;
+    if (fmt.points3D == ColmapFmt::Bin)
+        points = read_points3D_binary(recon_dir);
+    else if (fmt.points3D == ColmapFmt::Text)
+        points = read_points3D_text(recon_dir);
+
+    // ---- Centering, over ALL post-outlier frames and every point, while
+    // both are still double --------------------------------------------------
+    const dsparse::CenterMode center_mode = dsparse::center_mode_from_name(cfg.center_mode);
+    const std::array<double, 3> center = dsparse::scene_center(
+        center_mode, c2w_all.data(), n_all, points.xyz.data(), points.num());
+    for (int64_t i = 0; i < n_all; i++)
+        for (int r = 0; r < 3; r++) c2w_all[i*12 + r*4 + 3] -= center[r];
+    for (int64_t i = 0; i < points.num(); i++)
+        for (int r = 0; r < 3; r++) points.xyz[i*3 + r] -= center[r];
+
     // ---- train_frame_scale + viewer remap transform over ALL post-outlier
     // frames (train + eval, matching the Python dataparser, which splits
     // after normalization). No applied_transform on the COLMAP path, so
     // train_to_normalized = inv(T_n_from_camera). -----------------------------
-    double T_n[16], T_inv[16];
-    double scale_factor = dsparse::compute_normalized_transform(c2w_all, n_all, T_n);
+    fs::path image_dir = fs::path(dataset_dir) / cfg.image_dir;
+
+    // Relative to image_dir, the way COLMAP writes it. Some exporters write it
+    // relative to the dataset instead ("images/x.png"), which is honoured when
+    // that is where the file is.
+    std::vector<std::string> rel_names(n_all);
+    for (int64_t i = 0; i < n_all; i++) {
+        rel_names[i] = frames[i]->name;
+        std::error_code ec;
+        const fs::path in_dataset = fs::path(dataset_dir) / frames[i]->name;
+        if (fs::exists(image_dir / frames[i]->name, ec) ||
+            !fs::exists(in_dataset, ec))
+            continue;
+        const fs::path rel = in_dataset.lexically_normal().lexically_relative(
+            image_dir.lexically_normal());
+        if (!rel.empty() && *rel.begin() != "..") rel_names[i] = rel.generic_string();
+    }
+
+    // Read before the split, like everything else the whole set decides.
+    std::vector<std::string> all_paths(n_all);
+    for (int64_t i = 0; i < n_all; i++)
+        all_paths[i] = (image_dir / rel_names[i]).string();
+    const std::vector<uint8_t> exif_o =
+        dsparse::read_exif_orientations(cfg.exif_orientation, all_paths);
+    // `apply` turns the pixels, so the levelling has nothing left to correct.
+    const bool exif_level = cfg.exif_orientation == "orient" && !exif_o.empty();
+    const bool exif_turn = cfg.exif_orientation == "apply" && !exif_o.empty();
+
+    double T_n[16], T_inv[16], R_align[9];
+    double scale_factor = dsparse::compute_normalized_transform(
+        c2w_all.data(), n_all, T_n, R_align, exif_level ? exif_o.data() : nullptr);
     dsparse::invert_affine4x4(T_n, T_inv);
     float train_frame_scale = (float)(scale_factor != 0.0 ? 1.0 / scale_factor : 1.0);
 
     // ---- eval_mode train subset --------------------------------------------
-    std::vector<std::string> names(n_all);
-    for (int64_t i = 0; i < n_all; i++) names[i] = frames[i]->name;
-    std::vector<int64_t> subset = dsparse::train_subset(n_all, names, cfg);
-
-    fs::path image_dir = fs::path(dataset_dir) / cfg.image_dir;
+    std::vector<int64_t> subset = dsparse::train_subset(n_all, rel_names, cfg);
 
     ParsedDataset ds;
     const int64_t N = (int64_t)subset.size();
     ds.num_cameras = N;
     ds.train_frame_scale = train_frame_scale;
     for (int k = 0; k < 16; k++) ds.train_to_normalized[k] = (float)T_inv[k];
+    for (int k = 0; k < 9; k++) ds.normalized_rotation[k] = (float)R_align[k];
+    ds.center = center;
+    ds.center_mode = dsparse::kCenterModeNames[(int)center_mode];
+    ds.points = std::move(points);
+    read_gauge(recon_dir, ds);
     ds.camera_models.reserve(N);
     ds.camera_distortions.reserve(N);
     ds.image_filenames.reserve(N);
@@ -791,6 +873,7 @@ ParsedDataset parse_colmap_dataset(const std::string& dataset_dir,
     ds.c2w.resize(N * 12);
     ds.intrins.resize(N * 4);
     ds.dist_coeffs.resize(N * kCameraDistortionParams);
+    if (exif_turn) ds.exif_quarter_turns.assign(N, 0);
 
     // One bake per COLMAP camera record, not per frame: a record is one
     // physical camera, and a fitted one costs a least-squares solve.
@@ -815,39 +898,35 @@ ParsedDataset parse_colmap_dataset(const std::string& dataset_dir,
     for (int64_t j = 0; j < N; j++) {
         const int64_t i = subset[j];
         const ColmapImage& im = *frames[i];
+        const std::string& name = rel_names[i];
         auto cam_it = cameras.find(im.camera_id);
         if (cam_it == cameras.end())
-            throw std::runtime_error("ColmapParser: image " + im.name +
+            throw std::runtime_error("ColmapParser: image " + name +
                                      " references missing camera id " +
                                      std::to_string(im.camera_id));
         const ColmapCamera& cam = cam_it->second;
 
-        fs::path img_path = image_dir / im.name;
+        fs::path img_path = image_dir / name;
         if (cfg.require_image_files && !fs::exists(img_path))
             throw std::runtime_error("ColmapParser: " + img_path.string() +
                                      " does not exist (set --image-dir if needed)");
         ds.image_filenames.push_back(img_path.string());
 
+        const int turns =
+            exif_turn ? sfm::exifTransform(exif_o[i]).turns_cw : 0;
+        if (exif_turn) ds.exif_quarter_turns[j] = (uint8_t)turns;
+
         BakedIntrins bi = baked.at(im.camera_id);
-        float W = (float)cam.width, H = (float)cam.height;
-        if (cfg.rescale_camera_to_fit > 0.0f) {
-            float s = cfg.rescale_camera_to_fit;
-            bi.fx /= s; bi.fy /= s; bi.cx /= s; bi.cy /= s;
-            if (bi.source.source_model >= 0)
-                srccam::rescale(bi.source.source_model, bi.source.params, s);
-            auto round_dim = [&](float v) {
-                if (cfg.downscale_rounding_mode == "ceil")  return std::ceil(v / s);
-                if (cfg.downscale_rounding_mode == "round") return std::round(v / s);
-                return std::floor(v / s);
-            };
-            W = round_dim(W); H = round_dim(H);
-        }
+        double W = (double)cam.width, H = (double)cam.height;
+        double fx = bi.fx, fy = bi.fy, cx = bi.cx, cy = bi.cy;
+        dsparse::fit_camera_resolution(cfg, ds.image_filenames.back(),
+                                       W, H, fx, fy, cx, cy, &bi.source, turns);
         ds.widths.push_back((int32_t)W);
         ds.heights.push_back((int32_t)H);
-        ds.intrins[j*4 + 0] = bi.fx;
-        ds.intrins[j*4 + 1] = bi.fy;
-        ds.intrins[j*4 + 2] = bi.cx;
-        ds.intrins[j*4 + 3] = bi.cy;
+        ds.intrins[j*4 + 0] = (float)fx;
+        ds.intrins[j*4 + 1] = (float)fy;
+        ds.intrins[j*4 + 2] = (float)cx;
+        ds.intrins[j*4 + 3] = (float)cy;
         std::copy(bi.dist.begin(), bi.dist.end(),
                   ds.dist_coeffs.begin() + j*kCameraDistortionParams);
 
@@ -855,15 +934,15 @@ ParsedDataset parse_colmap_dataset(const std::string& dataset_dir,
         ds.camera_distortions.push_back((int32_t)bi.distortion);
         if (any_redistort) ds.redistort[j] = bi.source;
 
-        std::copy(&c2w_all[i*12], &c2w_all[i*12] + 12, &ds.c2w[j*12]);
+        for (int k = 0; k < 12; k++) ds.c2w[j*12 + k] = (float)c2w_all[i*12 + k];
 
         // Auxiliary supervision buffers, discovered by filename convention.
         mask_files[j]   = dsparse::find_aux_file(
-            (fs::path(dataset_dir) / cfg.mask_dir).string(),   im.name, "mask");
+            (fs::path(dataset_dir) / cfg.mask_dir).string(),   name, "mask");
         depth_files[j]  = dsparse::find_aux_file(
-            (fs::path(dataset_dir) / cfg.depth_dir).string(),  im.name, "depth");
+            (fs::path(dataset_dir) / cfg.depth_dir).string(),  name, "depth");
         normal_files[j] = dsparse::find_aux_file(
-            (fs::path(dataset_dir) / cfg.normal_dir).string(), im.name, "normal");
+            (fs::path(dataset_dir) / cfg.normal_dir).string(), name, "normal");
         any_mask   |= !mask_files[j].empty();
         any_depth  |= !depth_files[j].empty();
         any_normal |= !normal_files[j].empty();
@@ -872,14 +951,6 @@ ParsedDataset parse_colmap_dataset(const std::string& dataset_dir,
     if (any_depth)  ds.depth_filenames  = std::move(depth_files);
     if (any_normal) ds.normal_filenames = std::move(normal_files);
 
-    // In lenient (viewer) mode, tolerate a missing points3D file so a
-    // cameras-only reconstruction still yields camera poses / frustums.
-    if (fs::exists(fs::path(recon_dir) / "points3D.bin"))
-        ds.points = read_points3D_binary(recon_dir);
-    else if (fs::exists(fs::path(recon_dir) / "points3D.txt"))
-        ds.points = read_points3D_text(recon_dir);
-    else if (cfg.require_image_files)
-        ds.points = read_points3D_binary(recon_dir);   // throws "cannot open"
     // validation_fraction holds out part of the TRAIN set; the eval split is
     // already a held-out set, so it is all "train" from the DataManager's
     // point of view.
@@ -952,9 +1023,9 @@ ParsedDataset parse_dataset(const std::string& dataset_dir,
     if (fs::exists(fs::path(dataset_dir) / "transforms.json"))
         return parse_nerfstudio_dataset(dataset_dir, cfg);
 
-    bool text_format = false;
+    ColmapModelFmt fmt;
     std::string colmap_near_miss;
-    bool has_colmap = !find_colmap_recon(dataset_dir, cfg, &text_format,
+    bool has_colmap = !find_colmap_recon(dataset_dir, cfg, &fmt,
                                          /*verbose=*/false,
                                          &colmap_near_miss).empty();
     bool has_metashape = has_metashape_xml(dataset_dir, cfg);
@@ -981,8 +1052,9 @@ ParsedDataset parse_dataset(const std::string& dataset_dir,
         dataset_dir + " does not look like a supported dataset.\n"
         "Looked for:\n"
         "  nerfstudio  transforms.json in the dataset dir\n"
-        "  COLMAP      cameras/images/points3D (.bin or .txt) under sparse/0,\n"
-        "              colmap/sparse/0, sparse, colmap or the dataset dir itself\n"
+        "  COLMAP      cameras and images, points3D if any (.bin or .txt) under\n"
+        "              sparse/0, colmap/sparse/0, sparse, colmap or the dataset\n"
+        "              dir itself\n"
         "  Metashape   a camera-export .xml in the dataset dir\n" +
         (colmap_near_miss.empty() ? std::string()
                                   : "Closest match: " + colmap_near_miss + ".\n") +

@@ -3,6 +3,8 @@
 // table in SfmConfig.h, so a new knob is one row and never a fourth edit.
 #include "sfm/SfmConfig.h"
 
+#include "sfm/core/Log.h"
+#include "sfm/vk/VkContext.h"
 #include "i18n/catalog/SfmFields.h"
 
 #include <algorithm>
@@ -221,7 +223,8 @@ const char* groupLabel(const char* group) {
         {"pipeline", &F::group_pipeline}, {"colour", &F::group_colour},
         {"camera", &F::group_camera},
         {"features", &F::group_features}, {"matching", &F::group_matching},
-        {"mapper", &F::group_mapper},     {"manage", &F::group_manage},
+        {"mapper", &F::group_mapper},     {"rig", &F::group_rig},
+        {"manage", &F::group_manage},
         {"merge", &F::group_merge},       {"input", &F::group_input},
         {"runtime", &F::group_runtime},
     };
@@ -263,7 +266,11 @@ FieldResult setConfigField(SfmConfig& cfg, uint32_t cmd, const std::string& arg,
     if ((uint32_t)(cmds) & cmd) {                                                                  \
         FieldResult r = trySetField(cfg.member, key, name, argc, argv, i, (double)(lo),            \
                                     (double)(hi), choices, seen, error);                           \
-        if (r != FieldResult::Unknown) return r;                                                   \
+        if (r != FieldResult::Unknown) {                                                           \
+            if (r == FieldResult::Ok && key == "device")                                           \
+                cfg.device_request_set = true;                                                     \
+            return r;                                                                               \
+        }                                                                                           \
     }
     SFM_CONFIG_FIELDS(SFM_TRY_SET)
 #undef SFM_TRY_SET
@@ -301,25 +308,29 @@ std::string applyPresets(SfmConfig& cfg, const std::set<std::string>& seen,
     // FULL resolution, so working size is what its memory is spent on. Its
     // feature counts are lower too, which is the detector's design rather
     // than a budget: it emits fewer, better-localized points.
-    const bool learned = isAlikedType(cfg.features);
+    const bool learned = isAlikedType(cfg.features) || isLomaType(cfg.features);
     if (cfg.quality == "low") {
         presetSet(seen, moved, "max-image-size", cfg.max_image_size, learned ? 800 : 1000);
         presetSet(seen, moved, "max-features", cfg.sift.max_num_features, 2048);
         presetSet(seen, moved, "aliked-max-features", cfg.aliked.max_num_features, 1024);
+        presetSet(seen, moved, "loma-max-features", cfg.loma.max_num_features, 1024);
         presetSet(seen, moved, "prefilter-neighbors", cfg.prefilter.num_neighbors, 16);
     } else if (cfg.quality == "medium") {
         presetSet(seen, moved, "max-image-size", cfg.max_image_size, learned ? 1200 : 1600);
         presetSet(seen, moved, "max-features", cfg.sift.max_num_features, 4096);
         presetSet(seen, moved, "aliked-max-features", cfg.aliked.max_num_features, 2048);
+        presetSet(seen, moved, "loma-max-features", cfg.loma.max_num_features, 2048);
         presetSet(seen, moved, "prefilter-neighbors", cfg.prefilter.num_neighbors, 24);
     } else if (cfg.quality == "high") {
         presetSet(seen, moved, "max-image-size", cfg.max_image_size, learned ? 1600 : 2400);
         presetSet(seen, moved, "max-features", cfg.sift.max_num_features, 8192);
         presetSet(seen, moved, "aliked-max-features", cfg.aliked.max_num_features, 4096);
+        presetSet(seen, moved, "loma-max-features", cfg.loma.max_num_features, 4096);
     } else if (cfg.quality == "extreme") {
         presetSet(seen, moved, "max-image-size", cfg.max_image_size, learned ? 2400 : 3200);
         presetSet(seen, moved, "max-features", cfg.sift.max_num_features, 16384);
         presetSet(seen, moved, "aliked-max-features", cfg.aliked.max_num_features, 8192);
+        presetSet(seen, moved, "loma-max-features", cfg.loma.max_num_features, 8192);
         presetSet(seen, moved, "prefilter-neighbors", cfg.prefilter.num_neighbors, 48);
     } else {
         return "unknown --quality '" + cfg.quality + "' (low, medium, high or extreme)";
@@ -353,7 +364,7 @@ std::string applyPresets(SfmConfig& cfg, const std::set<std::string>& seen,
     if (learned && !isLearnedMatcher(cfg.matcher))
         presetSet(seen, moved, "ratio", cfg.match.max_ratio, 0.92f);
 
-    // LightGlue decides on its own assignment, so the ratio test and the
+    // A learned matcher decides its own assignment, so the ratio test and the
     // cross-check are not merely unnecessary -- they are a second filter on a
     // quantity it does not produce. Its own confidence is the only threshold.
     if (isLearnedMatcher(cfg.matcher)) {
@@ -416,29 +427,65 @@ std::string SfmConfig::finalize(uint32_t cmd) {
     twoview.ransac.max_error = max_error;
     mapper.max_reproj_error = max_error;
 
-    if (features != "sift" && !isAlikedType(features))
+    if (features != "sift" && !isAlikedType(features) && !isLomaType(features))
         return "unknown --features '" + features +
-               "' (sift, aliked-n16rot or aliked-n32)";
+               "' (sift, aliked-n16rot, aliked-n32, loma-b128 or loma-b)";
     if (matcher != "bruteforce" && !isLearnedMatcher(matcher))
-        return "unknown --matcher '" + matcher + "' (bruteforce or lightglue)";
-    // LightGlue is trained on one frontend's descriptors, and matching SIFT
-    // with it would run and return nonsense. Only `auto` can check that here:
-    // `match` reads features off disk and has no --features to compare
-    // against, so its guard is on the descriptors themselves, in
-    // LearnedMatcher.cpp, which is the more honest place for it anyway.
+        return "unknown --matcher '" + matcher +
+               "' (bruteforce, lightglue or loma-b128)";
+    // Matching SIFT with a learned matcher would run and return nonsense.
+    // Only `auto` can check it here; `match` reads features off disk, so its
+    // guard is on the descriptors themselves, in LearnedMatcher.cpp.
     if ((cmd & (CMD_AUTO | CMD_EXTRACT)) && isLearnedMatcher(matcher) &&
-        !isAlikedType(features))
+        !isAlikedType(features) && !isLomaType(features))
         return "--matcher " + matcher + " needs learned descriptors; add "
                "--features aliked-n16rot";
+    // The two families do not mix either: LightGlue reads ALIKED's descriptors
+    // and a LoMa matcher reads DeDoDe's, and each would run on the other's and
+    // return nonsense rather than fail.
+    if ((cmd & (CMD_AUTO | CMD_EXTRACT)) && isLomaType(matcher) != isLomaType(features) &&
+        isLearnedMatcher(matcher))
+        return "--matcher " + matcher + " and --features " + features +
+               " are different frontends; a learned matcher only reads the "
+               "descriptors it was trained on";
+    // Nor do two LoMa variants whose descriptors differ. The matcher would
+    // refuse them anyway, but only after the extraction had run.
+    if ((cmd & (CMD_AUTO | CMD_EXTRACT)) && isLomaType(matcher) && isLomaType(features) &&
+        lomaDescriptorDim(matcher) != lomaDescriptorDim(features))
+        return "--matcher " + matcher + " wants " +
+               std::to_string(lomaDescriptorDim(matcher)) + "-D descriptors and "
+               "--features " + features + " makes " +
+               std::to_string(lomaDescriptorDim(features)) + "-D ones";
+    // Two metric references would each claim the gauge, and the fit would be
+    // whichever the code happened to try first.
+    const bool gps = metric_gps != "none";
+    if (!metric_positions.empty() && gps)
+        return "--metric-positions and --metric-gps are two references for one "
+               "gauge; pass one";
+    if (gps && image_dir.empty() && !(cmd & CMD_AUTO))
+        return "--metric-gps reads each image's EXIF, so it needs --images";
+    // GPS is metres-accurate and a positions file is usually centimetres, so
+    // one default cannot serve both; 0 means "the one for this source".
+    if (metric_max_error == 0)
+        metric_max_error = gps ? 5.0 : 0.5;
+    if (!telemetry.empty()) {
+        bool listed = false;
+        for (const TelemetryInput& t : telemetry_inputs)
+            if (t.prefix.empty() && t.path == telemetry) listed = true;
+        if (!listed) telemetry_inputs.push_back({"", telemetry, 0, 0});
+    }
+
     lightglue.device = device;
+    loma.device = loma_match.device = device;
     if (max_image_size <= 0) max_image_size = defaultMaxImageSize(features);
 
     sift.device = match.device = prefilter.device = mapper.device = device;
     aliked.device = device;
+    // UUID crosses stage and worker boundaries; the int remains legacy input spelling.
     mapper.threads = threads;
     const bool v = !quiet;
     sift.verbose = mapper.verbose = manager.verbose = merge.verbose = aliked.verbose = v;
-    lightglue.verbose = v;
+    lightglue.verbose = loma.verbose = loma_match.verbose = v;
 
     // Scoring problems are ~1/32 the size of full matching, so the selection
     // pass batches at least as many pairs per submit as the matcher does.
@@ -466,6 +513,55 @@ PairMode SfmConfig::pairMode() const {
 }
 
 // ---------------------------------------------------------------------------
+// Device resolution
+// ---------------------------------------------------------------------------
+
+std::string SfmConfig::selectorForDevice(const std::string& request, bool request_set,
+                                          std::string& error) {
+    error.clear();
+    // The request's own spelling wins; an unset one uses environment, then Auto.
+    const bool supplied = request_set || !request.empty();
+    const spirula::vkselect::Request req =
+        spirula::vkselect::requestFrom(request, supplied);
+    const spirula::vkselect::Resolution& res = VkContext::cachedSelector(req);
+    if (res.ok()) return res.selector;
+    // Only the effective default Auto may use the CPU path when no device exists.
+    if (!supplied &&
+        res.status == spirula::vkselect::ResolveStatus::NoDevice &&
+        req.kind == spirula::vkselect::Request::Kind::Auto)
+        return std::string();
+    error = res.error;
+    return std::string();
+}
+
+std::string SfmConfig::resolveDevice() {
+    // Resolve the request once before stages inspect it.
+    const bool request_set = device_request_set || !device_request.empty() ||
+                             !device_selector.empty() || device >= 0;
+    const bool request_text = device_request_set || !device_request.empty();
+    const std::string request =
+        request_text ? device_request
+        : !device_selector.empty() ? device_selector
+        : device >= 0 ? std::to_string(device) : std::string();
+    std::string error;
+    device_selector = selectorForDevice(request, request_set, error);
+    if (!error.empty()) return error;
+    // An ordinal request still sets the legacy int, so a caller that has not
+    // migrated keeps working; the UUID is what fans out.
+    if (request_text) {
+        const spirula::vkselect::Request req = spirula::vkselect::parseRequest(request);
+        if (req.kind == spirula::vkselect::Request::Kind::Ordinal) device = req.ordinal;
+    }
+    sift.device_selector = match.device_selector = prefilter.device_selector =
+        mapper.device_selector = aliked.device_selector = lightglue.device_selector =
+            loma.device_selector = loma_match.device_selector = device_selector;
+    if (!device_selector.empty())
+        sfm::slog::diag(sfm::slog::Tag::Device, "[gpu] running on %s",
+                        device_selector.c_str());
+    return "";
+}
+
+// ---------------------------------------------------------------------------
 // Help
 // ---------------------------------------------------------------------------
 
@@ -488,6 +584,44 @@ void printConfigOptions(FILE* out, uint32_t cmd, const SfmConfig& defaults) {
 void printOptionLine(FILE* out, const std::string& flag, const std::string& value,
                      const std::string& help) {
     printOption(out, flag, "", value, help, "");
+}
+
+// ---------------------------------------------------------------------------
+// stageSignature
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Flags of a stage that cannot change what it writes: how fast it goes, on
+// which device, how much it says about it.
+bool signatureRelevant(const char* name) {
+    for (const char* n : {"threads", "decode-threads", "decode-budget", "device",
+                          "quiet", "profile", "spv-path"})
+        if (std::strcmp(name, n) == 0) return false;
+    return true;
+}
+
+}  // namespace
+
+std::string stageSignature(const SfmConfig& cfg, uint32_t cmd) {
+    std::string out;
+#define SFM_SIG_FIELD(member, name, cmds, tier, group, lo, hi, choices, help)   \
+    if (((uint32_t)(cmds) & cmd) && (tier) != Tier::Alias && signatureRelevant(name)) \
+        out += std::string(name) + "=" + valueString(cfg.member) + "\n";
+    SFM_CONFIG_FIELDS(SFM_SIG_FIELD)
+#undef SFM_SIG_FIELD
+    // Per-group lenses reach the camera setup, and so verification, without
+    // being table rows: `--camera-model cam0=opencv-fisheye` and the manifest
+    // both land here.
+    if (cmd & (CMD_MATCH | CMD_MAP))
+        for (const CameraOverride& o : cfg.camera.overrides) {
+            out += "override " + o.prefix + "=";
+            if (o.has_model) out += camInfo(o.model).cli_name;
+            if (o.has_focal) out += "," + valueString(o.focal);
+            for (double e : o.extra) out += "," + valueString(e);
+            out += "\n";
+        }
+    return out;
 }
 
 }  // namespace sfm

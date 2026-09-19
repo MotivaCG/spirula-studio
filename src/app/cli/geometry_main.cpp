@@ -9,17 +9,21 @@
 #include "app/Tools.h"
 
 #include "app/DepthPng.h"
+#include "app/FrameLook.h"
 #include "app/GeometryModel.h"
 #include "app/GeometryWarp.h"
 #include "app/WriterPool.h"
 #include "data/CameraMath.h"
 #include "data/DatasetParser.h"
+#include "data/ImageProbe.h"
+#include "core/VulkanDeviceSelection.h"
 #include "i18n/Locale.h"
+#include "i18n/TimeFormat.h"
 #include "i18n/catalog/Geometry.h"
+#include "nn/Device.h"
 #include "nn/core/Error.h"
 #include "nn/core/Log.h"
 #include "nn/io/Image.h"
-#include "nn/vk/Context.h"
 
 #include <algorithm>
 #include <cmath>
@@ -34,6 +38,7 @@ namespace fs = std::filesystem;
 namespace G = spirula::i18n::msg::geometry;
 
 using spirula::i18n::format;
+using spirula::i18n::format_duration;
 
 namespace {
 
@@ -45,6 +50,9 @@ enum class Tri { Auto, Yes, No };
 
 struct Options {
     std::string dataset;
+    // Relative to the dataset, or absolute: a capture reconstructed from
+    // photos read where they are keeps its images outside the dataset folder.
+    std::string image_dir = "images";
     std::string model = "moge2-vitb";
     // The written maps' longest side, and Metric3D's inference size on top of
     // that (metric3d/README.md). A ceiling on one face, not on the frame.
@@ -85,6 +93,7 @@ void usage() {
     for (const std::string& l : spirula::i18n::wrap(G::usage_target.get(), 80))
         std::fprintf(stderr, "    %s\n", l.c_str());
     std::fprintf(stderr, "\n%s\n", G::head_options.get());
+    help_row("--image-dir <dir>", G::opt_image_dir);
     help_row("--model <id|file>", G::opt_model);
     help_row("--max-size <n>", G::opt_max_size);
     help_row("--num-tokens <n>", G::opt_num_tokens);
@@ -101,7 +110,7 @@ void usage() {
     // prints is a table of numerical errors, read by whoever changed the warp.
     std::fprintf(stderr, "    --check                   "
                          "run the camera round-trip self-test and exit\n");
-    std::fprintf(stderr, "\n%s --device <index|name>  --lang <code>\n",
+    std::fprintf(stderr, "\n%s --device <index|name|uuid>  --lang <code>\n",
                  G::label_common.get());
     std::fprintf(stderr, "%s SS_NN_LOG=0..3  SS_VK_DEVICE  SS_PROFILE=1\n",
                  G::label_environment.get());
@@ -132,14 +141,6 @@ float depth_scale(const std::vector<float>& depth) {
     const size_t at = (size_t)((double)(v.size() - 1) * 0.999);
     std::nth_element(v.begin(), v.begin() + (long)at, v.end());
     return std::fmax(v[at], 1e-6f);
-}
-
-std::string human_time(double ms) {
-    char buf[64];
-    if (ms < 60000) std::snprintf(buf, sizeof buf, "%.0fs", ms / 1000.0);
-    else if (ms < 3600000) std::snprintf(buf, sizeof buf, "%.0fm", ms / 60000.0);
-    else std::snprintf(buf, sizeof buf, "%.1fh", ms / 3600000.0);
-    return buf;
 }
 
 // ---------------------------------------------------------------------------
@@ -386,7 +387,10 @@ int self_check() {
         hc.width = c.w; hc.height = c.h;
         hc.fx = c.fx; hc.fy = c.fy; hc.cx = c.cx; hc.cy = c.cy;
         std::copy(std::begin(c.dist), std::end(c.dist), std::begin(hc.dist));
-        const std::vector<camhost::SplitFace> faces = camhost::plan_split_faces(hc);
+        // With the back frame, so a lens seen past 135 degrees is checked for
+        // the coverage the whole cube owes it, not the trainer's default five.
+        const std::vector<camhost::SplitFace> faces =
+            camhost::plan_split_faces(hc, camhost::FaceFit::Uniform, true);
         const bool equi = c.model == (int)CameraModelType::EQUIRECTANGULAR;
         const double* table = equi ? camhost::equirect_face_axes()
                                    : camhost::fisheye_face_axes();
@@ -466,6 +470,9 @@ int spirula_geometry_main(int argc, char** argv) {
     app::set_program_name(argc > 0 ? argv[0] : nullptr, "spirula geometry");
     Options o;
     std::string device;
+    // An explicit --device, including an empty one: `--device ""` is the
+    // caller's Auto, which must beat SS_VK_DEVICE the way a chosen index does.
+    bool device_set = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -478,6 +485,7 @@ int spirula_geometry_main(int argc, char** argv) {
         };
         if (a == "--help" || a == "-h") { usage(); return 0; }
         else if (a == "--check") return self_check();
+        else if (a == "--image-dir") o.image_dir = next();
         else if (a == "--model") o.model = next();
         else if (a == "--max-size") o.max_size = std::atoi(next());
         else if (a == "--num-tokens") o.num_tokens = std::atoi(next());
@@ -492,7 +500,7 @@ int spirula_geometry_main(int argc, char** argv) {
         else if (a == "--image-gamut") o.image_gamut = next();
         else if (a == "--image-linear") o.image_is_linear = true;
         else if (a == "--no-image-linear") o.image_is_linear = false;
-        else if (a == "--device") device = next();
+        else if (a == "--device") { device = next(); device_set = true; }
         else if (!a.empty() && a[0] == '-') {
             std::fprintf(stderr, "unknown option '%s'\n\n", a.c_str());
             usage();
@@ -506,21 +514,26 @@ int spirula_geometry_main(int argc, char** argv) {
         return 2;
     }
     if (!o.want_depth && !o.want_normal) return 0;
-    if (!device.empty()) {
-        // Creating the context here fixes the device for the process; the
-        // model's own Context::get() then returns this one.
-        nn::vk::ContextOptions vo;
-        char* end = nullptr;
-        const long idx = std::strtol(device.c_str(), &end, 10);
-        if (end && *end == '\0') vo.device_index = (int)idx;
-        else vo.device_match = device;
-        nn::vk::Context::get(vo);
+    // Resolve once before weights load; all later stages inherit the UUID.
+    // Explicit --device beats SS_VK_DEVICE, then Auto.
+    const spirula::vkselect::Request req =
+        spirula::vkselect::requestFrom(device, device_set);
+    try {
+        nn::configure_device(req.text);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "\nerror: %s\n", e.what());
+        return 1;
     }
+    // The canonical identity, which is what the predictor and every later
+    // context of the process inherits; no ordinal survives this line.
+    const std::string selector = nn::configured_device_selector();
 
     try {
         // ---- the dataset --------------------------------------------------
         DatasetParserConfig cfg;
         cfg.require_image_files = false;   // the point cloud is not our business
+        cfg.image_dir = o.image_dir;
+        cfg.probe_image_size = probe_image_size;
         const ParsedDataset ds = parse_dataset(o.dataset, cfg, "");
         const int64_t N = ds.num_cameras;
         NN_CHECK(N > 0, "'%s' holds no images", o.dataset.c_str());
@@ -551,7 +564,7 @@ int spirula_geometry_main(int argc, char** argv) {
         // Before the warps: which input sizes round-trip is the network's, and
         // Metric3D's decoder crops where MoGe resamples its own output.
         app::GeometryModel pred;
-        pred.load(o.model);
+        pred.load(o.model, selector);
 
         // ---- one warp plan per camera --------------------------------------
         const int patch = pred.sizeGranularity();
@@ -641,7 +654,7 @@ int spirula_geometry_main(int argc, char** argv) {
 
         app::WriterPool writers;
         const double t_start = nn::now_ms();
-        int64_t written = 0, skipped = 0;
+        int64_t written = 0, skipped = 0, unreadable = 0;
         double model_ms = 0;
 
         for (int64_t i = 0; i < N; ++i) {
@@ -661,12 +674,20 @@ int spirula_geometry_main(int argc, char** argv) {
                                                  o.image_gamut, o.image_is_linear);
             if (img.empty()) {
                 NN_LOG_WARN("skipping %s\n", ds.image_filenames[(size_t)i].c_str());
+                ++unreadable;
                 continue;
             }
             const std::vector<float> src =
                 app::resize_area(img.data.data(), img.width, img.height,
                                  img.channels, warp.sampleWidth(),
                                  warp.sampleHeight());
+
+            // The network was trained upright, and a face cut from a photo
+            // stored sideways is sideways. Turned for the forward pass and
+            // back before the blend, so the maps stay in the stored frame.
+            const sfm::ExifTransform turn =
+                app::photo_turn(ds.image_filenames[(size_t)i]);
+            const sfm::ExifTransform back = app::inverse_turn(turn);
 
             const double t0 = nn::now_ms();
             std::vector<std::vector<float>> face_depth, face_normal;
@@ -676,10 +697,20 @@ int spirula_geometry_main(int argc, char** argv) {
                 app::GeometryRequest rq = app::face_request(warp, k, o.num_tokens);
                 rq.want_depth = need_depth;
                 rq.want_normal = need_normal;
+                int fw = rq.width, fh = rq.height;
+                app::turn_pixels(turn, 3, face_rgb, fw, fh);
+                rq = app::turn_request(rq, turn);
                 app::GeometryPrediction p = pred.predict(face_rgb.data(), rq);
-                NN_CHECK(p.width == warp.faceWidth(k) && p.height == warp.faceHeight(k),
+                NN_CHECK(p.width == rq.width && p.height == rq.height,
                          "the network returned %dx%d for a %dx%d face", p.width,
-                         p.height, warp.faceWidth(k), warp.faceHeight(k));
+                         p.height, rq.width, rq.height);
+                int dw = p.width, dh = p.height;
+                app::turn_pixels(back, 1, p.depth, dw, dh);
+                dw = p.width;
+                dh = p.height;
+                app::turn_normals(back, p.normal, dw, dh);
+                p.width = warp.faceWidth(k);
+                p.height = warp.faceHeight(k);
                 // Millimetres on every face before they are blended: Metric3D's
                 // depth is canonical to the face's own focal.
                 const float mm = (float)pred.depthToMillimetres(warp.faceFocal(k));
@@ -749,16 +780,26 @@ int spirula_geometry_main(int argc, char** argv) {
                             format(G::log_progress,
                                    {(long long)(written + skipped), (long long)N,
                                     (long long)std::lround(each),
-                                    human_time(each * (double)(N - i - 1))})
+                                    format_duration(each * (double)(N - i - 1) / 1000.0)})
                                 .c_str());
                 std::fflush(stdout);
             }
         }
         writers.finish();
         std::printf("\r%s\n",
-                    format(G::log_done, {(long long)written, (long long)skipped,
-                                         human_time(nn::now_ms() - t_start)})
+                    format(G::log_done,
+                           {(long long)written, (long long)skipped,
+                            format_duration((nn::now_ms() - t_start) / 1000.0)})
                         .c_str());
+        // Nothing readable means the wrong image_dir, not an empty dataset:
+        // exiting 0 reports a reconstruction that wrote an empty normals/ as
+        // a success.
+        if (written == 0 && unreadable > 0) {
+            std::fprintf(stderr, "%s\n",
+                         format(G::err_no_images_read, {image_root.string()})
+                             .c_str());
+            return 1;
+        }
         return writers.failures() ? 1 : 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "\nerror: %s\n", e.what());

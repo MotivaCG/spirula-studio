@@ -1,27 +1,21 @@
-// Fused 3DGS geometry optimizer (Vulkan backend), mirroring
-// fused_optim_3dgs_geometry_kernel in kernels/optim/FusedGeometryOptim.cu: one thread per
-// splat (256/block), per-splat regularizer gradients, then in-place Adam on
-// scales / quats (Riemannian) / opacities / means (optionally
-// scale-agnostic), plus features_dc when non-SH Adam-state quantization is
-// on (the fp32 path drives DC via a separate fused_adam_step launch). This
-// is the non-FPBO geometry step: data gradients come from the fp32 v_*
-// buffers or the block-wise 16-bit grad-quant codec, not from a camera loop.
+// Fused 3DGS geometry optimizer (Vulkan backend): one thread per splat
+// (256/block), per-splat regularizer gradients, then in-place Adam on scales /
+// quats (Riemannian) / opacities / means, plus features_dc under kNonShQuant
+// (the fp32 path drives DC from a separate fused_adam_step launch).
 //
-// Spec constants:
-//   kScaleAgnostic = use_scale_agnostic_mean
-//   kZeroGrad      = zero fp32 grad buffers after consuming them
-//   kNonShQuant    = non_sh.enabled (16-bit qadam for the five attributes)
-//   kGqMask        = which grad-quant buffers exist (1 means, 2 quats,
-//                    4 scales, 8 opac, 16 dc) — folded decode-vs-fp32 reads
+// Spec: kScaleAgnostic, kZeroGrad, kNonShQuant, kGqMask (bit per grad-quant
+// buffer: 1 means, 2 quats, 4 scales, 8 opac, 16 dc), kColorTrust (linear
+// splat colour space; features_dc only).
 //
 // Barriers only exist in the kNonShQuant reduces, which every thread
 // reaches (`inside` masks work, never control flow around a reduce).
-
 #define CudaDeviceExport ForceInline
 #include "shaders/per_splat_losses.slang"
+#include "shaders/pixel_wise.slang"
 #include "shaders/projection_utils.slang"
 #undef CudaDeviceExport
 #include "optim_quant.slang"
+#include "screen_size_hinge.slang"
 
 [SpecializationConstant]
 const int kScaleAgnostic = 0;
@@ -31,6 +25,8 @@ const int kZeroGrad = 0;
 const int kNonShQuant = 0;
 [SpecializationConstant]
 const int kGqMask = 0;
+[SpecializationConstant]
+const int kColorTrust = 0;
 
 static const float kGeoBeta1 = 0.9f;
 static const float kGeoBeta2 = 0.999f;
@@ -98,8 +94,12 @@ struct OptimGeoParams {
     float erank_reg_weight;
     float erank_reg_weight_s3;
     float quat_norm_reg_weight;
+    float dc_reg_weight;
     float sh_reg_weight;
     float grad_scale;
+    float max_screen_size;
+    float max_screen_size_penalty;
+    float eps_tr;              // colour trust region (kColorTrust != 0)
     int32_t scalar_step;
     uint32_t has_steps;
     uint32_t has_densify_score;
@@ -224,6 +224,11 @@ void fused_optim_3dgs_geometry(uint3 wg: SV_GroupID,
             oq_state_read<3>(kNonShQuant != 0, p.nq_scales_packed,
                              p.nq_scales_bounds, p.g1_scales, p.g2_scales,
                              block_id, gid, g1, g2);
+            v_scale += screen_size_hinge_grad(
+                p.radii[gid], p.max_screen_size, p.max_screen_size_penalty,
+                scale,
+                oq_sqrt3(float3(g2[0], g2[1], g2[2]) * ibc2) +
+                    float3(kAdamEps));
             [ForceUnroll]
             for (int i = 0; i < 3; i++) {
                 g1[i] = kGeoBeta1 * g1[i] + (1.0f - kGeoBeta1) * v_scale[i];
@@ -409,12 +414,20 @@ void fused_optim_3dgs_geometry(uint3 wg: SV_GroupID,
             // L1-shrinkage DC color regularization (mirrors the fp32 path's
             // fused_adam_step l2_reg + offset = 0.5/kSh0).
             const float dc_off = 0.5f / kGeoSh0;
-            v_dc.x += p.sh_reg_weight *
-                      (max(fdc.x - dc_off, 0.0f) + min(fdc.x + dc_off, 0.0f));
-            v_dc.y += p.sh_reg_weight *
-                      (max(fdc.y - dc_off, 0.0f) + min(fdc.y + dc_off, 0.0f));
-            v_dc.z += p.sh_reg_weight *
-                      (max(fdc.z - dc_off, 0.0f) + min(fdc.z + dc_off, 0.0f));
+            float under_reg_weight = p.dc_reg_weight + p.sh_reg_weight;
+            v_dc.x += p.dc_reg_weight * max(fdc.x - dc_off, 0.0f) +
+                under_reg_weight * min(fdc.x + dc_off, 0.0f);
+            v_dc.y += p.dc_reg_weight * max(fdc.y - dc_off, 0.0f) +
+                under_reg_weight * min(fdc.y + dc_off, 0.0f);
+            v_dc.z += p.dc_reg_weight * max(fdc.z - dc_off, 0.0f) +
+                under_reg_weight * min(fdc.z + dc_off, 0.0f);
+
+            // Adam runs on x = splat_dc_encode(dc); carry the gradient there.
+            if (kColorTrust != 0) {
+                v_dc.x /= linear_rgb_to_srgb_grad(kGeoSh0 * fdc.x + 0.5f);
+                v_dc.y /= linear_rgb_to_srgb_grad(kGeoSh0 * fdc.y + 0.5f);
+                v_dc.z /= linear_rgb_to_srgb_grad(kGeoSh0 * fdc.z + 0.5f);
+            }
 
             float g1[3], g2[3];
             oq_state_read<3>(kNonShQuant != 0, p.nq_dc_packed, p.nq_dc_bounds,
@@ -427,9 +440,24 @@ void fused_optim_3dgs_geometry(uint3 wg: SV_GroupID,
             }
             float3 g1v = float3(g1[0], g1[1], g1[2]);
             float3 g2v = float3(g2[0], g2[1], g2[2]);
-            float3 new_dc = fdc - lr_features_dc * g1v /
-                                      (oq_sqrt3(g2v * ibc2) +
-                                       float3(kAdamEps));
+            float3 delta_dc = -lr_features_dc * g1v /
+                                  (oq_sqrt3(g2v * ibc2) + float3(kAdamEps));
+            float3 new_dc = fdc + delta_dc;
+            if (kColorTrust != 0) {
+                // The encode supplies the brightness scaling, so the rail is a
+                // bare radius; the 2 matches the colour-proportional clip.
+                float clip = kGeoSh0 * sqrt(max(2.0f * p.eps_tr /
+                                                max(_geo_sigmoid(opac), 1e-12f),
+                                                0.0f));
+                delta_dc = clamp(delta_dc, -float3(clip), float3(clip));
+                delta_dc.x = isfinite(delta_dc.x) ? delta_dc.x : 0.0f;
+                delta_dc.y = isfinite(delta_dc.y) ? delta_dc.y : 0.0f;
+                delta_dc.z = isfinite(delta_dc.z) ? delta_dc.z : 0.0f;
+                new_dc = float3(
+                    splat_dc_decode(splat_dc_encode(fdc.x) + delta_dc.x),
+                    splat_dc_decode(splat_dc_encode(fdc.y) + delta_dc.y),
+                    splat_dc_decode(splat_dc_encode(fdc.z) + delta_dc.z));
+            }
             p.features_dc[3 * gid] = new_dc.x;
             p.features_dc[3 * gid + 1] = new_dc.y;
             p.features_dc[3 * gid + 2] = new_dc.z;

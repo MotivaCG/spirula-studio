@@ -2,6 +2,8 @@
 
 #include "app/gui/TrainRunner.h"
 
+#include "backend/api/BackendRuntime.h"
+#include "engine/Engine.h"
 #include "i18n/catalog/Log.h"
 
 #include <algorithm>
@@ -33,12 +35,22 @@ spirula::TrainerProgress TrainRunner::latest_progress() {
     return _latest;
 }
 
+double TrainRunner::avg_latency_locked() const {
+    if (_latencies.empty()) return -1.0;
+    double sum = 0.0;
+    for (double v : _latencies) sum += v;
+    return sum / (double)_latencies.size();
+}
+
+double TrainRunner::avg_step_latency() {
+    std::lock_guard<std::mutex> lk(_mu);
+    return avg_latency_locked();
+}
+
 double TrainRunner::eta_seconds() {
     std::lock_guard<std::mutex> lk(_mu);
-    if (_latencies.empty() || _latest.total_steps <= 0) return -1.0;
-    double avg = 0;
-    for (double v : _latencies) avg += v;
-    avg /= (double)_latencies.size();
+    const double avg = avg_latency_locked();
+    if (avg < 0.0 || _latest.total_steps <= 0) return -1.0;
     return avg * std::max(0, _latest.total_steps - (_latest.step + 1));
 }
 
@@ -75,6 +87,13 @@ void TrainRunner::shutdown() {
     request_stop();
     join_worker();
     if (_web_viewer) { _web_viewer->stop(); _web_viewer.reset(); }
+}
+
+void TrainRunner::release_engine() {
+    shutdown();
+    _engine_ready = false;
+    _session.reset();
+    engine_reset();
 }
 
 void TrainRunner::load_dataset(const TrainConfig& cfg, const std::string& preset) {
@@ -121,6 +140,15 @@ void TrainRunner::start_training(const TrainConfig& cfg, const std::string& pres
     TrainerSession* s = _session.get();
     _worker = std::thread([this, s] {
         try {
+#ifndef SS_BACKEND_VULKAN
+            // The CUDA runtime's current device is per thread; this worker
+            // does all the engine work, so it re-applies the process-wide
+            // selection before the first driver call.
+            if (!backend::device_bind())
+                throw std::runtime_error(
+                    "could not make the selected GPU current on the training "
+                    "thread; restart the application or choose another GPU");
+#endif
             s->check_config();
             s->load_dataset();
             s->setup_engine();

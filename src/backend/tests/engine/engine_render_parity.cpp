@@ -54,6 +54,10 @@ int main(int argc, char** argv) {
     }
     const bool dumping = std::strcmp(argv[1], "dump") == 0;
 
+    // Kernel parity, not binning policy: pin the granularity so a reference
+    // stays comparable across runs that would otherwise adapt it.
+    engine_set_bin_tile_size(bin_tile_x(kMacroLog2Default));
+
     std::mt19937 rng(20260717u);
     auto uf = [&](float lo, float hi) {
         return lo + (hi - lo) * (float)(rng() & 0xffffff) / 16777215.0f;
@@ -100,7 +104,8 @@ int main(int argc, char** argv) {
     };
 
     // --- background: SH skybox with deterministic coefficients ---
-    engine_init_background_sh(/*sh_degree=*/2, /*linear=*/false);
+    engine_init_background_sh(/*sh_degree=*/2, /*transfer=*/0,
+                              /*linear=*/false);
     {
         std::vector<float> bg_sh(9 * 3);
         for (auto& v : bg_sh) v = uf(-0.4f, 0.4f);
@@ -109,13 +114,14 @@ int main(int argc, char** argv) {
                              bg_sh.data(), bg_sh.size() * sizeof(float),
                              MemcpyKind::HostToDevice);
     }
-    engine_set_background_step_params(4321u, 0.6f);
+    engine_set_background_step_params(4321u, 0.6f, /*num_loss_scales=*/3,
+                                      /*loss_scale_min_pixels=*/0);
 
     // --- color space: mildly non-identity splat matrix (sRGB working) ---
     engine_init_color_space(
-        /*splat_enabled=*/true, /*splat_is_linear=*/false,
+        /*splat_enabled=*/true, /*splat_transfer=*/0, /*splat_is_linear=*/false,
         {0.9f, 0.08f, 0.02f, 0.05f, 0.9f, 0.05f, 0.02f, 0.08f, 0.9f},
-        /*image_enabled=*/false, /*image_is_linear=*/false,
+        /*image_enabled=*/false, /*image_transfer=*/0, /*image_is_linear=*/false,
         {1, 0, 0, 0, 1, 0, 0, 0, 1});
 
     std::vector<float> acc;      // float outputs
@@ -161,7 +167,7 @@ int main(int argc, char** argv) {
         {"3dgs", "PINHOLE", 0, false, true, 0},
         {"3dgs", "PINHOLE", 1, false, true, 0},
         {"mip", "FISHEYE", 2, false, false, 2},
-        {"3dgut", "PINHOLE", 3, false, false, 0},
+        {"3dgut", "PINHOLE", 2, false, false, 0},
         {"3dgs", "EQUIRECTANGULAR", 0, true, false, 0},
     };
     for (const Cfg& c : cfgs) {
@@ -176,12 +182,34 @@ int main(int argc, char** argv) {
         pull(c.median, c.dist_type != 0);
     }
 
-    // --- noise background mode ---
-    engine_init_background_noise(/*linear=*/false);
+    // --- the randomized background modes, then the fixed colour ---
+    // Three loss scales, so the cell size the noise draws is one of three.
     set_cams("PINHOLE", 1);
-    forward_3dgs("3dgs", 3, false, false, 0);
-    backend::device_synchronize();
-    pull(0, 0);
+    for (int mode = 0; mode < 3; mode++) {
+        if (mode == 0) engine_init_background_noise(0, false);
+        if (mode == 1) engine_init_background_pseudorandom(0, false);
+        if (mode == 2) engine_init_background_random(0, false);
+        for (uint32_t seed : {7u, 8u, 9u}) {
+            engine_set_background_step_params(seed, 0.6f, 3, 0);
+            forward_3dgs("3dgs", 3, false, false, 0);
+            backend::device_synchronize();
+            pull(0, 0);
+        }
+    }
+    {
+        const float color[3] = {0.2f, 0.65f, 0.9f};
+        engine_init_background_color(color, /*transfer=*/0, /*linear=*/false);
+        forward_3dgs("3dgs", 3, false, false, 0);
+        backend::device_synchronize();
+        pull(0, 0);
+
+        const float black[3] = {0.0f, 0.0f, 0.0f};
+        engine_init_background_color(black, /*transfer=*/0, /*linear=*/false);
+        if (engine().background.enabled) {
+            std::fprintf(stderr, "all-black background must disable the blend\n");
+            return 1;
+        }
+    }
 
     // --- depth -> normal (viewer buffer path) on the last render ---
     {
@@ -241,7 +269,7 @@ int main(int argc, char** argv) {
         // bends its edges by less than the byte-comparison tolerance.
         const std::vector<float> rows = dist_fixture::distortion_rows(1);
         for (int i : {1, 2, 4, 5}) {
-            int tier = i == 2 ? 2 : (i == 5 ? 3 : 1);  // fisheye: no RATIONAL
+            int tier = (i == 2 || i == 5) ? 2 : 1;
             v_tier[i] = tier;
             for (int k = 0; k < kCameraDistortionParams; k++)
                 v_dist[(size_t)i * kCameraDistortionParams + k] =

@@ -48,14 +48,12 @@ bool pixel_ray<D : ICameraDistortion>(float* dist_coeffs, uint cid,
     switch (kDistortion) {                      \
     case 0:  CALL(DistNone); break;             \
     case 1:  CALL(DistOpenCV); break;           \
-    case 2:  CALL(DistThinPrism); break;        \
-    default: CALL(DistRational); break;         \
+    default: CALL(DistThinPrism); break;        \
     }
 
-// CALL(camera model, D) over the ELEVEN compiled (model, tier) combos
-// (camera_distortion_is_compiled in core/CameraModel.h). Combos outside that
-// set fall through to the nearest compiled tier rather than duplicating an
-// arm -- no launcher dispatches them.
+// CALL(camera model, D) over the compiled combos (camera_distortion_is_compiled
+// in core/CameraModel.h). Combos outside that set fall through to the nearest
+// compiled tier rather than duplicating an arm -- no launcher dispatches them.
 #define SS_DISPATCH_CAM_DIST(CALL)                                      \
     switch (kCameraModel) {                                             \
     case 1:                                                             \
@@ -79,8 +77,7 @@ bool pixel_ray<D : ICameraDistortion>(float* dist_coeffs, uint cid,
         switch (kDistortion) {                                          \
         case 0:  CALL(CameraModelType::PINHOLE, DistNone); break;       \
         case 1:  CALL(CameraModelType::PINHOLE, DistOpenCV); break;     \
-        case 2:  CALL(CameraModelType::PINHOLE, DistThinPrism); break;  \
-        default: CALL(CameraModelType::PINHOLE, DistRational); break;   \
+        default: CALL(CameraModelType::PINHOLE, DistThinPrism); break;  \
         }                                                               \
         break;                                                          \
     }

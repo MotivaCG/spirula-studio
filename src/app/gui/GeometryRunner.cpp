@@ -3,7 +3,7 @@
 #include "app/gui/GeometryRunner.h"
 
 #include "app/FrameMask.h"
-#include "app/gui/AppPaths.h"
+#include "app/AppPaths.h"
 #include "app/gui/Subprocess.h"
 #include "i18n/Locale.h"
 #include "i18n/catalog/Dataset.h"
@@ -13,6 +13,7 @@
 #ifdef SS_TOOL_GEOMETRY
 #include "metric3d/model/Fetch.h"
 #include "moge/model/Fetch.h"
+#include "nn/Device.h"
 #include "nn/io/Fetch.h"
 #endif
 
@@ -202,7 +203,7 @@ std::string geometry_availability() {
 #ifndef SS_TOOL_GEOMETRY
     return lmsg::err_no_geometry_module.get();
 #else
-    if (exe_path().empty()) return lmsg::err_no_exe_path.get();
+    if (app::exe_path().empty()) return lmsg::err_no_exe_path.get();
     return "";
 #endif
 }
@@ -221,8 +222,9 @@ bool run_geometry_step(const GeometryJob& job, const std::string& dataset,
     auto log = [&](const std::string& s, bool detail) { prog.note(s, detail); };
 
     std::vector<std::string> argv = {
-        exe_path(), "--lang", spirula::i18n::code(spirula::i18n::current()),
+        app::exe_path(), "--lang", spirula::i18n::code(spirula::i18n::current()),
         "geometry", dataset,
+        "--image-dir", images.empty() ? std::string("images") : images,
         "--model", job.model,
         "--max-size", std::to_string(job.max_size),
         "--num-tokens", std::to_string(job.num_tokens),
@@ -235,6 +237,15 @@ bool run_geometry_step(const GeometryJob& job, const std::string& dataset,
     if (job.want_depth) argv.push_back("--depth");
     if (!job.want_normal) argv.push_back("--no-normal");
     if (job.overwrite) argv.push_back("--overwrite");
+    // Carry the frozen UUID so an inherited environment cannot redirect the child.
+    std::string device = job.device_uuid;
+#ifdef SS_TOOL_GEOMETRY
+    if (device.empty()) device = nn::configured_device_selector();
+#endif
+    if (!device.empty()) {
+        argv.push_back("--device");
+        argv.push_back(device);
+    }
     if (!job.image_gamut.empty()) {
         argv.push_back("--image-gamut");
         argv.push_back(job.image_gamut);

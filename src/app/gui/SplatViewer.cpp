@@ -2,6 +2,7 @@
 
 #include "app/gui/SplatViewer.h"
 
+#include "backend/api/BackendRuntime.h"
 #include "checkpoint/Resume.h"
 #include "checkpoint/SplatPly.h"
 #include "config/TrainConfig.h"
@@ -37,7 +38,8 @@ TorchTensorView tv(std::vector<float>& v, std::vector<int64_t> shape) {
 // viewer a kilometre away looking at a dot -- and the median is what is left.
 // `radius` comes back as the web viewer's model radius, twice the MEDIAN
 // distance from the centre.
-void scene_extent(const std::vector<float>& xyz, int64_t n,
+template <typename T>
+void scene_extent(const std::vector<T>& xyz, int64_t n,
                   float center[3], float& radius) {
     center[0] = center[1] = center[2] = 0.0f;
     radius = 1.0f;
@@ -49,15 +51,15 @@ void scene_extent(const std::vector<float>& xyz, int64_t n,
     tmp.reserve((size_t)(n / step + 1));
     for (int d = 0; d < 3; d++) {
         tmp.clear();
-        for (int64_t i = 0; i < n; i += step) tmp.push_back(xyz[(size_t)i * 3 + d]);
+        for (int64_t i = 0; i < n; i += step) tmp.push_back((float)xyz[(size_t)i * 3 + d]);
         std::nth_element(tmp.begin(), tmp.begin() + tmp.size() / 2, tmp.end());
         center[d] = tmp[tmp.size() / 2];
     }
     tmp.clear();
     for (int64_t i = 0; i < n; i += step) {
-        const float dx = xyz[(size_t)i * 3 + 0] - center[0];
-        const float dy = xyz[(size_t)i * 3 + 1] - center[1];
-        const float dz = xyz[(size_t)i * 3 + 2] - center[2];
+        const float dx = (float)xyz[(size_t)i * 3 + 0] - center[0];
+        const float dy = (float)xyz[(size_t)i * 3 + 1] - center[1];
+        const float dz = (float)xyz[(size_t)i * 3 + 2] - center[2];
         tmp.push_back(dx * dx + dy * dy + dz * dz);
     }
     std::nth_element(tmp.begin(), tmp.begin() + tmp.size() / 2, tmp.end());
@@ -140,16 +142,20 @@ std::string SplatViewer::gamut() const {
     std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(_mu));
     return _gamut;
 }
+int SplatViewer::transfer() const {
+    std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(_mu));
+    return _transfer;
+}
 bool SplatViewer::linear_color() const {
     std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(_mu));
     return _linear;
 }
 
-void SplatViewer::set_color_space(const char* gamut, bool linear) {
+void SplatViewer::set_color_space(const char* gamut, int transfer, bool linear) {
     const int slot = _scene_slot.load();
     if (slot < 0) return;
     const std::string g = gamut ? gamut : "";
-    const bool on = linear || !g.empty();
+    const bool on = transfer != 0 || linear || !g.empty();
     {
         std::lock_guard<std::mutex> lk(*_engine_mutex);
         // Splat side only: there is no GT image to convert here.
@@ -157,11 +163,12 @@ void SplatViewer::set_color_space(const char* gamut, bool linear) {
             return std::vector<float>(m.begin(), m.end());
         };
         engine_scene_set_color_space(
-            slot, on, linear,
+            slot, on, transfer, linear,
             on ? vec(spirula::gamut_to_rec709(g)) : std::vector<float>{});
     }
     std::lock_guard<std::mutex> lk(_mu);
     _gamut = g;
+    _transfer = transfer;
     _linear = linear;
 }
 
@@ -321,6 +328,7 @@ void SplatViewer::run(std::string path) {
         {
             std::lock_guard<std::mutex> lk(_mu);
             _gamut = color.splat_gamut;
+            _transfer = (int)color.splat_transfer;
             _linear = color.splat_linear;
         }
 
@@ -348,8 +356,23 @@ void SplatViewer::run(std::string path) {
                                   0, 0, 0, 1};
         vc.base_camera_size = 0.0f;   // no cameras to draw
         vc.scene_slot = _pending_slot;
+        {
+            const double inv = unit > 1e-20f ? 1.0 / unit : 1.0;
+            const double A[12] = {inv, 0, 0, -inv * center[0],
+                                  0, inv, 0, -inv * center[1],
+                                  0, 0, inv, -inv * center[2]};
+            vc.centers = dsparse::scene_centers(nullptr, 0, c.means.data(),
+                                                c.num, 3, A);
+        }
 
         {
+#ifndef SS_BACKEND_VULKAN
+            // CUDA current-device state is per thread; bind before the upload.
+            if (!backend::device_bind())
+                throw std::runtime_error(
+                    "could not make the selected GPU current on the viewer "
+                    "thread; restart the application or choose another GPU");
+#endif
             std::lock_guard<std::mutex> lk(*_engine_mutex);
             const int64_t K = c.dim_sh() - 1;
             // Claimed before the upload, not after: an upload that throws part
@@ -363,12 +386,13 @@ void SplatViewer::run(std::string path) {
                           tv(c.opacities,   {c.num, 1}),
                           tv(c.features_dc, {c.num, 3}),
                           tv(c.features_sh, {c.num, K, 3}));
-            const bool cs_on = color.splat_linear || !color.splat_gamut.empty();
+            const bool cs_on = color.splat_on();
             auto vec = [](const spirula::Mat3f& m) {
                 return std::vector<float>(m.begin(), m.end());
             };
             engine_scene_set_color_space(
-                _pending_slot, cs_on, color.splat_linear,
+                _pending_slot, cs_on, (int)color.splat_transfer,
+                color.splat_linear,
                 cs_on ? vec(spirula::gamut_to_rec709(color.splat_gamut))
                       : std::vector<float>{});
         }

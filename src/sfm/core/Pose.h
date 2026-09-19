@@ -113,6 +113,11 @@ inline Pose transformPose(const Sim3& T, const Pose& p) {
     return {R, p.t * T.scale - mul(R, T.t)};
 }
 
+// (A then B) applied as x -> B(A(x)), matching composePose's argument order.
+inline Sim3 composeSim3(const Sim3& b, const Sim3& a) {
+    return {b.scale * a.scale, mul(b.R, a.R), mul(b.R, a.t) * b.scale + b.t};
+}
+
 inline Sim3 invertSim3(const Sim3& T) {
     Sim3 inv;
     inv.scale = 1.0 / T.scale;

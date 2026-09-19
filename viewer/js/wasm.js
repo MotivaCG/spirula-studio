@@ -149,7 +149,7 @@ export async function loadModelFromUrl(url, name) {
 
 // ---- public: parse a PLY / OBJ file via WASM ----
 async function loadNative(file, hint) {
-  if (hint !== 1) {
+  if (hint === 0) {
     const res = await tryStreamPly(file);
     if (res) return res;
   }
@@ -367,9 +367,9 @@ async function loadOBJTexture(objFile, text, siblings) {
 export async function loadModel(files) {
   const list = Array.from(files);
   // pick the main model file
-  const exts = ['.ply','.glb','.gltf','.obj'];
+  const exts = ['.ply','.glb','.gltf','.obj','.stl'];
   const main = list.find(f => exts.some(e => f.name.toLowerCase().endsWith(e)));
-  if (!main) throw new Error('no supported model file found (.ply/.obj/.gltf/.glb)');
+  if (!main) throw new Error('no supported model file found (.ply/.obj/.gltf/.glb/.stl)');
   if (main.urlStream) return await loadModelFromUrl(main.urlStream, main.name);
   const lname = main.name.toLowerCase();
   if (lname.endsWith('.gltf') || lname.endsWith('.glb')) {
@@ -385,6 +385,7 @@ export async function loadModel(files) {
     res.image = image;
     return res;
   }
+  if (lname.endsWith('.stl')) return await loadNative(main, 2);
   // PLY (splat or mesh, auto-detected)
   return await loadNative(main, 0);
 }
@@ -421,8 +422,9 @@ export function meshHistogram(param, nbins) {
 }
 export function meshEdgeCount() { return call('ssv_mesh_edge_count'); }
 export function bbox() { return f32(call('ssv_bbox'), 6).slice(); }
-// robust fit sphere: [cx, cy, cz, medianDistance]
-export function fitSphere() { return f32(call('ssv_fit_sphere'), 4).slice(); }
+// fit sphere about centering mode `mode` (index.html #center-mode):
+// [cx, cy, cz, medianDistance]
+export function fitSphere(mode = 2) { return f32(call('ssv_fit_sphere', 'number', ['number'], [mode|0]), 4).slice(); }
 // nearest ray/mesh hit distance (model-native frame), or -1
 export function raycastMesh(ox, oy, oz, dx, dy, dz) {
   return call('ssv_raycast_mesh','number',
@@ -530,7 +532,8 @@ export function dsSummary() {
 export function dsLastError() {
   return Module.ccall('ssv_ds_last_error', 'string', [], []);
 }
-export function dsFitSphere() { return f32(call('ssv_ds_fit_sphere') >>> 0, 4).slice(); }
+export function dsFitSphere(mode = 2) { return f32(call('ssv_ds_fit_sphere', 'number', ['number'], [mode|0]) >>> 0, 4).slice(); }
+export function dsFrustumSize() { return call('ssv_ds_frustum_size'); }
 export function dsPickPoint(ox, oy, oz, dx, dy, dz) {
   const ptr = Module.ccall('ssv_ds_pick_point', 'number',
     ['number','number','number','number','number','number'], [ox,oy,oz,dx,dy,dz]) >>> 0;
