@@ -3025,6 +3025,34 @@ SS_MSG_EN(export_keep_all_splats_help,
     "so its index order matches the live buffers. For a sequence trained "
     "frame by frame: a dropped splat shifts every later index and breaks "
     "frame-to-frame correspondence.");
+SS_MSG_EN(temporal_frames, "Train a chunk of frames");
+SS_MSG_EN(temporal_frames_help,
+    "Semicolon-separated dataset folders for the frames after --data, all with "
+    "the same cameras. One splat population is trained on every frame at once: "
+    "position, rotation, opacity and base colour per frame, scale and "
+    "higher-order SH shared. Writes one PLY per frame under frames/.");
+SS_MSG_EN(temporal_smooth_every, "Temporal smoothing interval");
+SS_MSG_EN(temporal_smooth_every_help,
+    "Steps between two temporal smoothing passes of a chunk run.");
+SS_MSG_EN(temporal_smooth_position, "Temporal smoothing of positions");
+SS_MSG_EN(temporal_smooth_position_help,
+    "Weight, 0 to 1, of one smoothing step on each position's acceleration "
+    "along time at each pass. Constant-velocity motion is not penalized.");
+SS_MSG_EN(temporal_smooth_rotation, "Temporal smoothing of rotations");
+SS_MSG_EN(temporal_smooth_rotation_help,
+    "As for positions, on each rotation's angular acceleration.");
+SS_MSG_EN(temporal_smooth_opacity, "Temporal smoothing of opacity");
+SS_MSG_EN(temporal_smooth_opacity_help,
+    "Weight, 0 to 1, of one smoothing step on each opacity logit's change "
+    "between frames.");
+SS_MSG_EN(temporal_smooth_color, "Temporal smoothing of colour");
+SS_MSG_EN(temporal_smooth_color_help,
+    "As for opacity, on the base colour coefficients.");
+SS_MSG_EN(temporal_pin_first, "Hold the first frame of a chunk");
+SS_MSG_EN(temporal_pin_first_help,
+    "Keep the chunk's first frame exactly as --init-ply gives it: it is neither "
+    "trained nor smoothed, and the frames after it are smoothed away from it. "
+    "For a chunk that continues the last frame of the previous one.");
 
 SS_MSG(scale_init,
     EN("Initial splat size"), JA("スプラットの初期サイズ"),

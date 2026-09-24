@@ -299,6 +299,18 @@ private:
     // Seconds per step over the window, or -1 while it is empty.
     double avg_step_latency() const;
 
+    // The engine's DataManager over these files, with every other input from ds.
+    void install_data_manager(const std::vector<std::string>& images,
+                              const std::vector<std::string>& masks,
+                              const std::vector<std::string>& depths,
+                              const std::vector<std::string>& normals);
+    // cfg.temporal_frames: one DataManager per frame, the splats cloned into each.
+    void setup_chunk();
+    void save_chunk(int step);
+    void eval_frame(const std::string& data, const std::filesystem::path& metrics);
+    std::vector<std::string> _chunk_dirs;  // [0] is cfg.data
+    uint64_t _chunk_rng = 0x9e3779b97f4a7c15ull;
+
     mutable std::mutex _time_mutex;                        // guards the clock
     std::chrono::steady_clock::time_point _start_time{};   // {} = not started
     std::chrono::steady_clock::time_point _end_time{};     // {} = running

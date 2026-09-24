@@ -12,6 +12,7 @@
 #include "data/CameraMath.h"
 #include "data/ImageProbe.h"
 #include "data/Knn.h"
+#include "engine/EngineTemporal.h"
 #include "sfm/core/Exif.h"
 
 #ifndef _WIN32
@@ -728,6 +729,25 @@ void TrainerSession::check_config() {
         log(lmsg::warn_init_ply_ignored.get());
     else if (!cfg.init_ply.empty())
         find_splat_ply(cfg.init_ply);  // before the dataset is parsed, not after
+    _chunk_dirs.clear();
+    if (!unset(cfg.temporal_frames)) {
+        _chunk_dirs.push_back(cfg.data);
+        std::string rest = cfg.temporal_frames;
+        for (size_t at = 0; at <= rest.size();) {
+            size_t end = rest.find(';', at);
+            if (end == std::string::npos) end = rest.size();
+            if (end > at) _chunk_dirs.push_back(rest.substr(at, end - at));
+            at = end + 1;
+        }
+        if (!cfg.resume.empty())
+            throw std::runtime_error("--temporal-frames cannot be resumed");
+        // Every frame shares one population and one optimizer layout: no
+        // densification, full-precision Adam state.
+        cfg.quantization_level = 0;
+        cfg.refine_start_iter = cfg.num_iterations + 1;
+        cfg.export_keep_all_splats = true;
+        log("chunk training over " + std::to_string(_chunk_dirs.size()) + " frames");
+    }
     if (cfg.validation_fraction > 0)
         log(lmsg::warn_validation_unported.get());
     if (cfg.orientation_method != "up" || cfg.center_method != "poses")
@@ -918,6 +938,7 @@ void TrainerSession::setup_engine() {
     log(lfmt(lmsg::output_directory, {fs::absolute(out_dir).string()}));
 
     // ---- Engine setup -------------------------------------------------
+    engine_temporal_end();
     engine_reset();
 
     ColorResolution color = resolve_color(cfg);
@@ -970,44 +991,8 @@ void TrainerSession::setup_engine() {
     }
 
     // ---- DataManager ---------------------------------------------------
-    const int64_t N = ds.num_cameras;
-    int64_t num_val = (int64_t)ds.val_indices.size();
-    int64_t num_train = N - num_val;
-    // Batch-size policy.
-    double n_batch = std::max((double)num_train / std::max(cfg.max_batch_per_epoch, 1), 1.0);
-    int train_bs = std::max(1, (int)(n_batch + 0.5));
-    int val_bs = 1;
-    if (num_val > 0)
-        val_bs = std::max(1, (int)std::ceil(n_batch * (double)num_val / (double)num_train));
-
-    DataManagerConfig dm;
-    dm.cache_mode  = (cfg.cache_images == "disk") ? CacheMode::DISK : CacheMode::CPU;
-    // A split needs a mask even when none is on disk: the synthesized
-    // all-white one becomes the post-split FOV mask (0 past the lens),
-    // without which the unseen face regions train as black.
-    dm.load_masks  = has_mask || post.any_fov_mask;
-    dm.load_depths      = has_depth;
-    dm.load_normals     = has_normal;
-    dm.train_batch_size = train_bs;
-    dm.val_batch_size   = val_bs;
-    dm.flip_mask = cfg.flip_mask;
-    dm.mask_boundary_offset = cfg.mask_boundary_offset;
-    engine_setup_data_manager(
-        dm, ds.camera_models, ds.camera_distortions,
-        ds.image_filenames,
-        has_mask ? ds.mask_filenames : std::vector<std::string>{},
-        has_depth ? ds.depth_filenames : std::vector<std::string>{},
-        has_normal ? ds.normal_filenames : std::vector<std::string>{},
-        ds.widths, ds.heights,
-        post.any_warp ? post.K_per_camera : std::vector<int32_t>{},
-        post.any_warp ? post.post_offsets : std::vector<int32_t>{},
-        post.viewmats, post.intrins, post.dist_coeffs,
-        post.any_warp ? post.post_widths : std::vector<int32_t>{},
-        post.any_warp ? post.post_heights : std::vector<int32_t>{},
-        post.any_warp ? post.face_axes : std::vector<float>{},
-        post.input_intrins, post.input_dist_coeffs,
-        post.redistort_models, post.redistort_params,
-        ds.train_indices, ds.val_indices);
+    install_data_manager(ds.image_filenames, ds.mask_filenames, ds.depth_filenames,
+                         ds.normal_filenames);
 
     // ---- Bilagrid / PPISP init -----------------------------------------
     // Enablement conditions are static here (dataset modalities known up
@@ -1090,6 +1075,108 @@ void TrainerSession::setup_engine() {
         log(st.ppisp_frozen ? ("PPISP reused from " + cfg.ppisp_from)
                          : ("no PPISP in " + cfg.ppisp_from + "; fitting one"));
     }
+    if (_chunk_dirs.size() > 1) setup_chunk();
+}
+
+void TrainerSession::install_data_manager(const std::vector<std::string>& images,
+                                          const std::vector<std::string>& masks,
+                                          const std::vector<std::string>& depths,
+                                          const std::vector<std::string>& normals) {
+    const int64_t N = ds.num_cameras;
+    int64_t num_val = (int64_t)ds.val_indices.size();
+    int64_t num_train = N - num_val;
+    // Batch-size policy.
+    double n_batch = std::max((double)num_train / std::max(cfg.max_batch_per_epoch, 1), 1.0);
+    int train_bs = std::max(1, (int)(n_batch + 0.5));
+    int val_bs = 1;
+    if (num_val > 0)
+        val_bs = std::max(1, (int)std::ceil(n_batch * (double)num_val / (double)num_train));
+
+    DataManagerConfig dm;
+    dm.cache_mode  = (cfg.cache_images == "disk") ? CacheMode::DISK : CacheMode::CPU;
+    // A split needs a mask even when none is on disk: the synthesized
+    // all-white one becomes the post-split FOV mask (0 past the lens),
+    // without which the unseen face regions train as black.
+    dm.load_masks  = has_mask || post.any_fov_mask;
+    dm.load_depths      = has_depth;
+    dm.load_normals     = has_normal;
+    dm.train_batch_size = train_bs;
+    dm.val_batch_size   = val_bs;
+    dm.flip_mask = cfg.flip_mask;
+    dm.mask_boundary_offset = cfg.mask_boundary_offset;
+    if (_chunk_dirs.size() > 1) {
+        // One decoder pool per frame: the defaults would start 32 threads each.
+        dm.workers_rgb = 4;
+        dm.workers_depth = dm.workers_normal = 2;
+        dm.prefetch_batches = 2;
+    }
+    engine_setup_data_manager(
+        dm, ds.camera_models, ds.camera_distortions,
+        images,
+        has_mask ? masks : std::vector<std::string>{},
+        has_depth ? depths : std::vector<std::string>{},
+        has_normal ? normals : std::vector<std::string>{},
+        ds.widths, ds.heights,
+        post.any_warp ? post.K_per_camera : std::vector<int32_t>{},
+        post.any_warp ? post.post_offsets : std::vector<int32_t>{},
+        post.viewmats, post.intrins, post.dist_coeffs,
+        post.any_warp ? post.post_widths : std::vector<int32_t>{},
+        post.any_warp ? post.post_heights : std::vector<int32_t>{},
+        post.any_warp ? post.face_axes : std::vector<float>{},
+        post.input_intrins, post.input_dist_coeffs,
+        post.redistort_models, post.redistort_params,
+        ds.train_indices, ds.val_indices);
+}
+
+// Frame k's files are frame 0's with the dataset root swapped: the cameras are
+// shared, so only the pixels differ.
+void TrainerSession::setup_chunk() {
+    const int frames = (int)_chunk_dirs.size();
+    engine_temporal_begin(frames, cfg.use_fused_proj_bwd_optim, cfg.use_per_splat_bias_correction);
+    engine_temporal_stash_data_manager(0);
+    const fs::path root = fs::path(cfg.data);
+    auto remap = [&](const std::vector<std::string>& files, const std::string& dir) {
+        std::vector<std::string> out;
+        out.reserve(files.size());
+        for (const std::string& f : files) {
+            if (f.empty()) { out.push_back(f); continue; }
+            const fs::path p(f);
+            const fs::path rel = p.is_absolute() ? p.lexically_relative(root) : p;
+            if (rel.empty() || *rel.begin() == "..")
+                throw std::runtime_error("chunk training: " + f + " is outside --data");
+            const fs::path mapped = fs::path(dir) / rel;
+            if (!fs::exists(mapped))
+                throw std::runtime_error("chunk training: missing " + mapped.string());
+            out.push_back(mapped.string());
+        }
+        return out;
+    };
+    for (int k = 1; k < frames; k++) {
+        const std::string& dir = _chunk_dirs[k];
+        install_data_manager(remap(ds.image_filenames, dir),
+                             has_mask ? remap(ds.mask_filenames, dir) : ds.mask_filenames,
+                             has_depth ? remap(ds.depth_filenames, dir) : ds.depth_filenames,
+                             has_normal ? remap(ds.normal_filenames, dir) : ds.normal_filenames);
+        engine_temporal_stash_data_manager(k);
+    }
+    engine_temporal_select(0);
+    log("chunk: " + std::to_string(frames) + " frames x " +
+        std::to_string(engine_get_cur_num_splats()) + " splats");
+}
+
+void TrainerSession::save_chunk(int step) {
+    const int keep = engine_temporal_current();
+    const fs::path root = out_dir / "frames";
+    fs::create_directories(root);
+    std::ofstream list(root / "frames.txt");
+    for (int k = 0; k < engine_temporal_frames(); k++) {
+        char name[32];
+        std::snprintf(name, sizeof name, "%03d", k);
+        engine_temporal_select(k);
+        engine_save_checkpoint((root / name).string(), false, step, true);
+        list << name << ' ' << _chunk_dirs[k] << '\n';
+    }
+    engine_temporal_select(keep);
 }
 
 // Where the run's first splats come from: the dataset's point cloud, an
@@ -1156,6 +1243,10 @@ void TrainerSession::restore_checkpoint() {
 }
 
 void TrainerSession::save_checkpoint(int step) {
+    if (engine_temporal_active()) {
+        save_chunk(step);
+        return;
+    }
     char name[32];
     std::snprintf(name, sizeof name, "step-%09d.ckpt", step);
     fs::path ckpt = out_dir / name;
@@ -1190,6 +1281,16 @@ void TrainerSession::maybe_boost_opacity(int step) {
 // One step. Split out of train() so a front-end that keeps its own loop
 // shares this per-step config rather than rebuilding it.
 std::map<std::string, float> TrainerSession::train_step(int step) {
+    if (engine_temporal_active()) {
+        // splitmix64: a frame per step, independent of the DataManagers' draws.
+        uint64_t z = (_chunk_rng += 0x9e3779b97f4a7c15ull);
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+        z ^= z >> 31;
+        const int held = cfg.temporal_pin_first ? 1 : 0;
+        const uint64_t trained = (uint64_t)std::max(engine_temporal_frames() - held, 1);
+        engine_temporal_select(held + (int)(z % trained));
+    }
     maybe_boost_opacity(step);
     int sh_degree_to_use = step / std::max(cfg.sh_degree_warmup_every, 1);
     EngineStepConfig sc = build_step_config(cfg, st, step);
@@ -1203,6 +1304,11 @@ std::map<std::string, float> TrainerSession::train_step(int step) {
     if (const char* err = backend::last_error())
         throw std::runtime_error("GPU backend error at step " +
                                  std::to_string(step) + ": " + err);
+    if (engine_temporal_active() && cfg.temporal_smooth_every > 0 &&
+        (step + 1) % cfg.temporal_smooth_every == 0)
+        engine_temporal_smooth({cfg.temporal_smooth_position, cfg.temporal_smooth_rotation,
+                                cfg.temporal_smooth_opacity, cfg.temporal_smooth_color},
+                               cfg.temporal_pin_first);
 
     // Divergence never recovers, and the run otherwise continues in silence to
     // a black render and a checkpoint with zero splats. Reported values sit
@@ -1447,6 +1553,19 @@ std::vector<uint8_t> to_png_bytes(const std::vector<float>& rgb) {
 void TrainerSession::eval() {
     // eval_mode "all" trains on every frame, so nothing is held out.
     if (cfg.eval_mode == "all") return;
+    if (!engine_temporal_active()) {
+        eval_frame(cfg.data, out_dir / "metrics.json");
+        return;
+    }
+    for (int k = 0; k < engine_temporal_frames(); k++) {
+        char name[32];
+        std::snprintf(name, sizeof name, "%03d", k);
+        engine_temporal_select(k);
+        eval_frame(_chunk_dirs[k], out_dir / "frames" / name / "metrics.json");
+    }
+}
+
+void TrainerSession::eval_frame(const std::string& data, const fs::path& metrics) {
 
     // Re-parse for the eval side of the split. The parser computes the split
     // over all frames, so this is the exact complement of what training saw.
@@ -1469,7 +1588,7 @@ void TrainerSession::eval() {
     pcfg.metashape_psx           = cfg.metashape_psx;
     pcfg.split                   = "eval";
 
-    ParsedDataset eds = parse_dataset(cfg.data, pcfg, cfg.data_format);
+    ParsedDataset eds = parse_dataset(data, pcfg, cfg.data_format);
     if (eds.num_cameras == 0) {
         log(lmsg::eval_split_empty.get());
         return;
@@ -1521,6 +1640,13 @@ void TrainerSession::eval() {
     }
 
     log(lfmt(lmsg::eval_views, {(long long)epost.n_post}));
+    if (cfg.save_eval_images) {
+        // Which file each eval-*-NNNNN.png pair came from, for masked scoring.
+        std::ofstream views(metrics.parent_path() / "eval_views.txt");
+        for (int64_t i = 0; i < eds.num_cameras; i++)
+            views << eds.image_filenames[(size_t)i] << "\t"
+                  << (eds.mask_filenames.empty() ? "" : eds.mask_filenames[(size_t)i]) << "\n";
+    }
 
     // Rendering is serial (one process-global engine), but scoring a view --
     // colour correction, the metrics, and the PNG encode -- is pure host work
@@ -1582,7 +1708,7 @@ void TrainerSession::eval() {
                 std::snprintf(nm, sizeof nm, "eval-%s-%05d.png", kind,
                               (int)j.index);
                 std::vector<uint8_t> bytes = to_png_bytes(img);
-                stbi_write_png((out_dir / nm).string().c_str(), j.W, j.H, j.C,
+                stbi_write_png((metrics.parent_path() / nm).string().c_str(), j.W, j.H, j.C,
                                bytes.data(), j.W * j.C);
             };
             // Both sides, because the LPIPS tool needs the pair -- and the
@@ -1700,7 +1826,7 @@ void TrainerSession::eval() {
 
     // metrics.json: per-image lists plus avg_* scalars, the shape
     // reference/python/benchmark.py reads back.
-    std::ofstream mf((out_dir / "metrics.json").string());
+    std::ofstream mf(metrics.string());
     if (!mf) throw std::runtime_error("cannot write metrics.json");
     mf << "{\n";
     bool first = true;
@@ -1719,7 +1845,7 @@ void TrainerSession::eval() {
     mf << ",\n    \"training_time\": " << training_time_s;
     mf << ",\n    \"engine_vram\": " << engine_vram_mb;
     mf << "\n}\n";
-    log(lfmt(lmsg::eval_metrics_written, {(out_dir / "metrics.json").string()}));
+    log(lfmt(lmsg::eval_metrics_written, {metrics.string()}));
     // Eval renders at full resolution and can push the pool past its
     // training-time mark, so re-capture over train()'s snapshot.
     engine_profile_capture_vram();
