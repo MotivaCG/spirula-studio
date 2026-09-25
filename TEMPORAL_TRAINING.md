@@ -392,6 +392,30 @@ Not shown: whether the warp's gain holds with smoothing on and over 32 frames;
 why C3's fit decays over 45-76 (the window runs here do not decay over 11
 frames); seed spread.
 
+### 5.6 Battery B2: repeated-frame control (2026-09-25)
+
+Hypothesis: if frame 50 repeated as a motionless sequence also loses subject
+splats, part of the loss comes from re-optimizing, not from motion. Same init
+(Forge frame 50), same flags, no smoothing.
+
+| run | motion | live k >0.02/>0.1/>0.5, 50 → 60 | coverage 50 → 60 |
+|---|---|---|---|
+| RF1 window W6, frame 50 ×11 | no | 150/125/59 → 124/105/52 (−16 % at >0.1) | 90 → 89 % |
+| Wd same window, real frames | yes | 147/125/59 → 98/82/43 (−34 %) | 89 → 86 % |
+| RF3 plain chain, frame 50 ×11 | no | 152/127/58 → 120/102/53 (−20 %) | 90 → 87 % |
+| R1 same chain, real frames | yes | 152/127/58 → 84/72/39 (−43 %) | 90 → 81 % |
+| RF2 frame 50, 64k steps continuous | no | 155/131/60 → 134/118/65 (−10 %) | 90 → 89 % |
+
+What it shows: about half of the count loss happens without motion, from
+re-optimizing (the criterion set before the run was "≥ half → re-optimization
+is a main cause"; it lands at ~47 %, on the edge). But **that half costs almost
+no coverage**: it is redundant splats consolidating. The **loss of covered
+surface comes with motion** (coverage 89-90 → 81-86 % only with real frames).
+Decision: go on to births, judged by coverage, fit, detail and flicker, not by
+counts.
+
+Not shown: whether the re-optimization dimming costs fit over longer takes.
+
 ### 5.4 Known weaknesses of these results (review of 2026-09-25)
 
 An outside review of this record raised these; all are accepted.
