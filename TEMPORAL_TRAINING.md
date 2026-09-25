@@ -416,6 +416,36 @@ counts.
 
 Not shown: whether the re-optimization dimming costs fit over longer takes.
 
+### 5.7 Battery B3: births that keep identity, frames 50-60 (2026-09-25)
+
+Code: `engine_temporal_birth` (`--temporal-birth-dir/-gap/-fraction`). When a
+frame enters the window, its subject SfM points (`births.py`: hull-filtered,
+colour, spacing to the 4th neighbour, median ~17 mm) with no live splat within
+1 cm take rows whose opacity is < 0.005 in **every** frame, held ones included
+(so no frame already trained or written changes): position of the point,
+identity rotation, colour of the point, scale half the spacing, opacity 0.1 in
+the entering frame only (dead in every earlier one), no optimizer history. Cap
+2 % per frame; 800-1500 were born per frame.
+
+Window W6, 4000 steps, warp on, no smoothing. Criterion set before the run
+(vs Ws): coverage at 60 ≥ +2 points, fit and detail not below by > 0.2 dB,
+flicker not above by > 15 %.
+
+| run | fit dB | detail dB | regional flicker | live >0.1 50 → 60 | coverage 50 → 60 | verdict |
+|---|---|---|---|---|---|---|
+| Ws warp (B1) | 30.13 | 35.35 | **10.94** | 124k → 99k | 89 → 88 % | reference |
+| B3b + boost 1.5 | 30.09 | 35.30 | 14.76 | 125k → 137k | 89 → 88 % | fails: +35 % flicker, no coverage |
+| B3c + births | 30.13 | 35.38 | 13.18 | 123k → 107k | 89 → **92 %** | fails flicker (+20 %) |
+| **B3d + births + boost 1.5** | 30.08 | 35.34 | 11.45 | 124k → 142k | 89 → **91 %** | **passes** |
+
+What it shows: births restore covered surface lost to motion (+3-4 points)
+with no cost in fit or detail. Over 11 frames that surface does not show in
+fit yet. B3d passes the flicker criterion and B3c does not, but 11.45 vs 13.18
+is one run each: not established.
+
+Not shown: whether covered surface holds fit over a full take (C3 fell to
+27.2 dB), the effect with smoothing on, seed spread. Next: battery B4.
+
 ### 5.4 Known weaknesses of these results (review of 2026-09-25)
 
 An outside review of this record raised these; all are accepted.

@@ -1220,6 +1220,22 @@ void TrainerSession::advance_window(int step) {
         }
         install_frame_data(_window_next++);
         engine_temporal_push(cfg.temporal_entry_opacity_boost, warped ? &warp : nullptr);
+        if (!unset(cfg.temporal_birth_dir)) {
+            char name[32];
+            std::snprintf(name, sizeof name, "%03d.bin", _window_next - 1);
+            std::ifstream in(fs::path(cfg.temporal_birth_dir) / name, std::ios::binary);
+            int32_t count = 0;
+            std::vector<float> points;
+            if (in.read(reinterpret_cast<char*>(&count), 4) && count > 0) {
+                points.resize((size_t)count * 7);
+                if (!in.read(reinterpret_cast<char*>(points.data()), (std::streamsize)(points.size() * 4)))
+                    points.clear();
+            }
+            const int64_t born = engine_temporal_birth(
+                points, cfg.temporal_birth_gap,
+                (int64_t)(cfg.temporal_birth_fraction * (float)engine_get_cur_num_splats()));
+            log(std::string("frame ") + name + ": " + std::to_string(born) + " splats born");
+        }
         _slot_age.push_back(0);
     }
     int trainable = 0, oldest = -1;

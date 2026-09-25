@@ -46,6 +46,11 @@ void engine_temporal_hold(int frame);
 bool engine_temporal_held(int frame);
 void engine_temporal_drop_front();
 
+// Births into the last frame: points (rows [xyz, rgb 0..1, spacing]) with no
+// live splat within `gap` take rows dead in every frame, held ones included, so
+// no frame already shown changes. Returns how many were born.
+int64_t engine_temporal_birth(const std::vector<float>& points, float gap, int64_t max_new);
+
 // One smoothing step along time per attribute, weights in [0, 1]: second
 // difference for position and rotation, first for opacity and colour.
 void engine_temporal_smooth(const TemporalSmoothing& weights);

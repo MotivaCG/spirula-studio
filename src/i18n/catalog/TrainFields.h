@@ -3073,6 +3073,19 @@ SS_MSG_EN(temporal_entry_opacity_boost, "Opacity boost for each window frame");
 SS_MSG_EN(temporal_entry_opacity_boost_help,
     "Multiplies every opacity of a frame entering the window, capped at 0.99. 1 "
     "leaves it as the previous frame had it.");
+SS_MSG_EN(temporal_birth_dir, "Birth points per frame");
+SS_MSG_EN(temporal_birth_dir_help,
+    "Folder of NNN.bin (int32 count, then float32 rows x, y, z, r, g, b in 0..1, "
+    "point spacing): subject points of frame NNN of --temporal-frames. When the "
+    "frame enters the window, those with no live splat nearby are born into rows "
+    "dead in every frame, so no frame already trained or written changes.");
+SS_MSG_EN(temporal_birth_gap, "Birth gap");
+SS_MSG_EN(temporal_birth_gap_help,
+    "A point is born only if no live splat of the entering frame lies within this "
+    "distance, in scene units.");
+SS_MSG_EN(temporal_birth_fraction, "Birth budget");
+SS_MSG_EN(temporal_birth_fraction_help,
+    "Largest share of the population born into one entering frame.");
 SS_MSG_EN(temporal_warp_dir, "Warps between frames");
 SS_MSG_EN(temporal_warp_dir_help,
     "Folder of deformation graphs, NNN.bin carrying frame NNN-1 of --temporal-frames "

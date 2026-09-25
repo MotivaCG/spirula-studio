@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <memory>
 #include <unordered_map>
 #include <stdexcept>
@@ -371,4 +372,123 @@ void engine_temporal_smooth(const TemporalSmoothing& w) {
         if (!t.slots[k].held) upload(k, h[k]);
     if (t.active >= 0) copy_slot(t.active, true);
     backend::device_synchronize();
+}
+
+int64_t engine_temporal_birth(const std::vector<float>& points, float gap, int64_t max_new) {
+    Temporal& t = *g_temporal;
+    EngineState& s = engine();
+    const size_t n = (size_t)t.splats, frames = t.slots.size(), last = frames - 1;
+    if (points.empty() || max_new <= 0 || frames == 0) return 0;
+    if (s.world.sh_value_bits != 32)
+        throw std::runtime_error("chunk training: births need full-precision SH");
+    if (t.active >= 0) copy_slot(t.active, false);
+    backend::device_synchronize();
+    std::vector<HostParams> h;
+    for (size_t k = 0; k < frames; k++) h.push_back(download((int)k));
+
+    // Rows transparent in every frame: changing their shared scale and SH then
+    // changes no frame, trained or already written.
+    const float dead = std::log(0.005f / 0.995f), live = std::log(0.1f / 0.9f);
+    std::vector<int64_t> free_rows;
+    for (size_t i = 0; i < n; i++) {
+        bool gone = true;
+        for (size_t k = 0; k < frames && gone; k++) gone = h[k].opacities[i] < dead;
+        if (gone) free_rows.push_back((int64_t)i);
+    }
+
+    // Gaps: points with no live splat of the entering frame within `gap`.
+    std::unordered_map<int64_t, std::vector<int>> grid;
+    auto key = [&](float x, float y, float z) {
+        return ((int64_t)std::floor(x / gap) + (1 << 20)) * (int64_t(1) << 42) +
+               ((int64_t)std::floor(y / gap) + (1 << 20)) * (int64_t(1) << 21) +
+               ((int64_t)std::floor(z / gap) + (1 << 20));
+    };
+    const HostParams& cur = h[last];
+    for (size_t i = 0; i < n; i++)
+        if (cur.opacities[i] > live)
+            grid[key(cur.means[3 * i], cur.means[3 * i + 1], cur.means[3 * i + 2])].push_back((int)i);
+    std::vector<size_t> born;
+    for (size_t p = 0; p + 7 <= points.size() && born.size() < free_rows.size() &&
+                       (int64_t)born.size() < max_new; p += 7) {
+        const float* q = points.data() + p;
+        bool covered = false;
+        for (int dx = -1; dx <= 1 && !covered; dx++)
+            for (int dy = -1; dy <= 1 && !covered; dy++)
+                for (int dz = -1; dz <= 1 && !covered; dz++) {
+                    auto it = grid.find(key(q[0] + dx * gap, q[1] + dy * gap, q[2] + dz * gap));
+                    if (it == grid.end()) continue;
+                    for (int i : it->second) {
+                        const float* m = cur.means.data() + 3 * i;
+                        const float d2 = (m[0] - q[0]) * (m[0] - q[0]) + (m[1] - q[1]) * (m[1] - q[1]) +
+                                         (m[2] - q[2]) * (m[2] - q[2]);
+                        if (d2 < gap * gap) { covered = true; break; }
+                    }
+                }
+        if (!covered) born.push_back(p);
+    }
+    if (born.empty()) return 0;
+
+    auto get = [&](void* src, size_t floats) {
+        std::vector<float> v(floats);
+        backend::memcpy_sync(v.data(), src, floats * 4, backend::MemcpyKind::DeviceToHost);
+        return v;
+    };
+    auto put = [&](void* dst, const std::vector<float>& v) {
+        backend::memcpy_sync(dst, v.data(), v.size() * 4, backend::MemcpyKind::HostToDevice);
+    };
+    const size_t sh_row = 3 * (size_t)s.num_sh;
+    std::vector<float> scales = get(s.world.scales.data_ptr(), 3 * n);
+    std::vector<float> sh = get(s.world.features_sh.data_ptr(), sh_row * n);
+    constexpr float kSHC0 = 0.28209479177387814f;
+    const float start = std::log(0.1f / 0.9f);
+    for (size_t j = 0; j < born.size(); j++) {
+        const float* q = points.data() + born[j];
+        const size_t r = (size_t)free_rows[j];
+        for (size_t k = 0; k < frames; k++) {
+            HostParams& f = h[k];
+            std::copy(q, q + 3, f.means.data() + 3 * r);
+            const float ident[4] = {1, 0, 0, 0};
+            std::copy(ident, ident + 4, f.quats.data() + 4 * r);
+            for (int c = 0; c < 3; c++) f.dc[3 * r + c] = (q[3 + c] - 0.5f) / kSHC0;
+            // Born in the entering frame only; every earlier frame keeps it dead.
+            if (k == last) f.opacities[r] = start;
+        }
+        const float ls = std::log(std::max(q[6], 1e-4f) * 0.5f);
+        for (int a = 0; a < 3; a++) scales[3 * r + a] = ls;
+        std::fill_n(sh.data() + sh_row * r, sh_row, 0.0f);
+    }
+    for (size_t k = 0; k < frames; k++) upload((int)k, h[k]);
+    // The new rows start with no optimizer history, in the entering frame's slot
+    // (the moments follow the four parameter fields) and in the shared state.
+    {
+        const size_t params = n * sizeof(float) * (3 + 4 + 1 + 3);
+        std::vector<char> tail(t.slot_bytes - params);
+        char* base = static_cast<char*>(t.slots[last].mem) + params;
+        backend::memcpy_sync(tail.data(), base, tail.size(), backend::MemcpyKind::DeviceToHost);
+        size_t off = 0;
+        for (const Field& f : per_frame_fields(t.splats)) {
+            if (off < params) { off += f.bytes; continue; }
+            const size_t per = f.bytes / n;
+            for (size_t j = 0; j < born.size(); j++)
+                std::memset(tail.data() + (off - params) + per * (size_t)free_rows[j], 0, per);
+            off += f.bytes;
+        }
+        backend::memcpy_sync(base, tail.data(), tail.size(), backend::MemcpyKind::HostToDevice);
+    }
+    put(s.world.scales.data_ptr(), scales);
+    put(s.world.features_sh.data_ptr(), sh);
+    for (void* m : {s.optim.g1_scales.data_ptr(), s.optim.g2_scales.data_ptr()}) {
+        std::vector<float> v = get(m, 3 * n);
+        for (size_t j = 0; j < born.size(); j++) std::fill_n(v.data() + 3 * free_rows[j], 3, 0.0f);
+        put(m, v);
+    }
+    if (!s.optim.sh_quantize_enabled())
+        for (void* m : {s.optim.g1_features_sh.data_ptr(), s.optim.g2_features_sh.data_ptr()}) {
+            std::vector<float> v = get(m, sh_row * n);
+            for (size_t j = 0; j < born.size(); j++) std::fill_n(v.data() + sh_row * free_rows[j], sh_row, 0.0f);
+            put(m, v);
+        }
+    if (t.active >= 0) copy_slot(t.active, true);
+    backend::device_synchronize();
+    return (int64_t)born.size();
 }
