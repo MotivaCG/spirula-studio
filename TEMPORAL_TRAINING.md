@@ -14,7 +14,11 @@ measured, all paths, and what comes next.
   (the build fails on comment blocks over 3 lines) and the two-backend rule
   (nothing in this work adds a kernel, on purpose).
 - Dated 2026-09-25. Everything was measured on **one take with single runs**.
-  Seed noise was never measured, so treat differences under ~20 % as unproven.
+  Seed noise was never measured. The "~20 %" used below is a caution, not a
+  measured uncertainty: nothing here is a winner until replicated (section 8).
+- **This file is a living log.** Every new experiment is added to section 5,
+  every conclusion it changes is corrected in place, and section 8 is kept as
+  the current plan. Section 5.4 lists the known weaknesses of what is here.
 
 ---
 
@@ -267,8 +271,12 @@ Second chunk alone (frames 50-55, continuing C2's frame 50), to separate causes:
 Verdict:
 - The end frames of a chunk get about 6× less constraint from the 2nd difference
   and spike. The **context frame** fixed it (kept, in `chain3.ps1`).
-- **Freezing scale rejected** (−2 dB, flicker ×2). Gracia can freeze it only
-  because it also has births.
+- **Freezing scale rejected** (−2 dB, flicker ×2 in V1 vs C2). That Gracia can
+  freeze scale *because* it also has births is a plausible hypothesis, not a
+  result.
+- Attribution is partial: C1 → C2 changed context frame, scale and noise at
+  once, C2 → C3 pinning and scale. V1/V2 separate pinning from freezing on one
+  chunk only. C3's overall gain is measured; each component's share is not.
 - **Pinning rejected** (−1 dB): later removed from the code; the window's held
   frames replace it.
 - MCMC noise off **rejected**: the population halved over six chunks.
@@ -333,14 +341,48 @@ path with init = the previous frame's PLY:
 | Forge, owner's recipe (46-50) | warped init | 192k (46) | — | 132k (50) |
 | Forge's `warped_init.ply` for 46-50 | — | carries exactly the previous frame's population; adds nothing | | |
 
-**Conclusion.** The death is **not caused by chunk or window training**. Every
-warm start without births loses subject splats as people move, **including the
-owner's own pipeline**: for the optimizer, switching off a splat whose surface
-moved is cheaper than moving it.
+**Current reading (not yet proven, see 5.4).** Chunk or window training is not
+the only cause: every warm start without births lost subject splats here,
+**including the owner's own pipeline** (R1, R2, Forge 46-50). The working
+hypothesis is that, for the optimizer, switching off a splat whose surface moved
+is cheaper than moving it.
 - Smoothing (logit-space opacity especially) and missing warps accelerate it.
-- Warps and an opacity boost on entry slow it.
-- Births are what keep a population: Gracia's per-chunk refresh, or the newer
-  Forge recipe's `--init-ply-add-points 1` plus densification (~175k stable).
+- Warps and an opacity boost on entry slow it, **as counted by opacity > 0.1**.
+  The boost raises opacities directly and may raise the count without restoring
+  surface or detail; Wj and Ws have no fit or flicker numbers yet.
+- Births are what the populations that stay stable have in common: Gracia's
+  per-chunk refresh, the newer Forge recipe's `--init-ply-add-points 1` plus
+  densification (~175k).
+- Not separated yet: death from following motion vs death from re-optimizing
+  the same content over and over. The repeated-frame control (5.4) does that.
+
+### 5.4 Known weaknesses of these results (review of 2026-09-25)
+
+An outside review of this record raised these; all are accepted.
+
+1. **The population count confounds death with dimming.** Opacity > 0.1 is one
+   threshold. It must be read with several thresholds, a coverage measure of the
+   subject and image quality; Wj especially.
+2. **Motion vs repeated re-training is not separated.** D4-D6 train a frame once.
+   Needed: the same frame repeated as a sequence through the same window, budget
+   and state propagation; compared with the real sequence and with one long
+   continuous training of the fixed frame.
+3. **Several comparisons change more than one thing** (5.2 attribution note).
+4. **The Forge reference is not uniform** (two recipes, 45-50 and 51-76). The
+   final comparison needs one Forge recipe over the whole range.
+5. **Flicker needs a detail and motion companion.** 16 px blocks can hide lost
+   detail; the per-camera affine colour map separates colour from
+   reconstruction but is not the published colour. Needed: a high-frequency
+   measure, temporal crops of face, hands and clothes, and a check with the
+   published colour. Gracia's PSNR, bounded by registration, does not rank its
+   quality against spirula.
+6. **Robustness is untested.** Finalists need several seeds and a second take
+   with harder motion and occlusion.
+7. **Implementation risk for births.** Scale and SH are shared across frames.
+   Reusing a row that is still faintly visible in an earlier frame and changing
+   its shared attributes would alter that frame. Births must only take rows dead
+   in *every* frame (held ones included), and a test must show earlier frames
+   unchanged.
 
 ---
 
@@ -396,22 +438,26 @@ Forge today runs spirula once per frame (`graciarenderer.cpp`,
 
 ---
 
-## 8. Next steps (proposed, agreed direction)
+## 8. Next steps (current plan, in order)
 
-1. **Births that keep identity.** When a frame enters the window, seed the
-   subject points of its sparse cloud that fall in gaps (far from live splats)
-   into rows that are dead in the frames still training and faint in held ones:
-   colour of the point, scale from point spacing, low opacity, zero moments.
-   Cap about 2 % per frame. In earlier frames those rows stay dead, so there is
-   no pop. This is Gracia's lifetime mechanism, and Forge's `add-points`
-   without breaking identity.
-2. Measure on 50-60 with **all three metrics**: A = warp + births, B = A +
-   entry boost ×2, against Wj, Ws, Forge and Gracia.
-3. Best of A/B on the full 45-76 window, with a table and a GIF
-   (`make_gif.py`).
-4. Seed replicates.
-5. Forge integration (section 7), then `.vgs` writing from the per-frame PLYs
-   (fix the 30 Hz check in `vgsencode.cpp:468` first).
+1. **Better measurement first**: population at several opacity thresholds plus
+   subject coverage; a high-frequency (detail) fit; then fit and flicker for Wj
+   and Ws, which so far only have population counts.
+2. **Repeated-frame control**: frame 50 repeated as an 11-frame sequence through
+   the same window (W=6, 4000 steps, same state propagation), against the real
+   50-60 window and one continuous training of frame 50 with the same total
+   budget. Separates motion from repeated re-optimization.
+3. **Births that keep identity**: when a frame enters the window, seed the
+   subject points of its sparse cloud that fall in gaps into rows that are dead
+   in **every** frame, held ones included (colour of the point, scale from point
+   spacing, low opacity, zero moments), capped ~2 % per frame. Verify that
+   earlier frames' renders are unchanged. Then the 2×2: warp / warp + boost /
+   warp + births / warp + births + boost, everything else identical, on 50-60.
+4. A **uniform Forge baseline** over 45-76 (one recipe), then the best variant
+   on the full window, with the table, a GIF and crops of face, hands, clothes.
+5. Seeds for the finalists, and a second take with harder motion and occlusion.
+6. Forge integration (section 7), then `.vgs` writing from the per-frame PLYs
+   (fix the 30 Hz check in the VGS encoder first).
 
 Success targets: regional flicker ≤ 8, fit ≥ 30.5 dB held to the end of the
 take, subject population stable within ±10 %.
