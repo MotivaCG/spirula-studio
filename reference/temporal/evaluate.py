@@ -79,6 +79,40 @@ def fit_quality(ply, f, name):
     return float(np.mean(ps))
 
 
+def box_blur(x, r=3):
+    """Separable box blur of an HxWxC image, radius r px, edges clamped."""
+    for axis in (0, 1):
+        pad = [(0, 0)] * x.ndim; pad[axis] = (r + 1, r)
+        c = np.cumsum(np.pad(x, pad, mode="edge"), axis=axis)
+        n = x.shape[axis]
+        x = (np.take(c, range(2 * r + 1, 2 * r + 1 + n), axis=axis) -
+             np.take(c, range(0, n), axis=axis)) / (2 * r + 1)
+    return x
+
+
+def detail_quality(name):
+    """Masked PSNR of the high frequencies (image minus a 7 px box blur), after the
+    same per-channel colour map as fit_quality: what a loss of detail lowers."""
+    qdir = f"{HERE}/q/{name}"
+    pairs = [l.split("\t") for l in open(f"{qdir}/eval_views.txt").read().splitlines()]
+    thumb = lambda im: np.asarray(im.convert("RGB").resize((32, 56)), np.float32)
+    thumbs = np.stack([thumb(Image.open(img)) for img, _ in pairs])
+    ps = []
+    for i in range(len(pairs)):
+        gi = Image.open(f"{qdir}/eval-gt-{i:05d}.png")
+        gt = np.asarray(gi, np.float32) / 255
+        rd = np.asarray(Image.open(f"{qdir}/eval-render-{i:05d}.png"), np.float32) / 255
+        k = int(np.argmin(((thumbs - thumb(gi)) ** 2).sum((1, 2, 3))))
+        m = np.asarray(Image.open(pairs[k][1]).convert("L").resize(gt.shape[1::-1])) > 127
+        for c in range(3):
+            A = np.stack([rd[..., c][m], np.ones(int(m.sum()))], 1)
+            a, b = np.linalg.lstsq(A, gt[..., c][m], rcond=None)[0]
+            rd[..., c] = rd[..., c] * a + b
+        hg, hr = gt - box_blur(gt), rd - box_blur(rd)
+        ps.append(10 * np.log10(1 / max(np.mean((hg - hr)[m] ** 2), 1e-12)))
+    return float(np.mean(ps))
+
+
 def camera_views(qdir):
     """eval index -> (camera name, source image, mask), matched by content."""
     pairs = [l.split("\t") for l in open(f"{qdir}/eval_views.txt").read().splitlines()]

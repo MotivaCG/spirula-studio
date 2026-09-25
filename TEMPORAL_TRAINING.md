@@ -356,6 +356,42 @@ is cheaper than moving it.
 - Not separated yet: death from following motion vs death from re-optimizing
   the same content over and over. The repeated-frame control (5.4) does that.
 
+### 5.5 Battery B1: full metrics on existing runs, frames 50-60 (2026-09-25)
+
+No new training: evaluation of existing artifacts with added metrics. **Detail**
+= masked PSNR of the high frequencies (image minus a 7 px box blur) after the
+same colour map as fit. **Coverage** = share of the frame's SfM subject points
+with a splat of opacity > 0.1 within 1 cm. Population is given at three
+opacity thresholds.
+
+| run | fit dB | detail dB | regional flicker | live k >0.02/>0.1/>0.5 at 50 → 60 | coverage 50 → 60 |
+|---|---|---|---|---|---|
+| Gracia | (23.0) | (32.2) | **7.77** | — | — |
+| Forge | **30.95** | **36.71** | 19.17 | 155/131/60 → 328/181/14 | 90 → 94 % |
+| R1 plain chain | 29.53 | 34.99 | 21.22 | 152/127/58 → 84/72/39 | 90 → 81 % |
+| Wd window, nothing | 29.86 | 35.21 | 19.71 | 147/125/59 → 98/82/43 | 89 → 86 % |
+| Wg + boost ×1.5 | 29.95 | 35.13 | 18.88 | 146/125/61 → 131/113/79 | 89 → 85 % |
+| Wj + boost ×2 | 29.55 | 35.00 | 20.89 | 147/126/62 → 139/121/92 | 90 → 85 % |
+| **Ws + warp** | **30.13** | **35.35** | **10.94** | 150/124/58 → 116/99/50 | **89 → 88 %** |
+
+(These W runs have no temporal smoothing; Forge here is the newer recipe from 51.)
+
+What it shows:
+- **The entry opacity boost does not restore surface.** It raises counts
+  (Wj: 92k above 0.5) with the same coverage as Wd and slightly worse fit and
+  flicker. Rejected as a quality fix; the earlier "Wj best" came from the count.
+- **Most of the "death" is dimming or redundant splats, not lost surface**: Wd
+  loses 34 % of the >0.1 count but coverage only 89 → 86 % and fit does not
+  fall over this span.
+- **The warp is the real gain**: it halves the window's flicker (19.7 → 10.9)
+  and keeps coverage and the best fit/detail of our runs. Gracia is still ahead
+  on flicker in this span (7.8).
+- We are ~1.4 dB below Forge in detail.
+
+Not shown: whether the warp's gain holds with smoothing on and over 32 frames;
+why C3's fit decays over 45-76 (the window runs here do not decay over 11
+frames); seed spread.
+
 ### 5.4 Known weaknesses of these results (review of 2026-09-25)
 
 An outside review of this record raised these; all are accepted.
