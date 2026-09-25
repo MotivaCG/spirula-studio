@@ -472,6 +472,27 @@ frame 50 (checked), so the dataset switch at 50/51 is not the cause.
 Suspect: the entry opacity boost (B3b: +35 % flicker alone), worst where the
 subject is still. Battery B5 isolates it.
 
+### 5.9 Battery B5: where B4a's flicker comes from, frames 45-64 (2026-09-26)
+
+Same window as B4a (first frame 8000, warps and births from 45), one change
+each. B4a's frames 45-64 are reused (they were written before later frames
+entered).
+
+| run | fit | detail | regional flicker | coverage 64 | live >0.1 at 64 |
+|---|---|---|---|---|---|
+| C3 (chunks, smoothing) | 29.86 | 35.05 | **6.20** | 79 % | 79k |
+| B4a warp + births + boost | 30.31 | 35.68 | 30.44 | 92 % | 205k |
+| **B5a warp + births** | **30.58** | **35.89** | 15.45 | **93 %** | 130k |
+| B5c warp only | 30.55 | 35.83 | 14.53 | 91 % | 122k |
+
+What it shows: **the entry opacity boost caused half the flicker** (30 → 15)
+and is dropped from the recipe. **Births add no flicker** (B5a ≈ B5c) and give
+the best quality of all runs. The remaining gap to C3 (15 vs 6) coincides with
+the one thing C3 has and these windows lack: temporal smoothing. Battery B6.
+
+Not shown: whether smoothing closes the gap without costing coverage (B4b
+had smoothing but also the boost).
+
 ### 5.4 Known weaknesses of these results (review of 2026-09-25)
 
 An outside review of this record raised these; all are accepted.
