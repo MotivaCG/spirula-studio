@@ -3048,11 +3048,37 @@ SS_MSG_EN(temporal_smooth_opacity_help,
 SS_MSG_EN(temporal_smooth_color, "Temporal smoothing of colour");
 SS_MSG_EN(temporal_smooth_color_help,
     "As for opacity, on the base colour coefficients.");
-SS_MSG_EN(temporal_pin_first, "Hold the first frame of a chunk");
-SS_MSG_EN(temporal_pin_first_help,
-    "Keep the chunk's first frame exactly as --init-ply gives it: it is neither "
-    "trained nor smoothed, and the frames after it are smoothed away from it. "
-    "For a chunk that continues the last frame of the previous one.");
+SS_MSG_EN(temporal_window, "Sliding window of frames");
+SS_MSG_EN(temporal_window_help,
+    "Train the frames of --temporal-frames through a window of this many "
+    "instead of all at once: a frame enters every --temporal-frame-steps steps, "
+    "the oldest is written when the window is full and then held. 0 trains the "
+    "whole chunk together. Replaces --num-iterations.");
+SS_MSG_EN(temporal_frame_steps, "Steps per window frame");
+SS_MSG_EN(temporal_frame_steps_help,
+    "Steps between two frames entering the window, which is also about how "
+    "many steps each frame trains and the length of its own learning-rate "
+    "schedule.");
+SS_MSG_EN(temporal_first_frame_steps, "Steps for the first window frame");
+SS_MSG_EN(temporal_first_frame_steps_help,
+    "Steps the first frame of the window trains on its own before the second "
+    "enters, and the length of its learning-rate schedule. It starts from the "
+    "initial model rather than a neighbour, so it may need more than the rest. 0 "
+    "uses --temporal-frame-steps.");
+SS_MSG_EN(temporal_history, "Written frames kept in the window");
+SS_MSG_EN(temporal_history_help,
+    "Frames already written that stay in the window, held, so the frames after "
+    "them are smoothed towards what was written.");
+SS_MSG_EN(temporal_entry_opacity_boost, "Opacity boost for each window frame");
+SS_MSG_EN(temporal_entry_opacity_boost_help,
+    "Multiplies every opacity of a frame entering the window, capped at 0.99. 1 "
+    "leaves it as the previous frame had it.");
+SS_MSG_EN(temporal_warp_dir, "Warps between frames");
+SS_MSG_EN(temporal_warp_dir_help,
+    "Folder of deformation graphs, NNN.bin carrying frame NNN-1 of --temporal-frames "
+    "onto frame NNN (int32 node count, float32 skinning radius, then per node "
+    "float32 position, translation and wxyz rotation). A window frame entering "
+    "starts from the previous one moved by it rather than extrapolated.");
 
 SS_MSG(scale_init,
     EN("Initial splat size"), JA("スプラットの初期サイズ"),

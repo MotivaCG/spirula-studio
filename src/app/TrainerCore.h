@@ -306,10 +306,22 @@ private:
                               const std::vector<std::string>& normals);
     // cfg.temporal_frames: one DataManager per frame, the splats cloned into each.
     void setup_chunk();
+    void install_frame_data(int frame);
+    void advance_window(int step);
+    int first_frame_steps() const {
+        return cfg.temporal_first_frame_steps > 0 ? cfg.temporal_first_frame_steps
+                                                  : cfg.temporal_frame_steps;
+    }
+    void write_frame(int slot, int step);
     void save_chunk(int step);
     void eval_frame(const std::string& data, const std::filesystem::path& metrics);
     std::vector<std::string> _chunk_dirs;  // [0] is cfg.data
     uint64_t _chunk_rng = 0x9e3779b97f4a7c15ull;
+    // Sliding window: take frame of slot 0, next frame to enter, steps each
+    // slot has trained, and the per-frame learning-rate schedule.
+    int _window_first = 0, _window_next = 0;
+    std::vector<int> _slot_age;
+    TrainConfig _window_schedule;
 
     mutable std::mutex _time_mutex;                        // guards the clock
     std::chrono::steady_clock::time_point _start_time{};   // {} = not started
