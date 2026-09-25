@@ -56,9 +56,9 @@ voxel grid instead.
 | Gracia's version of the take | `d:\Trabajos\ScanMeNow\SMNWebviewer\Playcanvas\public\data\tiki.mint` (also `content\` and `dist\`) |
 | other Gracia samples | `D:\Trabajos\THE4DSCANNER\GraciaScenes\Samples\cycling_clean_300.mint` (25 Hz), `gymnastic_s2_t2_clean.mint` (50 Hz) |
 | `.mint` format spec + decoder | `D:\Trabajos\THE4DSCANNER\GraciaConverter\Gracia4DGSConverter\MINT_FORMAT.md`, `mintfile.cpp/h`; self-contained copy used by the probe: `...\Gracia4DGSConverter\build\despill-candidate\mintfile.cpp/h` |
-| `.vgs` container | `D:\Trabajos\THE4DSCANNER\VGSFileFormat` (`FORMAT.md`, `core/src/vgsframe.cpp` is the normative decoder) |
+| `.vgs` container | `D:\Trabajos\THE4DSCANNER\VGSFileFormat` (its `FORMAT.md`; the normative decoder is `vgsframe.cpp` in its `core\src`) |
 | SMNForge | `D:\Trabajos\ScanMeNow\RaspberrySoft\SMNForge` (branch `GraciaWarp`, commit `97aa162`, has `graciawarp.cpp`; the Profile build `build\Desktop_Qt_6_8_0_MSVC2022_64bit-Profile\release\SMNForge.exe` was used to extract frames 51-76) |
-| earlier temporal attempt | spirula branch `DualGSAstra` (`docs/notes/dualgs.md`): a DualGS-style deformation graph; the owner reports it was "a complete disaster" |
+| earlier temporal attempt | spirula branch `DualGSAstra` (its notes are `dualgs.md` in that branch's notes folder): a DualGS-style deformation graph; the owner reports it was "a complete disaster" |
 | agent memory of this project | `C:\Users\Victor\.claude\projects\d--Trabajos-FORMS-LichtFeld-Studio\memory\temporal-chunk-training.md` |
 
 ---
@@ -88,7 +88,7 @@ decoded with the owner's `MintFile` through a small probe (`reference/temporal/m
   per frame. **What reads as flicker is coherent regional change**, and Gracia
   does not have it.
 
-Side findings about the owner's `.vgs` encoder: `VGSFileFormat/core/src/vgsencode.cpp:468`
+Side findings about the owner's `.vgs` encoder: `D:\Trabajos\THE4DSCANNER\VGSFileFormat\core\src\vgsencode.cpp`, line 468,
 rejects any `.mint` that is not 30 Hz ("source timebase is not 30 Hz"). The
 header supports any timebase, but the encoder never derives it. Both non-tiki
 samples are 25 and 50 Hz. It was not fixed.
