@@ -446,6 +446,32 @@ is one run each: not established.
 Not shown: whether covered surface holds fit over a full take (C3 fell to
 27.2 dB), the effect with smoothing on, seed spread. Next: battery B4.
 
+### 5.8 Battery B4: the B3d recipe over the whole take 45-76 (2026-09-25)
+
+Window W6, 4000 steps per frame, first frame 8000, warp + births + entry boost
+1.5; B4b adds smoothing (every 50, weights 1). Criterion set before (vs C3):
+fit at 76 ≥ 29.5 dB and mean ≥ C3's, coverage at 76 ≥ 85 %, flicker ≤ 9.5.
+
+| run | fit mean (45 / 76) | detail | regional flicker | coverage 45 / 60 / 76 | live >0.1 45 / 76 |
+|---|---|---|---|---|---|
+| Gracia | (23.12) | (32.12) | 9.49 | — | — |
+| Forge | **30.99** (31.5 / 31.0) | **36.68** | 22.39 | 65 / 94 / 94 % | 167k / 180k |
+| C3 | 29.11 (30.3 / 27.2) | 34.63 | **7.87** | 62 / 81 / **55 %** | 134k / 48k |
+| **B4a** | **30.15** (31.6 / **30.0**) | 35.53 | **25.14** | 65 / 93 / **91 %** | 183k / 163k |
+| B4b + smoothing | 29.80 (30.5 / 29.4) | 35.12 | 22.95 | 66 / 93 / 85 % | 170k / 120k |
+
+(Coverage at 45 is ~65 % for everyone: that frame's SfM subject cloud is
+larger than the others'.)
+
+What it shows: **the quality decay is solved**: births + warp hold ~30 dB and
+91 % coverage to the end of the take (C3 fell to 27.2 dB and 55 %). But
+**flicker fails**: 25, worse than Forge. It is concentrated in pairs 49-65
+(35-61 per pair, C3 4-9 there) and back to 9-14 from 66. B3d on 50-60 had
+7-23 per pair. Neither images, masks, SfM clouds nor warps change around
+frame 50 (checked), so the dataset switch at 50/51 is not the cause.
+Suspect: the entry opacity boost (B3b: +35 % flicker alone), worst where the
+subject is still. Battery B5 isolates it.
+
 ### 5.4 Known weaknesses of these results (review of 2026-09-25)
 
 An outside review of this record raised these; all are accepted.
