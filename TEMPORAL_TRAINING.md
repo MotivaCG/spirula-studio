@@ -515,6 +515,29 @@ jumps 36-61 % only at C3's chunk boundaries, which are exactly C3's slightly
 worse pairs (8-9 vs 5-6). Per-frame smoothing cannot touch it: scale is shared.
 Battery B7 tests freezing or slowing scale in the window.
 
+### 5.11 Battery B7: slowing the shared scale in the window, frames 45-64 (2026-09-26)
+
+B5a recipe (warp + births, no boost, no smoothing) with scale frozen or its
+learning rate divided by 10.
+
+| run | fit | detail | regional flicker (per pair) | coverage 64 |
+|---|---|---|---|---|
+| C3 (reference) | 29.86 | 35.05 | 6.20 | 79 % |
+| B5a scale normal | 30.58 | 35.89 | 15.45 (spikes to 43) | 93 % |
+| B7a scale frozen | 30.34 | 35.67 | 7.63 (5-12) | 92 % |
+| **B7b scale lr / 10** | **30.96** | **36.05** | **7.24 (5-9)** | **92 %** |
+
+(Forge on this span: fit ~31.0, detail ~36.7.)
+
+What it shows: **the shared-scale drift was the window's remaining flicker.**
+Slowing scale halves flicker and removes the spikes, with no quality cost:
+B7b matches Forge's fit, is 0.6 dB below its detail, keeps the covered surface
+and is as stable as C3. **B7b is the candidate recipe.** Freezing scale fully
+(B7a) also works, slightly worse on fit. (This also revises 5.2: freezing scale
+cost fit in the chunk chain, where there were no births.)
+
+Not shown: the full take, seed spread. Battery B8.
+
 ### 5.4 Known weaknesses of these results (review of 2026-09-25)
 
 An outside review of this record raised these; all are accepted.

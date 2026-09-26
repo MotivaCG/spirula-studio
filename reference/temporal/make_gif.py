@@ -17,6 +17,8 @@ def panel_frames(tag, cam):
     return R, G, M
 
 run = sys.argv[1]; out = sys.argv[2]
+if len(sys.argv) > 4:  # optional first:last
+    a, b = sys.argv[4].split(":"); e.set_frames(int(a), int(b))
 sets = [set(e.camera_views(f"{e.HERE}/q/{tag}_{f}")) for tag in ("forge", run, "gracia") for f in e.FRAMES]
 common = sorted(set.intersection(*sets))
 cam = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] in common else common[0]
