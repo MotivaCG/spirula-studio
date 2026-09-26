@@ -493,6 +493,28 @@ the one thing C3 has and these windows lack: temporal smoothing. Battery B6.
 Not shown: whether smoothing closes the gap without costing coverage (B4b
 had smoothing but also the boost).
 
+### 5.10 Battery B6: smoothing on the window, frames 45-64 (2026-09-26)
+
+B5a recipe plus smoothing (weights 1, every 50 or every 25 steps).
+
+| run | fit | detail | regional flicker | coverage 64 |
+|---|---|---|---|---|
+| B5a no smoothing | 30.58 | 35.89 | 15.45 | 93 % |
+| B6a every 50 | 30.40 | 35.54 | 16.51 | 92 % |
+| B6b every 25 | 30.12 | 35.35 | 17.43 | 92 % |
+
+What it shows: smoothing does not reduce the window's flicker (and costs a
+little fit); isolated pairs spike to 30-43, at different pairs in each run.
+Fails the criterion.
+
+Found afterwards, with no GPU: **in the window the shared scale of a splat
+changes ~15 % between consecutive written frames** (median |Δ log scale|,
+B5a), because each frame is written at a different time while scale keeps
+training. Inside a C3 chunk it is exactly 0 (all frames written together); it
+jumps 36-61 % only at C3's chunk boundaries, which are exactly C3's slightly
+worse pairs (8-9 vs 5-6). Per-frame smoothing cannot touch it: scale is shared.
+Battery B7 tests freezing or slowing scale in the window.
+
 ### 5.4 Known weaknesses of these results (review of 2026-09-25)
 
 An outside review of this record raised these; all are accepted.
