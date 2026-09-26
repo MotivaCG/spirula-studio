@@ -563,6 +563,9 @@ only criterion not met (10 % was the guess). Remaining gap: ~0.8 dB of detail
 below Forge. GIF: `outputs\tc\B8a_45_76.gif` (half size `..._small.gif`), camera
 H2_P10, video | Forge | B8a | Gracia.
 
+Sequence for playback: `D:\Dependencias\spirula-studio\outputs\tc\sequences\B8a\`
+with `0045.ply` ... `0076.ply` (unpruned, COLMAP frame, SH degree 1).
+
 **B8 is the current recipe** (section 4 flags; `window.ps1 ... 6 4000
 --temporal-first-frame-steps 8000 --temporal-warp-dir ... --temporal-birth-dir
 ... --scales-lr 0.002 --scales-lr-final 0.0005`).
@@ -718,6 +721,10 @@ cmake --build build_tc -j 14 || exit /b 1
   Run with the Qt `bin` folder on `PATH`.
 - `warps.py <first> <last> <outdir>`: deformation graphs between consecutive
   frames.
+- `export_seq.py <run | name.seq> <first> <out_dir>`: copies a run's frames into
+  one folder named by take frame (`0045.ply`, `0046.ply`, ...) to play them as an
+  animation. **Every battery's finalist is exported this way** to
+  `D:\Dependencias\spirula-studio\outputs\tc\sequences\<run>\`.
 - `make_gif.py <run> <out.gif> [camera]`: loop of video | Forge | run | Gracia
   from one fixed camera.
 
