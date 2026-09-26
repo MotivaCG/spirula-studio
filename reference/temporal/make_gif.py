@@ -5,12 +5,21 @@ from PIL import Image, ImageDraw
 sys.path.insert(0, "."); import evaluate as e
 
 def panel_frames(tag, cam):
+    """Renders, videos and masks of one camera over FRAMES; a frame the eval loader
+    skipped for that camera repeats the previous one."""
     qdirs = [f"{e.HERE}/q/{tag}_{f}" for f in e.FRAMES]
     views = [e.camera_views(q) for q in qdirs]
     load = lambda p: np.asarray(Image.open(p), np.float32) / 255
-    R = [load(f"{q}/eval-render-{v[cam][0]:05d}.png") for q, v in zip(qdirs, views)]
-    G = [load(f"{q}/eval-gt-{v[cam][0]:05d}.png") for q, v in zip(qdirs, views)]
-    M = [np.asarray(Image.open(v[cam][1]).convert("L").resize(G[0].shape[1::-1])) > 127 for v in views]
+    R, G, M = [], [], []
+    for q, v in zip(qdirs, views):
+        if cam not in v:
+            R.append(R[-1] if R else None); G.append(G[-1] if G else None); M.append(M[-1] if M else None)
+            continue
+        R.append(load(f"{q}/eval-render-{v[cam][0]:05d}.png")); G.append(load(f"{q}/eval-gt-{v[cam][0]:05d}.png"))
+        M.append(np.asarray(Image.open(v[cam][1]).convert("L").resize(G[-1].shape[1::-1])) > 127)
+    first = next(i for i, g in enumerate(G) if g is not None)
+    for i in range(first):
+        R[i], G[i], M[i] = R[first], G[first], M[first]
     r = np.concatenate([x[m] for x, m in zip(R, M)]); g = np.concatenate([x[m] for x, m in zip(G, M)])
     coef = [np.linalg.lstsq(np.stack([r[:, c], np.ones(len(r))], 1), g[:, c], rcond=None)[0] for c in range(3)]
     R = [np.clip(np.stack([x[..., c] * coef[c][0] + coef[c][1] for c in range(3)], -1), 0, 1) for x in R]
@@ -19,8 +28,10 @@ def panel_frames(tag, cam):
 run = sys.argv[1]; out = sys.argv[2]
 if len(sys.argv) > 4:  # optional first:last
     a, b = sys.argv[4].split(":"); e.set_frames(int(a), int(b))
-sets = [set(e.camera_views(f"{e.HERE}/q/{tag}_{f}")) for tag in ("forge", run, "gracia") for f in e.FRAMES]
-common = sorted(set.intersection(*sets))
+from collections import Counter
+present = Counter(c for tag in ("forge", run, "gracia") for f in e.FRAMES
+                  for c in e.camera_views(f"{e.HERE}/q/{tag}_{f}"))
+common = [c for c, _ in present.most_common()]
 cam = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] in common else common[0]
 print("camera", cam, "of", common)
 Rf, G, M = panel_frames("forge", cam)

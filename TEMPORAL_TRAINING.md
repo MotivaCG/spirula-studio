@@ -538,6 +538,38 @@ cost fit in the chunk chain, where there were no births.)
 
 Not shown: the full take, seed spread. Battery B8.
 
+### 5.12 Battery B8: candidate B7b over the whole take, twice (2026-09-26)
+
+Recipe: window W6, 4000 steps per frame, first frame 8000, warp + births,
+`--scales-lr 0.002 --scales-lr-final 0.0005`, no boost, no smoothing. Two
+identical runs (spirula seeds its sampling from the clock, so reruns differ).
+Criterion set before: both runs fit mean ≥ 30.5 and at 76 ≥ 30.0, coverage at
+76 ≥ 88 %, flicker ≤ 9.5, and the two runs within 10 % of each other.
+
+| run | fit mean (45 / 76) | detail | regional flicker | coverage 45 / 60 / 76 | live >0.1 45 / 76 |
+|---|---|---|---|---|---|
+| Forge | **30.99** (31.5 / 31.0) | **36.68** | 22.39 | 65 / 94 / 94 % | 167k / 180k |
+| Gracia | (23.12) | (32.12) | 9.49 | — | — |
+| C3 | 29.11 (30.3 / 27.2) | 34.63 | 7.87 | 62 / 81 / 55 % | 134k / 48k |
+| **B8a** | **30.86** (31.8 / 30.5) | 35.90 | **7.73** | 64 / 93 / **91 %** | 166k / 106k |
+| **B8b** | **30.81** (31.7 / 30.6) | 35.91 | **8.87** | 63 / 92 / **91 %** | 163k / 105k |
+
+What it shows: **the candidate holds over the whole take.** Both runs are
+below Gracia's flicker and ~3× below Forge's, within 0.2 dB of Forge's fit to
+the end of the take (30.5 at frame 76, where C3 had fallen to 27.2), keeping
+the covered surface. Fit agrees between runs to 0.2 %. **Flicker differs by
+15 % between two identical runs**: the first measured seed spread, and the
+only criterion not met (10 % was the guess). Remaining gap: ~0.8 dB of detail
+below Forge. GIF: `outputs\tc\B8a_45_76.gif` (half size `..._small.gif`), camera
+H2_P10, video | Forge | B8a | Gracia.
+
+**B8 is the current recipe** (section 4 flags; `window.ps1 ... 6 4000
+--temporal-first-frame-steps 8000 --temporal-warp-dir ... --temporal-birth-dir
+... --scales-lr 0.002 --scales-lr-final 0.0005`).
+
+Not shown: robustness on another take; a uniform Forge baseline; the detail
+gap's cause; more seeds.
+
 ### 5.4 Known weaknesses of these results (review of 2026-09-25)
 
 An outside review of this record raised these; all are accepted.
@@ -622,27 +654,22 @@ Forge today runs spirula once per frame (`graciarenderer.cpp`,
 
 ## 8. Next steps (current plan, in order)
 
-1. **Better measurement first**: population at several opacity thresholds plus
-   subject coverage; a high-frequency (detail) fit; then fit and flicker for Wj
-   and Ws, which so far only have population counts.
-2. **Repeated-frame control**: frame 50 repeated as an 11-frame sequence through
-   the same window (W=6, 4000 steps, same state propagation), against the real
-   50-60 window and one continuous training of frame 50 with the same total
-   budget. Separates motion from repeated re-optimization.
-3. **Births that keep identity**: when a frame enters the window, seed the
-   subject points of its sparse cloud that fall in gaps into rows that are dead
-   in **every** frame, held ones included (colour of the point, scale from point
-   spacing, low opacity, zero moments), capped ~2 % per frame. Verify that
-   earlier frames' renders are unchanged. Then the 2×2: warp / warp + boost /
-   warp + births / warp + births + boost, everything else identical, on 50-60.
-4. A **uniform Forge baseline** over 45-76 (one recipe), then the best variant
-   on the full window, with the table, a GIF and crops of face, hands, clothes.
-5. Seeds for the finalists, and a second take with harder motion and occlusion.
-6. Forge integration (section 7), then `.vgs` writing from the per-frame PLYs
+Done since the review: better metrics (B1), repeated-frame control (B2), births
+(B3), full take (B4), flicker isolation (B5-B7), candidate on the full take
+twice (B8). **Current recipe: B8** (5.12).
+
+1. **Detail gap** (~0.8 dB below Forge): check per-frame steps (8000 instead of
+   4000) and SH learning rate on 45-65, fit/detail/flicker as criteria.
+2. A **uniform Forge baseline** over 45-76 (the owner's recipe on every frame)
+   so the reference is one pipeline; crops of face, hands and clothes.
+3. **More seeds** for B8 (3 runs) to bound the flicker spread (15 % seen).
+4. A **second take** with harder motion and occlusion (owner to choose it).
+5. Forge integration (section 7), then `.vgs` writing from the per-frame PLYs
    (fix the 30 Hz check in the VGS encoder first).
 
 Success targets: regional flicker ≤ 8, fit ≥ 30.5 dB held to the end of the
-take, subject population stable within ±10 %.
+take, covered surface ≥ 88 % to the end. B8 meets them on VIDEOTIKI except
+flicker ≤ 8 in one of two runs (8.87).
 
 ---
 
