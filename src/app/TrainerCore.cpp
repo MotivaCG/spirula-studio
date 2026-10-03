@@ -729,32 +729,7 @@ void TrainerSession::check_config() {
         log(lmsg::warn_init_ply_ignored.get());
     else if (!cfg.init_ply.empty())
         find_splat_ply(cfg.init_ply);  // before the dataset is parsed, not after
-    _chunk_dirs.clear();
-    if (!unset(cfg.temporal_frames)) {
-        _chunk_dirs.push_back(cfg.data);
-        std::string rest = cfg.temporal_frames;
-        for (size_t at = 0; at <= rest.size();) {
-            size_t end = rest.find(';', at);
-            if (end == std::string::npos) end = rest.size();
-            if (end > at) _chunk_dirs.push_back(rest.substr(at, end - at));
-            at = end + 1;
-        }
-        if (!cfg.resume.empty())
-            throw std::runtime_error("--temporal-frames cannot be resumed");
-        // Every frame shares one population and one optimizer layout: no
-        // densification, full-precision Adam state.
-        cfg.quantization_level = 0;
-        if (cfg.temporal_window > 0) {
-            // A frame enters every temporal_frame_steps steps and leaves the
-            // window temporal_window entries later; the last ones then drain.
-            const int n = (int)_chunk_dirs.size();
-            cfg.num_iterations =
-                first_frame_steps() + cfg.temporal_frame_steps * (n + cfg.temporal_window - 2);
-        }
-        cfg.refine_start_iter = cfg.num_iterations + 1;
-        cfg.export_keep_all_splats = true;
-        log("chunk training over " + std::to_string(_chunk_dirs.size()) + " frames");
-    }
+    configure_chunk();
     if (cfg.validation_fraction > 0)
         log(lmsg::warn_validation_unported.get());
     if (cfg.orientation_method != "up" || cfg.center_method != "poses")
@@ -1135,137 +1110,6 @@ void TrainerSession::install_data_manager(const std::vector<std::string>& images
         ds.train_indices, ds.val_indices);
 }
 
-// Frame k's files are frame 0's with the dataset root swapped: the cameras are
-// shared, so only the pixels differ.
-void TrainerSession::install_frame_data(int frame) {
-    const fs::path root = fs::path(cfg.data);
-    const std::string& dir = _chunk_dirs[(size_t)frame];
-    auto remap = [&](const std::vector<std::string>& files) {
-        std::vector<std::string> out;
-        out.reserve(files.size());
-        for (const std::string& f : files) {
-            if (f.empty()) { out.push_back(f); continue; }
-            const fs::path p(f);
-            const fs::path rel = p.is_absolute() ? p.lexically_relative(root) : p;
-            if (rel.empty() || *rel.begin() == "..")
-                throw std::runtime_error("chunk training: " + f + " is outside --data");
-            const fs::path mapped = fs::path(dir) / rel;
-            if (!fs::exists(mapped))
-                throw std::runtime_error("chunk training: missing " + mapped.string());
-            out.push_back(mapped.string());
-        }
-        return out;
-    };
-    install_data_manager(remap(ds.image_filenames),
-                         has_mask ? remap(ds.mask_filenames) : ds.mask_filenames,
-                         has_depth ? remap(ds.depth_filenames) : ds.depth_filenames,
-                         has_normal ? remap(ds.normal_filenames) : ds.normal_filenames);
-}
-
-void TrainerSession::setup_chunk() {
-    const int frames = cfg.temporal_window > 0 ? 1 : (int)_chunk_dirs.size();
-    engine_temporal_begin(frames, cfg.use_fused_proj_bwd_optim, cfg.use_per_splat_bias_correction);
-    engine_temporal_stash_data_manager(0);
-    for (int k = 1; k < frames; k++) {
-        install_frame_data(k);
-        engine_temporal_stash_data_manager(k);
-    }
-    engine_temporal_select(0);
-    _window_first = 0;
-    _window_next = frames;
-    _slot_age.assign((size_t)frames, 0);
-    _window_schedule = cfg;
-    _window_schedule.num_iterations = cfg.temporal_frame_steps;
-    _window_schedule.max_steps = cfg.temporal_frame_steps;
-    fs::create_directories(out_dir / "frames");
-    std::ofstream(out_dir / "frames" / "frames.txt");
-    log("chunk: " + std::to_string(_chunk_dirs.size()) + " frames" +
-        (cfg.temporal_window > 0 ? ", window " + std::to_string(cfg.temporal_window) : "") +
-        ", " + std::to_string(engine_get_cur_num_splats()) + " splats");
-}
-
-void TrainerSession::write_frame(int slot, int step) {
-    const int frame = _window_first + slot;
-    char name[32];
-    std::snprintf(name, sizeof name, "%03d", frame);
-    const int keep = engine_temporal_current();
-    engine_temporal_select(slot);
-    engine_save_checkpoint((out_dir / "frames" / name).string(), false, step, true);
-    std::ofstream(out_dir / "frames" / "frames.txt", std::ios::app)
-        << name << ' ' << _chunk_dirs[(size_t)frame] << '\n';
-    if (keep >= 0) engine_temporal_select(keep);
-}
-
-// Every temporal_frame_steps steps the next frame enters at the back, and once
-// the window is full its oldest trainable frame is written and held: later
-// frames are smoothed against it but never change it.
-void TrainerSession::advance_window(int step) {
-    const int W = cfg.temporal_window;
-    if (_window_next < (int)_chunk_dirs.size()) {
-        engine_temporal_park();
-        TemporalWarp warp;
-        bool warped = false;
-        if (!unset(cfg.temporal_warp_dir)) {
-            char name[32];
-            std::snprintf(name, sizeof name, "%03d.bin", _window_next);
-            std::ifstream in(fs::path(cfg.temporal_warp_dir) / name, std::ios::binary);
-            int32_t nodes = 0;
-            if (in.read(reinterpret_cast<char*>(&nodes), 4) &&
-                in.read(reinterpret_cast<char*>(&warp.bind_radius), 4) && nodes > 0) {
-                warp.nodes.resize((size_t)nodes * 10);
-                warped = (bool)in.read(reinterpret_cast<char*>(warp.nodes.data()),
-                                       (std::streamsize)(warp.nodes.size() * 4));
-            }
-            if (!warped) log(std::string("no warp ") + name + ", extrapolating");
-        }
-        install_frame_data(_window_next++);
-        engine_temporal_push(cfg.temporal_entry_opacity_boost, warped ? &warp : nullptr);
-        if (!unset(cfg.temporal_birth_dir)) {
-            char name[32];
-            std::snprintf(name, sizeof name, "%03d.bin", _window_next - 1);
-            std::ifstream in(fs::path(cfg.temporal_birth_dir) / name, std::ios::binary);
-            int32_t count = 0;
-            std::vector<float> points;
-            if (in.read(reinterpret_cast<char*>(&count), 4) && count > 0) {
-                points.resize((size_t)count * 7);
-                if (!in.read(reinterpret_cast<char*>(points.data()), (std::streamsize)(points.size() * 4)))
-                    points.clear();
-            }
-            const int64_t born = engine_temporal_birth(
-                points, cfg.temporal_birth_gap,
-                (int64_t)(cfg.temporal_birth_fraction * (float)engine_get_cur_num_splats()));
-            log(std::string("frame ") + name + ": " + std::to_string(born) + " splats born");
-        }
-        _slot_age.push_back(0);
-    }
-    int trainable = 0, oldest = -1;
-    for (int k = 0; k < engine_temporal_frames(); k++)
-        if (!engine_temporal_held(k)) { trainable++; if (oldest < 0) oldest = k; }
-    // The last trainable frame is left for save_chunk, so a step always has one.
-    const bool flushing = _window_next == (int)_chunk_dirs.size();
-    if (oldest >= 0 && (trainable > W || (flushing && trainable > 1))) {
-        write_frame(oldest, step);
-        engine_temporal_hold(oldest);
-    }
-    int held_front = 0;
-    while (held_front < engine_temporal_frames() && engine_temporal_held(held_front)) held_front++;
-    while (held_front > cfg.temporal_history) {
-        engine_temporal_drop_front();
-        _slot_age.erase(_slot_age.begin());
-        _window_first++;
-        held_front--;
-    }
-}
-
-void TrainerSession::save_chunk(int step) {
-    if (cfg.temporal_window > 0) {
-        for (int k = 0; k < engine_temporal_frames(); k++)
-            if (!engine_temporal_held(k)) write_frame(k, step);
-        return;
-    }
-    for (int k = 0; k < engine_temporal_frames(); k++) write_frame(k, step);
-}
-
 // Where the run's first splats come from: the dataset's point cloud, an
 // --init-ply warm start, or both. A resume overwrites them either way.
 SeedSplats TrainerSession::seed_world(const ColorResolution& color) {
@@ -1370,32 +1214,7 @@ void TrainerSession::maybe_boost_opacity(int step) {
 std::map<std::string, float> TrainerSession::train_step(int step) {
     int schedule_step = step;
     const TrainConfig* schedule = &cfg;
-    if (engine_temporal_active()) {
-        const int after_first = step - first_frame_steps();
-        if (cfg.temporal_window > 0 && after_first >= 0 &&
-            after_first % cfg.temporal_frame_steps == 0)
-            advance_window(step);
-        std::vector<int> trainable;
-        for (int k = 0; k < engine_temporal_frames(); k++)
-            if (!engine_temporal_held(k)) trainable.push_back(k);
-        // splitmix64: a frame per step, independent of the DataManagers' draws.
-        uint64_t z = (_chunk_rng += 0x9e3779b97f4a7c15ull);
-        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
-        z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
-        z ^= z >> 31;
-        const int slot = trainable[(size_t)(z % trainable.size())];
-        engine_temporal_select(slot);
-        // A window frame runs its own learning-rate schedule, over its own steps.
-        if (cfg.temporal_window > 0) {
-            // The first frame's schedule is stretched over its own budget.
-            const int life = _window_first + slot == 0 ? first_frame_steps()
-                                                       : cfg.temporal_frame_steps;
-            schedule_step = std::min(
-                (int)((int64_t)_slot_age[(size_t)slot]++ * cfg.temporal_frame_steps / life),
-                cfg.temporal_frame_steps);
-            schedule = &_window_schedule;
-        }
-    }
+    if (engine_temporal_active()) chunk_step(step, schedule_step, schedule);
     maybe_boost_opacity(step);
     int sh_degree_to_use = step / std::max(cfg.sh_degree_warmup_every, 1);
     EngineStepConfig sc = build_step_config(*schedule, st, schedule_step);
@@ -1411,10 +1230,7 @@ std::map<std::string, float> TrainerSession::train_step(int step) {
     if (const char* err = backend::last_error())
         throw std::runtime_error("GPU backend error at step " +
                                  std::to_string(step) + ": " + err);
-    if (engine_temporal_active() && cfg.temporal_smooth_every > 0 &&
-        (step + 1) % cfg.temporal_smooth_every == 0)
-        engine_temporal_smooth({cfg.temporal_smooth_position, cfg.temporal_smooth_rotation,
-                                cfg.temporal_smooth_opacity, cfg.temporal_smooth_color});
+    if (engine_temporal_active()) chunk_after_step(step);
 
     // Divergence never recovers, and the run otherwise continues in silence to
     // a black render and a checkpoint with zero splats. Reported values sit
@@ -1659,17 +1475,11 @@ std::vector<uint8_t> to_png_bytes(const std::vector<float>& rgb) {
 void TrainerSession::eval() {
     // eval_mode "all" trains on every frame, so nothing is held out.
     if (cfg.eval_mode == "all") return;
-    if (!engine_temporal_active()) {
-        eval_frame(cfg.data, out_dir / "metrics.json");
+    if (engine_temporal_active()) {
+        eval_chunk();
         return;
     }
-    if (cfg.temporal_window > 0) return;  // the frames scored are already gone
-    for (int k = 0; k < engine_temporal_frames(); k++) {
-        char name[32];
-        std::snprintf(name, sizeof name, "%03d", k);
-        engine_temporal_select(k);
-        eval_frame(_chunk_dirs[k], out_dir / "frames" / name / "metrics.json");
-    }
+    eval_frame(cfg.data, out_dir / "metrics.json");
 }
 
 void TrainerSession::eval_frame(const std::string& data, const fs::path& metrics) {

@@ -3059,6 +3059,13 @@ SS_MSG_EN(temporal_frame_steps_help,
     "Steps between two frames entering the window, which is also about how "
     "many steps each frame trains and the length of its own learning-rate "
     "schedule.");
+SS_MSG_EN(temporal_keyframe_every, "Window keyframe interval");
+SS_MSG_EN(temporal_keyframe_every_help,
+    "Every this many take frames, a window frame gets --temporal-keyframe-steps; "
+    "the steps past --temporal-frame-steps train it alone as it enters. 0 is off.");
+SS_MSG_EN(temporal_keyframe_steps, "Steps for a window keyframe");
+SS_MSG_EN(temporal_keyframe_steps_help,
+    "Training budget of a keyframe, and the length of its learning-rate schedule.");
 SS_MSG_EN(temporal_first_frame_steps, "Steps for the first window frame");
 SS_MSG_EN(temporal_first_frame_steps_help,
     "Steps the first frame of the window trains on its own before the second "
@@ -3078,7 +3085,8 @@ SS_MSG_EN(temporal_birth_dir_help,
     "Folder of NNN.bin (int32 count, then float32 rows x, y, z, r, g, b in 0..1, "
     "point spacing): subject points of frame NNN of --temporal-frames. When the "
     "frame enters the window, those with no live splat nearby are born into rows "
-    "dead in every frame, so no frame already trained or written changes.");
+    "dead in every frame, so no frame already trained or written changes. \"auto\" "
+    "computes them from each frame's SfM points and masks.");
 SS_MSG_EN(temporal_birth_gap, "Birth gap");
 SS_MSG_EN(temporal_birth_gap_help,
     "A point is born only if no live splat of the entering frame lies within this "
@@ -3086,12 +3094,23 @@ SS_MSG_EN(temporal_birth_gap_help,
 SS_MSG_EN(temporal_birth_fraction, "Birth budget");
 SS_MSG_EN(temporal_birth_fraction_help,
     "Largest share of the population born into one entering frame.");
+SS_MSG_EN(temporal_init_dir, "Frames to refine");
+SS_MSG_EN(temporal_init_dir_help,
+    "Folder of frames/NNN/splat.ply, one per frame of the chunk, same rows: every "
+    "frame starts from its own file, scale and SH included and kept per frame, to "
+    "refine a finished chunk (no window, no births).");
+SS_MSG_EN(temporal_lock_shared, "One scale and SH per record");
+SS_MSG_EN(temporal_lock_shared_help,
+    "Once a frame is written, the shared scale and SH of every splat in it stop "
+    "training until a birth starts a new splat in that row, so each splat keeps "
+    "one scale and SH over the chunk, as .vgs stores them.");
 SS_MSG_EN(temporal_warp_dir, "Warps between frames");
 SS_MSG_EN(temporal_warp_dir_help,
     "Folder of deformation graphs, NNN.bin carrying frame NNN-1 of --temporal-frames "
     "onto frame NNN (int32 node count, float32 skinning radius, then per node "
     "float32 position, translation and wxyz rotation). A window frame entering "
-    "starts from the previous one moved by it rather than extrapolated.");
+    "starts from the previous one moved by it rather than extrapolated. \"auto\" "
+    "fits them between consecutive frames' subject SfM points.");
 
 SS_MSG(scale_init,
     EN("Initial splat size"), JA("スプラットの初期サイズ"),

@@ -21,6 +21,7 @@
 #include "engine/Engine.h"
 #include "core/ColorSpace.h"
 #include "data/DatasetParser.h"
+#include "app/TemporalInputs.h"
 #include "app/webviewer/RenderWorker.h"
 #include "config/TrainConfig.h"
 
@@ -304,14 +305,33 @@ private:
                               const std::vector<std::string>& masks,
                               const std::vector<std::string>& depths,
                               const std::vector<std::string>& normals);
-    // cfg.temporal_frames: one DataManager per frame, the splats cloned into each.
+    // Chunk training (cfg.temporal_frames), defined in TrainerChunk.cpp: one
+    // DataManager per frame, the splats cloned into each.
+    void configure_chunk();
     void setup_chunk();
+    void chunk_step(int step, int& schedule_step, const TrainConfig*& schedule);
+    void chunk_after_step(int step);
+    void eval_chunk();
     void install_frame_data(int frame);
     void advance_window(int step);
     int first_frame_steps() const {
         return cfg.temporal_first_frame_steps > 0 ? cfg.temporal_first_frame_steps
                                                   : cfg.temporal_frame_steps;
     }
+    // Take frames past the first whose budget is temporal_keyframe_steps; the
+    // steps past temporal_frame_steps train that frame alone as it enters.
+    bool is_keyframe(int frame) const {
+        return frame > 0 && cfg.temporal_keyframe_every > 0 &&
+               frame % cfg.temporal_keyframe_every == 0;
+    }
+    int keyframe_extra() const {
+        return std::max(cfg.temporal_keyframe_steps - cfg.temporal_frame_steps, 0);
+    }
+    std::vector<int> _advance_at;
+    size_t _next_advance = 0;
+    int _solo_until = -1;
+    // The last entered frame's subject, the source of the next "auto" warp.
+    SubjectPoints _subject;
     void write_frame(int slot, int step);
     void save_chunk(int step);
     void eval_frame(const std::string& data, const std::filesystem::path& metrics);

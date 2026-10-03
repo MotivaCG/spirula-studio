@@ -19,6 +19,9 @@ measured, all paths, and what comes next.
 - **This file is a living log.** Every new experiment is added to section 5,
   every conclusion it changes is corrected in place, and section 8 is kept as
   the current plan. Section 5.4 lists the known weaknesses of what is here.
+- **2026-09-27 VGS audit:** executed CPU contracts, export blockers, and the
+  staged low-token test handover are in [TEMPORAL_VGS_TEST_PLAN.md](TEMPORAL_VGS_TEST_PLAN.md).
+  B8 remains the training candidate; PLY-to-VGS conversion is not validated.
 
 ---
 
@@ -92,10 +95,10 @@ decoded with the owner's `MintFile` through a small probe (`reference/temporal/m
   per frame. **What reads as flicker is coherent regional change**, and Gracia
   does not have it.
 
-Side findings about the owner's `.vgs` encoder: `D:\Trabajos\THE4DSCANNER\VGSFileFormat\core\src\vgsencode.cpp`, line 468,
-rejects any `.mint` that is not 30 Hz ("source timebase is not 30 Hz"). The
-header supports any timebase, but the encoder never derives it. Both non-tiki
-samples are 25 and 50 Hz. It was not fixed.
+The earlier VGS encoder rejected non-30 Hz sources. Rechecked 2026-09-27:
+current `vgsencode.cpp::setTimebase` derives rational timing from the source.
+That implementation is already fixed; built-exporter timebase tests remain in
+the VGS test plan. Both non-tiki samples are 25 and 50 Hz.
 
 ---
 
@@ -427,6 +430,12 @@ identity rotation, colour of the point, scale half the spacing, opacity 0.1 in
 the entering frame only (dead in every earlier one), no optimizer history. Cap
 2 % per frame; 800-1500 were born per frame.
 
+Audit correction (2026-09-27): the `<0.005` criterion is not exact absence.
+The CPU tests in `TEMPORAL_VGS_TEST_PLAN.md` show that earlier in-memory slots
+are modified and can remain above the raster cutoff; older optimizer moments
+also survive. Disk PLYs already written are unchanged. Generation/lifetime
+semantics and GPU render invariance still need validation before VGS export.
+
 Window W6, 4000 steps, warp on, no smoothing. Criterion set before the run
 (vs Ws): coverage at 60 ≥ +2 points, fit and detail not below by > 0.2 dB,
 flicker not above by > 15 %.
@@ -555,8 +564,9 @@ Criterion set before: both runs fit mean ≥ 30.5 and at 76 ≥ 30.0, coverage a
 | **B8b** | **30.81** (31.7 / 30.6) | 35.91 | **8.87** | 63 / 92 / **91 %** | 163k / 105k |
 
 What it shows: **the candidate holds over the whole take.** Both runs are
-below Gracia's flicker and ~3× below Forge's, within 0.2 dB of Forge's fit to
-the end of the take (30.5 at frame 76, where C3 had fallen to 27.2), keeping
+below Gracia's flicker and ~3× below Forge's, within 0.2 dB of Forge's mean fit.
+The final-frame gap is 0.4-0.5 dB (30.5/30.6 at frame 76 versus Forge's 31.0,
+where C3 had fallen to 27.2), keeping
 the covered surface. Fit agrees between runs to 0.2 %. **Flicker differs by
 15 % between two identical runs**: the first measured seed spread, and the
 only criterion not met (10 % was the guess). Remaining gap: ~0.8 dB of detail
@@ -572,6 +582,46 @@ with `0045.ply` ... `0076.ply` (unpruned, COLMAP frame, SH degree 1).
 
 Not shown: robustness on another take; a uniform Forge baseline; the detail
 gap's cause; more seeds.
+
+### 5.13 Battery B9: detail candidates, frames 45-64 (2026-09-27)
+
+The three runs completed; full metrics and manifests are in
+`outputs/tc/B9_20260927_battery`. Same B8 recipe except the stated change.
+
+| run | fit mean / final dB | detail dB | flicker | coverage at 64 | training time |
+|---|---|---|---|---|---|
+| control | 30.969 / 30.901 | 36.056 | 9.834 | 92.38% | 25:18 |
+| 8000 steps/frame | 31.380 / 31.486 | 36.246 | 7.316 | 92.06% | 43:33 |
+| SH learning rate x2 | 31.044 / 31.017 | 36.120 | 7.725 | 92.60% | 23:51 |
+
+8k is promising for fit (+0.411 dB mean), at 72% more measured training time.
+Its detail gain (+0.190 dB) misses the predeclared >=0.2 dB promotion threshold;
+SH x2 gains only 0.064 dB detail. Neither is promoted. Flicker comparisons are
+single-run observations; the control has early pair spikes around 34. B8 remains
+the reference. The three B8R repetitions were still pending/in progress when this
+entry was written. See section 7 of `TEMPORAL_VGS_TEST_PLAN.md` for interpretation
+and actions. VGS lifetime/representation validation remains outstanding.
+
+### 5.14 Batteries FC3-FC5, R, R2X: Forge chunks through `.vgs` (2026-10-02/03)
+
+Forge's chunk path (SMNForge `GRACIA_CHUNK_TRAINING.md`) on 45-76, published
+frames encoded by VGSFileFormat's `vgsplyseq` (encoding 0, one 31-frame chunk):
+
+| run | fit | detail | flicker | MB / 31 frames |
+|---|---|---|---|---|
+| FC4 published (lock + opacity/colour smoothing) | 24.28 | 34.60 | 9.52 | — |
+| FC4 `.vgs` | 23.27 | 32.87 | 15.31 | 24.9 |
+| FC5 published (+ position/rotation 2nd order) | 24.05 | 34.29 | 10.31 | — |
+| FC5 `.vgs` | 23.76 | 33.59 | 11.49 | 24.6 |
+
+Training jitter is what the codec cannot keep: FC5 cuts its error from
+11.8 mm / 20 deg to 3.9 mm / 7.5 deg. R2X (one attribute exact at a time on
+R1's `.vgs`): with the position model reused, rotation was the largest
+remaining loss (+0.24 dB, -1.1 flicker), opacity and colour ~0.5 flicker each.
+Refining on the codec's positions (`--temporal-init-dir`, visible set fixed)
+helped FC4's codec positions but not FC5's (23.61 / 12.44): dropped.
+Per-splat vibration, `splat_vibration.py`, median second difference vs Gracia:
+luminance 0.0004 vs 0.0018, opacity 0.0123 vs 0.0032 — opacity is what is left.
 
 ### 5.4 Known weaknesses of these results (review of 2026-09-25)
 
@@ -626,8 +676,24 @@ schedule (Wn).
 
 ## 7. What SMNForge needs to use this
 
-Forge today runs spirula once per frame (`graciarenderer.cpp`,
-`smnprocesstasks.cpp` → `MakeGaussianUsingSpirula`).
+**Code layout (2026-09-28):** chunk training's TrainerSession members live in
+`src/app/TrainerChunk.cpp` (warps/births inputs in `src/app/TemporalInputs.cpp`,
+engine side in `src/engine/EngineTemporal.*`); `TrainerCore.cpp` keeps only the
+calls, so upstream merges stay small. Forge runs the spirula copy in
+`build_tc_deploy` (registry `Paths/Spirula`, was `build_temporal_cuda_vs2022`).
+
+**Done 2026-09-28 (uncommitted), SMNForge branch `TemporalChunk`:**
+`--graciaseed chunk` does points 1-4 below; details and how to run it in
+SMNForge's `GRACIA_CHUNK_TRAINING.md`. On this side, `--temporal-warp-dir auto`
+and `--temporal-birth-dir auto` (`src/app/TemporalInputs.cpp`, C++ port of
+`hull.py`/`warps.py`/`births.py`; on 45→47 it gives 10304 vs 10302 subject
+points and warp RMS 24.0→16.5 vs 24.1→16.7 mm) fit warps and births inside
+spirula, so Forge passes only frame folders. Prune keeps rows (removed splats
+written back with opacity logit -20). First test: battery FC,
+`outputs/tc/battery_FC.ps1` → `FC_report.md`, on the copy `VIDEOTIKI_CHUNK`.
+
+The original plan, for reference. Forge ran spirula once per frame
+(`graciarenderer.cpp`, `smnprocesstasks.cpp` → `MakeGaussianUsingSpirula`).
 
 1. **Prepare frames without training them.** SfM with the locked prior, masks
    and undistort into `.work\NNN\undistorted`, as today. The option is missing:
@@ -661,14 +727,24 @@ Done since the review: better metrics (B1), repeated-frame control (B2), births
 (B3), full take (B4), flicker isolation (B5-B7), candidate on the full take
 twice (B8). **Current recipe: B8** (5.12).
 
-1. **Detail gap** (~0.8 dB below Forge): check per-frame steps (8000 instead of
-   4000) and SH learning rate on 45-65, fit/detail/flicker as criteria.
+Before the quality runs below, address the birth/lifetime and VGS representation
+gates in [TEMPORAL_VGS_TEST_PLAN.md](TEMPORAL_VGS_TEST_PLAN.md). The 2026-09-27
+audit executed 17 CPU checks and scanned both B8 sequences. It reproduced unsafe
+birth-state assumptions and the legacy direct-position interpolation mismatch;
+VGS scale is static per chunk record whereas B8 scales still vary. These checks
+do not replace GPU render/optimizer validation. The separate plan includes the
+results, exact commands, prerequisites, and serial runners for the quality runs.
+
+1. **Detail gap** (~0.8 dB below Forge): B9 tested 8000 steps and SH learning
+   rate x2 on 45-64 (section 5.13). Neither met the detail promotion threshold.
+   Finish B8R repetitions, inspect worst pairs, then confirm the promising 8k
+   fit gain on 45-76 with repetitions before changing the reference recipe.
 2. A **uniform Forge baseline** over 45-76 (the owner's recipe on every frame)
    so the reference is one pipeline; crops of face, hands and clothes.
 3. **More seeds** for B8 (3 runs) to bound the flicker spread (15 % seen).
 4. A **second take** with harder motion and occlusion (owner to choose it).
 5. Forge integration (section 7), then `.vgs` writing from the per-frame PLYs
-   (fix the 30 Hz check in the VGS encoder first).
+   after the lifetime, representation and round-trip gates in the VGS test plan.
 
 Success targets: regional flicker ≤ 8, fit ≥ 30.5 dB held to the end of the
 take, covered surface ≥ 88 % to the end. B8 meets them on VIDEOTIKI except
@@ -745,3 +821,70 @@ python D:\Dependencias\spirula-studio\reference\temporal\evaluate.py 45:76 --pai
 - Comment blocks over 3 lines fail the build.
 - The eval loader samples with replacement.
 - Per-frame depth/normal files exist only for frame 45 of this take.
+
+## 10. Follow-up execution (2026-09-27)
+
+The B8R battery finished three full 45-76 repetitions. Mean fit was
+30.840/30.842/30.879 dB; final fit 30.563/30.523/30.634; detail
+35.897/35.911/35.905; flicker 7.778/7.695/7.304; final coverage
+90.41/90.95/90.30%. Source:
+`outputs/tc/B8R_20260927_battery/status.json` and per-run metrics.
+These runs support B8's stability on this take, while historical B8b's 8.87
+flicker cautions against treating 7.78 as a hard upper bound.
+
+B10 now runs three full-length 8000-step repetitions serially, using the same
+original executable as B8/B9. Read
+`outputs/tc/B10_20260927_battery/status.json`; compare full-span detail,
+fit, coverage, flicker and worst pairs before changing the B8 reference.
+The visual check of B9's worst-pair frames from a fixed camera is saved at
+`outputs/tc/audit_20260927_02/B9_worst_pairs_H2_P10.png`.
+
+Birth handling has since changed in Spirula source, separate from B10:
+births obey mutual spacing, row reuse stays below the 1/255 raster cutoff in
+all resident frames, old frame attributes are preserved, reused-row moments
+are reset, generation events are recorded, and smoothing respects generations.
+The focused CPU shim reports 16/16 temporal contracts passing in
+`outputs/tc/audit_20260927_warp_valid_v3/summary.json`. It also found and
+excludes 10 near-zero quaternion warp nodes out of 124,821 in this take.
+CUDA compiled;
+Vulkan linking is blocked by unresolved `__std_*` symbols in the existing
+toolchain, so backend parity is unverified. B11 is queued after B10 for one
+full CUDA trial with the new executable. Its queue status is
+`outputs/tc/B11_20260927_queue_status.json`. See
+[TEMPORAL_VGS_TEST_PLAN.md](TEMPORAL_VGS_TEST_PLAN.md), section 8, for the
+exact artifacts, limitations and next gates. This paragraph records the earlier
+queue state; the completion and export follow-up below supersedes it.
+
+## 11. Completed training and VGS comparison (2026-09-27)
+
+B10 completed all three full 45-76 repetitions: fit mean
+31.230/31.217/31.214, final 31.022/30.992/31.047, detail
+36.084/36.087/36.099, flicker 7.041/7.198/7.922. Its mean detail gain
+over B8R is about 0.186 dB, below the previously declared 0.2 dB criterion.
+The fit improvement is repeatable on this take; it does not prove the cost of
+8000 steps is justified or validate a second take.
+
+B11 (corrected births, B8 training budget) completed: fit mean 30.778,
+final 30.490, detail 35.894, flicker 7.299, final coverage 89.895%.
+It passes the predeclared reference gate. Only one B11 run exists; the three
+B8R runs are supporting historical evidence, not repetitions of this binary.
+
+The real CUDA birth fixture now passes 8/8 cases, including both sides of the
+1/255 threshold, held-frame render invariance, 100 optimizer steps and smoothing
+on/off. The fixture's initial missing camera distortion row was corrected;
+that failure was test setup, not evidence against the training algorithm.
+Log: `outputs/tc/birth_gpu_validation.log`. Vulkan remains unverified.
+
+C12 freezes all 32 B11 PLYs byte-for-byte, preserves birth generations, schema,
+explicit ticks and hashes, and compares four outputs without retraining:
+lossless samples, existing VGS encoding 0 held frames, adaptive tracks and
+int16 residuals. Sizes refer to real compressed `.vgs`, never PGS proxies.
+Experimental modes require an opt-in decoder and are not yet compatible with
+existing VGS viewers. `.mint` and the default decoder remain unchanged.
+
+The synthetic fixture passes native round trips and Chrome/WebGL2 upload and
+GPU/CPU parity on RTX 4070. Existing encoding 0 uses actual viewer packing;
+native pages upload directly from decoded WASM views. Full-scene web rendering
+and sorting are outside this benchmark. Existing VGS regression tests: 11/11.
+For pending full-sequence results and low-token commands see
+[TEMPORAL_VGS_TEST_PLAN.md](TEMPORAL_VGS_TEST_PLAN.md), section 9.

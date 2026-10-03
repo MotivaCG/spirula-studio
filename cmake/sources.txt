@@ -39,6 +39,8 @@ src/data/*.cpp
 src/data/parsers/*.cpp
 src/app/webviewer/*.cpp
 src/app/TrainerCore.cpp
+src/app/TemporalInputs.cpp
+src/app/TrainerChunk.cpp
 src/app/EvalMetrics.cpp
 src/external/*.cpp
 src/external/*.c
@@ -55,6 +57,8 @@ src/data/*.cpp
 src/data/parsers/*.cpp
 src/app/webviewer/*.cpp
 src/app/TrainerCore.cpp
+src/app/TemporalInputs.cpp
+src/app/TrainerChunk.cpp
 src/app/EvalMetrics.cpp
 src/external/*.cpp
 src/external/*.c
