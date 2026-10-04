@@ -623,6 +623,122 @@ helped FC4's codec positions but not FC5's (23.61 / 12.44): dropped.
 Per-splat vibration, `splat_vibration.py`, median second difference vs Gracia:
 luminance 0.0004 vs 0.0018, opacity 0.0123 vs 0.0032 — opacity is what is left.
 
+### 5.15 Batteries OB, OC, CX, DX5, PS, FC6, RB: what `.vgs` still loses (2026-10-03/04)
+
+Scripts in `outputs/tc/battery_<name>.ps1`. OB and OC run spirula alone on 45-76
+with FC5's recipe (warps/births from `warps45`/`births45`, no depth, no prune);
+the rest work on FC5's or FC6's Forge output.
+
+**OB: an L1 band on each written frame's opacity change** (4DGCPro's rate
+penalty, as a proximal step: the change since the previous frame shrinks by the
+band, smaller changes vanish, nothing crosses 1/255). Rejected and reverted:
+
+| run | band | fit raw | flicker raw | fit `.vgs` | flicker `.vgs` | dA2 med / p90 |
+|---|---|---|---|---|---|---|
+| OB0 | 0 | 29.83 | 11.64 | 28.47 | 17.34 | 0.0116 / 0.0375 |
+| OB1 | 0.01 | 29.58 | 11.93 | 28.20 | 19.64 | 0.0069 / 0.0305 |
+| OB2 | 0.02 | 29.25 | 16.26 | 27.90 | 26.96 | 0.0035 / 0.0273 |
+| OB3 | 0.04 | 28.62 | 17.46 | 27.27 | 27.79 | 0.0000 / 0.0216 |
+
+OB2 matches Gracia's per-splat opacity vibration (0.0032) and flickers 40 %
+more: the following frames compensate the frozen one with larger changes.
+**The per-splat vibration median does not predict rendered flicker**; it is a
+diagnostic, decisions go by rendered flicker.
+
+**OC: smoothing strength**, one part stronger at a time against OB0. None wins:
+
+| run | change | fit raw | flicker raw | fit `.vgs` | flicker `.vgs` | codec error |
+|---|---|---|---|---|---|---|
+| OB0 | — | 29.83 | 11.64 | 28.47 | 17.34 | 9.6 mm / 6.8 deg |
+| OC1 | position/rotation weight 2 | 29.65 | 11.63 | 28.45 | 19.84 | 8.2 mm / 5.7 deg |
+| OC2 | every 50 steps | 29.34 | 13.03 | 28.22 | 19.49 | 7.9 mm / 5.9 deg |
+| OC3 | opacity/colour weight 2 | 29.54 | 11.76 | 28.21 | 21.01 | 9.7 mm / 7.0 deg |
+
+Unpruned spirula runs give spiky per-pair `.vgs` flicker (single pairs of
+30-47), so differences of 2-4 here are within noise; Forge's pruned output gives
+a smooth curve. `.vgs` decisions are taken on Forge output.
+
+**CX: the codec's own settings** on FC5's published frames:
+
+| run | setting | fit | flicker | first pair | MB / 31 frames |
+|---|---|---|---|---|---|
+| FC5 `.vgs` | residual rotation, 0.5 mm / 2 deg, 16384 atoms | 23.76 | 11.49 | 14.1 | 24.6 |
+| CX1 | rotation as samples (0.12 deg error) | 23.80 | 11.36 | 13.7 | 45.2 |
+| CX2 | rotation tolerance 1 deg | 23.75 | 11.49 | 14.1 | 24.6 |
+| CX3 | position tolerance 0.25 mm | 23.76 | 11.51 | 13.9 | 24.7 |
+| CX4 | 32768 position atoms | 23.79 | 11.39 | 13.9 | 28.1 |
+
+**DX5: one attribute exact** (one encode, `--export-exact`):
+
+| exact | fit | flicker | first pair |
+|---|---|---|---|
+| none (FC5 `.vgs`) | 23.76 | 11.49 | 14.1 |
+| position | 24.01 | 10.42 | 10.0 |
+| colour DC | 23.76 | 11.49 | 14.1 |
+| opacity | 23.76 | 11.52 | 14.1 |
+| scale + SH | 23.76 | 11.48 | 14.1 |
+| all but position | 23.80 | 11.41 | 13.7 |
+| (FC5 published) | 24.05 | 10.31 | 9.4 |
+
+**Position is ~95 % of the codec's loss**, including the first pair (frame 0:
+5.5 mm against 3.7 mm for the others). Almost every record already uses the four
+terms encoding 0 allows (ranks 2070 / 8317 / 6732 / 314928), which is why
+tolerances and more atoms barely help.
+
+**PS: splitting records** whose decoded position strays past a bound
+(`--max-position-error`):
+
+| bound | fit | flicker | first pair | records | MB / 31 frames |
+|---|---|---|---|---|---|
+| none | 23.76 | 11.49 | 14.1 | 332047 | 24.6 |
+| 20 mm | 23.79 | 11.21 | 12.6 | 364327 | 25.76 |
+| 10 mm | 23.82 | 11.09 | 11.8 | 484727 | 30.3 |
+| 6 mm | 23.86 | 10.94 | 10.8 | 890618 | 45.8 |
+
+**FC6: Forge with position smoothing weight 2** (rotation 1). Codec error
+3.9 → 3.3 mm, but training lost what the codec gained: published 24.04 / 10.54
+(FC5 24.05 / 10.31), `.vgs` 23.78 / 11.53, with 20 mm splits 23.81 / 11.32 at
+25.3 MB. Reverted.
+
+**RB: the joint refine on codec positions, on Forge's own work folders** with
+PPISP learned in the run (FC5's refine had trained on the VIDEOTIKI take with
+its frozen PPISP). Better than FC5's refine, still worse than not refining:
+RB1 23.78 / 11.95 (`.vgs` 23.73 / 12.14); RB2, half the appearance rates,
+23.67 / 12.48. Appearance cannot make up for position error: the refine path is
+closed.
+
+**Current best: FC5's recipe in Forge, encoded with `vgsplyseq --rotation
+residual --max-position-error 20`.**
+
+| | fit | detail | flicker | size |
+|---|---|---|---|---|
+| Forge per frame, published | 24.76 | 35.48 | 12.69 | not compressible in time |
+| Gracia | — | — | 9.49 | ~31 MB / chunk |
+| FC5 published | 24.05 | 34.29 | 10.31 | — |
+| **FC5 `.vgs`, 20 mm splits** | **23.79** | **33.61** | **11.21** | **25.76 MB / 31 frames** |
+
+At the size target (25.8 MB per chunk, ~309 MB for the take, 17 % under
+Gracia), encoding 0 with real 31-frame chunks, readable by the current viewer.
+Measured on one chunk only (45-76); the take's 12 chunks are not validated yet.
+The gap left to the published frames (+0.9 flicker) is position that four
+terms cannot hold.
+
+**Papers (ideas only), against what we found:**
+
+| paper | idea | fit with VGS / our results |
+|---|---|---|
+| ReCon-GS | motion as summed motions of hierarchical anchors | best fit: translation-only anchors = dictionary atoms, weights = the four terms (rotating anchors make a splat's path depend on its offset, which encoding 0 cannot store); next step |
+| QUEEN | L0 gate on residuals, quantization-aware training | gate fits a position residual on top of anchors; quantization not needed (DX5: appearance is not lost) |
+| PackUV | freeze the static, quantize in training | freezing = `--temporal-lock-shared`; done |
+| Dynamic 3D Gaussians | fixed appearance per splat | scale and SH: yes; opacity: no (OB) |
+| 4DGCPro | L1 / rate penalty on per-frame changes | appearance: rejected (OB); may suit a position residual |
+| CDGS | differentiable record budget | fits: fewer records would pay for more splits; untried |
+| OMG4 | merge short-lived records | little to gain (~2k one-frame records of 332k) |
+| TED-4DGS | learnable activation windows | births with generations already give one lifetime per record |
+| FreeTimeGS / SharpTimeGS | soft temporal opacity | clashes with one hard lifetime per record |
+| TRiGS | kNN rigidity | subsumed by anchors |
+| MoRGS | optical-flow loss | motion correctness, not size or codec; not now |
+
 ### 5.4 Known weaknesses of these results (review of 2026-09-25)
 
 An outside review of this record raised these; all are accepted.
@@ -666,6 +782,9 @@ An outside review of this record raised these; all are accepted.
 | Fresh Adam moments per entering frame (`--temporal-fresh-moments`) | Forge restarts Adam every frame | −62 %: Adam's first steps push rarely used splats off | code removed |
 | Per-frame scale (`--temporal-per-frame-scale`) | Forge changes scale ×2.5/frame | no change | code removed |
 | Held-out-camera evaluation | standard protocol | fog from neighbours' background splats | replaced by trained views + mask |
+| Opacity change band on written frames (`--temporal-opacity-band`, OB) | per-splat opacity vibration 4x Gracia's | vibration down to Gracia's, rendered flicker up 40-50 % | code removed |
+| Stronger smoothing (OC, FC6) | lower codec position error | codec error down, training quality down as much | weights stay at 1 |
+| Joint refine on the codec's positions (FC4/FC5 REF, RB) | let appearance absorb the codec's position error | worse than encoding the published frames | not used |
 
 Hypotheses disproved on the way: fp32 optimizer (D5), auxiliary warmup
 schedules (Wr), number of steps (R2), interleaving frames (Wp), initial copies of
@@ -722,6 +841,16 @@ The original plan, for reference. Forge ran spirula once per frame
 ---
 
 ## 8. Next steps (current plan, in order)
+
+**Plan of 2026-10-04** (supersedes the list further down; best result in 5.15):
+
+1. Anchor motion (ReCon-GS's idea): per chunk, anchors with translation
+   trajectories; each splat's position = base + four anchor weights + an
+   L1/L0-penalised residual. `vgsplyseq` loads that model instead of fitting it,
+   so the codec's position error is the residual alone.
+2. A record budget (CDGS's idea) to pay for splits within the size target.
+3. The whole take through Forge (12 chunks) to validate size and quality.
+4. `vgsplyseq` inside Forge's chunk path.
 
 Done since the review: better metrics (B1), repeated-frame control (B2), births
 (B3), full take (B4), flicker isolation (B5-B7), candidate on the full take
