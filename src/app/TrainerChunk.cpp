@@ -84,6 +84,11 @@ void TrainerSession::setup_chunk() {
     engine_temporal_begin(frames, cfg.use_fused_proj_bwd_optim, cfg.use_per_splat_bias_correction,
                           whole_frames);
     engine_temporal_lock_shared(cfg.temporal_lock_shared);
+    if (cfg.temporal_anchors > 0) {
+        if (_subject.xyz.empty()) _subject = subject_points(_chunk_dirs[0]);
+        log("chunk: motion through " +
+            std::to_string(engine_temporal_anchors(cfg.temporal_anchors, _subject.xyz)) + " anchors");
+    }
     engine_temporal_stash_data_manager(0);
     for (int k = 1; k < frames; k++) {
         install_frame_data(k);
@@ -135,6 +140,7 @@ void TrainerSession::write_frame(int slot, int step) {
     // What is written is what gets frozen: the frozen values, not the drift
     // of the steps since they were last put back.
     if (cfg.temporal_lock_shared) engine_temporal_restore_locked();
+    engine_temporal_project_motion();
     const int frame = _window_first + slot;
     char name[32];
     std::snprintf(name, sizeof name, "%03d", frame);
@@ -293,9 +299,11 @@ void TrainerSession::chunk_after_step(int step) {
     // Every 10 steps: 1 ms of transfers each time, and 10 steps of drift at a
     // slowed scale rate move a frozen splat by nothing measurable.
     if (cfg.temporal_lock_shared && (step + 1) % 10 == 0) engine_temporal_restore_locked();
-    if (cfg.temporal_smooth_every > 0 && (step + 1) % cfg.temporal_smooth_every == 0)
+    if (cfg.temporal_smooth_every > 0 && (step + 1) % cfg.temporal_smooth_every == 0) {
         engine_temporal_smooth({cfg.temporal_smooth_position, cfg.temporal_smooth_rotation,
                                 cfg.temporal_smooth_opacity, cfg.temporal_smooth_color});
+        engine_temporal_project_motion();
+    }
 }
 
 void TrainerSession::eval_chunk() {

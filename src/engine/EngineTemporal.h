@@ -70,3 +70,11 @@ int64_t engine_temporal_birth(const std::vector<float>& points, float gap, int64
 // One smoothing step along time per attribute, weights in [0, 1]: second
 // difference for position and rotation, first for opacity and colour.
 void engine_temporal_smooth(const TemporalSmoothing& weights);
+
+// Motion through anchors (TemporalAnchors.h): about `anchors` placed over the
+// splats shown now near `subject` (xyz rows); returns how many. A record is
+// bound in the first held frame that shows it and moves freely until then.
+int engine_temporal_anchors(int anchors, const std::vector<float>& subject);
+// Every trainable frame: its anchors fitted to its bound rows, and those rows
+// put back on them, so written frames move only as the anchors do.
+void engine_temporal_project_motion();

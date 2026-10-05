@@ -3048,6 +3048,12 @@ SS_MSG_EN(temporal_smooth_opacity_help,
 SS_MSG_EN(temporal_smooth_color, "Temporal smoothing of colour");
 SS_MSG_EN(temporal_smooth_color_help,
     "As for opacity, on the base colour coefficients.");
+SS_MSG_EN(temporal_anchors, "Motion anchors");
+SS_MSG_EN(temporal_anchors_help,
+    "Splats move only as a blend of their four nearest anchors' displacements, "
+    "about this many anchors per chunk, which is how .vgs stores motion: the "
+    "written frames need no position approximation. Applied every smoothing "
+    "interval and before a frame is written. 0 = splats move freely.");
 SS_MSG_EN(temporal_window, "Sliding window of frames");
 SS_MSG_EN(temporal_window_help,
     "Train the frames of --temporal-frames through a window of this many "

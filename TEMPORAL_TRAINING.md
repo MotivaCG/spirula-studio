@@ -739,6 +739,53 @@ terms cannot hold.
 | TRiGS | kNN rigidity | subsumed by anchors |
 | MoRGS | optical-flow loss | motion correctness, not size or codec; not now |
 
+### 5.16 Motion through anchors: batteries AN and FC7 (2026-10-04/05)
+
+`--temporal-anchors N` (`src/engine/TemporalAnchors.*`, glue in
+`EngineTemporal.cpp`, hooks in `TrainerChunk.cpp`). ReCon-GS's idea, translation
+only, shaped to encoding 0:
+
+- About N anchors, one per occupied cell of a grid over the splats within 4 cm
+  of frame 0's subject SfM points (the room does not move; over all splats the
+  anchors landed 15 cm apart and AN1's first try lost 2 dB and doubled flicker).
+- A record is bound in the first held frame that shows it: its four nearest
+  anchors, weights that sum to one and rebuild its position from theirs (motion
+  linear across the four moves it exactly), and a base. Rows more than three
+  anchor spacings away stay still.
+- Every smoothing interval and before a frame is written, each trainable frame's
+  anchor displacements are fitted to its bound rows (weighted least squares,
+  Jacobi-preconditioned CG, stopping when no anchor moves 0.1 mm) and the rows
+  are put back on them. Written frames move only as the anchors do; records
+  move freely until bound.
+
+Battery AN, spirula alone on 45-76 with FC5's recipe (`outputs/tc/battery_AN.ps1`):
+
+| run | fit raw | flicker raw | fit `.vgs` | flicker `.vgs` | MB / 31 frames | codec position rms |
+|---|---|---|---|---|---|---|
+| OB0, free motion | 29.83 | 11.64 | 28.47 | 17.34 | 23.8 | 9.6 mm |
+| AN1, 8192 anchors | 29.02 | 6.65 | 28.60 | 8.08 | 22.5 | 1.5 mm |
+| AN2, 16384 anchors | 28.94 | 6.76 | 28.44 | 7.57 | 22.7 | 2.1 mm |
+
+FC7, Forge's chunk path with FC5's recipe and 8192 anchors (`battery_FC7.ps1`):
+
+| run | fit | detail | flicker | MB / 31 frames |
+|---|---|---|---|---|
+| FC5 raw (unpruned) | 29.50 | — | 12.50 | — |
+| FC7 raw (unpruned) | 28.58 | 34.37 | 6.98 | — |
+| FC5 published | 24.05 | 34.29 | 10.31 | — |
+| FC7 published | 23.86 | 33.79 | 9.91 | — |
+| FC5 `.vgs`, 20 mm splits | 23.79 | 33.61 | 11.21 | 25.76 |
+| **FC7 `.vgs`** | **23.77** | **33.61** | **10.35** | **23.8** |
+
+Anchors halve the raw flicker in Forge too (12.5 -> 7.0) and the codec now loses
+0.09 dB / 0.44 flicker (splits past 20 mm find nothing to split). **Current best:
+FC7.** What is left comes from Forge's prune: +2.9 flicker over the raw frames,
+most of it in frames 66-76 (pairs 8-10 raw, 11-15 published). Next: the chunk
+prune (SMNForge `GraciaChunk::publish`).
+
+Note for batteries: `evaluate.py` caches renders in `outputs/tc/q/<run>.seq_<frame>`
+by run name; a rerun under the same name must delete them first.
+
 ### 5.4 Known weaknesses of these results (review of 2026-09-25)
 
 An outside review of this record raised these; all are accepted.
@@ -842,15 +889,15 @@ The original plan, for reference. Forge ran spirula once per frame
 
 ## 8. Next steps (current plan, in order)
 
-**Plan of 2026-10-04** (supersedes the list further down; best result in 5.15):
+**Plan of 2026-10-05** (supersedes the list further down; best result in 5.16):
 
-1. Anchor motion (ReCon-GS's idea): per chunk, anchors with translation
-   trajectories; each splat's position = base + four anchor weights + an
-   L1/L0-penalised residual. `vgsplyseq` loads that model instead of fitting it,
-   so the codec's position error is the residual alone.
-2. A record budget (CDGS's idea) to pay for splits within the size target.
-3. The whole take through Forge (12 chunks) to validate size and quality.
-4. `vgsplyseq` inside Forge's chunk path.
+1. Done: anchor motion (5.16).
+2. The chunk prune in Forge, now the largest flicker source (+2.9).
+3. If the codec's own dictionary misses the anchors' trajectories, write the
+   anchor model next to the frames and let `vgsplyseq` load it (today 1.5 mm
+   rms is left; splits past 20 mm find nothing).
+4. The whole take through Forge (12 chunks) to validate size and quality.
+5. `vgsplyseq` inside Forge's chunk path.
 
 Done since the review: better metrics (B1), repeated-frame control (B2), births
 (B3), full take (B4), flicker isolation (B5-B7), candidate on the full take

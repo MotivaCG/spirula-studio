@@ -4,6 +4,7 @@
 #include "data/DataManager.h"
 #include "engine/EngineInternal.h"
 #include "engine/EngineState.h"
+#include "engine/TemporalAnchors.h"
 
 #include <algorithm>
 #include <cmath>
@@ -23,6 +24,7 @@ struct Slot {
     void* mem = nullptr;  // every per-frame field, back to back
     std::unique_ptr<DataManager> dm;
     std::vector<uint32_t> generation;
+    std::vector<float> anchors;  // the anchors' displacements in this frame
     bool held = false;
 };
 
@@ -43,6 +45,11 @@ struct Temporal {
     std::vector<std::vector<uint8_t>> shown;
     std::vector<uint8_t> locked;
     std::vector<float> locked_scales, locked_sh;
+    // Motion through anchors (TemporalAnchors.h). A row's base belongs to the
+    // record (generation) it was bound for; until then the row moves freely.
+    std::unique_ptr<AnchorRig> rig;
+    std::vector<float> base;
+    std::vector<uint32_t> based;  // generation + 1 of the bound record, 0 = none
 };
 
 std::unique_ptr<Temporal> g_temporal;
@@ -329,6 +336,7 @@ void engine_temporal_push(float opacity_boost, const TemporalWarp* warp) {
     Slot s;
     s.mem = backend::device_malloc_checked(t.slot_bytes, "chunk training frames");
     s.generation = t.slots.back().generation;
+    s.anchors = t.slots.back().anchors;
     backend::memcpy_async(s.mem, t.slots.back().mem, t.slot_bytes,
                           backend::MemcpyKind::DeviceToDevice);
     const int n = (int)t.slots.size();
@@ -498,6 +506,71 @@ void engine_temporal_smooth(const TemporalSmoothing& w) {
         }
     for (int k = 0; k < frames; k++)
         if (!t.slots[k].held) upload(k, h[k]);
+    if (t.active >= 0) copy_slot(t.active, true);
+    backend::device_synchronize();
+}
+
+int engine_temporal_anchors(int anchors, const std::vector<float>& subject) {
+    Temporal& t = *g_temporal;
+    if (t.active >= 0) copy_slot(t.active, false);
+    backend::device_synchronize();
+    const HostParams h = download(0);
+    const size_t n = (size_t)t.splats;
+    std::vector<float> shown;
+    for (size_t r = 0; r < n; r++)
+        if (h.opacities[r] > kShownLogit) shown.insert(shown.end(), &h.means[3 * r], &h.means[3 * r] + 3);
+    t.rig = std::make_unique<AnchorRig>(anchor_rig(shown, subject, anchors, n));
+    t.base.assign(3 * n, 0.0f);
+    t.based.assign(n, 0);
+    for (Slot& s : t.slots) s.anchors.assign(t.rig->rest.size(), 0.0f);
+    return (int)(t.rig->rest.size() / 3);
+}
+
+void engine_temporal_project_motion() {
+    Temporal& t = *g_temporal;
+    if (!t.rig) return;
+    if (t.active >= 0) copy_slot(t.active, false);
+    backend::device_synchronize();
+    const size_t n = (size_t)t.splats, frames = t.slots.size();
+    std::vector<HostParams> h;
+    for (size_t k = 0; k < frames; k++) h.push_back(download((int)k));
+    // A record is bound in the first held frame that shows it, where it is.
+    for (size_t k = 0; k < frames; k++) {
+        const Slot& s = t.slots[k];
+        if (!s.held) continue;
+        std::vector<float> at = t.rig->rest;
+        for (size_t i = 0; i < at.size(); i++) at[i] += s.anchors[i];
+        const AnchorGrid grid = anchor_grid(*t.rig, at);
+        for (size_t r = 0; r < n; r++) {
+            if (t.based[r] == s.generation[r] + 1 || h[k].opacities[r] <= kShownLogit) continue;
+            const float* p = &h[k].means[3 * r];
+            anchor_bind(*t.rig, grid, r, p);
+            const std::array<float, 3> o = anchor_offset(*t.rig, r, s.anchors);
+            for (int c = 0; c < 3; c++) t.base[3 * r + c] = p[c] - o[c];
+            t.based[r] = s.generation[r] + 1;
+        }
+    }
+    // Each trainable frame: the anchors that best explain its bound rows, then
+    // those rows put where the anchors take them.
+    for (size_t k = 0; k < frames; k++) {
+        Slot& s = t.slots[k];
+        if (s.held) continue;
+        std::vector<uint32_t> rows;
+        std::vector<float> offsets, importance;
+        for (size_t r = 0; r < n; r++) {
+            if (t.based[r] != s.generation[r] + 1 || h[k].opacities[r] <= kShownLogit) continue;
+            rows.push_back((uint32_t)r);
+            for (int c = 0; c < 3; c++) offsets.push_back(h[k].means[3 * r + c] - t.base[3 * r + c]);
+            importance.push_back(1.0f / (1.0f + std::exp(-h[k].opacities[r])));
+        }
+        anchor_solve(*t.rig, rows, offsets, importance, s.anchors);
+        for (size_t r = 0; r < n; r++) {
+            if (t.based[r] != s.generation[r] + 1) continue;
+            const std::array<float, 3> o = anchor_offset(*t.rig, r, s.anchors);
+            for (int c = 0; c < 3; c++) h[k].means[3 * r + c] = t.base[3 * r + c] + o[c];
+        }
+        upload((int)k, h[k]);
+    }
     if (t.active >= 0) copy_slot(t.active, true);
     backend::device_synchronize();
 }

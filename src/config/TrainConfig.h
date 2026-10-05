@@ -166,6 +166,7 @@ inline int train_tier_rank(const char* tier) {
     X(float, temporal_smooth_rotation, 0.0f, "splats", "expert", "")         \
     X(float, temporal_smooth_opacity, 0.0f, "splats", "expert", "")          \
     X(float, temporal_smooth_color, 0.0f, "splats", "expert", "")            \
+    X(int, temporal_anchors, 0, "splats", "expert", "")                      \
     X(int, temporal_window, 0, "splats", "advanced", "")                     \
     X(int, temporal_frame_steps, 8000, "splats", "advanced", "")             \
     X(int, temporal_first_frame_steps, 0, "splats", "advanced", "")          \
