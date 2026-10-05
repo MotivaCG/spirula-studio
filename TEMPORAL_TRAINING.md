@@ -803,14 +803,18 @@ fast rigid objects. Forge's chunk recipe is FC4's again. **From here on a result
 is judged by full-resolution crops across the chunk and a per-frame brightness
 check; fit, detail and flicker alone are not enough.**
 
-Open: transparent junk. A published FC4 frame has 395k rows, ~145k invisible:
-~85k room splats the prune killed (kept so rows stay aligned) and ~60k dead
-rows reserved for births. Gracia reconstructs only the subject; this path
-trains the room for the whole chunk and hides it afterwards. Causes: the chunk
-starts from the unpruned model, its population is fixed (births need a dead
-reserve), and nothing keeps the background transparent in training. Next, to
-be designed first: subject-only seed with a small birth margin, transparent
-background in training, a population that grows with births.
+Open: transparent junk. Every frame of the FC4 chunk has 395k rows. Raw, every
+row is shown in some frame (335k in frame 0, 374k in frame 31; the rest are born
+later or already dead). Published, 250k / 296k are shown: the 78.6k records the
+chunk prune kills (room and other splats outside the subject) are never shown
+but stay in every frame with logit -20 so rows stay aligned. Gracia's frames
+hold only the subject (165-185k, section 2). Causes: the chunk carries the room
+(right for training: FC1, seeded from the pruned frame, had no room and lost
+4.5 dB; wrong for the frames), its population is fixed, and it has 128.8k
+births per chunk where Gracia renews ~10 % at chunk boundaries (its births
+inside a chunk are not measured). The background is never cleared in training:
+an alpha loss outside the mask caused false transparency, which is why Forge
+trains the room and prunes afterwards. Design in `TEMPORAL_SUBJECT_ONLY.md`.
 
 Note for batteries: `evaluate.py` caches renders in `outputs/tc/q/<run>.seq_<frame>`
 by run name; a rerun under the same name must delete them first.
@@ -921,9 +925,11 @@ The original plan, for reference. Forge ran spirula once per frame
 **Plan of 2026-10-05, after the review** (supersedes the list further down;
 recipe FC4, see 5.17):
 
-1. No transparent junk, as Gracia: design first, then a subject-only seed with
-   a small birth margin, a transparent background in training, a population
-   that grows with births. Rows per published frame ~ splats shown.
+1. No transparent junk, as Gracia: rows per published frame ~ splats shown.
+   First Gracia's counts from `tiki.mint` (rows, splats shown, births and
+   deaths per frame and per chunk), then the design (`TEMPORAL_SUBJECT_ONLY.md`):
+   the room stays in training but out of the frames, the subject population
+   grows with births. The background is never cleared in training.
 2. The brightness drift left in FC4 (-6 % over the chunk).
 3. Size and stability of FC4's `.vgs` (15.3 flicker through the codec) without
    constraining motion.
