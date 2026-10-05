@@ -777,11 +777,40 @@ FC7, Forge's chunk path with FC5's recipe and 8192 anchors (`battery_FC7.ps1`):
 | FC5 `.vgs`, 20 mm splits | 23.79 | 33.61 | 11.21 | 25.76 |
 | **FC7 `.vgs`** | **23.77** | **33.61** | **10.35** | **23.8** |
 
-Anchors halve the raw flicker in Forge too (12.5 -> 7.0) and the codec now loses
-0.09 dB / 0.44 flicker (splits past 20 mm find nothing to split). **Current best:
-FC7.** What is left comes from Forge's prune: +2.9 flicker over the raw frames,
-most of it in frames 66-76 (pairs 8-10 raw, 11-15 published). Next: the chunk
-prune (SMNForge `GraciaChunk::publish`).
+By the metrics, anchors halve the raw flicker in Forge (12.5 -> 7.0) and the
+codec loses 0.09 dB / 0.44 flicker. **Looked at, FC7 is unusable:** the tiki
+glass, a small object turning in the hand, is smeared from frame 52 on;
+translation-only anchors 3 cm apart cannot follow it, and the metrics (fit over
+the whole mask, pair flicker) do not see it. `--temporal-anchors` stays in the
+code, off by default; Forge does not use it.
+
+### 5.17 Review of 2026-10-05: FC4 is the recipe again
+
+Full-resolution crops (glass, hands, face) at frames 45/52/60/70 and mean splat
+brightness per frame (alpha-weighted luminance of the base colour):
+
+| run | sharpness | brightness, frame 0 -> 31 |
+|---|---|---|
+| Forge per frame | reference | 0.370 -> 0.366, no drift |
+| FC4 published | closest to Forge | 0.360 -> 0.338 (-6 %) |
+| FC5 published (+ position/rotation 2nd order) | turning glass softer | 0.350 -> 0.319 (-9 %), visibly darker |
+| FC7 published (+ anchors) | glass smeared | 0.350 -> 0.322 (-8 %) |
+| KB_K2, spirula, frozen PPISP | — | 0.502 -> 0.496 (-1 %) |
+| OB0, spirula, frozen PPISP, FC5's recipe | — | 0.503 -> 0.479 (-5 %) |
+
+Smoothing motion darkens the chunk (with or without a learned PPISP) and lags
+fast rigid objects. Forge's chunk recipe is FC4's again. **From here on a result
+is judged by full-resolution crops across the chunk and a per-frame brightness
+check; fit, detail and flicker alone are not enough.**
+
+Open: transparent junk. A published FC4 frame has 395k rows, ~145k invisible:
+~85k room splats the prune killed (kept so rows stay aligned) and ~60k dead
+rows reserved for births. Gracia reconstructs only the subject; this path
+trains the room for the whole chunk and hides it afterwards. Causes: the chunk
+starts from the unpruned model, its population is fixed (births need a dead
+reserve), and nothing keeps the background transparent in training. Next, to
+be designed first: subject-only seed with a small birth margin, transparent
+background in training, a population that grows with births.
 
 Note for batteries: `evaluate.py` caches renders in `outputs/tc/q/<run>.seq_<frame>`
 by run name; a rerun under the same name must delete them first.
@@ -889,15 +918,19 @@ The original plan, for reference. Forge ran spirula once per frame
 
 ## 8. Next steps (current plan, in order)
 
-**Plan of 2026-10-05** (supersedes the list further down; best result in 5.16):
+**Plan of 2026-10-05, after the review** (supersedes the list further down;
+recipe FC4, see 5.17):
 
-1. Done: anchor motion (5.16).
-2. The chunk prune in Forge, now the largest flicker source (+2.9).
-3. If the codec's own dictionary misses the anchors' trajectories, write the
-   anchor model next to the frames and let `vgsplyseq` load it (today 1.5 mm
-   rms is left; splits past 20 mm find nothing).
-4. The whole take through Forge (12 chunks) to validate size and quality.
-5. `vgsplyseq` inside Forge's chunk path.
+1. No transparent junk, as Gracia: design first, then a subject-only seed with
+   a small birth margin, a transparent background in training, a population
+   that grows with births. Rows per published frame ~ splats shown.
+2. The brightness drift left in FC4 (-6 % over the chunk).
+3. Size and stability of FC4's `.vgs` (15.3 flicker through the codec) without
+   constraining motion.
+4. The whole take through Forge, then `vgsplyseq` inside Forge.
+
+Every step judged by full-resolution crops across the chunk and per-frame
+brightness, not by the metrics alone.
 
 Done since the review: better metrics (B1), repeated-frame control (B2), births
 (B3), full take (B4), flicker isolation (B5-B7), candidate on the full take
