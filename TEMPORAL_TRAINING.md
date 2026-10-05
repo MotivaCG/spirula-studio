@@ -88,7 +88,8 @@ decoded with the owner's `MintFile` through a small probe (`reference/temporal/m
   twins and a new splat set with the same bounding box. This looks like
   independent segments, probably trained in parallel.
 - **About 10 % of splats are renewed at each chunk boundary** (births and
-  deaths). The subject population stays around 165-185k.
+  deaths). The subject population stays around 165-185k (over frames
+  45-76: 154-184k at opacity > 0.1, 180-220k by 5.17's shown rule).
 - Per splat, colour and opacity jitter almost like noise (roughness of the
   second difference over the first ≈ 1; white noise is 1.73), but the jitter is
   uncorrelated between splats. Whole-body luminance changes only 0.0003-0.0008
@@ -803,18 +804,30 @@ fast rigid objects. Forge's chunk recipe is FC4's again. **From here on a result
 is judged by full-resolution crops across the chunk and a per-frame brightness
 check; fit, detail and flicker alone are not enough.**
 
-Open: transparent junk. Every frame of the FC4 chunk has 395k rows. Raw, every
-row is shown in some frame (335k in frame 0, 374k in frame 31; the rest are born
-later or already dead). Published, 250k / 296k are shown: the 78.6k records the
-chunk prune kills (room and other splats outside the subject) are never shown
-but stay in every frame with logit -20 so rows stay aligned. Gracia's frames
-hold only the subject (165-185k, section 2). Causes: the chunk carries the room
-(right for training: FC1, seeded from the pruned frame, had no room and lost
-4.5 dB; wrong for the frames), its population is fixed, and it has 128.8k
-births per chunk where Gracia renews ~10 % at chunk boundaries (its births
-inside a chunk are not measured). The background is never cleared in training:
-an alpha loss outside the mask caused false transparency, which is why Forge
-trains the room and prunes afterwards. Design in `TEMPORAL_SUBJECT_ONLY.md`.
+Open: transparent junk. Counted the same way on both (shown: opacity > 1/255
+and largest scale > 0.1 mm), FC4 against `tiki.mint` over frames 45-76. The
+`.mint` is the output of Gracia's own, private trainer: it describes the
+result, not how it is trained.
+
+| | Gracia `tiki.mint` | FC4 published | FC4 raw |
+|---|---|---|---|
+| splats shown per frame | 180-220k (mean 202k) | 241-285k (mean 278k) | 321-359k |
+| of them opacity > 0.5 | 57k | 82k | 122k |
+| births / deaths per frame | ~3.0k / ~1.7k | ~3.0k / ~1.6k | ~3.0k / ~1.8k |
+| records (rows) per chunk | 249k, 285k (chunks 1, 2) | 395k | 395k |
+| shown in some frame | 99 % | 77 % (305k) | 96 % |
+
+Over the whole take Gracia's chunks hold 204-337k records, 32-118k born inside
+the chunk; up to 36k of a frame's active records are below the shown rule.
+Births and deaths run at Gracia's rate (its ~10 % renewal, section 2, is at
+chunk boundaries). The differences: ~90k rows never shown in every published
+frame (the room the chunk prune kills, written dead so rows stay aligned, and
+rows that shrank away), and ~75k more splats shown per frame, not yet
+identified. The room is right in training (FC1, seeded from the pruned frame,
+had no room and lost 4.5 dB) and wrong in the frames. The background is never
+cleared in training: an alpha loss outside the mask caused false transparency,
+which is why Forge trains the room and prunes afterwards. Design in
+`TEMPORAL_SUBJECT_ONLY.md`.
 
 Note for batteries: `evaluate.py` caches renders in `outputs/tc/q/<run>.seq_<frame>`
 by run name; a rerun under the same name must delete them first.
@@ -926,10 +939,10 @@ The original plan, for reference. Forge ran spirula once per frame
 recipe FC4, see 5.17):
 
 1. No transparent junk, as Gracia: rows per published frame ~ splats shown.
-   First Gracia's counts from `tiki.mint` (rows, splats shown, births and
-   deaths per frame and per chunk), then the design (`TEMPORAL_SUBJECT_ONLY.md`):
-   the room stays in training but out of the frames, the subject population
-   grows with births. The background is never cleared in training.
+   Gracia's counts are measured (5.17); next, what the ~75k extra splats per
+   frame are, then the design (`TEMPORAL_SUBJECT_ONLY.md`): the room stays in
+   training but out of the frames, the subject population grows with births.
+   The background is never cleared in training.
 2. The brightness drift left in FC4 (-6 % over the chunk).
 3. Size and stability of FC4's `.vgs` (15.3 flicker through the codec) without
    constraining motion.
