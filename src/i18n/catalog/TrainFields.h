@@ -3048,6 +3048,18 @@ SS_MSG_EN(temporal_smooth_opacity_help,
 SS_MSG_EN(temporal_smooth_color, "Temporal smoothing of colour");
 SS_MSG_EN(temporal_smooth_color_help,
     "As for opacity, on the base colour coefficients.");
+SS_MSG_EN(temporal_smooth_coherence, "Coherent motion");
+SS_MSG_EN(temporal_smooth_coherence_help,
+    "Weight, 0 to 1, pulling each position's step from the previous frame "
+    "towards an affine fit of the steps of the splats within 2 cm, at each "
+    "smoothing pass. "
+    "Stops splats sliding apart; turns and translations are kept.");
+SS_MSG_EN(temporal_continue, "Continue a chunk");
+SS_MSG_EN(temporal_continue_help,
+    "The previous chunk's last frame folder (its sparse model and masks, for "
+    "the warp out of it). The initial PLY is that frame as written: held from "
+    "the start, never trained or written, the frames after it trained against "
+    "it as inside one chunk. Needs a temporal window.");
 SS_MSG_EN(temporal_anchors, "Motion anchors");
 SS_MSG_EN(temporal_anchors_help,
     "Splats move only as a blend of their four nearest anchors' displacements, "
@@ -3100,11 +3112,29 @@ SS_MSG_EN(temporal_birth_gap_help,
 SS_MSG_EN(temporal_birth_fraction, "Birth budget");
 SS_MSG_EN(temporal_birth_fraction_help,
     "Largest share of the population born into one entering frame.");
+SS_MSG_EN(temporal_relocate, "Relocation budget");
+SS_MSG_EN(temporal_relocate_help,
+    "Share of the population split, every relocation interval, in the newest frame: "
+    "splats drawn by the densification score are halved along their long axis and "
+    "each new half takes a row dead in every frame, as a new record. A chain without "
+    "it loses detail from frame to frame. 0 turns it off.");
+SS_MSG_EN(temporal_spare, "Spare rows");
+SS_MSG_EN(temporal_spare_help,
+    "Dead rows added after the seed's, as a share of it, within cap_max: rows for "
+    "relocation to take, which a chunk otherwise has almost none of.");
+SS_MSG_EN(temporal_relocate_every, "Relocation interval");
+SS_MSG_EN(temporal_relocate_every_help,
+    "Steps between relocations into the newest frame.");
 SS_MSG_EN(temporal_init_dir, "Frames to refine");
 SS_MSG_EN(temporal_init_dir_help,
     "Folder of frames/NNN/splat.ply, one per frame of the chunk, same rows: every "
     "frame starts from its own file, scale and SH included and kept per frame, to "
     "refine a finished chunk (no window, no births).");
+SS_MSG_EN(temporal_room_ply, "Static room");
+SS_MSG_EN(temporal_room_ply_help,
+    "A PLY of everything around the subject, loaded before the seed: rendered and "
+    "trained with one state for every frame of the chunk, never written to a "
+    "frame. Frames hold only the seed's rows; the room is kept as frames/room.ply.");
 SS_MSG_EN(temporal_lock_shared, "One scale and SH per record");
 SS_MSG_EN(temporal_lock_shared_help,
     "Once a frame is written, the shared scale and SH of every splat in it stop "

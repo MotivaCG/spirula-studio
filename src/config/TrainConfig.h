@@ -166,6 +166,8 @@ inline int train_tier_rank(const char* tier) {
     X(float, temporal_smooth_rotation, 0.0f, "splats", "expert", "")         \
     X(float, temporal_smooth_opacity, 0.0f, "splats", "expert", "")          \
     X(float, temporal_smooth_color, 0.0f, "splats", "expert", "")            \
+    X(float, temporal_smooth_coherence, 0.0f, "splats", "expert", "")        \
+    X(std::string, temporal_continue, "", "splats", "expert", "none")         \
     X(int, temporal_anchors, 0, "splats", "expert", "")                      \
     X(int, temporal_window, 0, "splats", "advanced", "")                     \
     X(int, temporal_frame_steps, 8000, "splats", "advanced", "")             \
@@ -178,8 +180,12 @@ inline int train_tier_rank(const char* tier) {
     X(std::string, temporal_birth_dir, "", "splats", "advanced", "none")     \
     X(float, temporal_birth_gap, 0.01f, "splats", "expert", "")              \
     X(float, temporal_birth_fraction, 0.02f, "splats", "expert", "")         \
+    X(float, temporal_relocate, 0.0f, "splats", "expert", "")                \
+    X(int, temporal_relocate_every, 500, "splats", "expert", "")             \
+    X(float, temporal_spare, 0.0f, "splats", "expert", "")                   \
     X(bool, temporal_lock_shared, false, "splats", "advanced", "")           \
     X(std::string, temporal_init_dir, "", "splats", "advanced", "none")      \
+    X(std::string, temporal_room_ply, "", "splats", "advanced", "none")      \
     X(std::optional<float>, scale_init, std::nullopt, "splats", "advanced", "") \
     X(std::optional<float>, opacity_init, std::nullopt, "splats", "advanced", "") \
     X(bool, suppress_initial_scales, false, "splats", "expert", "")          \

@@ -5,11 +5,13 @@
 #include "engine/EngineInternal.h"
 #include "engine/EngineState.h"
 #include "engine/TemporalAnchors.h"
+#include "nn/core/Parallel.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <random>
 #include <unordered_map>
 #include <stdexcept>
 
@@ -30,7 +32,8 @@ struct Slot {
 
 struct Temporal {
     int active = -1;
-    int64_t splats = 0;
+    int64_t room = 0;    // static rows before the per-frame ones
+    int64_t splats = 0;  // per-frame rows
     size_t slot_bytes = 0;
     std::vector<Slot> slots;
     // Rows whose shared scale and SH no longer train: their record (row,
@@ -57,33 +60,46 @@ std::unique_ptr<Temporal> g_temporal;
 // Alpha 1/255: what a renderer and the .vgs writer still show.
 const float kShownLogit = std::log(1.0f / 254.0f);
 
+// Engine row `room` of a buffer with `row_bytes` per row: where the per-frame
+// rows start.
+void* after_room(void* buffer, size_t row_bytes, int64_t room) {
+    return buffer ? static_cast<char*>(buffer) + row_bytes * (size_t)room : nullptr;
+}
+void* after_room(void* buffer, size_t row_bytes) {
+    return after_room(buffer, row_bytes, g_temporal->room);
+}
+
 // The slot layout: the per-frame parameters, then their Adam moments and
-// bias-correction steps, so each frame resumes its own optimizer state.
-std::vector<Field> per_frame_fields(int64_t n, bool shape) {
+// bias-correction steps, so each frame resumes its own optimizer state. Rows
+// [room, room + n) of each buffer.
+std::vector<Field> per_frame_fields(int64_t room, int64_t n, bool shape) {
     EngineState& s = engine();
     auto& w = s.world;
     auto& o = s.optim;
     if (o.non_sh_quantize_enabled())
         throw std::runtime_error("chunk training needs quantization_level 0");
-    const size_t f3 = sizeof(float3) * n, f4 = sizeof(float4) * n, f1 = sizeof(float) * n;
+    const size_t f3 = sizeof(float3), f4 = sizeof(float4), f1 = sizeof(float);
+    auto field = [&](void* buffer, size_t row_bytes) {
+        return Field{after_room(buffer, row_bytes, room), row_bytes * (size_t)n};
+    };
     std::vector<Field> fields = {
-        {w.means.data_ptr(), f3}, {w.quats.data_ptr(), f4},
-        {w.opacities.data_ptr(), f1}, {w.features_dc.data_ptr(), f3},
+        field(w.means.data_ptr(), f3), field(w.quats.data_ptr(), f4),
+        field(w.opacities.data_ptr(), f1), field(w.features_dc.data_ptr(), f3),
     };
     fields.insert(fields.end(), {
-        {o.g1_means.data_ptr(), f3},    {o.g2_means.data_ptr(), f3},
-        {o.g1_quats.data_ptr(), f4},    {o.g2_quats.data_ptr(), f4},
-        {o.g1_opacities.data_ptr(), f1}, {o.g2_opacities.data_ptr(), f1},
-        {o.g1_features_dc.data_ptr(), f3}, {o.g2_features_dc.data_ptr(), f3},
+        field(o.g1_means.data_ptr(), f3),    field(o.g2_means.data_ptr(), f3),
+        field(o.g1_quats.data_ptr(), f4),    field(o.g2_quats.data_ptr(), f4),
+        field(o.g1_opacities.data_ptr(), f1), field(o.g2_opacities.data_ptr(), f1),
+        field(o.g1_features_dc.data_ptr(), f3), field(o.g2_features_dc.data_ptr(), f3),
     });
     if (o.bias_correction_steps.data_ptr())
-        fields.push_back({o.bias_correction_steps.data_ptr(), sizeof(int32_t) * n});
+        fields.push_back(field(o.bias_correction_steps.data_ptr(), sizeof(int32_t)));
     if (shape) {
-        const size_t sh = sizeof(float) * 3 * (size_t)engine().num_sh * n;
+        const size_t sh = sizeof(float) * 3 * (size_t)engine().num_sh;
         fields.insert(fields.end(), {
-            {w.scales.data_ptr(), f3}, {w.features_sh.data_ptr(), sh},
-            {o.g1_scales.data_ptr(), f3}, {o.g2_scales.data_ptr(), f3},
-            {o.g1_features_sh.data_ptr(), sh}, {o.g2_features_sh.data_ptr(), sh},
+            field(w.scales.data_ptr(), f3), field(w.features_sh.data_ptr(), sh),
+            field(o.g1_scales.data_ptr(), f3), field(o.g2_scales.data_ptr(), f3),
+            field(o.g1_features_sh.data_ptr(), sh), field(o.g2_features_sh.data_ptr(), sh),
         });
     }
     for (const Field& f : fields)
@@ -94,7 +110,7 @@ std::vector<Field> per_frame_fields(int64_t n, bool shape) {
 void copy_slot(int frame, bool to_live) {
     Temporal& t = *g_temporal;
     char* slot = static_cast<char*>(t.slots[frame].mem);
-    for (const Field& f : per_frame_fields(t.splats, t.per_frame_shape)) {
+    for (const Field& f : per_frame_fields(t.room, t.splats, t.per_frame_shape)) {
         if (to_live)
             backend::memcpy_async(f.live, slot, f.bytes, backend::MemcpyKind::DeviceToDevice);
         else
@@ -196,19 +212,99 @@ void smooth(std::vector<std::vector<float>*>& x, size_t width, float w, int orde
     }
 }
 
+constexpr float kRadius = 0.02f, kSigma = kRadius / 2, kRidge = 0.1f;
+
+// Splats slide along surfaces the image does not pin (neighbours ~5 cm apart
+// over a chunk, motion .vgs cannot store); each step moves towards an affine
+// fit of the steps within kRadius: a turn survives, even at a thin edge.
+void coherent_motion(std::vector<HostParams>& h, float w, const std::vector<Slot>& slots) {
+    if (w <= 0.0f) return;
+    const size_t n = h[0].opacities.size();
+    auto key = [](const float* p) {
+        return ((int64_t)std::floor(p[0] / kRadius) + (1 << 20)) * (int64_t(1) << 42) +
+               ((int64_t)std::floor(p[1] / kRadius) + (1 << 20)) * (int64_t(1) << 21) +
+               ((int64_t)std::floor(p[2] / kRadius) + (1 << 20));
+    };
+    for (size_t k = 1; k < h.size(); k++) {
+        if (slots[k].held) continue;
+        const std::vector<float>& from = h[k - 1].means;
+        std::vector<float>& to = h[k].means;
+        std::vector<int32_t> rows;
+        for (size_t r = 0; r < n; r++)
+            if (slots[k].generation[r] == slots[k - 1].generation[r] &&
+                h[k - 1].opacities[r] > kShownLogit && h[k].opacities[r] > kShownLogit)
+                rows.push_back((int32_t)r);
+        std::unordered_map<int64_t, std::vector<int32_t>> grid;
+        for (int32_t r : rows) grid[key(&from[3 * (size_t)r])].push_back(r);
+        std::vector<float> step(3 * rows.size());
+        nn::parallel_for((int64_t)rows.size(), [&](int64_t lo, int64_t hi) {
+            for (int64_t i = lo; i < hi; i++) {
+                const float* p = &from[3 * (size_t)rows[(size_t)i]];
+                // Weighted least squares of step = a + M (q - p), ridge on M.
+                double A[4][4] = {}, B[4][3] = {};
+                for (int dx = -1; dx <= 1; dx++)
+                    for (int dy = -1; dy <= 1; dy++)
+                        for (int dz = -1; dz <= 1; dz++) {
+                            const float c[3] = {p[0] + dx * kRadius, p[1] + dy * kRadius, p[2] + dz * kRadius};
+                            auto it = grid.find(key(c));
+                            if (it == grid.end()) continue;
+                            for (int32_t j : it->second) {
+                                const float* q = &from[3 * (size_t)j];
+                                const float d2 = (q[0] - p[0]) * (q[0] - p[0]) + (q[1] - p[1]) * (q[1] - p[1]) +
+                                                 (q[2] - p[2]) * (q[2] - p[2]);
+                                if (d2 > kRadius * kRadius) continue;
+                                const double wt = std::exp(-d2 / (2 * kSigma * kSigma)) /
+                                                  (1.0 + std::exp(-h[k - 1].opacities[(size_t)j]));
+                                const double u[4] = {1.0, (q[0] - p[0]) / kSigma, (q[1] - p[1]) / kSigma,
+                                                     (q[2] - p[2]) / kSigma};
+                                for (int a = 0; a < 4; a++) {
+                                    for (int b = 0; b < 4; b++) A[a][b] += wt * u[a] * u[b];
+                                    for (int c = 0; c < 3; c++) B[a][c] += wt * u[a] * (to[3 * (size_t)j + c] - q[c]);
+                                }
+                            }
+                        }
+                for (int a = 1; a < 4; a++) A[a][a] += kRidge * A[0][0];
+                for (int c = 0; c < 4; c++) {  // Gauss-Jordan, partial pivoting
+                    int best = c;
+                    for (int r = c + 1; r < 4; r++)
+                        if (std::abs(A[r][c]) > std::abs(A[best][c])) best = r;
+                    std::swap(A[c], A[best]);
+                    std::swap(B[c], B[best]);
+                    for (int r = 0; r < 4; r++) {
+                        if (r == c) continue;
+                        const double f = A[r][c] / A[c][c];
+                        for (int b = c; b < 4; b++) A[r][b] -= f * A[c][b];
+                        for (int b = 0; b < 3; b++) B[r][b] -= f * B[c][b];
+                    }
+                }
+                for (int a = 0; a < 3; a++) step[3 * (size_t)i + a] = (float)(B[0][a] / A[0][0]);
+            }
+        });
+        for (size_t i = 0; i < rows.size(); i++)
+            for (int a = 0; a < 3; a++) {
+                const size_t c = 3 * (size_t)rows[i] + a;
+                to[c] = from[c] + (1.0f - w) * (to[c] - from[c]) + w * step[3 * i + a];
+            }
+    }
+}
+
 }  // namespace
 
-void engine_temporal_begin(int frames, bool fused, bool per_splat_bias, bool per_frame_shape) {
+void engine_temporal_begin(int frames, bool fused, bool per_splat_bias, bool per_frame_shape,
+                           int64_t room) {
     if (frames < 1) throw std::runtime_error("chunk training needs at least one frame");
+    if (room < 0 || room >= engine().cur_num_splats)
+        throw std::runtime_error("chunk training: the room leaves no per-frame rows");
     engine_temporal_end();
     // Adam state is otherwise allocated by the first step; the slots copy it now.
     engine().optim.use_fused_proj_bwd_optim = fused;
     engine().optim.use_per_splat_bias_correction = per_splat_bias;
     engine_ensure_optim_state(32, 32, 32, per_splat_bias);
     auto t = std::make_unique<Temporal>();
-    t->splats = engine().cur_num_splats;
+    t->room = room;
+    t->splats = engine().cur_num_splats - room;
     t->per_frame_shape = per_frame_shape;
-    for (const Field& f : per_frame_fields(t->splats, per_frame_shape)) t->slot_bytes += f.bytes;
+    for (const Field& f : per_frame_fields(room, t->splats, per_frame_shape)) t->slot_bytes += f.bytes;
     g_temporal = std::move(t);
     for (int k = 0; k < frames; k++) {
         g_temporal->slots.emplace_back();
@@ -228,6 +324,7 @@ void engine_temporal_end() {
 }
 
 bool engine_temporal_active() { return g_temporal != nullptr; }
+int64_t engine_temporal_room() { return g_temporal ? g_temporal->room : 0; }
 int engine_temporal_frames() { return g_temporal ? (int)g_temporal->slots.size() : 0; }
 int engine_temporal_current() { return g_temporal ? g_temporal->active : -1; }
 
@@ -241,7 +338,7 @@ void engine_temporal_stash_data_manager(int frame) {
 void engine_temporal_select(int frame) {
     Temporal& t = *g_temporal;
     if (frame == t.active) return;
-    if (engine().cur_num_splats != t.splats)
+    if (engine().cur_num_splats != t.room + t.splats)
         throw std::runtime_error("chunk training: the splat population changed");
     Slot& to = t.slots[frame];
     if (!to.dm && !to.held) throw std::runtime_error("chunk training: frame has no images");
@@ -383,8 +480,9 @@ void lock_written_rows(int frame) {
         t.locked_scales.assign(3 * n, 0.0f);
         t.locked_sh.assign(sh_row * n, 0.0f);
     }
-    const std::vector<float> scales = get_floats(s.world.scales.data_ptr(), 3 * n);
-    const std::vector<float> sh = get_floats(s.world.features_sh.data_ptr(), sh_row * n);
+    const std::vector<float> scales = get_floats(after_room(s.world.scales.data_ptr(), 12), 3 * n);
+    const std::vector<float> sh =
+        get_floats(after_room(s.world.features_sh.data_ptr(), 4 * sh_row), sh_row * n);
     const std::vector<uint32_t>& written = t.slots[(size_t)frame].generation;
     const std::vector<uint32_t>& newest = t.slots.back().generation;
     for (size_t r = 0; r < n; r++) {
@@ -415,12 +513,12 @@ void engine_temporal_load_frame(int frame, const std::vector<float>& means,
     auto put = [&](void* dst, const std::vector<float>& v, size_t floats) {
         backend::memcpy_sync(dst, v.data(), floats * 4, backend::MemcpyKind::HostToDevice);
     };
-    put(s.world.means.data_ptr(), means, 3 * n);
-    put(s.world.quats.data_ptr(), quats, 4 * n);
-    put(s.world.opacities.data_ptr(), opacities, n);
-    put(s.world.features_dc.data_ptr(), dc, 3 * n);
-    put(s.world.scales.data_ptr(), scales, 3 * n);
-    put(s.world.features_sh.data_ptr(), sh, sh_row * n);
+    put(after_room(s.world.means.data_ptr(), 12), means, 3 * n);
+    put(after_room(s.world.quats.data_ptr(), 16), quats, 4 * n);
+    put(after_room(s.world.opacities.data_ptr(), 4), opacities, n);
+    put(after_room(s.world.features_dc.data_ptr(), 12), dc, 3 * n);
+    put(after_room(s.world.scales.data_ptr(), 12), scales, 3 * n);
+    put(after_room(s.world.features_sh.data_ptr(), 4 * sh_row), sh, sh_row * n);
     copy_slot(frame, false);
     t.shown.resize(t.slots.size());
     t.shown[(size_t)frame].resize(n);
@@ -434,15 +532,17 @@ void engine_temporal_restore_locked() {
     if (t.locked.empty()) return;
     EngineState& s = engine();
     const size_t n = (size_t)t.splats, sh_row = 3 * (size_t)s.num_sh;
-    std::vector<float> scales = get_floats(s.world.scales.data_ptr(), 3 * n);
-    std::vector<float> sh = get_floats(s.world.features_sh.data_ptr(), sh_row * n);
+    void* scales_at = after_room(s.world.scales.data_ptr(), 12);
+    void* sh_at = after_room(s.world.features_sh.data_ptr(), 4 * sh_row);
+    std::vector<float> scales = get_floats(scales_at, 3 * n);
+    std::vector<float> sh = get_floats(sh_at, sh_row * n);
     for (size_t r = 0; r < n; r++) {
         if (!t.locked[r]) continue;
         std::copy_n(t.locked_scales.data() + 3 * r, 3, scales.data() + 3 * r);
         std::copy_n(t.locked_sh.data() + sh_row * r, sh_row, sh.data() + sh_row * r);
     }
-    put_floats(s.world.scales.data_ptr(), scales);
-    put_floats(s.world.features_sh.data_ptr(), sh);
+    put_floats(scales_at, scales);
+    put_floats(sh_at, sh);
     backend::device_synchronize();
 }
 
@@ -484,6 +584,7 @@ void engine_temporal_smooth(const TemporalSmoothing& w) {
     };
     auto means = column(&HostParams::means), quats = column(&HostParams::quats);
     auto opac = column(&HostParams::opacities), dc = column(&HostParams::dc);
+    coherent_motion(h, w.coherence, t.slots);
     smooth(means, 3, w.position, 2, t.slots);
     smooth(quats, 4, w.rotation, 2, t.slots);
     // In opacity, not logit: a dead frame's logit is far more negative than a
@@ -575,6 +676,93 @@ void engine_temporal_project_motion() {
     backend::device_synchronize();
 }
 
+namespace {
+
+const float kDeadLogit = std::log((1.0f / 255.0f) / (1.0f - 1.0f / 255.0f));
+
+// Rows transparent in every frame: changing their shared scale and SH then
+// changes no frame. trained_only skips held frames: they are on disk, and a
+// new record there is apart from the one they hold.
+std::vector<int64_t> free_rows(const std::vector<HostParams>& h, bool trained_only = false,
+                               float below = kDeadLogit) {
+    std::vector<int64_t> rows;
+    for (size_t i = 0; i < (size_t)g_temporal->splats; i++) {
+        bool gone = true;
+        for (size_t k = 0; k < h.size() && gone; k++)
+            gone = (trained_only && g_temporal->slots[k].held) || h[k].opacities[i] < below;
+        if (gone) rows.push_back((int64_t)i);
+    }
+    return rows;
+}
+
+// A new record for `row` in the last frame. Trained frames from `from` on before it
+// get one of their own, dark and unlisted: smoothing then ties the new record to
+// neither the old one nor those dark states (it dimmed every new split away).
+void start_record(int64_t row, size_t from, std::vector<TemporalBirth>* events) {
+    Temporal& t = *g_temporal;
+    const size_t last = t.slots.size() - 1;
+    const uint32_t g = t.slots.back().generation[(size_t)row] + (from < last ? 2 : 1);
+    for (size_t k = from; k <= last; k++)
+        if (!t.slots[k].held) t.slots[k].generation[(size_t)row] = k == last ? g : g - 1;
+    if (!t.locked.empty()) t.locked[(size_t)row] = 0;
+    if (events) events->push_back({row, g, (int)last});
+}
+
+// The first frame still trained: a record restarted from there cannot be pulled
+// back into the old one by smoothing against a held frame that shows it.
+size_t first_trained() {
+    size_t k = 0;
+    while (k + 1 < g_temporal->slots.size() && g_temporal->slots[k].held) k++;
+    return k;
+}
+
+// Rows starting new records from frame `from` on: h holds every frame, scales and
+// sh the shared state. The rows start with no optimizer history, in every slot
+// (the moments follow the four parameter fields) and in the shared state.
+void restart_rows(std::vector<HostParams>& h, const std::vector<int64_t>& rows,
+                  const std::vector<float>& scales, const std::vector<float>& sh, size_t from,
+                  std::vector<TemporalBirth>* events) {
+    Temporal& t = *g_temporal;
+    EngineState& s = engine();
+    const size_t n = (size_t)t.splats, frames = t.slots.size();
+    for (int64_t r : rows) start_record(r, from, events);
+    for (size_t k = 0; k < frames; k++) upload((int)k, h[k]);
+    for (size_t frame = 0; frame < frames; frame++) {
+        const size_t params = n * sizeof(float) * (3 + 4 + 1 + 3);
+        std::vector<char> tail(t.slot_bytes - params);
+        char* base = static_cast<char*>(t.slots[frame].mem) + params;
+        backend::memcpy_sync(tail.data(), base, tail.size(), backend::MemcpyKind::DeviceToHost);
+        size_t off = 0;
+        for (const Field& f : per_frame_fields(t.room, t.splats, false)) {
+            if (off < params) { off += f.bytes; continue; }
+            const size_t per = f.bytes / n;
+            for (int64_t r : rows) std::memset(tail.data() + (off - params) + per * (size_t)r, 0, per);
+            off += f.bytes;
+        }
+        backend::memcpy_sync(base, tail.data(), tail.size(), backend::MemcpyKind::HostToDevice);
+    }
+    const size_t sh_row = 3 * (size_t)s.num_sh;
+    put_floats(after_room(s.world.scales.data_ptr(), 12), scales);
+    put_floats(after_room(s.world.features_sh.data_ptr(), 4 * sh_row), sh);
+    for (void* m : {after_room(s.optim.g1_scales.data_ptr(), 12),
+                    after_room(s.optim.g2_scales.data_ptr(), 12)}) {
+        std::vector<float> v = get_floats(m, 3 * n);
+        for (int64_t r : rows) std::fill_n(v.data() + 3 * r, 3, 0.0f);
+        put_floats(m, v);
+    }
+    if (!s.optim.sh_quantize_enabled())
+        for (void* m : {after_room(s.optim.g1_features_sh.data_ptr(), 4 * sh_row),
+                        after_room(s.optim.g2_features_sh.data_ptr(), 4 * sh_row)}) {
+            std::vector<float> v = get_floats(m, sh_row * n);
+            for (int64_t r : rows) std::fill_n(v.data() + sh_row * r, sh_row, 0.0f);
+            put_floats(m, v);
+        }
+    if (t.active >= 0) copy_slot(t.active, true);
+    backend::device_synchronize();
+}
+
+}  // namespace
+
 int64_t engine_temporal_birth(const std::vector<float>& points, float gap, int64_t max_new,
                               std::vector<TemporalBirth>* events) {
     Temporal& t = *g_temporal;
@@ -596,17 +784,8 @@ int64_t engine_temporal_birth(const std::vector<float>& points, float gap, int64
     backend::device_synchronize();
     std::vector<HostParams> h;
     for (size_t k = 0; k < frames; k++) h.push_back(download((int)k));
-
-    // Rows transparent in every frame: changing their shared scale and SH then
-    // changes no frame, trained or already written.
-    const float cutoff = 1.0f / 255.0f;
-    const float dead = std::log(cutoff / (1.0f - cutoff)), live = std::log(0.1f / 0.9f);
-    std::vector<int64_t> free_rows;
-    for (size_t i = 0; i < n; i++) {
-        bool gone = true;
-        for (size_t k = 0; k < frames && gone; k++) gone = h[k].opacities[i] < dead;
-        if (gone) free_rows.push_back((int64_t)i);
-    }
+    const std::vector<int64_t> spare = free_rows(h);
+    const float live = std::log(0.1f / 0.9f);
 
     // Gaps: points with no live splat of the entering frame within `gap`.
     std::unordered_map<int64_t, std::vector<int>> grid;
@@ -621,7 +800,7 @@ int64_t engine_temporal_birth(const std::vector<float>& points, float gap, int64
             grid[key(cur.means[3 * i], cur.means[3 * i + 1], cur.means[3 * i + 2])].push_back((int)i);
     std::unordered_map<int64_t, std::vector<size_t>> new_grid;
     std::vector<size_t> born;
-    for (size_t p = 0; p + 7 <= points.size() && born.size() < free_rows.size() &&
+    for (size_t p = 0; p + 7 <= points.size() && born.size() < spare.size() &&
                        (int64_t)born.size() < max_new; p += 7) {
         const float* q = points.data() + p;
         bool covered = false;
@@ -656,67 +835,121 @@ int64_t engine_temporal_birth(const std::vector<float>& points, float gap, int64
     }
     if (born.empty()) return 0;
 
-    auto get = [&](void* src, size_t floats) {
-        std::vector<float> v(floats);
-        backend::memcpy_sync(v.data(), src, floats * 4, backend::MemcpyKind::DeviceToHost);
-        return v;
-    };
-    auto put = [&](void* dst, const std::vector<float>& v) {
-        backend::memcpy_sync(dst, v.data(), v.size() * 4, backend::MemcpyKind::HostToDevice);
-    };
     const size_t sh_row = 3 * (size_t)s.num_sh;
-    std::vector<float> scales = get(s.world.scales.data_ptr(), 3 * n);
-    std::vector<float> sh = get(s.world.features_sh.data_ptr(), sh_row * n);
+    std::vector<float> scales = get_floats(after_room(s.world.scales.data_ptr(), 12), 3 * n);
+    std::vector<float> sh = get_floats(after_room(s.world.features_sh.data_ptr(), 4 * sh_row), sh_row * n);
     constexpr float kSHC0 = 0.28209479177387814f;
     const float start = std::log(0.1f / 0.9f);
+    const std::vector<int64_t> rows(spare.begin(), spare.begin() + (std::ptrdiff_t)born.size());
     for (size_t j = 0; j < born.size(); j++) {
         const float* q = points.data() + born[j];
-        const size_t r = (size_t)free_rows[j];
+        const size_t r = (size_t)rows[j];
         HostParams& f = h[last];
         std::copy(q, q + 3, f.means.data() + 3 * r);
         const float ident[4] = {1, 0, 0, 0};
         std::copy(ident, ident + 4, f.quats.data() + 4 * r);
         for (int c = 0; c < 3; c++) f.dc[3 * r + c] = (q[3 + c] - 0.5f) / kSHC0;
         f.opacities[r] = start;
-        t.slots[last].generation[r]++;
-        if (!t.locked.empty()) t.locked[r] = 0;
-        if (events) events->push_back({(int64_t)r, t.slots[last].generation[r]});
         const float ls = std::log(std::max(q[6], 1e-4f) * 0.5f);
         for (int a = 0; a < 3; a++) scales[3 * r + a] = ls;
         std::fill_n(sh.data() + sh_row * r, sh_row, 0.0f);
     }
-    for (size_t k = 0; k < frames; k++) upload((int)k, h[k]);
-    // The new rows start with no optimizer history, in the entering frame's slot
-    // (the moments follow the four parameter fields) and in the shared state.
-    for (size_t frame = 0; frame < frames; frame++) {
-        const size_t params = n * sizeof(float) * (3 + 4 + 1 + 3);
-        std::vector<char> tail(t.slot_bytes - params);
-        char* base = static_cast<char*>(t.slots[frame].mem) + params;
-        backend::memcpy_sync(tail.data(), base, tail.size(), backend::MemcpyKind::DeviceToHost);
-        size_t off = 0;
-        for (const Field& f : per_frame_fields(t.splats, false)) {
-            if (off < params) { off += f.bytes; continue; }
-            const size_t per = f.bytes / n;
-            for (size_t j = 0; j < born.size(); j++)
-                std::memset(tail.data() + (off - params) + per * (size_t)free_rows[j], 0, per);
-            off += f.bytes;
-        }
-        backend::memcpy_sync(base, tail.data(), tail.size(), backend::MemcpyKind::HostToDevice);
-    }
-    put(s.world.scales.data_ptr(), scales);
-    put(s.world.features_sh.data_ptr(), sh);
-    for (void* m : {s.optim.g1_scales.data_ptr(), s.optim.g2_scales.data_ptr()}) {
-        std::vector<float> v = get(m, 3 * n);
-        for (size_t j = 0; j < born.size(); j++) std::fill_n(v.data() + 3 * free_rows[j], 3, 0.0f);
-        put(m, v);
-    }
-    if (!s.optim.sh_quantize_enabled())
-        for (void* m : {s.optim.g1_features_sh.data_ptr(), s.optim.g2_features_sh.data_ptr()}) {
-            std::vector<float> v = get(m, sh_row * n);
-            for (size_t j = 0; j < born.size(); j++) std::fill_n(v.data() + sh_row * free_rows[j], sh_row, 0.0f);
-            put(m, v);
-        }
-    if (t.active >= 0) copy_slot(t.active, true);
-    backend::device_synchronize();
+    restart_rows(h, rows, scales, sh, last, events);
     return (int64_t)born.size();
+}
+
+int64_t engine_temporal_relocate(int64_t max_new, float min_opacity, uint64_t seed,
+                                 std::vector<TemporalBirth>* events) {
+    Temporal& t = *g_temporal;
+    EngineState& s = engine();
+    const size_t n = (size_t)t.splats, frames = t.slots.size(), last = frames - 1;
+    if (max_new <= 0 || frames == 0 || t.slots[last].held) return 0;
+    if (s.world.sh_value_bits != 32)
+        throw std::runtime_error("chunk training: relocation needs full-precision SH");
+    if (t.per_frame_shape)
+        throw std::runtime_error("chunk training: no relocation into frames loaded whole");
+    if (t.active >= 0) copy_slot(t.active, false);
+    backend::device_synchronize();
+    std::vector<HostParams> h;
+    for (size_t k = 0; k < frames; k++) h.push_back(download((int)k));
+    // Only rows whose record began before the trained frames restart there, so
+    // every row's records follow each other in time.
+    const size_t from = first_trained();
+    auto settled = [&](size_t r) { return t.slots[from].generation[r] == t.slots[last].generation[r]; };
+    const float faint = std::log(min_opacity / (1.0f - min_opacity));
+    std::vector<int64_t> spare;
+    for (int64_t r : free_rows(h, true, std::max(faint, kDeadLogit)))
+        if (settled((size_t)r)) spare.push_back(r);
+
+    // The densification score the steps since the last call accumulated (the
+    // engine keeps it while no refine step spends it), read and restarted.
+    float2* accum = s.optim.accum_buffer.data_ptr();
+    std::vector<float> score(2 * n);
+    backend::memcpy_sync(score.data(), accum + t.room, 2 * n * sizeof(float),
+                         backend::MemcpyKind::DeviceToHost);
+    s.optim.accum_buffer.zero();
+
+    // Sources: the last frame's shown splats, drawn by score without
+    // replacement (keys u^(1/w), largest first).
+    HostParams& f = h[last];
+    const float shown = std::log(0.05f / 0.95f);
+    std::mt19937_64 rng(seed);
+    std::uniform_real_distribution<float> uniform(1e-12f, 1.0f);
+    std::vector<std::pair<float, int64_t>> keys;
+    for (size_t i = 0; i < n; i++)
+        if (f.opacities[i] > shown && score[2 * i] > 0.0f)
+            keys.push_back({std::log(uniform(rng)) / score[2 * i], (int64_t)i});
+    const size_t count = std::min({(size_t)max_new, spare.size(), keys.size()});
+    if (count == 0) return 0;
+    std::partial_sort(keys.begin(), keys.begin() + (std::ptrdiff_t)count, keys.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    // Long-axis split (arXiv 2508.12313): halves a long half-axis apart, the new
+    // one a record in a spare row. A source no other trained frame shows starts a
+    // record too and is halved; else it keeps its record's scale (.vgs: constant).
+    auto alone = [&](size_t r) {
+        for (size_t k = 0; k < last; k++)
+            if (!t.slots[k].held && h[k].opacities[r] > kDeadLogit) return false;
+        return true;
+    };
+    const size_t sh_row = 3 * (size_t)s.num_sh;
+    std::vector<float> scales = get_floats(after_room(s.world.scales.data_ptr(), 12), 3 * n);
+    std::vector<float> sh = get_floats(after_room(s.world.features_sh.data_ptr(), 4 * sh_row), sh_row * n);
+    const std::vector<int64_t> rows(spare.begin(), spare.begin() + (std::ptrdiff_t)count);
+    // A spare row still faintly shown by an older trained frame goes dark there:
+    // its new record starts in the last frame, the one the split is for.
+    for (int64_t r : rows)
+        for (size_t k = 0; k < last; k++)
+            if (!t.slots[k].held) h[k].opacities[(size_t)r] = std::min(h[k].opacities[(size_t)r], 2 * kDeadLogit);
+    for (size_t j = 0; j < count; j++) {
+        const size_t src = (size_t)keys[j].second, dst = (size_t)rows[j];
+        const float* ls = scales.data() + 3 * src;
+        const int a = ls[0] > ls[1] && ls[0] > ls[2] ? 0 : ls[1] > ls[2] ? 1 : 2;
+        const float* q = f.quats.data() + 4 * src;
+        const float qn = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+        const float w = q[0] / qn, x = q[1] / qn, y = q[2] / qn, z = q[3] / qn;
+        const float R[3][3] = {{1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)},
+                               {2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)},
+                               {2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)}};
+        const float d = 0.5f * std::exp(ls[a]);
+        // Opacity shared so the pair covers what the source did: 1 - (1 - o)^(1/2).
+        const float o = 1.0f / (1.0f + std::exp(-f.opacities[src]));
+        const float half = 1.0f - std::sqrt(std::max(1.0f - o, 1e-6f));
+        const float logit = std::log(half / (1.0f - half));
+        for (int c = 0; c < 3; c++) {
+            f.means[3 * dst + c] = f.means[3 * src + c] + d * R[c][a];
+            f.means[3 * src + c] -= d * R[c][a];
+            f.dc[3 * dst + c] = f.dc[3 * src + c];
+            scales[3 * dst + c] = ls[c] + std::log(c == a ? 0.5f : 0.85f);
+        }
+        std::copy_n(f.quats.data() + 4 * src, 4, f.quats.data() + 4 * dst);
+        f.opacities[src] = f.opacities[dst] = logit;
+        std::copy_n(sh.data() + sh_row * src, sh_row, sh.data() + sh_row * dst);
+        if (alone(src) && settled(src)) {
+            std::copy_n(scales.data() + 3 * dst, 3, scales.data() + 3 * src);
+            start_record((int64_t)src, from, events);
+        }
+    }
+    restart_rows(h, rows, scales, sh, from, events);
+    return (int64_t)count;
 }

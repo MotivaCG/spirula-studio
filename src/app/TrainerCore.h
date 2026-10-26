@@ -308,6 +308,7 @@ private:
     // Chunk training (cfg.temporal_frames), defined in TrainerChunk.cpp: one
     // DataManager per frame, the splats cloned into each.
     void configure_chunk();
+    SeedSplats with_room(SeedSplats seed, const ColorResolution& color);
     void setup_chunk();
     void chunk_step(int step, int& schedule_step, const TrainConfig*& schedule);
     void chunk_after_step(int step);
@@ -315,11 +316,15 @@ private:
     void install_frame_data(int frame);
     void advance_window(int step);
     int first_frame_steps() const {
+        if (continues()) return 0;  // held, see setup_chunk
         return cfg.temporal_first_frame_steps > 0 ? cfg.temporal_first_frame_steps
                                                   : cfg.temporal_frame_steps;
     }
     // Take frames past the first whose budget is temporal_keyframe_steps; the
     // steps past temporal_frame_steps train that frame alone as it enters.
+    bool continues() const {
+        return !cfg.temporal_continue.empty() && cfg.temporal_continue != "none";
+    }
     bool is_keyframe(int frame) const {
         return frame > 0 && cfg.temporal_keyframe_every > 0 &&
                frame % cfg.temporal_keyframe_every == 0;
@@ -336,6 +341,7 @@ private:
     void save_chunk(int step);
     void eval_frame(const std::string& data, const std::filesystem::path& metrics);
     std::vector<std::string> _chunk_dirs;  // [0] is cfg.data
+    int64_t _room_rows = 0;                // cfg.temporal_room_ply's, before the seed's
     uint64_t _chunk_rng = 0x9e3779b97f4a7c15ull;
     // Sliding window: take frame of slot 0, next frame to enter, steps each
     // slot has trained, and the per-frame learning-rate schedule.

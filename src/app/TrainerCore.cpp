@@ -924,7 +924,7 @@ void TrainerSession::setup_engine() {
     engine_reset();
 
     ColorResolution color = resolve_color(cfg);
-    SeedSplats seed = seed_world(color);
+    SeedSplats seed = with_room(seed_world(color), color);
     int64_t cap = (int64_t)seed.opacities.size();
     int64_t dim_sh = (int64_t)(cfg.sh_degree + 1) * (cfg.sh_degree + 1);
     auto tv = [](std::vector<float>& v, std::vector<int64_t> shape) -> TorchTensorView {
@@ -1201,7 +1201,8 @@ void TrainerSession::save_checkpoint(int step) {
 // past a mark misses it, as with any step-keyed event.
 void TrainerSession::maybe_boost_opacity(int step) {
     const float k = cfg.opacity_boost.value_or(1.0f);
-    if (k <= 1.0f) return;
+    // A chunk's live splats are the frame trained that step: boosted, one frame jumped.
+    if (k <= 1.0f || engine_temporal_active()) return;
     const int marks[] = {(int)(0.40f * cfg.num_iterations),
                          (int)(0.85f * cfg.num_iterations)};
     if (step != marks[0] && step != marks[1]) return;

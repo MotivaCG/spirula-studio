@@ -16,6 +16,16 @@ namespace spirula {
 
 static bool unset(const std::string& v) { return v.empty() || v == "none"; }
 
+// New records, for the .vgs writer; `first` is the chunk frame in slot 0.
+static void append_births(const fs::path& out_dir, int first, const std::vector<TemporalBirth>& births) {
+    if (births.empty()) return;
+    fs::create_directories(out_dir / "frames");
+    std::ofstream events(out_dir / "frames" / "birth_events.tsv", std::ios::app);
+    for (const TemporalBirth& b : births)
+        events << first + b.slot << '\t' << b.row << '\t' << b.generation << '\n';
+    if (!events) throw std::runtime_error("cannot write temporal birth events");
+}
+
 ColorResolution resolve_color(const TrainConfig& c);
 
 // check_config's part: the frame folders, and the run length they imply.
@@ -32,6 +42,8 @@ void TrainerSession::configure_chunk() {
     }
     if (!cfg.resume.empty())
         throw std::runtime_error("--temporal-frames cannot be resumed");
+    if (continues() && cfg.temporal_window <= 0)
+        throw std::runtime_error("--temporal-continue needs --temporal-window");
     // Every frame shares one population and one optimizer layout: no
     // densification, full-precision Adam state.
     cfg.quantization_level = 0;
@@ -47,6 +59,87 @@ void TrainerSession::configure_chunk() {
     cfg.refine_start_iter = cfg.num_iterations + 1;
     cfg.export_keep_all_splats = true;
     log("chunk training over " + std::to_string(_chunk_dirs.size()) + " frames");
+}
+
+// --temporal-spare: dead rows after the seed's, copies of its first ones, for
+// relocation to take: without them a chunk frees almost none (battery RG). A chunk
+// continuing another keeps its rows, spare ones included: one row count per run.
+static SeedSplats with_spare(SeedSplats seed, float fraction) {
+    const size_t cap = seed.opacities.size();
+    const size_t first = (size_t)seed.num;
+    const size_t spare = std::min(cap - first, (size_t)(fraction * (float)first));
+    auto copy = [&](std::vector<float>& v) {
+        const size_t width = v.size() / cap;
+        for (size_t i = 0; i < spare; i++)
+            std::copy_n(v.begin() + width * (i % first), width, v.begin() + width * (first + i));
+    };
+    for (auto* v : {&seed.means, &seed.quats, &seed.scales, &seed.opacities, &seed.features_dc, &seed.features_sh})
+        copy(*v);
+    std::fill_n(seed.opacities.begin() + first, spare, -20.0f);
+    seed.num += (int64_t)spare;
+    return seed;
+}
+
+// --temporal-room-ply: the room's rows before the seed's, so a frame's row r
+// is engine row room + r and the frames written hold the seed's rows only.
+SeedSplats TrainerSession::with_room(SeedSplats seed, const ColorResolution& color) {
+    _room_rows = 0;
+    if (_chunk_dirs.size() < 2) return seed;
+    const float spare = continues() ? 0.0f : cfg.temporal_spare;
+    if (unset(cfg.temporal_room_ply)) return with_spare(std::move(seed), spare);
+    const SeedSplats room = seed_splats_from_ply(cfg.temporal_room_ply, cfg, color);
+    const size_t cap = seed.opacities.size();
+    if ((size_t)(room.num + seed.num) > cap)
+        throw std::runtime_error("--temporal-room-ply: the room and the seed exceed cap_max");
+    SeedSplats out = seed;
+    auto place = [&](std::vector<float>& to, const std::vector<float>& first,
+                     const std::vector<float>& then) {
+        const size_t width = to.size() / cap;
+        std::copy_n(first.begin(), width * (size_t)room.num, to.begin());
+        std::copy_n(then.begin(), width * (size_t)seed.num, to.begin() + width * (size_t)room.num);
+    };
+    place(out.means, room.means, seed.means);
+    place(out.quats, room.quats, seed.quats);
+    place(out.scales, room.scales, seed.scales);
+    place(out.opacities, room.opacities, seed.opacities);
+    place(out.features_dc, room.features_dc, seed.features_dc);
+    place(out.features_sh, room.features_sh, seed.features_sh);
+    out.num = room.num + seed.num;
+    _room_rows = room.num;
+    log("chunk: a static room of " + std::to_string(room.num) + " splats before the seed's " +
+        std::to_string(seed.num));
+    return with_spare(std::move(out), spare);
+}
+
+// Moves the first `rows` vertices of a binary PLY of floats into `to`.
+static void split_ply(const fs::path& from, const fs::path& to, int64_t rows) {
+    std::ifstream in(from, std::ios::binary);
+    std::string header, line;
+    int64_t count = -1, columns = 0;
+    while (std::getline(in, line)) {
+        if (line.rfind("element vertex ", 0) == 0) count = std::stoll(line.substr(15));
+        else if (line.rfind("property float ", 0) == 0) columns++;
+        else if (line.rfind("property ", 0) == 0)
+            throw std::runtime_error(from.string() + ": only float properties are split");
+        header += line + "\n";
+        if (line == "end_header") break;
+    }
+    if (count < rows) throw std::runtime_error(from.string() + ": fewer rows than the room");
+    std::vector<char> data((size_t)(count * columns * 4));
+    in.read(data.data(), (std::streamsize)data.size());
+    if (!in) throw std::runtime_error(from.string() + ": truncated");
+    in.close();
+    const std::string vertex = "element vertex " + std::to_string(count) + "\n";
+    auto write = [&](const fs::path& path, int64_t first, int64_t n) {
+        std::string h = header;
+        h.replace(h.find(vertex), vertex.size(), "element vertex " + std::to_string(n) + "\n");
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out << h;
+        out.write(data.data() + first * columns * 4, (std::streamsize)(n * columns * 4));
+        if (!out) throw std::runtime_error("cannot write " + path.string());
+    };
+    write(to, 0, rows);
+    write(from, rows, count - rows);
 }
 
 // Frame k's files are frame 0's with the dataset root swapped: the cameras are
@@ -82,7 +175,7 @@ void TrainerSession::setup_chunk() {
     if (whole_frames && cfg.temporal_window > 0)
         throw std::runtime_error("--temporal-init-dir needs every frame in the chunk (no window)");
     engine_temporal_begin(frames, cfg.use_fused_proj_bwd_optim, cfg.use_per_splat_bias_correction,
-                          whole_frames);
+                          whole_frames, _room_rows);
     engine_temporal_lock_shared(cfg.temporal_lock_shared);
     if (cfg.temporal_anchors > 0) {
         if (_subject.xyz.empty()) _subject = subject_points(_chunk_dirs[0]);
@@ -101,13 +194,20 @@ void TrainerSession::setup_chunk() {
         const SeedSplats s = seed_splats_from_ply(
             (fs::path(cfg.temporal_init_dir) / "frames" / name / "splat.ply").string(), cfg,
             resolve_color(cfg));
-        if (s.num != engine_get_cur_num_splats())
+        if (s.num != engine_get_cur_num_splats() - _room_rows)
             throw std::runtime_error(std::string("--temporal-init-dir: frame ") + name +
                                      " has another row count");
         engine_temporal_load_frame(k, s.means, s.quats, s.opacities, s.features_dc, s.scales,
                                    s.features_sh);
     }
     engine_temporal_select(0);
+    // Retrained alone, the previous chunk's last frame lost 85k splats and the
+    // boundary flickered twice the chunk's rate (FG6): it stays as written.
+    if (continues()) {
+        engine_temporal_hold(0);
+        if (cfg.temporal_warp_dir == "auto" || cfg.temporal_birth_dir == "auto")
+            _subject = subject_points(cfg.temporal_continue);
+    }
     _window_first = 0;
     _window_next = frames;
     // Steps at which a frame enters (then, once all have, at which one drains);
@@ -147,6 +247,10 @@ void TrainerSession::write_frame(int slot, int step) {
     const int keep = engine_temporal_current();
     engine_temporal_select(slot);
     engine_save_checkpoint((out_dir / "frames" / name).string(), false, step, true);
+    // The room is no frame's: the last frame written leaves it as the room's file.
+    if (_room_rows > 0)
+        split_ply(out_dir / "frames" / name / "splat.ply", out_dir / "frames" / "room.ply",
+                  _room_rows);
     std::ofstream(out_dir / "frames" / "frames.txt", std::ios::app)
         << name << ' ' << _chunk_dirs[(size_t)frame] << '\n';
     if (keep >= 0) engine_temporal_select(keep);
@@ -219,14 +323,7 @@ void TrainerSession::advance_window(int step) {
             const int64_t born = engine_temporal_birth(
                 points, cfg.temporal_birth_gap,
                 (int64_t)(cfg.temporal_birth_fraction * (float)engine_get_cur_num_splats()), &births);
-            if (!births.empty()) {
-                fs::create_directories(out_dir / "frames");
-                std::ofstream events(out_dir / "frames" / "birth_events.tsv", std::ios::app);
-                if (!events) throw std::runtime_error("cannot write temporal birth events");
-                for (const TemporalBirth& b : births)
-                    events << _window_next - 1 << '\t' << b.row << '\t' << b.generation << '\n';
-                if (!events) throw std::runtime_error("cannot write temporal birth events");
-            }
+            append_births(out_dir, _window_first, births);
             log(std::string("frame ") + name + ": " + std::to_string(born) + " splats born");
         }
         _slot_age.push_back(0);
@@ -301,8 +398,29 @@ void TrainerSession::chunk_after_step(int step) {
     if (cfg.temporal_lock_shared && (step + 1) % 10 == 0) engine_temporal_restore_locked();
     if (cfg.temporal_smooth_every > 0 && (step + 1) % cfg.temporal_smooth_every == 0) {
         engine_temporal_smooth({cfg.temporal_smooth_position, cfg.temporal_smooth_rotation,
-                                cfg.temporal_smooth_opacity, cfg.temporal_smooth_color});
+                                cfg.temporal_smooth_opacity, cfg.temporal_smooth_color,
+                                cfg.temporal_smooth_coherence});
         engine_temporal_project_motion();
+    }
+    // Without it each frame inherits the last one's splats and detail fades along
+    // the chain (battery RL). Only while the newest frame is entering: draining the
+    // window after the last one entered piled every split into that frame (RD2: 22k).
+    if (cfg.temporal_relocate <= 0.0f || cfg.temporal_window <= 0 || cfg.temporal_relocate_every <= 0 ||
+        (step + 1) % cfg.temporal_relocate_every != 0)
+        return;
+    const int newest = _window_next - 1;
+    const int entered = newest == 0 ? 0 : _advance_at[(size_t)newest - 1];
+    const int life = newest == 0         ? first_frame_steps()
+                     : is_keyframe(newest) ? cfg.temporal_frame_steps + keyframe_extra()
+                                           : cfg.temporal_frame_steps;
+    if (step + 1 < entered + life) {
+        // Asked and done both logged: free rows, not the budget, limit it (battery RS).
+        const int64_t budget = (int64_t)(cfg.temporal_relocate * (float)engine_get_cur_num_splats());
+        std::vector<TemporalBirth> births;
+        const int64_t moved = engine_temporal_relocate(budget, cfg.min_opacity, (uint64_t)step, &births);
+        append_births(out_dir, _window_first, births);
+        log("frame " + std::to_string(newest) + ": " + std::to_string(moved) + " of " +
+            std::to_string(budget) + " splats relocated");
     }
 }
 

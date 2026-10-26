@@ -14,11 +14,15 @@ struct TemporalSmoothing {
     float rotation = 0.0f;
     float opacity = 0.0f;
     float color = 0.0f;
+    float coherence = 0.0f;  // each frame's step towards its neighbourhood's
 };
 
-// Snapshots the live splats into every frame. The population is fixed from here
-// on: a densify step would change cur_num_splats and select() refuses that.
-void engine_temporal_begin(int frames, bool fused, bool per_splat_bias, bool per_frame_shape);
+// Snapshots rows [room, n) into every frame; the first `room` rows keep the one
+// state the live buffers hold. The population is fixed: select() refuses a
+// densify step. A frame's row r is engine row room + r.
+void engine_temporal_begin(int frames, bool fused, bool per_splat_bias, bool per_frame_shape,
+                           int64_t room);
+int64_t engine_temporal_room();
 void engine_temporal_end();
 bool engine_temporal_active();
 int engine_temporal_frames();
@@ -41,6 +45,7 @@ struct TemporalWarp {
 struct TemporalBirth {
     int64_t row = 0;
     uint32_t generation = 0;
+    int slot = 0;  // the frame the record starts in
 };
 
 // Appends a frame: the last one carried by `warp`, or moved on at the last
@@ -66,9 +71,15 @@ void engine_temporal_drop_front();
 // no frame already shown changes. Returns how many were born.
 int64_t engine_temporal_birth(const std::vector<float>& points, float gap, int64_t max_new,
                               std::vector<TemporalBirth>* events = nullptr);
+// Relocation into the last frame, as densification does it in a frame trained alone:
+// up to max_new splats drawn by the densification score since the last call, split
+// in two, each new half a record in a row under min_opacity in every trained frame.
+int64_t engine_temporal_relocate(int64_t max_new, float min_opacity, uint64_t seed,
+                                 std::vector<TemporalBirth>* events = nullptr);
 
 // One smoothing step along time per attribute, weights in [0, 1]: second
-// difference for position and rotation, first for opacity and colour.
+// difference for position and rotation, first for opacity and colour; first,
+// each frame's step pulled towards its neighbourhood's (coherence).
 void engine_temporal_smooth(const TemporalSmoothing& weights);
 
 // Motion through anchors (TemporalAnchors.h): about `anchors` placed over the
