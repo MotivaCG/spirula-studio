@@ -4,7 +4,9 @@
 
 #include "app/gui/ColmapRunner.h"
 
-#include "app/gui/ReconStamp.h"
+
+#include "core/Env.h"
+#include "core/ModelMirror.h"
 
 #include "i18n/catalog/Log.h"
 #include "app/AppPaths.h"
@@ -22,6 +24,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <set>
 
 namespace fs = std::filesystem;
@@ -123,6 +126,84 @@ int64_t model_num_images(const fs::path& dir) {
     return got == 1 ? (int64_t)n : 0;
 }
 
+// Registered image names of every model under sparse/: the union is what the
+// reconstruction covers.
+std::set<std::string> registered_names(const fs::path& ws) {
+    std::set<std::string> names;
+    std::error_code ec;
+    for (fs::directory_iterator it(ws / "sparse", ec), end; !ec && it != end;
+         it.increment(ec)) {
+        if (!it->is_directory()) continue;
+        if (it->path().filename().string().rfind(".", 0) == 0) continue;
+        FILE* f = std::fopen((it->path() / "images.bin").string().c_str(), "rb");
+        if (!f) continue;
+        uint64_t n = 0;
+        if (std::fread(&n, sizeof n, 1, f) != 1) { std::fclose(f); continue; }
+        for (uint64_t i = 0; i < n; i++) {
+            int32_t id, cam;
+            double q[4], t[3];
+            if (std::fread(&id, sizeof id, 1, f) != 1 ||
+                std::fread(q, sizeof(double), 4, f) != 4 ||
+                std::fread(t, sizeof(double), 3, f) != 3 ||
+                std::fread(&cam, sizeof cam, 1, f) != 1)
+                break;
+            std::string name;
+            for (char c; std::fread(&c, 1, 1, f) == 1 && c != '\0';)
+                name.push_back(c);
+            uint64_t np = 0;
+            if (std::fread(&np, sizeof np, 1, f) != 1) break;
+            std::fseek(f, long(np * (2 * sizeof(double) + sizeof(uint64_t))),
+                       SEEK_CUR);
+            names.insert(std::move(name));
+        }
+        std::fclose(f);
+    }
+    return names;
+}
+
+// The unregistered-images data file when SS_UNREG_LOG names one: every image
+// no sparse model took, grouped per folder; same format as the engine's own
+// (sfm/Pipeline.cpp). Full coverage writes nothing.
+void write_unregistered_list(const fs::path& ws, const std::string& images_dir) {
+    const char* path = spirula::env("UNREG_LOG");
+    if (!path || !*path || images_dir.empty()) return;
+    const std::set<std::string> reg = registered_names(ws);
+    std::map<std::string, std::vector<std::string>> missing;
+    size_t total = 0;
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(images_dir, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        if (!it->is_regular_file()) continue;
+        std::string ext = it->path().extension().string();
+        for (char& c : ext) c = char(std::tolower((unsigned char)c));
+        static const char* const exts[] = {".jpg", ".jpeg", ".png",  ".bmp",
+                                           ".tif", ".tiff", ".webp"};
+        bool image = false;
+        for (const char* e : exts) image = image || ext == e;
+        if (!image) continue;
+        const std::string rel =
+            fs::relative(it->path(), images_dir, ec).generic_string();
+        if (ec) continue;
+        total++;
+        if (reg.count(rel)) continue;
+        const size_t slash = rel.find('/');
+        missing[slash == std::string::npos
+                    ? std::string("(root)")
+                    : rel.substr(0, slash)]
+            .push_back(rel);
+    }
+    if (total == 0 || missing.empty()) return;
+    std::ofstream f(path, std::ios::trunc);
+    if (!f) return;
+    size_t unreg = 0;
+    for (const auto& kv : missing) unreg += kv.second.size();
+    f << "unregistered " << unreg << '/' << total << "\n";
+    for (const auto& kv : missing) {
+        f << '\n' << '[' << kv.first << "] " << kv.second.size() << '\n';
+        for (const std::string& n : kv.second) f << n << '\n';
+    }
+}
+
 }  // namespace
 
 ColmapRunner::~ColmapRunner() {
@@ -165,13 +246,27 @@ void ColmapRunner::take_reconstruction(ColmapJob& job) {
     const std::string workspace = job.workspace;
     const bool resume = job.resume;
     const float fps = job.video_fps;
+    const bool adaptive = job.adaptive_fps;
+    const float range = job.adaptive_range;
     const int sharp = job.sharp_window, maxf = job.max_frames;
+    const bool skip_blurry = job.skip_blurry;
+    const float blur_px = job.blur_px;
+    const bool blur_neighbour = job.blur_neighbour;
+    const int similar_bits = job.similar_bits;
+    const bool keep_skipped = job.keep_skipped;
     job = _live;
     job.inputs = inputs;
     job.workspace = workspace;
     job.resume = resume;
     job.video_fps = fps;
+    job.adaptive_fps = adaptive;
+    job.adaptive_range = range;
     job.sharp_window = sharp;
+    job.skip_blurry = skip_blurry;
+    job.blur_px = blur_px;
+    job.blur_neighbour = blur_neighbour;
+    job.similar_bits = similar_bits;
+    job.keep_skipped = keep_skipped;
     job.max_frames = maxf;
 }
 
@@ -180,13 +275,20 @@ void ColmapRunner::take_geometry(ColmapJob& job) {
     job.geometry = _live.geometry;
 }
 
+void ColmapRunner::take_dense(ColmapJob& job) {
+    std::lock_guard<std::mutex> lk(_mu);
+    job.dense = _live.dense;
+}
+
 void ColmapRunner::take_masking(PrepJob& prep) {
     std::lock_guard<std::mutex> lk(_mu);
     prep.mask_enable = _live.mask_enable;
     prep.mask_prompt = _live.mask_prompt;
     prep.mask_negative_prompt = _live.mask_negative_prompt;
+    prep.mask_feature_prompt = _live.mask_feature_prompt;
     prep.mask_keep_subject = _live.mask_keep_subject;
     prep.mask_max_image_size = _live.mask_max_image_size;
+    prep.mask_dilate_ratio = _live.mask_dilate_ratio;
     prep.mask_threshold = _live.mask_threshold;
     prep.mask_nms = _live.mask_nms;
     prep.mask_memory = _live.mask_memory;
@@ -195,10 +297,10 @@ void ColmapRunner::take_masking(PrepJob& prep) {
     prep.mask_clicks = _live.mask_clicks;
     prep.image_gamut = _live.image_gamut;
     prep.image_is_linear = _live.image_is_linear;
+    prep.image_exposure = _live.image_exposure;
     prep.mask_model_path = _live.mask_model_path;
-    prep.mask_model_name = _live.mask_model;
-    prep.force_external_masking = _live.force_external_masking;
-    prep.python_exe = _live.python_exe;
+    prep.mask_detector_path = _live.mask_detector_path;
+    prep.mask_detector_threshold = _live.mask_detector_threshold;
 }
 
 void ColmapRunner::cancel() { _cancel = true; }
@@ -302,11 +404,18 @@ std::string ColmapRunner::resolve_vocab_tree(const ColmapJob& job) {
     }
     fs::path tmp = dst;
     tmp += ".part";
-    int rc = exec({"curl", "-L", "-f", "--progress-bar",
-                   "-o", tmp.string(), kVocabTreeUrl});
+    int rc = 1;
+    for (const std::string& url : {std::string(kVocabTreeUrl),
+                                   spirula::model_mirror_url(kVocabTreeName)}) {
+        rc = exec({"curl", "-L", "-f", "--progress-bar", "--connect-timeout", "30",
+                   "--speed-limit", "1024", "--speed-time", "60",
+                   "-o", tmp.string(), url});
+        if (rc == 0 || rc == kCancelled) break;
+        fs::remove(tmp, ec);
+        log("vocabulary tree download from " + url + " failed");
+    }
     if (rc != 0) {
         fs::remove(tmp, ec);
-        log("vocabulary tree download failed");
         return "";
     }
     fs::rename(tmp, dst, ec);
@@ -328,45 +437,49 @@ double ColmapRunner::model_reproj_error(const ColmapJob& job,
     return err;
 }
 
-// What the model is made of, in a stable order, for the stamp left beside it
-// (ReconStamp.h). Not COLMAP's own command line -- this path spends several of
-// them; what matters is that the same panel produces the same list.
-static std::vector<std::string> colmap_recon_args(const ColmapJob& job) {
-    auto num = [](double v) {
-        char b[32];
-        std::snprintf(b, sizeof b, "%g", v);
-        return std::string(b);
-    };
-    auto flag = [](bool v) { return std::string(v ? "1" : "0"); };
-    return {
-        "--camera-model", job.camera_model,
-        "--camera-mode", std::to_string(job.camera_mode),
-        "--camera-params", job.camera_params,
-        "--focal-factor", num(job.init_focal_factor),
-        "--features", job.feature_type == 1 ? "aliked" : "sift",
-        "--lightglue", flag(job.lightglue),
-        "--quality", std::to_string(job.quality),
-        "--matcher", std::to_string(job.matcher),
-        "--loop-closure", flag(job.seq_loop_closure),
-        "--overlap", std::to_string(job.seq_overlap),
-        "--quadratic-overlap", flag(job.seq_quadratic_overlap),
-        "--max-features", std::to_string(job.max_num_features),
-        "--max-image-size", std::to_string(job.max_image_size),
-        "--affine-shape", flag(job.estimate_affine_shape),
-        "--ba-gpu", flag(job.ba_use_gpu),
-        "--extra-params", std::to_string(job.mapper_extra_params),
-        "--min-matches", std::to_string(job.min_num_matches),
-        "--max-ratio", num(job.match_max_ratio),
-        "--min-inliers", std::to_string(job.min_inliers_per_pair),
-        "--abs-pose-inliers", std::to_string(job.abs_pose_min_num_inliers),
-        "--abs-pose-inlier-ratio", num(job.abs_pose_min_inlier_ratio),
-        "--abs-pose-error", num(job.abs_pose_max_error),
-        "--merge-models", flag(job.merge_models),
-        "--final-ba", flag(job.final_bundle_adjust),
-        "--vocab-tree", job.vocab_tree_path,
-        "--masks", flag(job.mask_enable),
-        "--mask-prompt", job.mask_enable ? job.mask_prompt : std::string(),
-    };
+PrepJob ColmapRunner::prep_job(const ColmapJob& job) {
+    PrepJob pj;
+    pj.inputs = job.inputs;
+    pj.workspace = job.workspace;
+    pj.resume = job.resume;
+    pj.photo_import = job.photo_import;
+    // The one frozen GUI choice, so this run's built-in frame extraction and
+    // masking use the same GPU as everything else. COLMAP's own device
+    // routing is untouched.
+    pj.device = job.device;
+    pj.video_fps = job.video_fps;
+    pj.adaptive_fps = job.adaptive_fps;
+    pj.adaptive_range = job.adaptive_range;
+    pj.sharp_window = job.sharp_window;
+    pj.skip_blurry = job.skip_blurry;
+    pj.blur_px = job.blur_px;
+    pj.blur_neighbour = job.blur_neighbour;
+    pj.similar_bits = job.similar_bits;
+    pj.keep_skipped = job.keep_skipped;
+    pj.pano = job.pano;
+    pj.max_frames = job.max_frames;
+    pj.ffmpeg_exe = job.ffmpeg_exe;
+    pj.force_external_decode = job.force_external_decode;
+    pj.image_gamut = job.image_gamut;
+    pj.image_is_linear = job.image_is_linear;
+    pj.image_exposure = job.image_exposure;
+    pj.mask_enable = job.mask_enable;
+    pj.mask_prompt = job.mask_prompt;
+    pj.mask_negative_prompt = job.mask_negative_prompt;
+    pj.mask_feature_prompt = job.mask_feature_prompt;
+    pj.mask_keep_subject = job.mask_keep_subject;
+    pj.mask_max_image_size = job.mask_max_image_size;
+    pj.mask_dilate_ratio = job.mask_dilate_ratio;
+    pj.mask_threshold = job.mask_threshold;
+    pj.mask_nms = job.mask_nms;
+    pj.mask_memory = job.mask_memory;
+    pj.mask_detect_every = job.mask_detect_every;
+    pj.mask_memory_frames = job.mask_memory_frames;
+    pj.mask_clicks = job.mask_clicks;
+    pj.mask_model_path = job.mask_model_path;
+    pj.mask_detector_path = job.mask_detector_path;
+    pj.mask_detector_threshold = job.mask_detector_threshold;
+    return pj;
 }
 
 void ColmapRunner::run(ColmapJob job) {
@@ -381,21 +494,9 @@ void ColmapRunner::run(ColmapJob job) {
         fs::create_directories(ws);
 
         // Resume reuses what the last run completed, or a clean folder is
-        // insisted on; a model already there is reused whoever made it, and the
-        // input's own images are not leftovers (see SfmRunner).
+        // insisted on; the input's own images are not leftovers (see
+        // SfmRunner). Each step asks the plan when it is reached.
         const WorkspaceState prior = probe_workspace(ws.string(), job.inputs);
-        // The model, as the settings that make it, against the ones the model
-        // already there was made with. A model with no stamp came from
-        // somewhere else and is reused whatever the panel says.
-        ReconStamp now;
-        now.present = true;
-        now.engine = "colmap";
-        now.args = colmap_recon_args(job);
-        const std::string changed =
-            recon_stamp_change(read_recon_stamp(ws.string()), now);
-        const bool reuse_model = prior.model && !job.redo_model && changed.empty();
-        if (prior.model && !job.redo_model && !changed.empty())
-            log(spirula::i18n::format(lmsg::sfm_settings_changed, {changed}));
         if (prior.resumable() && !job.resume)
             return fail("the workspace already contains an unfinished run "
                         "(database.db / extracted frames / masks); enable "
@@ -404,47 +505,38 @@ void ColmapRunner::run(ColmapJob job) {
         if (prior.resumable())
             log("Resuming previous run in " + ws.string() +
                 " (completed stages are reused)");
-        if (reuse_model)
-            log(spirula::i18n::format(lmsg::sfm_reusing_model, {ws.string()}));
+        PrepJob pj = prep_job(job);
+        const DatasetRecord rec = read_plan_record(ws.string(), pj);
+        const PlanRequest req = job.request;
+        DatasetPlan plan = plan_dataset(plan_job(job, pj), prior, rec, req);
+        StepRecorder record(ws.string(), rec);
+        auto say = [&](Step s) {
+            for (const std::string& l : plan_log_lines(s, plan[s], ws.string())) log(l);
+        };
+        pj.redo_frames = plan[Step::Frames].act == Act::Redo;
+        pj.make_frames = makes(plan[Step::Frames].act);
+        pj.sort_frames = plan[Step::Frames].sort;
+        say(Step::Frames);
+        if (makes(plan[Step::Frames].act)) record.begin(Step::Frames, frames_fields(pj));
 
         std::string err;
-        if (!reuse_model && !check_colmap_version(job, err)) return fail(err);
-
         // ---- 1. frames and masks (shared with the built-in SfM path) -------
         PrepResult prep;
         {
-            PrepJob pj;
-            pj.inputs = job.inputs;
-            pj.workspace = job.workspace;
-            pj.resume = job.resume;
-            pj.redo_frames = job.redo_frames;
-            pj.redo_masks = job.redo_masks;
-            pj.photo_import = job.photo_import;
-            pj.video_fps = job.video_fps;
-            pj.sharp_window = job.sharp_window;
-            pj.pano = job.pano;
-            pj.max_frames = job.max_frames;
-            pj.ffmpeg_exe = job.ffmpeg_exe;
-            pj.force_external_decode = job.force_external_decode;
-            pj.mask_enable = job.mask_enable;
-            pj.mask_prompt = job.mask_prompt;
-            pj.mask_negative_prompt = job.mask_negative_prompt;
-            pj.mask_keep_subject = job.mask_keep_subject;
-            pj.mask_max_image_size = job.mask_max_image_size;
-            pj.mask_threshold = job.mask_threshold;
-            pj.mask_nms = job.mask_nms;
-            pj.mask_memory = job.mask_memory;
-            pj.mask_detect_every = job.mask_detect_every;
-            pj.mask_memory_frames = job.mask_memory_frames;
-            pj.mask_clicks = job.mask_clicks;
-            pj.mask_model_path = job.mask_model_path;
-            pj.mask_model_name = job.mask_model;
-            pj.force_external_masking = job.force_external_masking;
-            pj.python_exe = job.python_exe;
-
             DatasetPrep dp(&_prog, _films, _cancel);
-            if (!dp.run(pj, prep, err, [this](PrepJob& p) { take_masking(p); }))
-                return fail(err);
+            auto refresh = [&](PrepJob& p) {
+                take_masking(p);
+                plan = plan_dataset(plan_job(job, p), prior, rec, req, &plan, Step::Masks);
+                apply_masks_plan(plan[Step::Masks], p);
+                say(Step::Masks);
+                if (makes(plan[Step::Masks].act))
+                    record.begin(Step::Masks, masks_fields(p));
+                pj = p;
+            };
+            auto done = [&](Stage s, const PrepJob&) {
+                record.finish(s == Stage::Frames ? Step::Frames : Step::Masks);
+            };
+            if (!dp.run(pj, prep, err, refresh, done)) return fail(err);
         }
         const std::string images = prep.image_dir;
         const std::string image_dir_cfg = prep.image_dir_cfg;
@@ -452,9 +544,21 @@ void ColmapRunner::run(ColmapJob job) {
         const bool have_masks = !prep.mask_dir.empty();
         const std::string mask_dir_cfg = prep.mask_dir_cfg;
         _mask_flipped = prep.mask_dir_flipped;
+        take_reconstruction(job);
         if (prep.per_folder_cameras && job.camera_mode == 0) {
             log(lmsg::one_camera_per_folder.get());
             job.camera_mode = 1;
+        }
+        plan = plan_dataset(plan_job(job, pj), prior, rec, req, &plan, Step::Model);
+        say(Step::Model);
+        const bool reuse_model = !makes(plan[Step::Model].act);
+        if (!reuse_model && !check_colmap_version(job, err)) return fail(err);
+        // feature_extractor skips every image the database already holds, so a
+        // model being replaced -- over new frames or new settings -- starts
+        // from an empty one.
+        if (plan[Step::Model].act == Act::Redo) {
+            std::error_code fec;
+            fs::remove(ws / "database.db", fec);
         }
 
         // Everything COLMAP does, skipped whole for a run pointed at a
@@ -520,10 +624,7 @@ void ColmapRunner::run(ColmapJob job) {
                                           {(long long)groups.size()}));
 
             // ---- 3. feature extraction -----------------------------------------
-            take_reconstruction(job);
-            // Live edits and the per-folder camera fix-up land after the reuse
-            // question was asked; the stamp has to record what actually ran.
-            now.args = colmap_recon_args(job);
+            record.begin(Step::Model, model_fields(job, pj));
             set_stage(Stage::Features,
                       aliked ? lmsg::stage_colmap_features_aliked.get()
                              : lmsg::stage_colmap_features.get());
@@ -550,9 +651,26 @@ void ColmapRunner::run(ColmapJob job) {
                 shared.push_back("--SiftExtraction.estimate_affine_shape");
                 shared.push_back("1");
             }
-            if (have_masks) {
+            // COLMAP reads one mask tree, so the feature-only masks are
+            // intersected into a copy when training's are wanted there too.
+            std::string colmap_masks = have_masks && job.mask_features ? prep.mask_dir : "";
+            const fs::path both = ws / ".colmap_masks";
+            remove_tree(both);
+            if (!prep.feature_mask_dir.empty()) {
+                if (colmap_masks.empty()) {
+                    colmap_masks = prep.feature_mask_dir;
+                } else {
+                    std::string err;
+                    if (app::intersect_mask_trees(images, colmap_masks, prep.mask_dir_flipped,
+                                                  prep.feature_mask_dir, both.string(),
+                                                  &_cancel, err) < 0)
+                        return fail("could not write " + err);
+                    colmap_masks = both.string();
+                }
+            }
+            if (!colmap_masks.empty()) {
                 shared.push_back("--ImageReader.mask_path");
-                shared.push_back(prep.mask_dir);
+                shared.push_back(colmap_masks);
             }
             int rc = 0;
             std::vector<std::vector<std::string>> passes;
@@ -594,6 +712,7 @@ void ColmapRunner::run(ColmapJob job) {
                 if (rc == kCancelled) return fail("cancelled");
                 if (rc != 0) return fail("colmap feature_extractor failed (see log)");
             }
+            remove_tree(both);
 
             // ---- 4. matching -----------------------------------------------------
             // An explicit choice: the GUI presets sequential for video and
@@ -739,11 +858,12 @@ void ColmapRunner::run(ColmapJob job) {
                 return ms;
             };
             // The mapper only writes models on completion, so any existing
-            // one is from a FINISHED run -- reuse it. An interrupted mapper
-            // leaves nothing and simply reruns.
+            // one is from a FINISHED mapper -- reused when this run is finishing
+            // an interrupted one, thrown away when it is replacing the model.
+            if (plan[Step::Model].act == Act::Redo)
+                for (const auto& m : enumerate_models()) remove_tree(m.second);
             std::vector<std::pair<int64_t, fs::path>> models;
-            if (job.resume && !job.redo_model && changed.empty() &&
-                !(models = enumerate_models()).empty()) {
+            if (job.resume && !(models = enumerate_models()).empty()) {
                 log("Resume: " + std::to_string(models.size()) +
                     " existing model(s) under sparse/; skipping the mapper "
                     "(delete sparse/ to re-reconstruct)");
@@ -858,15 +978,39 @@ void ColmapRunner::run(ColmapJob job) {
             }
         }
 
-        if (!reuse_model) write_recon_stamp(ws.string(), now);
+        write_unregistered_list(ws, images);
+
+        if (!reuse_model) record.finish(Step::Model);
+
+        take_dense(job);
+        plan = plan_dataset(plan_job(job, pj), prior, rec, req, &plan, Step::Dense);
+        verify_dense_reuse(plan,ws.string(),_cancel);
+        say(Step::Dense);
+        if (makes(plan[Step::Dense].act)) {
+            record.begin(Step::Dense, dense_fields(job.dense), {"roma.ply"});
+            std::string error;
+            auto dense = job.dense;
+            if (dense.config.mask_dir == "masks" && !prep.mask_dir_cfg.empty()) {
+                dense.config.mask_dir = prep.mask_dir_cfg;
+                dense.config.invert_masks = dense.config.invert_masks != prep.mask_dir_flipped;
+            }
+            if (!run_dense_step(dense, ws.string(), images, _prog, _cancel, error)) return fail(error);
+            record.finish(Step::Dense);
+        }
 
         // ---- depth and normals ---------------------------------------------
         take_geometry(job);
-        if (job.geometry.enable) {
+        plan = plan_dataset(plan_job(job, pj), prior, rec, req, &plan, Step::Geometry);
+        say(Step::Geometry);
+        if (makes(plan[Step::Geometry].act)) {
+            const GeometryJob g = geometry_for_plan(job.geometry, plan[Step::Geometry]);
+            record.begin(Step::Geometry, geometry_fields(job.geometry),
+                         geometry_made(plan[Step::Geometry], rec));
             std::string gerr;
-            if (!run_geometry_step(job.geometry, ws.string(), images, _prog,
-                                   _films.geometry, _cancel, gerr))
+            if (!run_geometry_step(g, ws.string(), images, _prog, _films.geometry,
+                                   _cancel, gerr))
                 return fail(gerr);
+            record.finish(Step::Geometry);
         }
 
         // No marker file is written: the image dir is handed to the GUI

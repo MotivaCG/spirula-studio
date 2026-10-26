@@ -24,7 +24,7 @@ int main() {
                 std::vector<float> dc(6, 0.4f), sh(90, 0);
                 set_data_3dgs(N, view(means.data(), 4, {N, 3}), view(quats.data(), 4, {N, 4}),
                     view(scales.data(), 4, {N, 3}), view(opac.data(), 4, {N, 1}),
-                    view(dc.data(), 4, {N, 3}), view(sh.data(), 4, {N, 15, 3}));
+                    view(dc.data(), 4, {N, 3}), view(sh.data(), 4, {N, 15, 3}), 0);
                 engine_temporal_begin(3, false, true, false, 0);
                 for (int f = 0; f < 3; ++f) engine_temporal_hold(f);
                 engine_temporal_select(0);

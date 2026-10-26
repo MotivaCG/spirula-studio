@@ -41,17 +41,17 @@ void solve4(double a[4][4], double b[4]) {
 
 AnchorRig anchor_rig(const std::vector<float>& all, const std::vector<float>& subject, int anchors,
                      size_t rows) {
-    const float near = 0.04f;
+    const float reach = 0.04f;
     std::unordered_set<int64_t> around;
     for (size_t i = 0; i + 2 < subject.size(); i += 3)
         for (int dx = -1; dx <= 1; dx++)
             for (int dy = -1; dy <= 1; dy++)
                 for (int dz = -1; dz <= 1; dz++)
-                    around.insert(cell_key(subject[i] + dx * near, subject[i + 1] + dy * near,
-                                           subject[i + 2] + dz * near, near));
+                    around.insert(cell_key(subject[i] + dx * reach, subject[i + 1] + dy * reach,
+                                           subject[i + 2] + dz * reach, reach));
     std::vector<float> points;
     for (size_t i = 0; i + 2 < all.size(); i += 3)
-        if (around.count(cell_key(all[i], all[i + 1], all[i + 2], near)))
+        if (around.count(cell_key(all[i], all[i + 1], all[i + 2], reach)))
             points.insert(points.end(), &all[i], &all[i] + 3);
     if (anchors < 1 || points.size() < 3) throw std::runtime_error("anchors: no splats on the subject");
     float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
@@ -61,10 +61,10 @@ AnchorRig anchor_rig(const std::vector<float>& all, const std::vector<float>& su
             hi[a] = std::max(hi[a], points[i + a]);
         }
     // The cell whose occupied count is closest to `anchors`, by bisection.
-    float small = 1e-4f, large = std::max({hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2], 1e-3f});
+    float lower = 1e-4f, large = std::max({hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2], 1e-3f});
     for (int it = 0; it < 30; it++) {
-        const float mid = std::sqrt(small * large);
-        (occupied(points, mid) > (size_t)anchors ? small : large) = mid;
+        const float mid = std::sqrt(lower * large);
+        (occupied(points, mid) > (size_t)anchors ? lower : large) = mid;
     }
     AnchorRig rig;
     rig.spacing = large;
@@ -205,7 +205,7 @@ void anchor_solve(const AnchorRig& rig, const std::vector<uint32_t>& rows,
         }
     }
     if (seen == 0) return;
-    // A small pull to the prior: it settles anchors few rows see, and no row's
+    // A lower pull to the prior: it settles anchors few rows see, and no row's
     // anchors are underdetermined.
     const double lambda = 1e-3 * diag_sum / (double)seen;
 

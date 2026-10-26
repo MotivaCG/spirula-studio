@@ -79,8 +79,8 @@ int main() {
 
     setup();
     auto points = candidate();
-    auto near = candidate(0.001f);
-    points.insert(points.end(), near.begin(), near.end());
+    auto close = candidate(0.001f);
+    points.insert(points.end(), close.begin(), close.end());
     auto count = engine_temporal_birth(points, 0.01f, 4);
     result("H05_birth_spacing", count == 1, double(count), 1);
 

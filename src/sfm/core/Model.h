@@ -19,6 +19,7 @@
 
 #include "sfm/core/Camera.h"
 #include "sfm/core/Pose.h"
+#include "sfm/core/Rig.h"
 #include "sfm/geometry/LinAlg.h"
 
 namespace sfm {
@@ -43,6 +44,10 @@ struct Image {
     std::string name;
     Pose pose;                 // world -> camera
     bool registered = false;
+    // The file's EXIF Orientation (sfm/core/Exif.h), 1 when it has none or the
+    // pixels already carry it. Only the gauge fix reads it, and only a model
+    // built from features has it -- one read back from disk does not.
+    uint8_t exif_orientation = 1;
     std::vector<Vec2> points2D;              // keypoint coords (all features)
     std::vector<uint64_t> point3D_ids;       // parallel; kInvalidPoint3D if none
 
@@ -51,6 +56,20 @@ struct Image {
         for (uint64_t id : point3D_ids)
             if (id != kInvalidPoint3D) n++;
         return n;
+    }
+
+    // Every member but points2D, for an undo record of a model that never
+    // rewrites its keypoints. Names every member.
+    Image withoutPoints2D() const {
+        Image c;
+        c.id = id;
+        c.camera_id = camera_id;
+        c.name = name;
+        c.pose = pose;
+        c.registered = registered;
+        c.exif_orientation = exif_orientation;
+        c.point3D_ids = point3D_ids;
+        return c;
     }
 };
 
@@ -62,12 +81,32 @@ struct Reconstruction {
     std::map<uint32_t, Image> images;
     std::map<uint64_t, Point3D> points3D;
     uint64_t next_point3D_id = 1;
+    // Per rig of the run's RigTable, the extrinsics this model has settled on;
+    // empty until a rig's frames register. In this model's units (sfm/core/Rig.h).
+    std::vector<RigCalib> rigs;
+    // Images left outside their frame, with a pose of their own. The mapper
+    // keeps frames whole and never fills it; the solvers and the merge honour it.
+    std::set<uint32_t> rig_detached;
 
     uint32_t numRegistered() const {
         uint32_t n = 0;
         for (const auto& kv : images)
             if (kv.second.registered) n++;
         return n;
+    }
+
+    // A copy without the unregistered images, which never copies them: the
+    // mapper's model holds every image of the capture. Names every member.
+    Reconstruction registeredCopy() const {
+        Reconstruction m;
+        m.cameras = cameras;
+        for (const auto& kv : images)
+            if (kv.second.registered) m.images.emplace_hint(m.images.end(), kv);
+        m.points3D = points3D;
+        m.next_point3D_id = next_point3D_id;
+        m.rigs = rigs;
+        m.rig_detached = rig_detached;
+        return m;
     }
 
     uint64_t addPoint3D(const Vec3& xyz, const std::vector<TrackElement>& track) {
@@ -278,6 +317,30 @@ inline Reconstruction Reconstruction::readBinary(const std::string& dir) {
             r.points3D[id] = p;
             r.next_point3D_id = std::max(r.next_point3D_id, id + 1);
         }
+    }
+    // Some exporters drop untriangulated keypoints from images.bin and leave
+    // the tracks indexing the old lists (Hierarchical 3DGS "campus": 26.6 M of
+    // 29.7 M entries out of range), so a disagreeing model is re-tracked from images.
+    auto agrees = [&](uint64_t id, const TrackElement& e) {
+        auto it = r.images.find(e.image_id);
+        return it != r.images.end() && e.point2D_idx < it->second.point3D_ids.size() &&
+               it->second.point3D_ids[e.point2D_idx] == id;
+    };
+    bool consistent = true;
+    for (const auto& kv : r.points3D)
+        for (const TrackElement& e : kv.second.track) consistent = consistent && agrees(kv.first, e);
+    if (!consistent) {
+        std::fprintf(stderr, "[model] %s: tracks disagree with images.bin; rebuilt from the images\n",
+                     dir.c_str());
+        for (auto& kv : r.points3D) kv.second.track.clear();
+        for (auto& kv : r.images)
+            for (uint32_t k = 0; k < kv.second.point3D_ids.size(); k++) {
+                uint64_t& id = kv.second.point3D_ids[k];
+                if (id == kInvalidPoint3D) continue;
+                auto it = r.points3D.find(id);
+                if (it == r.points3D.end()) id = kInvalidPoint3D;
+                else it->second.track.push_back({kv.first, k});
+            }
     }
     return r;
 }

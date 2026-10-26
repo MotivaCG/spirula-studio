@@ -41,6 +41,8 @@ src/app/webviewer/*.cpp
 src/app/TrainerCore.cpp
 src/app/TemporalInputs.cpp
 src/app/TrainerChunk.cpp
+src/app/TrainForecast.cpp
+src/app/SystemRecorder.cpp
 src/app/EvalMetrics.cpp
 src/external/*.cpp
 src/external/*.c
@@ -59,6 +61,8 @@ src/app/webviewer/*.cpp
 src/app/TrainerCore.cpp
 src/app/TemporalInputs.cpp
 src/app/TrainerChunk.cpp
+src/app/TrainForecast.cpp
+src/app/SystemRecorder.cpp
 src/app/EvalMetrics.cpp
 src/external/*.cpp
 src/external/*.c

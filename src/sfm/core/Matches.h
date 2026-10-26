@@ -7,21 +7,87 @@
 // parse; it is not COLMAP's SQLite database.
 #pragma once
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <initializer_list>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "sfm/core/Camera.h"
+#include "sfm/core/Spill.h"
 
 namespace sfm {
 
 // One putative correspondence: feature idx1 in image1 <-> idx2 in image2.
+// Nothing past a matcher's own cap reads a descriptor distance, so none is
+// kept: a 4000-image video holds 225M of these through mapping.
 struct FeatureMatch {
     uint32_t idx1 = 0, idx2 = 0;
-    float distance = 0;   // L2 descriptor distance (not persisted)
+};
+
+// Keep the `cap` matches of smallest `dist` (parallel to `m`), ordered as
+// std::partial_sort leaves them.
+inline void keepClosest(std::vector<FeatureMatch>& m, const std::vector<float>& dist,
+                        size_t cap) {
+    if (cap == 0 || m.size() <= cap) return;
+    struct Scored {
+        float d;
+        FeatureMatch m;
+    };
+    std::vector<Scored> s(m.size());
+    for (size_t k = 0; k < m.size(); k++) s[k] = {dist[k], m[k]};
+    std::partial_sort(s.begin(), s.begin() + (std::ptrdiff_t)cap, s.end(),
+                      [](const Scored& a, const Scored& b) { return a.d < b.d; });
+    m.resize(cap);
+    for (size_t k = 0; k < cap; k++) m[k] = s[k].m;
+}
+
+static_assert(sizeof(FeatureMatch) == 8, "matches.bin and spillMatches write it as is");
+
+// A pair's matches: owned, or a read-only view into the file spillMatches
+// mapped. Reading code sees one const array either way; writing to a view
+// throws, so a writer that runs after the spill fails loudly, not by copying.
+class MatchList {
+public:
+    MatchList() = default;
+    MatchList(std::vector<FeatureMatch> v) : v_(std::move(v)) {}
+    MatchList(std::initializer_list<FeatureMatch> l) : v_(l) {}
+
+    size_t size() const { return view_ ? n_ : v_.size(); }
+    bool empty() const { return size() == 0; }
+    const FeatureMatch* data() const { return view_ ? view_ : v_.data(); }
+    const FeatureMatch* begin() const { return data(); }
+    const FeatureMatch* end() const { return data() + size(); }
+    const FeatureMatch& operator[](size_t k) const { return data()[k]; }
+    bool isView() const { return view_ != nullptr; }
+
+    // The only ways to write, so that reading through a non-const reference
+    // still reads the view.
+    std::vector<FeatureMatch>& mut() {
+        if (view_) throw std::logic_error("MatchList: writing to spilled matches");
+        return v_;
+    }
+    void push_back(const FeatureMatch& m) { mut().push_back(m); }
+    void pop_back() { mut().pop_back(); }
+    void resize(size_t n) { mut().resize(n); }
+    void reserve(size_t n) { mut().reserve(n); }
+    std::vector<FeatureMatch> toVector() const { return {begin(), end()}; }
+
+    void view(const FeatureMatch* p, size_t n) {
+        std::vector<FeatureMatch>().swap(v_);
+        view_ = n ? p : nullptr;
+        n_ = n;
+    }
+
+private:
+    std::vector<FeatureMatch> v_;
+    const FeatureMatch* view_ = nullptr;
+    size_t n_ = 0;
 };
 
 // All matches between one ordered image pair. When geometric verification has
@@ -30,7 +96,7 @@ struct FeatureMatch {
 struct TwoViewMatches {
     uint32_t image1 = 0, image2 = 0;      // indices into MatchesDatabase::images
     int32_t config = 0;                   // 0 = unverified
-    std::vector<FeatureMatch> matches;
+    MatchList matches;
 };
 
 // One image's identity in the match database.
@@ -51,27 +117,27 @@ struct MatchesDatabase {
     std::vector<Camera> cameras;         // one per distinct camera id
     std::vector<uint32_t> camera_ids;    // per image, parallel to `images`
     std::vector<uint8_t> focal_prior;    // parallel to `cameras`; 1 = not a guess
+    // 1 where THIS stage measured the focal rather than being told it. Kept
+    // apart from `focal_prior` because the mapper treats the two differently:
+    // it re-refines a measured focal and leaves a given one alone (D45).
+    std::vector<uint8_t> focal_measured;
     bool hasCameras() const {
         return !cameras.empty() && camera_ids.size() == images.size();
     }
+    // What the pairs' views point into, once spillMatches has run.
+    std::shared_ptr<const SpillFile> spill;
 };
 
-// ---- matches.bin --------------------------------------------------------
-// Header: char[4] "VKMT", u32 version=3, u32 num_images.
-//   per image: u32 name_len, char[name_len], u32 num_features
-// Then u32 num_pairs, per pair:
-//   u32 image1, u32 image2, i32 config, u32 num_matches,
-//   then num_matches*(u32 idx1, u32 idx2)
-// Then (v3) the camera section: u32 num_cameras, per camera
-//   u32 id, i32 width, i32 height, i32 colmap_model_id, u8 focal_prior,
-//   f64 pixel_scale, u32 num_params, f64 params[num_params]
-// followed by u32 num_camera_ids and that many u32 (one per image). A v2 file
-// stops after the pairs and reads back with no cameras.
+// ---------------------------------------------------------------------------
+// matches.bin -- "VKMT", u32 version=4; the layout is writeMatches below, and
+// an older file reads back as what it carried: v2 stops after the pairs and has
+// no cameras, v3 has cameras but no per-camera `focal_measured` byte.
+// ---------------------------------------------------------------------------
 
 inline void writeMatches(const std::string& path, const MatchesDatabase& db) {
     std::ofstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("cannot write " + path);
-    uint32_t version = 3, nimg = (uint32_t)db.images.size();
+    uint32_t version = 4, nimg = (uint32_t)db.images.size();
     f.write("VKMT", 4);
     f.write((const char*)&version, 4);
     f.write((const char*)&nimg, 4);
@@ -89,10 +155,7 @@ inline void writeMatches(const std::string& path, const MatchesDatabase& db) {
         f.write((const char*)&p.image2, 4);
         f.write((const char*)&p.config, 4);
         f.write((const char*)&nm, 4);
-        for (const FeatureMatch& m : p.matches) {
-            f.write((const char*)&m.idx1, 4);
-            f.write((const char*)&m.idx2, 4);
-        }
+        f.write((const char*)p.matches.data(), (std::streamsize)nm * 8);
     }
     uint32_t ncam = db.hasCameras() ? (uint32_t)db.cameras.size() : 0;
     f.write((const char*)&ncam, 4);
@@ -116,6 +179,10 @@ inline void writeMatches(const std::string& path, const MatchesDatabase& db) {
         uint32_t nid = (uint32_t)db.camera_ids.size();
         f.write((const char*)&nid, 4);
         f.write((const char*)db.camera_ids.data(), (std::streamsize)nid * 4);
+        for (uint32_t c = 0; c < ncam; c++) {
+            uint8_t m = c < db.focal_measured.size() ? db.focal_measured[c] : 0;
+            f.write((const char*)&m, 1);
+        }
     }
 }
 
@@ -147,11 +214,9 @@ inline MatchesDatabase readMatches(const std::string& path) {
         f.read((char*)&p.image2, 4);
         f.read((char*)&p.config, 4);
         f.read((char*)&nm, 4);
-        p.matches.resize(nm);
-        for (uint32_t j = 0; j < nm; j++) {
-            f.read((char*)&p.matches[j].idx1, 4);
-            f.read((char*)&p.matches[j].idx2, 4);
-        }
+        std::vector<FeatureMatch>& m = p.matches.mut();
+        m.resize(nm);
+        f.read((char*)m.data(), (std::streamsize)nm * 8);
     }
     if (version >= 3) {
         uint32_t ncam = 0;
@@ -185,10 +250,16 @@ inline MatchesDatabase readMatches(const std::string& path) {
                 f.read((char*)db.camera_ids.data(), (std::streamsize)nid * 4);
             }
         }
+        if (ncam && version >= 4) {
+            std::vector<uint8_t> measured(ncam);
+            f.read((char*)measured.data(), (std::streamsize)ncam);
+            if (f.gcount() == (std::streamsize)ncam) db.focal_measured = std::move(measured);
+        }
         if (!db.hasCameras()) {   // truncated section: no cameras, not bad ones
             db.cameras.clear();
             db.camera_ids.clear();
             db.focal_prior.clear();
+            db.focal_measured.clear();
         }
     }
     return db;
@@ -282,6 +353,25 @@ inline bool readPairMatches(const std::string& path,
         f.read((char*)&out[i].idx2, 4);
     }
     if (!f) { out.clear(); return false; }
+    return true;
+}
+
+// Every pair's matches into a SpillFile at `path`, read back as MatchList
+// views. False, with `db` untouched, on any failure.
+inline bool spillMatches(MatchesDatabase& db, const std::string& path) {
+    std::vector<std::pair<const void*, size_t>> chunks;
+    for (const TwoViewMatches& p : db.pairs)
+        if (!p.matches.empty()) chunks.push_back({p.matches.data(), p.matches.size() * 8});
+    std::shared_ptr<const SpillFile> spill = SpillFile::write(path, chunks);
+    if (!spill) return false;
+    const FeatureMatch* at = reinterpret_cast<const FeatureMatch*>(spill->data());
+    for (TwoViewMatches& p : db.pairs) {
+        const size_t n = p.matches.size();
+        p.matches.view(at, n);
+        at += n;
+    }
+    db.spill = std::move(spill);
+    releaseFreedHeap();
     return true;
 }
 

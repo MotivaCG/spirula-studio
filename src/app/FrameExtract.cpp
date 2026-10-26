@@ -1,27 +1,30 @@
 // FrameExtract.cpp -- see app/FrameExtract.h.
 //
-// Lifted out of the `spirula-sam extract` CLI when the GUI grew the same need:
-// the decode/select/mask/write loop is the part worth having exactly once, and
-// the two front ends differ only in how they report progress.
+// Which decoder runs, and what happens to a frame once it has chosen one
+// (app/FrameDecode.h): the select/mask/write loop is the part worth having
+// exactly once, whichever decoder and front end drive it.
 
 #include "app/FrameExtract.h"
+#include "app/CubeLut.h"
 
+#include "app/FrameDecode.h"
+#include "app/FrameMotion.h"
 #include "app/WriterPool.h"
+#include "app/gui/Subprocess.h"
 #include "i18n/catalog/Data.h"
+#include "i18n/catalog/Log.h"
 #include "nn/core/Log.h"
+#include "nn/Device.h"
 #include "nn/io/Image.h"
 #include "sam/Sam.h"
-#include "video/Demuxer.h"
-#include "video/VideoPipeline.h"
 
 #include <algorithm>
 #include <atomic>
-#include <condition_variable>
+#include <cmath>
 #include <cstdio>
-#include <deque>
+#include <functional>
 #include <filesystem>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -30,349 +33,264 @@ namespace fs = std::filesystem;
 
 namespace app {
 
-namespace {
+namespace lmsg = spirula::i18n::msg::log;
 
 void log_line(const FrameExtractSinks& sinks, const std::string& s) {
     if (sinks.log) sinks.log(s);
     else NN_LOG_ERROR("%s\n", s.c_str());
 }
 
-// The encoder thread pool this depends on is app/WriterPool.h: masking and
-// plain extraction both need it, so it does not live here.
+// What the plan came out as, for the log and for whatever is drawing it.
+void report_plan(const FrameExtractSinks& sinks, const std::vector<int64_t>& plan,
+                 int64_t frames, double fps) {
+    if (plan.empty()) return;
+    int64_t tightest = frames, widest = 0;
+    for (size_t i = 1; i < plan.size(); i++) {
+        const int64_t gap = plan[i] - plan[i - 1];
+        tightest = std::min(tightest, gap);
+        widest = std::max(widest, gap);
+    }
+    auto rate = [&](int64_t gap) {
+        return std::round((gap > 0 ? fps / (double)gap : fps) * 100.0) / 100.0;
+    };
+    log_line(sinks,
+             spirula::i18n::format(lmsg::motion_plan, {(long long)plan.size(),
+                                                       rate(widest), rate(tightest)}));
+    if (sinks.planned) sinks.planned(plan, frames);
+}
+
+namespace {
+
 using app::WriteJob;
 using app::WriterPool;
 
-// Which decoded frames are candidates and when a window is written. One copy,
-// because the paired path has to choose the same frames as the single-track
-// one and as the ffmpeg fallback.
-struct SelectClock {
-    int keep = 0, skip = 1;
-    int64_t count = 0;
-    bool candidate(int64_t i) const {
-        return keep == 0 ? (i % skip == 0) : (((i + keep) % skip) < keep);
-    }
-    void skipped() { ++count; }
-    // The Python increments its counter before the modulo test when a blur
-    // window is in use, and after it when it is not; both are reproduced here.
-    bool step() {
-        if (keep != 0) ++count;
-        const bool write = (count % skip) == 0;
-        if (keep == 0) ++count;
-        return write;
-    }
+// ---------------------------------------------------------------------------
+// Which decoder
+// ---------------------------------------------------------------------------
+
+struct Decoder {
+    bool builtin = false;
+    VideoFacts facts;                          // ffmpeg's probe, when not built-in
+    std::vector<std::pair<int, int>> sizes;    // one per track
 };
 
-// ---------------------------------------------------------------------------
-// Extraction
-// ---------------------------------------------------------------------------
-
-bool extract_track(const FrameExtractJob& o, const FrameExtractSinks& sinks,
-                   int track, const fs::path& image_dir,
-                   const fs::path& mask_dir, sam::Masker* masker,
-                   WriterPool& pool, FrameExtractStats& t,
-                   std::string& error) {
-    video::VideoPipeline pipe;
-    // The blur window holds `keep` decoded pictures at once.
-    if (!pipe.open(o.input, track, std::max(o.keep, 1), error)) return false;
-
-    fs::create_directories(image_dir);
-    if (masker) fs::create_directories(mask_dir);
-
-    video::ConvertOpts conv;
-    conv.scale = o.scale;
-    conv.rotate = o.rotate;
-
-    struct Buffered {
-        video::FrameHandle h;
-        int64_t index;
-    };
-    std::deque<Buffered> window;
-    const int keep = o.keep;
-    SelectClock clock{o.keep, o.skip, 0};
-    int written = 0;
-    bool measured_pending = false;
-
-    auto flush_window = [&](bool write) {
-        if (window.empty()) return;
-        if (write) {
-            if (measured_pending) {
-                const double t0 = nn::now_ms();
-                pipe.flushSharpness();
-                t.sharpness += nn::now_ms() - t0;
-                measured_pending = false;
-            }
-            size_t best = 0;
-            if (keep != 0) {
-                float best_score = -1.0f;
-                for (size_t i = 0; i < window.size(); ++i) {
-                    const float s = pipe.sharpness(window[i].h);
-                    if (s > best_score) {
-                        best_score = s;
-                        best = i;
-                    }
-                }
-            }
-            const Buffered& chosen = window[best];
-
-            nn::Image image;
-            double t0 = nn::now_ms();
-            std::string err;
-            if (!pipe.toImage(chosen.h, conv, image, err)) {
-                log_line(sinks, "frame " + std::to_string(chosen.index) + ": " + err);
-            } else {
-                t.convert += nn::now_ms() - t0;
-
-                char stem[64];
-                std::snprintf(stem, sizeof(stem), "%05lld", (long long)chosen.index);
-                if (masker) {
-                    t0 = nn::now_ms();
-                    sam::Mask mask;
-                    sam::Result overlay;
-                    // The decoded index, not the written one: a click was drawn
-                    // on a frame of the video, and only one frame per sharpness
-                    // window survives to be written.
-                    if (masker->run(image, mask, o.write_overlay ? &overlay : nullptr,
-                                    chosen.index)) {
-                        t.mask += nn::now_ms() - t0;
-                        WriteJob mj;
-                        mj.mask = std::move(mask);
-                        mj.path = (mask_dir / (std::string(stem) + ".png")).string();
-                        pool.submit(std::move(mj));
-                        if (o.write_overlay) {
-                            sam::save_overlay_png(
-                                image, overlay,
-                                (mask_dir / (std::string(stem) + "_overlay.png")).string());
-                        }
-                    } else {
-                        log_line(sinks, "frame " + std::to_string(chosen.index) +
-                                                ": masking failed: " + masker->lastError());
-                    }
-                }
-
-                const bool jpeg = o.quality >= 0 && o.quality <= 100;
-                WriteJob job;
-                job.path = (image_dir / (std::string(stem) + (jpeg ? ".jpg" : ".png"))).string();
-                if (sinks.preview && image.channels == 3)
-                    sinks.preview(image.data.data(), image.width, image.height,
-                                  job.path);
-                job.quality = o.quality;
-                job.image = std::move(image);
-                t0 = nn::now_ms();
-                pool.submit(std::move(job));
-                t.submit += nn::now_ms() - t0;
-                ++written;
-                ++t.written;
-                if (sinks.progress) sinks.progress(t.written, t.decoded);
-            }
+// The device must be frozen first: asking whether the built-in decoder works
+// creates it.
+bool pick_decoder(const FrameExtractJob& job, const FrameExtractSinks& sinks,
+                  Decoder& d, std::string& error) {
+    std::string why = "this build has no in-process video decoder"
+                      " (-DSS_ENABLE_PATENTED=OFF)";
+    if (job.decoder != FrameDecoder::Ffmpeg) {
+#ifdef SS_HAVE_VIDEO
+        why = video_decode_availability();
+        if (why.empty()) {
+            d.builtin = true;
+            d.sizes = video_track_sizes(job.input, error);
+            if (d.sizes.empty() && error.empty()) error = "no video track in " + job.input;
+            return !d.sizes.empty();
         }
-        for (auto& b : window) pipe.release(b.h);
-        window.clear();
-    };
-
-    while (o.max_frames <= 0 || written < o.max_frames) {
-        if (sinks.cancel && sinks.cancel->load()) {
-            error = "cancelled";
-            for (auto& b : window) pipe.release(b.h);
+#endif
+        if (job.decoder == FrameDecoder::Builtin) {
+            error = why;
             return false;
         }
-        video::FrameHandle h;
-        const double t0 = nn::now_ms();
-        if (!pipe.next(h, error)) {
-            t.decode += nn::now_ms() - t0;
-            if (!error.empty()) return false;
-            break;  // end of stream
-        }
-        t.decode += nn::now_ms() - t0;
-        ++t.decoded;
-
-        const int64_t i = h.index;
-        // A frame matters only if some write window can select it. Everything
-        // else is decoded (inter prediction needs it) but never touched again.
-        if (!clock.candidate(i)) {
-            pipe.release(h);
-            clock.skipped();
-            continue;
-        }
-
-        if (keep != 0) {
-            const double t1 = nn::now_ms();
-            pipe.queueSharpness(h);
-            t.sharpness += nn::now_ms() - t1;
-            measured_pending = true;
-            ++t.measured;
-        }
-        window.push_back({h, i});
-        if ((int)window.size() > std::max(keep, 1)) {
-            pipe.release(window.front().h);
-            window.pop_front();
-        }
-
-        if (clock.step()) flush_window(true);
     }
-    flush_window(false);
-    return true;
+    if (!gui::command_exists(job.ffmpeg_exe)) {
+        error = job.decoder == FrameDecoder::Ffmpeg
+                    ? spirula::i18n::format(lmsg::err_ffmpeg_not_found, {job.ffmpeg_exe})
+                    : spirula::i18n::format(lmsg::err_no_video_decoder,
+                                            {why, job.ffmpeg_exe});
+        return false;
+    }
+#ifdef SS_HAVE_VIDEO
+    if (job.decoder == FrameDecoder::Auto)
+        log_line(sinks, spirula::i18n::format(lmsg::decode_fallback_ffmpeg, {why}));
+#endif
+    static const std::atomic<bool> never{false};
+    ffmpeg_probe_video(job.ffmpeg_exe, job.input, d.facts,
+                       sinks.cancel ? *sinks.cancel : never);
+    d.sizes = d.facts.tracks;
+    if (d.sizes.empty()) error = "no video track in " + job.input;
+    return !d.sizes.empty();
 }
 
-// One decoded frame from each track, warped into every view. The two tracks
-// are one camera: they are decoded in lockstep and selected together, so a
-// window keeps whichever frame is sharpest over the whole sphere.
+bool measure_motion(const FrameExtractJob& job, const FrameExtractSinks& sinks,
+                    const Decoder& d, int track, int tracks, MotionPlanInput& out,
+                    FrameExtractStats& t, std::string& error) {
+#ifdef SS_HAVE_VIDEO
+    if (d.builtin)
+        return measure_motion_vulkan(job, sinks, track, tracks, out, t, error);
+#endif
+    return measure_motion_ffmpeg(job, sinks, d.facts, track, tracks, out, t, error);
+}
+
+// The tracks' chosen instants, from whichever decoder `d` is.
+using Decode = std::function<bool(const std::vector<int>& tracks, bool convert,
+                                  const InstantSink& on_frame)>;
+
+}  // namespace
+
+bool scan_motion(const FrameExtractJob& job, const FrameExtractSinks& sinks,
+                 MotionPlanInput& out, FrameExtractStats& stats,
+                 std::string& error) {
+    if (!sam::freeze_device(job.device, error)) return false;
+    Decoder d;
+    if (!pick_decoder(job, sinks, d, error)) return false;
+    const int n = (int)d.sizes.size();
+    stats.tracks = n;
+    return measure_motion(job, sinks, d, job.track >= 0 ? job.track : 0, n, out,
+                          stats, error);
+}
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// What a chosen instant becomes
+// ---------------------------------------------------------------------------
+
+// One track into one folder, masked on the way when there is a masker.
+bool extract_track(const FrameExtractJob& o, const FrameExtractSinks& sinks,
+                   const Decode& decode, int track, const fs::path& image_dir,
+                   const fs::path& mask_dir, sam::Masker* masker, WriterPool& pool,
+                   FrameExtractStats& t) {
+    fs::create_directories(image_dir);
+    if (masker) fs::create_directories(mask_dir);
+    const bool jpeg = o.quality >= 0 && o.quality <= 100;
+    auto on_frame = [&](std::vector<nn::Image>& imgs, int64_t index, std::string&) {
+        nn::Image& image = imgs[0];
+        char stem[64];
+        std::snprintf(stem, sizeof(stem), "%05lld", (long long)index);
+        if (masker) {
+            const double t0 = nn::now_ms();
+            sam::Mask mask;
+            sam::Result overlay;
+            // The decoded index, not the written one: a click was drawn on a
+            // frame of the video, and only one frame per sharpness window
+            // survives to be written.
+            if (masker->run(image, mask, o.write_overlay ? &overlay : nullptr, index)) {
+                t.mask += nn::now_ms() - t0;
+                WriteJob mj;
+                mj.mask = std::move(mask);
+                mj.path = (mask_dir / (std::string(stem) + ".png")).string();
+                pool.submit(std::move(mj));
+                if (o.write_overlay)
+                    sam::save_overlay_png(
+                        image, overlay,
+                        (mask_dir / (std::string(stem) + "_overlay.png")).string());
+            } else {
+                log_line(sinks, "frame " + std::to_string(index) +
+                                    ": masking failed: " + masker->lastError());
+            }
+        }
+        WriteJob job;
+        job.path = (image_dir / (std::string(stem) + (jpeg ? ".jpg" : ".png"))).string();
+        if (sinks.preview && image.channels == 3)
+            sinks.preview(image.data.data(), image.width, image.height, job.path);
+        job.quality = o.quality;
+        job.image = std::move(image);
+        const double t0 = nn::now_ms();
+        pool.submit(std::move(job));
+        t.submit += nn::now_ms() - t0;
+        ++t.written;
+        return true;
+    };
+    return decode({track}, true, on_frame);
+}
+
+// A 360 file's tracks, laid out as one canvas and resampled into every view.
 bool extract_pair(const FrameExtractJob& o, const FrameExtractSinks& sinks,
-                  const fs::path& image_dir, WriterPool& pool,
-                  FrameExtractStats& t, std::string& error) {
-    video::VideoPipeline pipe[2];
-    for (int k = 0; k < 2; k++)
-        if (!pipe[k].open(o.input, k, std::max(o.keep, 1), error)) return false;
-    for (int k = 0; k < 2; k++) {
-        if (pipe[k].format().width == o.eac.track_w &&
-            pipe[k].format().height == o.eac.track_h)
+                  const Decode& decode, const Decoder& d, const fs::path& image_dir,
+                  WriterPool& pool, FrameExtractStats& t, std::string& error) {
+    const std::vector<int> want = pano360_needs_track1(o.eac)
+                                      ? std::vector<int>{0, 1}
+                                      : std::vector<int>{0};
+    for (size_t k = 0; k < want.size(); k++) {
+        if (k < d.sizes.size() && d.sizes[k].first == o.eac.track_w &&
+            d.sizes[k].second == o.eac.track_h)
             continue;
         error = "track " + std::to_string(k) + " is not the size the 360 layout"
                 " was detected at";
         return false;
     }
-
     std::vector<Pano360Remap> maps(o.views.size());
     for (size_t i = 0; i < o.views.size(); i++) {
         pano360_remap(o.eac, o.views[i], maps[i]);
         fs::create_directories(image_dir / o.views[i].dir);
     }
     std::vector<uint8_t> canvas((size_t)o.eac.canvasW() * o.eac.canvasH() * 3);
+    const bool jpeg = o.quality >= 0 && o.quality <= 100;
 
-    struct Buffered {
-        video::FrameHandle h[2];
-        int64_t index;
-    };
-    std::deque<Buffered> window;
-    const int keep = o.keep;
-    SelectClock clock{o.keep, o.skip, 0};
-    int written = 0;
-    bool measured_pending = false;
-
-    auto release = [&](Buffered& b) {
-        for (int k = 0; k < 2; k++) pipe[k].release(b.h[k]);
-    };
-    auto drain = [&]() {
-        for (auto& b : window) release(b);
-        window.clear();
-    };
-
-    auto flush_window = [&](bool write) {
-        if (window.empty()) return;
-        if (write) {
-            if (measured_pending) {
-                const double t0 = nn::now_ms();
-                for (int k = 0; k < 2; k++) pipe[k].flushSharpness();
-                t.sharpness += nn::now_ms() - t0;
-                measured_pending = false;
+    auto on_frame = [&](std::vector<nn::Image>& track, int64_t index, std::string& err) {
+        for (size_t k = 0; k < track.size(); k++)
+            if (track[k].width != o.eac.track_w || track[k].height != o.eac.track_h) {
+                err = "track " + std::to_string(k) + " decoded at another size";
+                return false;
             }
-            size_t best = 0;
-            if (keep != 0) {
-                float best_score = -1.0f;
-                for (size_t i = 0; i < window.size(); ++i) {
-                    // Half the sphere each, so the sum is the whole capture's.
-                    const float s = pipe[0].sharpness(window[i].h[0]) +
-                                    pipe[1].sharpness(window[i].h[1]);
-                    if (s > best_score) {
-                        best_score = s;
-                        best = i;
-                    }
-                }
-            }
-            const Buffered& chosen = window[best];
-
-            double t0 = nn::now_ms();
-            nn::Image track[2];
-            std::string err;
-            bool ok = true;
-            for (int k = 0; k < 2 && ok; k++)
-                ok = pipe[k].toImage(chosen.h[k], video::ConvertOpts{}, track[k], err);
-            if (!ok) {
-                log_line(sinks, "frame " + std::to_string(chosen.index) + ": " + err);
-            } else {
-                pano360_canvas(o.eac, track[0].data.data(), track[1].data.data(),
-                               canvas.data());
-                t.convert += nn::now_ms() - t0;
-
-                char stem[64];
-                std::snprintf(stem, sizeof(stem), "%05lld", (long long)chosen.index);
-                const bool jpeg = o.quality >= 0 && o.quality <= 100;
-                for (size_t i = 0; i < o.views.size(); i++) {
-                    t0 = nn::now_ms();
-                    WriteJob job;
-                    job.image.width = maps[i].width;
-                    job.image.height = maps[i].height;
-                    job.image.channels = 3;
-                    job.image.data.resize((size_t)maps[i].width * maps[i].height * 3);
-                    pano360_apply(maps[i], canvas.data(), o.eac.canvasW(),
-                                  o.eac.canvasH(), 0, job.image.data.data());
-                    t.convert += nn::now_ms() - t0;
-                    job.path = (image_dir / o.views[i].dir /
-                                (std::string(stem) + (jpeg ? ".jpg" : ".png"))).string();
-                    job.quality = o.quality;
-                    // The reel shows the first view; the others are the same
-                    // instant seen the other way, and six thumbnails a frame is
-                    // not what the slider is for.
-                    if (i == 0 && sinks.preview)
-                        sinks.preview(job.image.data.data(), job.image.width,
-                                      job.image.height, job.path);
-                    t0 = nn::now_ms();
-                    pool.submit(std::move(job));
-                    t.submit += nn::now_ms() - t0;
-                    // Per view, not per frame: the count is what the progress
-                    // bar is scaled against, and a plan writes six files here.
-                    ++t.written;
-                }
-                ++written;
-                if (sinks.progress) sinks.progress(t.written, t.decoded);
-            }
+        double t0 = nn::now_ms();
+        pano360_canvas(o.eac, track[0].data.data(),
+                       track.size() > 1 ? track[1].data.data() : nullptr,
+                       canvas.data());
+        t.convert += nn::now_ms() - t0;
+        char stem[64];
+        std::snprintf(stem, sizeof(stem), "%05lld", (long long)index);
+        for (size_t i = 0; i < o.views.size(); i++) {
+            t0 = nn::now_ms();
+            WriteJob job;
+            job.image.width = maps[i].width;
+            job.image.height = maps[i].height;
+            job.image.channels = 3;
+            job.image.data.resize((size_t)maps[i].width * maps[i].height * 3);
+            pano360_apply(maps[i], canvas.data(), o.eac.canvasW(), o.eac.canvasH(), 0,
+                          job.image.data.data());
+            t.convert += nn::now_ms() - t0;
+            job.path = (image_dir / o.views[i].dir /
+                        (std::string(stem) + (jpeg ? ".jpg" : ".png"))).string();
+            job.quality = o.quality;
+            if (sinks.preview)
+                sinks.preview(job.image.data.data(), job.image.width, job.image.height,
+                              job.path);
+            t0 = nn::now_ms();
+            pool.submit(std::move(job));
+            t.submit += nn::now_ms() - t0;
+            // Per view, not per frame: the count is what the progress bar is
+            // scaled against, and a plan writes six files here.
+            ++t.written;
         }
-        drain();
+        return true;
     };
+    return decode(want, false, on_frame);
+}
 
-    while (o.max_frames <= 0 || written < o.max_frames) {
-        if (sinks.cancel && sinks.cancel->load()) {
-            error = "cancelled";
-            drain();
-            return false;
-        }
-        Buffered b{};
-        const double t0 = nn::now_ms();
-        bool got = true;
-        for (int k = 0; k < 2 && got; k++) got = pipe[k].next(b.h[k], error);
-        t.decode += nn::now_ms() - t0;
-        if (!got) {
-            // One track ending first leaves the other's picture held; the pool
-            // is about to go out of scope either way, but release it anyway so
-            // a future caller can reopen without a full pool.
-            for (int k = 0; k < 2; k++)
-                if (b.h[k].valid()) pipe[k].release(b.h[k]);
-            drain();
-            return error.empty();   // end of stream
-        }
-        ++t.decoded;
-
-        b.index = b.h[0].index;
-        if (!clock.candidate(b.index)) {
-            release(b);
-            clock.skipped();
-            continue;
-        }
-        if (keep != 0) {
-            const double t1 = nn::now_ms();
-            for (int k = 0; k < 2; k++) pipe[k].queueSharpness(b.h[k]);
-            t.sharpness += nn::now_ms() - t1;
-            measured_pending = true;
-            ++t.measured;
-        }
-        window.push_back(b);
-        if ((int)window.size() > std::max(keep, 1)) {
-            release(window.front());
-            window.pop_front();
-        }
-        if (clock.step()) flush_window(true);
+// Every track of a multi-lens file at the same instants, one folder per
+// track: the rig the frames of one stem form is then a rig in fact.
+bool extract_synced(const FrameExtractJob& o, const FrameExtractSinks& sinks,
+                    const Decode& decode, const std::vector<int>& tracks,
+                    const fs::path& base, WriterPool& pool, FrameExtractStats& t) {
+    std::vector<fs::path> dirs;
+    for (size_t k = 0; k < tracks.size(); k++) {
+        dirs.push_back(base / ("cam" + std::to_string(k)));
+        fs::create_directories(dirs.back());
+        log_line(sinks, "track " + std::to_string(tracks[k]) + " -> " + dirs.back().string());
     }
-    flush_window(false);
-    return true;
+    const bool jpeg = o.quality >= 0 && o.quality <= 100;
+    auto on_frame = [&](std::vector<nn::Image>& imgs, int64_t index, std::string&) {
+        char stem[64];
+        std::snprintf(stem, sizeof(stem), "%05lld", (long long)index);
+        for (size_t k = 0; k < imgs.size(); k++) {
+            WriteJob job;
+            job.path = (dirs[k] / (std::string(stem) + (jpeg ? ".jpg" : ".png"))).string();
+            if (sinks.preview && imgs[k].channels == 3)
+                sinks.preview(imgs[k].data.data(), imgs[k].width, imgs[k].height, job.path);
+            job.quality = o.quality;
+            job.image = std::move(imgs[k]);
+            const double t0 = nn::now_ms();
+            pool.submit(std::move(job));
+            t.submit += nn::now_ms() - t0;
+            ++t.written;
+        }
+        return true;
+    };
+    return decode(tracks, true, on_frame);
 }
 
 }  // namespace
@@ -381,31 +299,10 @@ bool extract_pair(const FrameExtractJob& o, const FrameExtractSinks& sinks,
 // Entry points
 // ---------------------------------------------------------------------------
 
-std::string video_decode_availability() {
-    return video::VideoPipeline::availability();
-}
-
-int video_track_count(const std::string& path, std::string& error) {
-    // The demuxer alone: creating a video session per track just to count them
-    // would be several hundred megabytes of DPB for nothing.
-    auto demux = video::open_demuxer(path, error);
-    if (!demux) return 0;
-    return (int)demux->tracks().size();
-}
-
-std::vector<std::pair<int, int>> video_track_sizes(const std::string& path,
-                                                   std::string& error) {
-    std::vector<std::pair<int, int>> out;
-    auto demux = video::open_demuxer(path, error);
-    if (!demux) return out;
-    for (const video::TrackInfo& t : demux->tracks())
-        out.emplace_back(t.width, t.height);
-    return out;
-}
-
-bool extract_frames(const FrameExtractJob& job_in, const FrameExtractSinks& sinks,
+bool extract_frames(const FrameExtractJob& job_in, const FrameExtractSinks& sinks_in,
                     FrameExtractStats& stats, std::string& error) {
     FrameExtractJob job = job_in;
+    FrameExtractSinks sinks = sinks_in;
     if (job.skip < 1) job.skip = 1;
     if (job.keep < 0) job.keep = (int)(0.5 * job.skip + 0.5);
     if (job.rotate % 90 != 0) {
@@ -413,8 +310,27 @@ bool extract_frames(const FrameExtractJob& job_in, const FrameExtractSinks& sink
         return false;
     }
 
-    error = video_decode_availability();
-    if (!error.empty()) return false;
+    // Before the decoder probe, which creates the device and reports the video
+    // queue family this job then decodes on. Everything after -- decoder,
+    // Masker, Tracker -- inherits that identity.
+    if (!sam::freeze_device(job.device.empty() ? job.mask.device : job.device,
+                            error))
+        return false;
+    // Past this point the canonical UUID is what crosses into the decoder and
+    // the masker; an ordinal only ever meant something in the resolution that
+    // consumed it.
+    job.device = nn::configured_device_selector();
+    job.mask.device = job.device;
+
+    Decoder dec;
+    if (!pick_decoder(job, sinks, dec, error)) return false;
+    std::shared_ptr<const CubeLut> lut;
+    if (!job.lut.empty()) {
+        lut = cube_lut_cached(job.lut, error);
+        if (!lut) return false;
+        log_line(sinks, spirula::i18n::format(lmsg::video_lut_applied,
+                                              {lut_display_name(job.lut)}));
+    }
 
     const bool pano = job.eac.valid() && !job.views.empty();
     if (pano) {
@@ -433,19 +349,39 @@ bool extract_frames(const FrameExtractJob& job_in, const FrameExtractSinks& sink
             return false;
         }
     }
+    if (job.sync_tracks && !job.mask.model.empty()) {
+        error = "masking during extraction does not support synchronized tracks;"
+                " mask the extracted frames instead";
+        return false;
+    }
 
     std::vector<int> tracks;
     if (job.track >= 0) {
-        tracks.push_back(job.track);
-    } else {
-        const int n = video_track_count(job.input, error);
-        if (n <= 0) {
-            if (error.empty()) error = "no video track in " + job.input;
+        if (job.track >= (int)dec.sizes.size()) {
+            error = "no video track " + std::to_string(job.track) + " in " + job.input;
             return false;
         }
-        for (int i = 0; i < n; ++i) tracks.push_back(i);
+        tracks.push_back(job.track);
+    } else {
+        for (int i = 0; i < (int)dec.sizes.size(); ++i) tracks.push_back(i);
     }
     stats.tracks = (int)tracks.size();
+
+#ifdef SS_HAVE_VIDEO
+    // ffmpeg turns the picture by the container's matrix itself.
+    if (dec.builtin) {
+        bool mixed = false;
+        const sfm::ExifTransform turn =
+            fold_auto_rotate(job.input, tracks, job, mixed);
+        if (turn.turns_cw > 0) {
+            log_line(sinks, spirula::i18n::format(
+                                lmsg::video_autorotate,
+                                {(long long)(90 * turn.turns_cw)}));
+            if (mixed) log_line(sinks, lmsg::video_autorotate_mixed.get());
+        }
+        if (turn.mirror) log_line(sinks, lmsg::video_autorotate_mirror.get());
+    }
+#endif
 
     std::unique_ptr<sam::Masker> masker;
     if (!job.mask.model.empty()) {
@@ -464,11 +400,73 @@ bool extract_frames(const FrameExtractJob& job_in, const FrameExtractSinks& sink
 
     const double t_start = nn::now_ms();
     bool ok = true;
+    const bool synced = !pano && job.sync_tracks && tracks.size() > 1;
+    // A frame left out goes to skipped_dir through the same pool, in the same
+    // colours a kept one has. ffmpeg's are mapped here: its kept frames get
+    // the LUT on the way to the sink, which a frame left out never reaches.
+    if (!job.skipped_dir.empty() && !pano && tracks.size() == 1) {
+        fs::create_directories(job.skipped_dir);
+        const bool jpeg = job.quality >= 0 && job.quality <= 100;
+        const bool map = lut && !dec.builtin;
+        sinks.judged = [&, jpeg, map](const FramePick& p, const nn::Image& im) {
+            if (p.verdict != PickVerdict::Kept) {
+                char stem[64];
+                std::snprintf(stem, sizeof(stem), "%05lld", (long long)p.index);
+                WriteJob w;
+                w.image = im;
+                if (map) apply_cube_lut(*lut, w.image.data.data(), w.image.data.size() / 3);
+                w.path = (fs::path(job.skipped_dir) /
+                          (std::string(stem) + (jpeg ? ".jpg" : ".png"))).string();
+                w.quality = job.quality;
+                pool.submit(std::move(w));
+            }
+            if (sinks_in.judged) sinks_in.judged(p, im);
+        };
+    }
+    // One plan for the whole file, measured on its first track: the tracks of
+    // a rig see the same motion, and the ones that do not are still one camera
+    // moving through one scene.
+    std::vector<int64_t> plan = job.plan;
+    if (job.adaptive && plan.empty()) {
+        MotionPlanInput mi;
+        if (!measure_motion(job, sinks, dec, tracks[0], (int)tracks.size(), mi, stats,
+                            error))
+            return false;
+        std::vector<std::vector<int64_t>> got =
+            plan_by_motion({mi}, job.adaptive_range);
+        if (!got.empty()) plan = std::move(got[0]);
+        if (plan.empty()) {
+            error = "the capture is too short to space frames by motion";
+            return false;
+        }
+        report_plan(sinks, plan, mi.frames, mi.fps);
+    }
+
+    const Decode decode = [&](const std::vector<int>& tr, bool convert,
+                              const InstantSink& on_frame) {
+#ifdef SS_HAVE_VIDEO
+        // Mapped by the GPU conversion, before the 8-bit rounding.
+        if (dec.builtin)
+            return decode_lockstep_vulkan(job, sinks, tr, convert, plan, stats, error,
+                                          on_frame);
+#endif
+        // ffmpeg hands over 8-bit RGB that the window is scored on, so the LUT
+        // goes on the instants kept, where it cannot move the choice.
+        const InstantSink mapped = [&](std::vector<nn::Image>& imgs, int64_t index,
+                                       std::string& err) {
+            for (nn::Image& im : imgs) apply_cube_lut(*lut, im.data.data(), im.data.size() / 3);
+            return on_frame(imgs, index, err);
+        };
+        return decode_lockstep_ffmpeg(job, sinks, dec.facts, tr, convert, plan, stats,
+                                      error, lut ? mapped : on_frame);
+    };
     if (pano) {
         stats.tracks = 2;
-        ok = extract_pair(job, sinks, base, pool, stats, error);
+        ok = extract_pair(job, sinks, decode, dec, base, pool, stats, error);
+    } else if (synced) {
+        ok = extract_synced(job, sinks, decode, tracks, base, pool, stats);
     }
-    for (size_t ti = 0; ti < tracks.size() && ok && !pano; ++ti) {
+    for (size_t ti = 0; ti < tracks.size() && ok && !pano && !synced; ++ti) {
         // A multi-track file (an Insta360 .insv carries two fisheye streams)
         // becomes cam0/, cam1/, ... -- one camera per folder downstream.
         const bool multi = tracks.size() > 1;
@@ -478,8 +476,8 @@ bool extract_frames(const FrameExtractJob& job_in, const FrameExtractSinks& sink
         if (multi)
             log_line(sinks, "track " + std::to_string(tracks[ti]) + " -> " +
                                 image_dir.string());
-        ok = extract_track(job, sinks, tracks[ti], image_dir, mask_dir, masker.get(),
-                           pool, stats, error);
+        ok = extract_track(job, sinks, decode, tracks[ti], image_dir, mask_dir,
+                           masker.get(), pool, stats);
     }
 
     const double t_drain = nn::now_ms();
@@ -488,6 +486,12 @@ bool extract_frames(const FrameExtractJob& job_in, const FrameExtractSinks& sink
     stats.total = nn::now_ms() - t_start;
     stats.encode_cpu = pool.busyMs();
     stats.write_failures = pool.failures();
+    if (stats.blurry > 0)
+        log_line(sinks, spirula::i18n::format(lmsg::blurry_skipped,
+                                              {(long long)stats.blurry}));
+    if (stats.similar > 0)
+        log_line(sinks, spirula::i18n::format(lmsg::similar_skipped,
+                                              {(long long)stats.similar}));
     return ok;
 }
 
@@ -524,10 +528,16 @@ std::string format_extract_stats(const FrameExtractStats& s,
     rows.push_back({dmsg::xs_written.get(),
                     format(dmsg::xs_written_to,
                            {(long long)s.written, out_dir}), false});
+    if (s.analyzed > 0)
+        rows.push_back({dmsg::xs_analyzed.get(),
+                        std::to_string((long long)s.analyzed), false});
     rows.push_back({dmsg::xs_decode.get(),
                     format(dmsg::xs_ms_fps,
                            {ms(s.decode), rate((double)s.decoded, s.decode)}),
                     true});
+    if (s.plan > 0)
+        rows.push_back({dmsg::xs_motion.get(),
+                        format(dmsg::xs_ms, {ms(s.plan)}), false});
     rows.push_back({dmsg::xs_sharpness.get(),
                     format(dmsg::xs_ms, {ms(s.sharpness)}), false});
     rows.push_back({dmsg::xs_convert.get(),

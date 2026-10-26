@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <exception>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -43,6 +44,7 @@
 #include "sfm/core/Features.h"
 #include "sfm/core/Matches.h"
 #include "sfm/core/Model.h"
+#include "sfm/core/PriorSource.h"
 #include "sfm/map/Mapper.h"
 #include "sfm/vk/VkContext.h"
 #include "sfm/core/Log.h"
@@ -103,6 +105,9 @@ struct SubDatabase {
     std::vector<FeatureSet> feats;
     std::vector<uint32_t> cam_ids;   // per local image, the *global* camera id
     std::vector<uint32_t> to_global; // local id -> database id
+    RigTable rigs;                   // the run's rigs over the local ids
+    SequenceTable seqs;              // ... and its sequences
+    std::unique_ptr<RemappedPriorSource> priors;   // ... and its sensor priors
 };
 
 // `adj[i]` = indices into db.pairs of every pair image i takes part in. Built
@@ -132,7 +137,8 @@ inline SubDatabase carveAtom(const MatchesDatabase& db, const std::vector<Featur
                              const std::vector<uint32_t>& cam_ids,
                              const std::vector<std::vector<uint32_t>>& adj,
                              const std::vector<uint32_t>& images,
-                             std::vector<uint32_t>& local) {
+                             std::vector<uint32_t>& local, const RigTable* rigs = nullptr,
+                             const SequenceTable* seqs = nullptr, PriorSource* priors = nullptr) {
     SubDatabase s;
     s.to_global = images;
     std::sort(s.to_global.begin(), s.to_global.end());
@@ -174,6 +180,9 @@ inline SubDatabase carveAtom(const MatchesDatabase& db, const std::vector<Featur
             s.db.pairs.back().image2 = local[p.image2];
         }
     }
+    if (rigs) s.rigs = rigs->subset(local, s.to_global.size());
+    if (seqs) s.seqs = seqs->subset(local, s.to_global.size());
+    if (priors) s.priors = std::make_unique<RemappedPriorSource>(*priors, s.to_global);
     for (uint32_t g : s.to_global) local[g] = UINT32_MAX;
     return s;
 }
@@ -203,7 +212,9 @@ inline std::vector<Reconstruction> reconstructAtoms(
     const MatchesDatabase& db, const std::vector<FeatureSet>& feats,
     const MapperOptions& base, const std::vector<uint32_t>& cam_ids,
     const std::map<uint32_t, Camera>& start_cams,
-    const std::vector<std::vector<uint32_t>>& atoms, const AtomOptions& opt, AtomStats& st) {
+    const std::vector<std::vector<uint32_t>>& atoms, const AtomOptions& opt, AtomStats& st,
+    const RigTable* rigs = nullptr, const SequenceTable* seqs = nullptr,
+    PriorSource* priors = nullptr) {
     const auto t0 = std::chrono::steady_clock::now();
     st.atoms = atoms.size();
 
@@ -261,8 +272,9 @@ inline std::vector<Reconstruction> reconstructAtoms(
             std::vector<uint32_t> local(db.images.size(), UINT32_MAX);
             for (size_t i = next++; i < atoms.size(); i = next++) {
                 detail::SubDatabase sub =
-                    detail::carveAtom(db, feats, cam_ids, adj, atoms[i], local);
-                Mapper m(sub.db, sub.feats, mo, sub.cam_ids);
+                    detail::carveAtom(db, feats, cam_ids, adj, atoms[i], local, rigs, seqs, priors);
+                Mapper m(sub.db, sub.feats, mo, sub.cam_ids, rigs ? &sub.rigs : nullptr,
+                         seqs ? &sub.seqs : nullptr, sub.priors.get());
                 m.useBaContext(&ctx);
                 uint32_t reg = 0;
                 for (Reconstruction& r : m.run()) {

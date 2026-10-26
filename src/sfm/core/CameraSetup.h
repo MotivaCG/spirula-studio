@@ -65,6 +65,7 @@ struct CameraOverride {
     // (sfm/core/Camera.h packIntrinsics). Empty = start at zero.
     bool has_extra = false;
     std::vector<double> extra;
+    std::vector<double> params;
 };
 
 // Which of the three per-group settings a `PREFIX=VALUE` argument carries.
@@ -141,6 +142,7 @@ struct CameraSetupOptions {
     // the group starts at Camera::defaultFor's geometric guess.
     CamModel model = CamModel::OpenCV;
     double focal = 0;
+    std::vector<double> params;
     // Dataset-wide starting distortion, in the model's BA order; a group an
     // override names uses that instead. Empty = start at zero, as COLMAP does.
     std::vector<double> extra;
@@ -456,8 +458,18 @@ inline CameraSetup buildCameras(const std::vector<ImageEntry>& images,
             given = true;
         }
         out.cameras[id] = Camera::defaultFor(id, feats[i].width, feats[i].height, focal, model);
+        const auto& params = ovr && !ovr->params.empty() ? ovr->params
+                            : model == opt.model ? opt.params : std::vector<double>{};
+        if (!params.empty()) {
+            unpackColmap(out.cameras[id], params.data());
+            if (ovr && ovr->has_focal) out.cameras[id].setFocal(ovr->focal);
+            else if (opt.focal > 0 && !(ovr && !ovr->params.empty()))
+                out.cameras[id].setFocal(opt.focal);
+            given = known = true;
+        }
         if (ovr && ovr->has_extra) setExtraParams(out.cameras[id], ovr->extra);
-        else if (!opt.extra.empty()) setExtraParams(out.cameras[id], opt.extra);
+        else if (!opt.extra.empty() && !(ovr && !ovr->params.empty()))
+            setExtraParams(out.cameras[id], opt.extra);
         // A spherical camera has no focal length: the image dimensions are the
         // calibration, exactly, so it counts as known however the run was
         // invoked. That is what keeps both focal searches (the two-view one
@@ -487,9 +499,11 @@ inline CameraSetup buildCameras(const std::vector<ImageEntry>& images,
 inline void storeCameraSetup(MatchesDatabase& db, const CameraSetup& cs) {
     db.cameras.clear();
     db.focal_prior.clear();
+    db.focal_measured.clear();
     for (const auto& kv : cs.cameras) {
         db.cameras.push_back(kv.second);
         db.focal_prior.push_back(cs.focal_known.count(kv.first) ? 1 : 0);
+        db.focal_measured.push_back(cs.focal_measured.count(kv.first) ? 1 : 0);
     }
     db.camera_ids = cs.ids;
 }
@@ -503,6 +517,14 @@ inline bool loadCameraSetup(const MatchesDatabase& db, CameraSetup& cs) {
         const Camera& cam = db.cameras[i];
         cs.cameras[cam.id] = cam;
         const bool prior = i < db.focal_prior.size() && db.focal_prior[i];
+        // A focal the two-view stage measured is deliberately NOT `given`: the
+        // mapper still probes and refines it, and a reader that promoted it
+        // would reconstruct differently from the run that wrote the file.
+        if (i < db.focal_measured.size() && db.focal_measured[i]) {
+            cs.focal_measured.insert(cam.id);
+            cs.focal_known.insert(cam.id);
+            continue;
+        }
         // A focal that differs from the geometric default was measured -- by the
         // two-view search, by EXIF, or by hand -- and the search has nothing to
         // add to it. One that does not is still a guess, and is reported as one.
