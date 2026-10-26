@@ -4282,6 +4282,19 @@ SS_MSG_EN(temporal_init_dir_help,
     "Folder of frames/NNN/splat.ply, one per frame of the chunk, same rows: every "
     "frame starts from its own file, scale and SH included and kept per frame, to "
     "refine a finished chunk (no window, no births).");
+SS_MSG_EN(spacetime_init, "Train the chunk in spacetime");
+SS_MSG_EN(spacetime_init_help,
+    "A finished chunk run (frames/NNN/splat.ply and birth_events.tsv) to start from: "
+    "each of its records becomes one splat with a trajectory over the whole chunk "
+    "(position, rotation and base colour as splines, opacity within a soft life "
+    "window), trained on every frame's views at once. Needs --temporal-frames.");
+SS_MSG_EN(spacetime_window_lr, "Life window rate");
+SS_MSG_EN(spacetime_window_lr_help,
+    "How fast each record's first and last frame move, in frames per step.");
+SS_MSG_EN(spacetime_batch, "Views per record step");
+SS_MSG_EN(spacetime_batch_help,
+    "Views whose gradients one update of the records averages: one view a step is "
+    "too noisy for a record seen from every frame.");
 SS_MSG_EN(temporal_room_ply, "Static room");
 SS_MSG_EN(temporal_room_ply_help,
     "A PLY of everything around the subject, loaded before the seed: rendered and "

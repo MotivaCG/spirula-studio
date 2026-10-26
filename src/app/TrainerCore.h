@@ -25,6 +25,7 @@
 #include "core/ColorSpace.h"
 #include "data/DatasetParser.h"
 #include "app/TemporalInputs.h"
+#include "engine/EngineSpacetime.h"
 #include "data/Region.h"
 #include "app/webviewer/RenderWorker.h"
 #include "config/TrainConfig.h"
@@ -119,6 +120,10 @@ SeedSplats seed_splats(const ColmapPoints3D& pts, const TrainConfig& cfg,
 // relative_scale, splat gamut). The PLY must be in this run's training frame.
 SeedSplats seed_splats_from_ply(const std::string& path, const TrainConfig& cfg,
                                 const ColorResolution& color);
+
+// Moves the first `rows` vertices of a binary PLY of floats into `to` (chunk frames:
+// the room's rows into frames/room.ply).
+void split_ply(const std::filesystem::path& from, const std::filesystem::path& to, int64_t rows);
 
 // The dataset's own seeds appended after the PLY's (--init-ply-add-points), so
 // the warm start covers what the source model has and the point cloud covers
@@ -373,11 +378,12 @@ private:
     // Seconds per step over the window, or -1 while it is empty.
     double avg_step_latency() const;
 
-    // The engine's DataManager over these files, with every other input from ds.
+    // The engine's DataManager over these files, with every other input from ds;
+    // frames > 1: the files of that many frames back to back, ds's cameras each.
     void install_data_manager(const std::vector<std::string>& images,
                               const std::vector<std::string>& masks,
                               const std::vector<std::string>& depths,
-                              const std::vector<std::string>& normals);
+                              const std::vector<std::string>& normals, int frames = 1);
     // Chunk training (cfg.temporal_frames), defined in TrainerChunk.cpp: one
     // DataManager per frame, the splats cloned into each.
     void configure_chunk();
@@ -387,6 +393,13 @@ private:
     void chunk_after_step(int step);
     void eval_chunk();
     void install_frame_data(int frame);
+    std::vector<std::string> frame_files(const std::vector<std::string>& files, int frame) const;
+    // Spacetime training (cfg.spacetime_init), defined in TrainerSpacetime.cpp.
+    bool spacetime() const;
+    SeedSplats spacetime_seed(const ColorResolution& color, size_t cap);
+    void setup_spacetime();
+    void save_spacetime(int step);
+    SpacetimeRecords _spacetime;  // fitted by spacetime_seed, until the engine takes them
     void advance_window(int step);
     int first_frame_steps() const {
         if (continues()) return 0;  // held, see setup_chunk

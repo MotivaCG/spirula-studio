@@ -238,7 +238,7 @@ inline bool train_choices_free_form(const char* choices) {
     X(float, temporal_spare, 0.0f, "splats", "expert", "")                   \
     X(bool, temporal_lock_shared, false, "splats", "advanced", "")           \
     X(std::string, temporal_init_dir, "", "splats", "advanced", "none")      \
-    X(std::string, temporal_room_ply, "", "splats", "advanced", "none")      \
+    X(std::string, temporal_room_ply, "", "splats", "advanced", "none")          X(std::string, spacetime_init, "", "splats", "advanced", "none")             X(float, spacetime_window_lr, 0.02f, "splats", "expert", "")                 X(int, spacetime_batch, 4, "splats", "expert", "")                       \
     X(bool, background_match_luminance, false, "splats", "advanced", "")     \
     X(float, viewer_kernel_fraction, 0.3f, "splats", "advanced", "")         \
     X(std::optional<float>, scale_init, 0.35f, "splats", "advanced", "") \

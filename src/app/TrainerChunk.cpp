@@ -44,6 +44,8 @@ void TrainerSession::configure_chunk() {
         throw std::runtime_error("--temporal-frames cannot be resumed");
     if (continues() && cfg.temporal_window <= 0)
         throw std::runtime_error("--temporal-continue needs --temporal-window");
+    if (spacetime() && (cfg.temporal_window > 0 || continues()))
+        throw std::runtime_error("--spacetime-init trains the chunk whole: no window, no continue");
     // Every frame shares one population and one optimizer layout: no
     // densification, full-precision Adam state.
     cfg.quantization_level = 0;
@@ -58,6 +60,16 @@ void TrainerSession::configure_chunk() {
     }
     cfg.refine_start_iter = cfg.num_iterations + 1;
     cfg.export_keep_all_splats = true;
+    // Spacetime chains the engine's per-frame gradients to the records: the
+    // unfused optimizer leaves them in engine().grad, one view a step.
+    if (spacetime()) {
+        cfg.use_fused_proj_bwd_optim = false;
+        // Scale and SH come converged from the chunk run and .vgs keeps them per
+        // record; trained one view a step they cost 0.56 dB (battery ST).
+        cfg.scales_lr = 0.0f;
+        cfg.scales_lr_final = 0.0f;
+        cfg.features_sh_lr = 0.0f;
+    }
     log("chunk training over " + std::to_string(_chunk_dirs.size()) + " frames");
 }
 
@@ -85,9 +97,15 @@ static SeedSplats with_spare(SeedSplats seed, float fraction) {
 SeedSplats TrainerSession::with_room(SeedSplats seed, const ColorResolution& color) {
     _room_rows = 0;
     if (_chunk_dirs.size() < 2) return seed;
-    const float spare = continues() ? 0.0f : cfg.temporal_spare;
-    if (unset(cfg.temporal_room_ply)) return with_spare(std::move(seed), spare);
-    const SeedSplats room = seed_splats_from_ply(cfg.temporal_room_ply, cfg, color);
+    const float spare = continues() || spacetime() ? 0.0f : cfg.temporal_spare;
+    // Spacetime starts from the chunk run's room as it trained, not the one it
+    // started from: frozen untrained, it cost the subject its colour (battery ST).
+    const fs::path trained = fs::path(cfg.spacetime_init) / "frames" / "room.ply";
+    const std::string room_ply = spacetime() && fs::exists(trained) ? trained.string() : cfg.temporal_room_ply;
+    const SeedSplats room = unset(room_ply) ? SeedSplats{} : seed_splats_from_ply(room_ply, cfg, color);
+    _room_rows = room.num;
+    if (spacetime()) seed = spacetime_seed(color, seed.opacities.size());
+    if (unset(room_ply)) return with_spare(std::move(seed), spare);
     const size_t cap = seed.opacities.size();
     if ((size_t)(room.num + seed.num) > cap)
         throw std::runtime_error("--temporal-room-ply: the room and the seed exceed cap_max");
@@ -105,14 +123,12 @@ SeedSplats TrainerSession::with_room(SeedSplats seed, const ColorResolution& col
     place(out.features_dc, room.features_dc, seed.features_dc);
     place(out.features_sh, room.features_sh, seed.features_sh);
     out.num = room.num + seed.num;
-    _room_rows = room.num;
     log("chunk: a static room of " + std::to_string(room.num) + " splats before the seed's " +
         std::to_string(seed.num));
     return with_spare(std::move(out), spare);
 }
 
-// Moves the first `rows` vertices of a binary PLY of floats into `to`.
-static void split_ply(const fs::path& from, const fs::path& to, int64_t rows) {
+void split_ply(const fs::path& from, const fs::path& to, int64_t rows) {
     std::ifstream in(from, std::ios::binary);
     std::string header, line;
     int64_t count = -1, columns = 0;
@@ -144,32 +160,35 @@ static void split_ply(const fs::path& from, const fs::path& to, int64_t rows) {
 
 // Frame k's files are frame 0's with the dataset root swapped: the cameras are
 // shared, so only the pixels differ.
-void TrainerSession::install_frame_data(int frame) {
+std::vector<std::string> TrainerSession::frame_files(const std::vector<std::string>& files,
+                                                     int frame) const {
     const fs::path root = fs::path(cfg.data);
     const std::string& dir = _chunk_dirs[(size_t)frame];
-    auto remap = [&](const std::vector<std::string>& files) {
-        std::vector<std::string> out;
-        out.reserve(files.size());
-        for (const std::string& f : files) {
-            if (f.empty()) { out.push_back(f); continue; }
-            const fs::path p(f);
-            const fs::path rel = p.is_absolute() ? p.lexically_relative(root) : p;
-            if (rel.empty() || *rel.begin() == "..")
-                throw std::runtime_error("chunk training: " + f + " is outside --data");
-            const fs::path mapped = fs::path(dir) / rel;
-            if (!fs::exists(mapped))
-                throw std::runtime_error("chunk training: missing " + mapped.string());
-            out.push_back(mapped.string());
-        }
-        return out;
-    };
-    install_data_manager(remap(ds.image_filenames),
-                         has_mask ? remap(ds.mask_filenames) : ds.mask_filenames,
-                         has_depth ? remap(ds.depth_filenames) : ds.depth_filenames,
-                         has_normal ? remap(ds.normal_filenames) : ds.normal_filenames);
+    std::vector<std::string> out;
+    out.reserve(files.size());
+    for (const std::string& f : files) {
+        if (f.empty()) { out.push_back(f); continue; }
+        const fs::path p(f);
+        const fs::path rel = p.is_absolute() ? p.lexically_relative(root) : p;
+        if (rel.empty() || *rel.begin() == "..")
+            throw std::runtime_error("chunk training: " + f + " is outside --data");
+        const fs::path mapped = fs::path(dir) / rel;
+        if (!fs::exists(mapped))
+            throw std::runtime_error("chunk training: missing " + mapped.string());
+        out.push_back(mapped.string());
+    }
+    return out;
+}
+
+void TrainerSession::install_frame_data(int frame) {
+    install_data_manager(frame_files(ds.image_filenames, frame),
+                         has_mask ? frame_files(ds.mask_filenames, frame) : ds.mask_filenames,
+                         has_depth ? frame_files(ds.depth_filenames, frame) : ds.depth_filenames,
+                         has_normal ? frame_files(ds.normal_filenames, frame) : ds.normal_filenames);
 }
 
 void TrainerSession::setup_chunk() {
+    if (spacetime()) return setup_spacetime();
     const int frames = cfg.temporal_window > 0 ? 1 : (int)_chunk_dirs.size();
     const bool whole_frames = !unset(cfg.temporal_init_dir);
     if (whole_frames && cfg.temporal_window > 0)

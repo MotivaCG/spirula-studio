@@ -17,6 +17,7 @@
 #include "data/DataManager.h"
 #include "engine/Engine.h"
 #include "engine/EngineInternal.h"
+#include "engine/EngineSpacetime.h"  // SMN
 #include "engine/EngineState.h"
 #include "i18n/catalog/Log.h"
 
@@ -342,6 +343,7 @@ std::map<std::string, float> engine_train_step_managed(
         std::chrono::duration<double>(std::chrono::steady_clock::now() - wait_start).count();
     if (stp.subs.empty())
         throw std::runtime_error("engine_train_step_managed: empty training step");
+    engine_spacetime_before_step(stp);  // SMN: the records at the views' frame
 
     if (cfg.loss.luminance_normalization > 0.0f)
         _normalize_weights_by_luminance(cfg.loss, stp, cfg.loss.luminance_normalization);
@@ -361,7 +363,7 @@ std::map<std::string, float> engine_train_step_managed(
         int K = b.K;
         for (int j = 0; j < b.input_num; ++j) {
             int32_t off = b.post_offsets[j];
-            for (int k = 0; k < K; ++k) buf[(size_t)j * K + k] = off + k;
+            for (int k = 0; k < K; ++k) buf[(size_t)j * K + k] = engine_spacetime_camera(off + k);  // SMN
         }
     };
 

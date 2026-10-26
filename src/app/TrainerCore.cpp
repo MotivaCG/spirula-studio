@@ -1497,10 +1497,10 @@ void TrainerSession::setup_engine() {
 void TrainerSession::install_data_manager(const std::vector<std::string>& images,
                                           const std::vector<std::string>& masks,
                                           const std::vector<std::string>& depths,
-                                          const std::vector<std::string>& normals) {
+                                          const std::vector<std::string>& normals, int frames) {
     const int64_t N = ds.num_cameras;
-    int64_t num_val = (int64_t)ds.val_indices.size();
-    int64_t num_train = N - num_val;
+    int64_t num_val = (int64_t)ds.val_indices.size() * frames;
+    int64_t num_train = N * frames - num_val;
     // Batch-size policy.
     double n_batch = std::max((double)num_train / std::max(cfg.max_batch_per_epoch, 1), 1.0);
     int train_bs = std::max(1, (int)(n_batch + 0.5));
@@ -1518,6 +1518,7 @@ void TrainerSession::install_data_manager(const std::vector<std::string>& images
         log(lfmt(lmsg::batch_from_renders,
                  {(double)v_q, (long long)bs_old, (long long)train_bs}));
     }
+    if (frames > 1) train_bs = 1;  // a step's views must share a frame
     _batches_per_epoch = (int)std::max<int64_t>(1, (num_train + train_bs - 1) / train_bs);
     int val_bs = 1;
     if (num_val > 0)
@@ -1534,9 +1535,15 @@ void TrainerSession::install_data_manager(const std::vector<std::string>& images
     dm.train_batch_size = train_bs;
     dm.val_batch_size   = val_bs;
     dm.flip_mask = cfg.flip_mask;
-    set_alpha_config(dm, alpha_images);
+    // Per-camera inputs repeated for each frame; view indices shifted by N a frame.
+    auto tile = [frames](auto v) {
+        const size_t n = v.size();
+        for (int f = 1; f < frames; f++) v.insert(v.end(), v.begin(), v.begin() + (std::ptrdiff_t)n);
+        return v;
+    };
+    set_alpha_config(dm, tile(alpha_images));
     dm.mask_boundary_offset = cfg.mask_boundary_offset;
-    dm.exif_quarter_turns = ds.exif_quarter_turns;
+    dm.exif_quarter_turns = tile(ds.exif_quarter_turns);
     dm.deficit_sampling  = cfg.view_sampling == "deficit";
     dm.deficit_power     = cfg.view_deficit_power;
     dm.deficit_max_ratio = cfg.view_deficit_max_ratio;
@@ -1553,28 +1560,41 @@ void TrainerSession::install_data_manager(const std::vector<std::string>& images
             log(divisor > 1 ? lfmt(lmsg::progressive_stage, {(long long)divisor, (long long)from})
                             : lfmt(lmsg::progressive_stage_full, {(long long)from}));
     }
-    if (_chunk_dirs.size() > 1) {
+#ifdef SS_SPACETIME_DECODED_CACHE
+    // Every frame's images decoded once and held in RAM (~29 GB for 32 frames of
+    // 101 1296x2304 views): no decoding while training. Off: they stream from disk.
+    if (frames > 1) dm.cache_mode = CacheMode::CPU;
+#endif
+    if (_chunk_dirs.size() > 1 && frames == 1) {
         // One decoder pool per frame: the defaults would start 32 threads each.
         dm.workers_rgb = 4;
         dm.workers_depth = dm.workers_normal = 2;
         dm.prefetch_batches = 2;
     }
+    if (frames > 1 && post.any_warp)
+        throw std::runtime_error("spacetime training: split (warped) cameras are not supported");
+    auto shift = [&](std::vector<int32_t> v) {
+        const size_t n = v.size();
+        for (int f = 1; f < frames; f++)
+            for (size_t i = 0; i < n; i++) v.push_back(v[i] + (int32_t)(f * N));
+        return v;
+    };
     engine_setup_data_manager(
-        dm, ds.camera_models, ds.camera_distortions,
+        dm, tile(ds.camera_models), tile(ds.camera_distortions),
         images,
         has_mask ? masks : std::vector<std::string>{},
         has_depth ? depths : std::vector<std::string>{},
         has_normal ? normals : std::vector<std::string>{},
-        ds.widths, ds.heights,
+        tile(ds.widths), tile(ds.heights),
         post.any_warp ? post.K_per_camera : std::vector<int32_t>{},
         post.any_warp ? post.post_offsets : std::vector<int32_t>{},
-        post.viewmats, post.intrins, post.dist_coeffs,
+        tile(post.viewmats), tile(post.intrins), tile(post.dist_coeffs),
         post.any_warp ? post.post_widths : std::vector<int32_t>{},
         post.any_warp ? post.post_heights : std::vector<int32_t>{},
         post.any_warp ? post.face_axes : std::vector<float>{},
-        post.input_intrins, post.input_dist_coeffs,
-        post.redistort_models, post.redistort_params,
-        ds.train_indices, ds.val_indices);
+        tile(post.input_intrins), tile(post.input_dist_coeffs),
+        tile(post.redistort_models), tile(post.redistort_params),
+        shift(ds.train_indices), shift(ds.val_indices));
     engine_set_view_stats(dm.deficit_sampling);
 }
 
@@ -1647,6 +1667,10 @@ void TrainerSession::save_checkpoint(int step, bool full) {
         save_chunk(step);
         return;
     }
+    if (engine_spacetime_active()) {
+        save_spacetime(step);
+        return;
+    }
     char name[32];
     std::snprintf(name, sizeof name, "step-%09d.ckpt", step);
     fs::path ckpt = out_dir / name;
@@ -1670,7 +1694,7 @@ void TrainerSession::save_checkpoint(int step, bool full) {
 void TrainerSession::maybe_boost_opacity(int step) {
     const float k = cfg.opacity_boost.value_or(1.0f);
     // A chunk's live splats are the frame trained that step: boosted, one frame jumped.
-    if (k <= 1.0f || engine_temporal_active()) return;
+    if (k <= 1.0f || engine_temporal_active() || engine_spacetime_active()) return;
     const int marks[] = {(int)(0.40f * cfg.num_iterations),
                          (int)(0.85f * cfg.num_iterations)};
     if (step != marks[0] && step != marks[1]) return;
@@ -1709,6 +1733,9 @@ std::map<std::string, float> TrainerSession::train_step(int step) {
         throw std::runtime_error("GPU backend error at step " +
                                  std::to_string(step) + ": " + err);
     if (engine_temporal_active()) chunk_after_step(step);
+    if (engine_spacetime_active())
+        engine_spacetime_after_step({sc.optim.lr_means, sc.optim.lr_quats, sc.optim.lr_features_dc,
+                                     sc.optim.lr_opacities, cfg.spacetime_window_lr, cfg.spacetime_batch});
 
     // Divergence never recovers, and the run otherwise continues in silence to
     // a black render and a checkpoint with zero splats. Reported values sit
@@ -2079,6 +2106,7 @@ void TrainerSession::eval(const std::function<void(const EvalProgress&)>& on_pro
         eval_chunk();
         return;
     }
+    if (engine_spacetime_active()) return;  // the frames are scored from their PLYs
     eval_frame(cfg.data, out_dir / "metrics.json", on_progress);
 }
 
