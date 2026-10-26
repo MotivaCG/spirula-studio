@@ -12,14 +12,14 @@ sys.path.insert(0, PROBE); sys.path.insert(0, HERE)
 import flicker_lib as fl
 import hull
 
-WORK = "C:/Users/Victor/Documents/Gracia4DGSConverter/VIDEOTIKI/output/.work"
+WORK = os.environ.get("TC_WORK", "C:/Users/Victor/Documents/Gracia4DGSConverter/VIDEOTIKI/output/.work")
 FRAMES = list(range(45, 51))
 
 
 def set_frames(first, last):
     global FRAMES
     FRAMES[:] = list(range(first, last + 1))
-frame_dir = lambda f: f"{WORK}/000000{f}/undistorted"
+frame_dir = lambda f: f"{WORK}/{f:08d}/undistorted"
 LUMA = fl.LUMA
 
 

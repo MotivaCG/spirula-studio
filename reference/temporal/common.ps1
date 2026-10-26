@@ -1,10 +1,11 @@
 # Shared settings for the chunk-training experiments on VIDEOTIKI frames 45-50.
 $Take = "C:/Users/Victor/Documents/Gracia4DGSConverter/VIDEOTIKI/output"
-$Work = "$Take/.work"
+# TC_WORK: another take's prepared frames (same cameras), e.g. a Forge run kept with -graciakeepwork.
+$Work = if ($env:TC_WORK) { $env:TC_WORK } else { "$Take/.work" }
 $Out = "D:/Dependencias/spirula-studio/outputs/tc"
 # Experiments run a copy, so build_tc can be rebuilt while one is running.
 $Exe = "$Out/bin/spirula.exe"
-function FrameDir($f) { "$Work/000000$f/undistorted" }
+function FrameDir($f) { "$Work/{0:d8}/undistorted" -f $f }
 function ForgeCkpt($f) { (Get-ChildItem (FrameDir $f) -Recurse -Directory -Filter "step-*.ckpt" | Sort-Object Name | Select-Object -Last 1).FullName }
 # Forge's per-frame flags (depth/normal files exist for frame 45 only, so off).
 $Common = @(
