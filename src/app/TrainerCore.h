@@ -399,6 +399,7 @@ private:
     SeedSplats spacetime_seed(const ColorResolution& color, size_t cap);
     void setup_spacetime();
     void save_spacetime(int step);
+    void spacetime_after_step(int step, const EngineStepConfig& sc);
     SpacetimeRecords _spacetime;  // fitted by spacetime_seed, until the engine takes them
     void advance_window(int step);
     int first_frame_steps() const {

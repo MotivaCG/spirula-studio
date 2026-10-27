@@ -116,6 +116,10 @@ SeedSplats TrainerSession::spacetime_seed(const ColorResolution& color, size_t c
             if (first >= 0) records.push_back({r, first, last});
         }
     }
+    // --spacetime-spare: records shown nowhere, copies of the first ones, for relocation.
+    const size_t real = records.size();
+    const size_t spare = (size_t)(cfg.spacetime_spare * (float)real);
+    for (size_t j = 0; j < spare; j++) records.push_back(records[j % real]);
     if (records.size() + (size_t)_room_rows > cap)
         throw std::runtime_error("--spacetime-init: " + std::to_string(records.size()) +
                                  " records and the room exceed cap_max");
@@ -126,7 +130,7 @@ SeedSplats TrainerSession::spacetime_seed(const ColorResolution& color, size_t c
     st.pos.assign(n * kSpacetimePos * 3, 0.0f);
     st.rot.assign(n * kSpacetimeRot * 4, 0.0f);
     st.color.assign(n * kSpacetimeColor * 3, 0.0f);
-    st.opacity.assign(n, 0.0f);
+    st.opacity.assign(n * kSpacetimeOpacity, 0.0f);
     st.window.assign(2 * n, 0.0f);
     SeedSplats seed;
     seed.num = (int64_t)n;
@@ -138,12 +142,11 @@ SeedSplats TrainerSession::spacetime_seed(const ColorResolution& color, size_t c
     seed.features_sh.assign(sh * cap, 0.0f);
     nn::parallel_for((int64_t)n, [&](int64_t lo, int64_t hi) {
         std::vector<int> at;
-        std::vector<float> x, q, c;
+        std::vector<float> x, q, c, o;
         for (int64_t i = lo; i < hi; i++) {
             const Record& rec = records[(size_t)i];
             const size_t r = (size_t)rec.row;
-            at.clear(), x.clear(), q.clear(), c.clear();
-            float alpha = 0.0f;
+            at.clear(), x.clear(), q.clear(), c.clear(), o.clear();
             const float* q0 = frames[rec.first].quats.data() + 4 * r;
             for (int f = rec.first; f <= rec.last; f++) {
                 const SeedSplats& s = frames[f];
@@ -155,13 +158,12 @@ SeedSplats TrainerSession::spacetime_seed(const ColorResolution& color, size_t c
                 const float* qf = &s.quats[4 * r];
                 const float dot = qf[0] * q0[0] + qf[1] * q0[1] + qf[2] * q0[2] + qf[3] * q0[3];
                 for (int k = 0; k < 4; k++) q.push_back(dot < 0.0f ? -qf[k] : qf[k]);
-                alpha += 1.0f / (1.0f + std::exp(-s.opacities[r]));
+                o.push_back(std::clamp(s.opacities[r], -9.0f, 9.0f));
             }
             fit_spline(kSpacetimePos, F, at, x, 3, st.pos.data() + (size_t)i * kSpacetimePos * 3);
             fit_spline(kSpacetimeRot, F, at, q, 4, st.rot.data() + (size_t)i * kSpacetimeRot * 4);
             fit_spline(kSpacetimeColor, F, at, c, 3, st.color.data() + (size_t)i * kSpacetimeColor * 3);
-            alpha = std::clamp(alpha / (float)at.size(), 0.01f, 0.99f);
-            st.opacity[(size_t)i] = std::log(alpha / (1.0f - alpha));
+            fit_spline(kSpacetimeOpacity, F, at, o, 1, st.opacity.data() + (size_t)i * kSpacetimeOpacity);
             st.window[2 * (size_t)i] = rec.first == 0 ? -3.0f : (float)rec.first - 0.5f;
             st.window[2 * (size_t)i + 1] = rec.last == F - 1 ? (float)F + 2.0f : (float)rec.last + 0.5f;
             const SeedSplats& s = frames[rec.first];
@@ -173,8 +175,12 @@ SeedSplats TrainerSession::spacetime_seed(const ColorResolution& color, size_t c
             std::copy_n(&s.features_sh[sh * r], sh, &seed.features_sh[sh * (size_t)i]);
         }
     });
-    log("spacetime: " + std::to_string(n) + " records from " + std::to_string(R) + " rows of " +
-        cfg.spacetime_init);
+    for (size_t i = real; i < n; i++) {
+        std::fill_n(st.opacity.data() + i * kSpacetimeOpacity, kSpacetimeOpacity, -20.0f);
+        seed.opacities[i] = -20.0f;
+    }
+    log("spacetime: " + std::to_string(real) + " records from " + std::to_string(R) + " rows of " +
+        cfg.spacetime_init + ", " + std::to_string(n - real) + " spare");
     return seed;
 }
 
@@ -208,13 +214,30 @@ void TrainerSession::save_spacetime(int step) {
     for (int f = 0; f < F; f++) {
         char name[32];
         std::snprintf(name, sizeof name, "%03d", f);
-        engine_spacetime_set_frame(f);
+        engine_spacetime_set_frame(f, true);
         engine_save_checkpoint((out_dir / "frames" / name).string(), false, step, true);
         if (_room_rows > 0)
             split_ply(out_dir / "frames" / name / "splat.ply", out_dir / "frames" / "room.ply", _room_rows);
         list << name << ' ' << _chunk_dirs[(size_t)f] << '\n';
     }
     if (keep >= 0) engine_spacetime_set_frame(keep);
+    // For the .vgs writer: every row is one record over the whole chunk.
+    std::ofstream events(out_dir / "frames" / "birth_events.tsv", std::ios::trunc);
+    for (int64_t r = 0; r < engine_spacetime_records().rows; r++) events << 0 << '\t' << r << '\t' << 1 << '\n';
+    if (!list || !events) throw std::runtime_error("spacetime: cannot write the frame list or birth events");
+}
+
+void TrainerSession::spacetime_after_step(int step, const EngineStepConfig& sc) {
+    engine_spacetime_after_step({sc.optim.lr_means, sc.optim.lr_quats, sc.optim.lr_features_dc,
+                                 sc.optim.lr_opacities, cfg.spacetime_window_lr, cfg.spacetime_batch,
+                                 sc.optim.mcmc_opacity_reg_weight});
+    if (cfg.spacetime_relocate <= 0.0f || cfg.spacetime_relocate_every <= 0 ||
+        (step + 1) % cfg.spacetime_relocate_every != 0)
+        return;
+    const int64_t budget =
+        (int64_t)(cfg.spacetime_relocate * (float)engine_spacetime_records().rows);
+    const int64_t moved = engine_spacetime_relocate(budget, cfg.min_opacity, (uint64_t)step);
+    log("spacetime: " + std::to_string(moved) + " of " + std::to_string(budget) + " records relocated");
 }
 
 }  // namespace spirula

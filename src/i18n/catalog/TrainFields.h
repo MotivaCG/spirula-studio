@@ -4295,6 +4295,17 @@ SS_MSG_EN(spacetime_batch, "Views per record step");
 SS_MSG_EN(spacetime_batch_help,
     "Views whose gradients one update of the records averages: one view a step is "
     "too noisy for a record seen from every frame.");
+SS_MSG_EN(spacetime_relocate, "Spacetime relocation budget");
+SS_MSG_EN(spacetime_relocate_help,
+    "Share of the records that may move, every relocation interval: records shown "
+    "in no frame take long-axis splits of those the densification score points "
+    "at, one record for the whole chunk each. 0 turns it off.");
+SS_MSG_EN(spacetime_relocate_every, "Spacetime relocation interval");
+SS_MSG_EN(spacetime_relocate_every_help, "Steps between two spacetime relocations.");
+SS_MSG_EN(spacetime_spare, "Spare records");
+SS_MSG_EN(spacetime_spare_help,
+    "Records shown in no frame added after the chunk run's, as a share of them, "
+    "for relocation to take from the start.");
 SS_MSG_EN(temporal_room_ply, "Static room");
 SS_MSG_EN(temporal_room_ply_help,
     "A PLY of everything around the subject, loaded before the seed: rendered and "

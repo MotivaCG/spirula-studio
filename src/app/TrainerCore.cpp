@@ -1733,9 +1733,7 @@ std::map<std::string, float> TrainerSession::train_step(int step) {
         throw std::runtime_error("GPU backend error at step " +
                                  std::to_string(step) + ": " + err);
     if (engine_temporal_active()) chunk_after_step(step);
-    if (engine_spacetime_active())
-        engine_spacetime_after_step({sc.optim.lr_means, sc.optim.lr_quats, sc.optim.lr_features_dc,
-                                     sc.optim.lr_opacities, cfg.spacetime_window_lr, cfg.spacetime_batch});
+    if (engine_spacetime_active()) spacetime_after_step(step, sc);
 
     // Divergence never recovers, and the run otherwise continues in silence to
     // a black render and a checkpoint with zero splats. Reported values sit
