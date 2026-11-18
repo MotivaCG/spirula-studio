@@ -1,11 +1,12 @@
 // PPISP image transform + regularization losses (Vulkan backend), mirroring
-// the PPISP kernels in kernels/ppisp/Ppisp.cu. All device math comes from the
-// canonical shaders/ppisp.slang (same functions the CUDA build calls through
-// generated/ppisp.cuh), so forward values match up to fast-math rounding and
-// gradients are the same autodiff.
+// kernels/ppisp/Ppisp.cu. All device math is shaders/ppisp.slang, the same
+// functions the CUDA build calls through generated/ppisp.cuh.
 //
 // Spec constants (IDs by declaration order — dispatches must pass ALL):
-//   0: kParamType — 0 = Original (36), 1 = RQS (39), 2 = NoCRF (24)
+//   0: kParamType — 0 = Original (36), 1 = RQS (39), 2 = NoCRF (24),
+//                   3 = NoCRFNoVig (9)
+//   1: kClampOutput — clamp the result to [0,1] (CRF-less layouts only)
+//   2: kExposureArithmeticMean — regularize log2(mean gain), not mean(log2 gain)
 
 #include "atomic_float.slang"
 
@@ -16,29 +17,13 @@
 [SpecializationConstant]
 const int kParamType = 0;
 
-static const int kMaxParams = PPISP_RQS_NUM_PARAMS;                 // 39
-static const int kMaxRawLosses = int(RawPPISPRegLossIndexRQS::length);  // 23
-static const int kNumWeighted = int(PPISPRegLossIndex::length);     // 6
+[SpecializationConstant]
+const int kClampOutput = 0;
 
-[ForceInline]
-int _pp_num_params() {
-    return kParamType == 0 ? PPISP_NUM_PARAMS
-                           : (kParamType == 1 ? PPISP_RQS_NUM_PARAMS
-                                              : PPISP_NO_CRF_NUM_PARAMS);
-}
+[SpecializationConstant]
+const int kExposureArithmeticMean = 0;
 
-[ForceInline]
-int _pp_num_raw_losses() {
-    return kParamType == 0 ? int(RawPPISPRegLossIndex::length)
-                           : (kParamType == 1
-                                  ? int(RawPPISPRegLossIndexRQS::length)
-                                  : int(RawPPISPRegLossIndexNoCRF::length));
-}
-
-[ForceInline]
-bool _pp_finite(float v) {
-    return (asuint(v) & 0x7f800000u) != 0x7f800000u;
-}
+#include "ppisp_apply.slang"
 
 // ---------------------------------------------------------------------------
 // ppisp_forward / ppisp_backward
@@ -59,63 +44,6 @@ struct PpispImageParams {
     uint wgs_per_row;  // pixel axis folds across (wg.x, wg.z); wg.y = batch
     int _pad0;
 };
-
-[ForceInline]
-float3 _pp_apply(float3 pixel, float2 pix_coord, float2 image_center,
-                 float2 img_size, float pbuf[kMaxParams]) {
-    if (kParamType == 0) {
-        float ps[PPISP_NUM_PARAMS];
-        [ForceUnroll]
-        for (int i = 0; i < PPISP_NUM_PARAMS; i++) ps[i] = pbuf[i];
-        return apply_ppisp(pixel, pix_coord, image_center, img_size, ps);
-    } else if (kParamType == 1) {
-        float ps[PPISP_RQS_NUM_PARAMS];
-        [ForceUnroll]
-        for (int i = 0; i < PPISP_RQS_NUM_PARAMS; i++) ps[i] = pbuf[i];
-        return apply_ppisp_rqs(pixel, pix_coord, image_center, img_size, ps);
-    } else {
-        float ps[PPISP_NO_CRF_NUM_PARAMS];
-        [ForceUnroll]
-        for (int i = 0; i < PPISP_NO_CRF_NUM_PARAMS; i++) ps[i] = pbuf[i];
-        return apply_ppisp_no_crf(pixel, pix_coord, image_center, img_size, ps);
-    }
-}
-
-[ForceInline]
-void _pp_apply_vjp(float3 pixel, float2 pix_coord, float2 image_center,
-                   float2 img_size, float pbuf[kMaxParams], float3 v_out,
-                   out float3 v_pixel, out float vbuf[kMaxParams]) {
-    [ForceUnroll]
-    for (int i = 0; i < kMaxParams; i++) vbuf[i] = 0.0f;
-    if (kParamType == 0) {
-        float ps[PPISP_NUM_PARAMS];
-        [ForceUnroll]
-        for (int i = 0; i < PPISP_NUM_PARAMS; i++) ps[i] = pbuf[i];
-        float vs[PPISP_NUM_PARAMS];
-        apply_ppisp_vjp(pixel, pix_coord, image_center, img_size, ps, v_out,
-                        v_pixel, vs);
-        [ForceUnroll]
-        for (int i = 0; i < PPISP_NUM_PARAMS; i++) vbuf[i] = vs[i];
-    } else if (kParamType == 1) {
-        float ps[PPISP_RQS_NUM_PARAMS];
-        [ForceUnroll]
-        for (int i = 0; i < PPISP_RQS_NUM_PARAMS; i++) ps[i] = pbuf[i];
-        float vs[PPISP_RQS_NUM_PARAMS];
-        apply_ppisp_rqs_vjp(pixel, pix_coord, image_center, img_size, ps,
-                            v_out, v_pixel, vs);
-        [ForceUnroll]
-        for (int i = 0; i < PPISP_RQS_NUM_PARAMS; i++) vbuf[i] = vs[i];
-    } else {
-        float ps[PPISP_NO_CRF_NUM_PARAMS];
-        [ForceUnroll]
-        for (int i = 0; i < PPISP_NO_CRF_NUM_PARAMS; i++) ps[i] = pbuf[i];
-        float vs[PPISP_NO_CRF_NUM_PARAMS];
-        apply_ppisp_no_crf_vjp(pixel, pix_coord, image_center, img_size, ps,
-                               v_out, v_pixel, vs);
-        [ForceUnroll]
-        for (int i = 0; i < PPISP_NO_CRF_NUM_PARAMS; i++) vbuf[i] = vs[i];
-    }
-}
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
@@ -146,7 +74,8 @@ void ppisp_image_fwd(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
     p.out_image[3 * pix + 2] = out_pixel.z;
 }
 
-groupshared float _pp_red64[64];
+static const uint kPpispReduceThreads = 64u;
+#include "ppisp_reduce.slang"
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
@@ -172,34 +101,33 @@ void ppisp_image_bwd(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
 
     if (inside) {
         uint pix = (bid * uint(p.H) + y) * uint(p.W) + x;
-        float3 pixel = float3(p.in_image[3 * pix], p.in_image[3 * pix + 1],
-                              p.in_image[3 * pix + 2]);
         float3 v_out = float3(p.out_image[3 * pix], p.out_image[3 * pix + 1],
                               p.out_image[3 * pix + 2]);
-        float4 intr = p.intrins[bid];
-        float3 v_pixel;
-        _pp_apply_vjp(pixel, float2(float(x), float(y)),
-                      float2(intr.z, intr.w),
-                      float2(p.actual_image_width, p.actual_image_height),
-                      pbuf, v_out, v_pixel, vbuf);
+        // Both gradients are linear in the incoming one, so a zero one -- a
+        // masked pixel, mostly -- has no transform to differentiate. Not a
+        // return: the block reduction below needs every thread.
+        float3 v_pixel = float3(0.0f);
+        if (any(v_out != float3(0.0f))) {
+            float3 pixel = float3(p.in_image[3 * pix], p.in_image[3 * pix + 1],
+                                  p.in_image[3 * pix + 2]);
+            float4 intr = p.intrins[bid];
+            _pp_apply_vjp(pixel, float2(float(x), float(y)),
+                          float2(intr.z, intr.w),
+                          float2(p.actual_image_width, p.actual_image_height),
+                          pbuf, v_out, v_pixel, vbuf);
+        }
         p.v_in_image[3 * pix] = v_pixel.x;
         p.v_in_image[3 * pix + 1] = v_pixel.y;
         p.v_in_image[3 * pix + 2] = v_pixel.z;
     }
 
-    // Block-wide per-parameter reduce, one atomic per (block, param).
-    for (int i = 0; i < np; i++) {
+    [ForceUnroll]
+    for (int i = 0; i < kMaxParams; i++) {
+        if (i >= np) continue;
         float param = _pp_finite(vbuf[i]) ? vbuf[i] : 0.0f;
-        GroupMemoryBarrierWithGroupSync();
-        _pp_red64[tid] = param;
-        GroupMemoryBarrierWithGroupSync();
-        [ForceUnroll]
-        for (uint s = 32; s > 0; s >>= 1) {
-            if (tid < s) _pp_red64[tid] += _pp_red64[tid + s];
-            GroupMemoryBarrierWithGroupSync();
-        }
-        if (tid == 0 && _pp_red64[0] != 0.0f)
-            atomic_add_f32(&p.v_ppisp_params[p_id * np + i], _pp_red64[0]);
+        float sum = ppisp_reduce_sum(param, tid);
+        if (tid == 0 && sum != 0.0f)
+            atomic_add_f32(&p.v_ppisp_params[p_id * np + i], sum);
     }
 }
 
@@ -226,7 +154,8 @@ void _pp_raw_losses(float pbuf[kMaxParams], out float lbuf[kMaxRawLosses]) {
         [ForceUnroll]
         for (int i = 0; i < PPISP_NUM_PARAMS; i++) ps[i] = pbuf[i];
         float ls[int(RawPPISPRegLossIndex::length)] =
-            compute_raw_ppisp_regularization_loss(ps);
+            compute_raw_ppisp_regularization_loss(
+                ps, kExposureArithmeticMean != 0);
         [ForceUnroll]
         for (int i = 0; i < int(RawPPISPRegLossIndex::length); i++)
             lbuf[i] = ls[i];
@@ -235,18 +164,30 @@ void _pp_raw_losses(float pbuf[kMaxParams], out float lbuf[kMaxRawLosses]) {
         [ForceUnroll]
         for (int i = 0; i < PPISP_RQS_NUM_PARAMS; i++) ps[i] = pbuf[i];
         float ls[int(RawPPISPRegLossIndexRQS::length)] =
-            compute_raw_ppisp_rqs_regularization_loss(ps);
+            compute_raw_ppisp_rqs_regularization_loss(
+                ps, kExposureArithmeticMean != 0);
         [ForceUnroll]
         for (int i = 0; i < int(RawPPISPRegLossIndexRQS::length); i++)
             lbuf[i] = ls[i];
-    } else {
+    } else if (kParamType == 2) {
         float ps[PPISP_NO_CRF_NUM_PARAMS];
         [ForceUnroll]
         for (int i = 0; i < PPISP_NO_CRF_NUM_PARAMS; i++) ps[i] = pbuf[i];
         float ls[int(RawPPISPRegLossIndexNoCRF::length)] =
-            compute_raw_ppisp_no_crf_regularization_loss(ps);
+            compute_raw_ppisp_no_crf_regularization_loss(
+                ps, kExposureArithmeticMean != 0);
         [ForceUnroll]
         for (int i = 0; i < int(RawPPISPRegLossIndexNoCRF::length); i++)
+            lbuf[i] = ls[i];
+    } else {
+        float ps[PPISP_NO_CRF_NO_VIG_NUM_PARAMS];
+        [ForceUnroll]
+        for (int i = 0; i < PPISP_NO_CRF_NO_VIG_NUM_PARAMS; i++) ps[i] = pbuf[i];
+        float ls[int(RawPPISPRegLossIndexNoCRFNoVig::length)] =
+            compute_raw_ppisp_no_crf_no_vig_regularization_loss(
+                ps, kExposureArithmeticMean != 0);
+        [ForceUnroll]
+        for (int i = 0; i < int(RawPPISPRegLossIndexNoCRFNoVig::length); i++)
             lbuf[i] = ls[i];
     }
 }
@@ -312,7 +253,8 @@ void ppisp_reg_final_fwd(uint tid: SV_GroupThreadID,
         for (int i = 0; i < int(RawPPISPRegLossIndex::length); i++)
             raw[i] = p.raw_losses[i];
         float o[kNumWeighted] =
-            compute_ppisp_regularization_loss(raw, p.B, w);
+            compute_ppisp_regularization_loss(
+                raw, p.B, kExposureArithmeticMean != 0, w);
         [ForceUnroll]
         for (int i = 0; i < kNumWeighted; i++) ls[i] = o[i];
     } else if (kParamType == 1) {
@@ -321,16 +263,28 @@ void ppisp_reg_final_fwd(uint tid: SV_GroupThreadID,
         for (int i = 0; i < int(RawPPISPRegLossIndexRQS::length); i++)
             raw[i] = p.raw_losses[i];
         float o[kNumWeighted] =
-            compute_ppisp_rqs_regularization_loss(raw, p.B, w);
+            compute_ppisp_rqs_regularization_loss(
+                raw, p.B, kExposureArithmeticMean != 0, w);
         [ForceUnroll]
         for (int i = 0; i < kNumWeighted; i++) ls[i] = o[i];
-    } else {
+    } else if (kParamType == 2) {
         float raw[int(RawPPISPRegLossIndexNoCRF::length)];
         [ForceUnroll]
         for (int i = 0; i < int(RawPPISPRegLossIndexNoCRF::length); i++)
             raw[i] = p.raw_losses[i];
         float o[kNumWeighted] =
-            compute_ppisp_no_crf_regularization_loss(raw, p.B, w);
+            compute_ppisp_no_crf_regularization_loss(
+                raw, p.B, kExposureArithmeticMean != 0, w);
+        [ForceUnroll]
+        for (int i = 0; i < kNumWeighted; i++) ls[i] = o[i];
+    } else {
+        float raw[int(RawPPISPRegLossIndexNoCRFNoVig::length)];
+        [ForceUnroll]
+        for (int i = 0; i < int(RawPPISPRegLossIndexNoCRFNoVig::length); i++)
+            raw[i] = p.raw_losses[i];
+        float o[kNumWeighted] =
+            compute_ppisp_no_crf_no_vig_regularization_loss(
+                raw, p.B, kExposureArithmeticMean != 0, w);
         [ForceUnroll]
         for (int i = 0; i < kNumWeighted; i++) ls[i] = o[i];
     }
@@ -360,7 +314,8 @@ void ppisp_reg_final_bwd(uint tid: SV_GroupThreadID,
         for (int i = 0; i < int(RawPPISPRegLossIndex::length); i++)
             raw[i] = p.raw_losses[i];
         float o[int(RawPPISPRegLossIndex::length)] =
-            compute_ppisp_regularization_loss_vjp(raw, p.B, w, vl);
+            compute_ppisp_regularization_loss_vjp(
+                raw, p.B, kExposureArithmeticMean != 0, w, vl);
         [ForceUnroll]
         for (int i = 0; i < int(RawPPISPRegLossIndex::length); i++)
             p.v_ppisp_params[i] = o[i];
@@ -370,19 +325,32 @@ void ppisp_reg_final_bwd(uint tid: SV_GroupThreadID,
         for (int i = 0; i < int(RawPPISPRegLossIndexRQS::length); i++)
             raw[i] = p.raw_losses[i];
         float o[int(RawPPISPRegLossIndexRQS::length)] =
-            compute_ppisp_rqs_regularization_loss_vjp(raw, p.B, w, vl);
+            compute_ppisp_rqs_regularization_loss_vjp(
+                raw, p.B, kExposureArithmeticMean != 0, w, vl);
         [ForceUnroll]
         for (int i = 0; i < int(RawPPISPRegLossIndexRQS::length); i++)
             p.v_ppisp_params[i] = o[i];
-    } else {
+    } else if (kParamType == 2) {
         float raw[int(RawPPISPRegLossIndexNoCRF::length)];
         [ForceUnroll]
         for (int i = 0; i < int(RawPPISPRegLossIndexNoCRF::length); i++)
             raw[i] = p.raw_losses[i];
         float o[int(RawPPISPRegLossIndexNoCRF::length)] =
-            compute_ppisp_no_crf_regularization_loss_vjp(raw, p.B, w, vl);
+            compute_ppisp_no_crf_regularization_loss_vjp(
+                raw, p.B, kExposureArithmeticMean != 0, w, vl);
         [ForceUnroll]
         for (int i = 0; i < int(RawPPISPRegLossIndexNoCRF::length); i++)
+            p.v_ppisp_params[i] = o[i];
+    } else {
+        float raw[int(RawPPISPRegLossIndexNoCRFNoVig::length)];
+        [ForceUnroll]
+        for (int i = 0; i < int(RawPPISPRegLossIndexNoCRFNoVig::length); i++)
+            raw[i] = p.raw_losses[i];
+        float o[int(RawPPISPRegLossIndexNoCRFNoVig::length)] =
+            compute_ppisp_no_crf_no_vig_regularization_loss_vjp(
+                raw, p.B, kExposureArithmeticMean != 0, w, vl);
+        [ForceUnroll]
+        for (int i = 0; i < int(RawPPISPRegLossIndexNoCRFNoVig::length); i++)
             p.v_ppisp_params[i] = o[i];
     }
 }
@@ -413,7 +381,8 @@ void ppisp_reg_raw_bwd(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
         for (int i = 0; i < int(RawPPISPRegLossIndex::length); i++)
             vr[i] = p.raw_losses[i];
         float o[PPISP_NUM_PARAMS] =
-            compute_raw_ppisp_regularization_loss_vjp(ps, vr);
+            compute_raw_ppisp_regularization_loss_vjp(
+                ps, kExposureArithmeticMean != 0, vr);
         [ForceUnroll]
         for (int i = 0; i < PPISP_NUM_PARAMS; i++) vbuf[i] = o[i];
     } else if (kParamType == 1) {
@@ -425,10 +394,11 @@ void ppisp_reg_raw_bwd(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
         for (int i = 0; i < int(RawPPISPRegLossIndexRQS::length); i++)
             vr[i] = p.raw_losses[i];
         float o[PPISP_RQS_NUM_PARAMS] =
-            compute_raw_ppisp_rqs_regularization_loss_vjp(ps, vr);
+            compute_raw_ppisp_rqs_regularization_loss_vjp(
+                ps, kExposureArithmeticMean != 0, vr);
         [ForceUnroll]
         for (int i = 0; i < PPISP_RQS_NUM_PARAMS; i++) vbuf[i] = o[i];
-    } else {
+    } else if (kParamType == 2) {
         float ps[PPISP_NO_CRF_NUM_PARAMS];
         [ForceUnroll]
         for (int i = 0; i < PPISP_NO_CRF_NUM_PARAMS; i++) ps[i] = pbuf[i];
@@ -437,9 +407,23 @@ void ppisp_reg_raw_bwd(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
         for (int i = 0; i < int(RawPPISPRegLossIndexNoCRF::length); i++)
             vr[i] = p.raw_losses[i];
         float o[PPISP_NO_CRF_NUM_PARAMS] =
-            compute_raw_ppisp_no_crf_regularization_loss_vjp(ps, vr);
+            compute_raw_ppisp_no_crf_regularization_loss_vjp(
+                ps, kExposureArithmeticMean != 0, vr);
         [ForceUnroll]
         for (int i = 0; i < PPISP_NO_CRF_NUM_PARAMS; i++) vbuf[i] = o[i];
+    } else {
+        float ps[PPISP_NO_CRF_NO_VIG_NUM_PARAMS];
+        [ForceUnroll]
+        for (int i = 0; i < PPISP_NO_CRF_NO_VIG_NUM_PARAMS; i++) ps[i] = pbuf[i];
+        float vr[int(RawPPISPRegLossIndexNoCRFNoVig::length)];
+        [ForceUnroll]
+        for (int i = 0; i < int(RawPPISPRegLossIndexNoCRFNoVig::length); i++)
+            vr[i] = p.raw_losses[i];
+        float o[PPISP_NO_CRF_NO_VIG_NUM_PARAMS] =
+            compute_raw_ppisp_no_crf_no_vig_regularization_loss_vjp(
+                ps, kExposureArithmeticMean != 0, vr);
+        [ForceUnroll]
+        for (int i = 0; i < PPISP_NO_CRF_NO_VIG_NUM_PARAMS; i++) vbuf[i] = o[i];
     }
 
     for (int i = 0; i < np; i++) {

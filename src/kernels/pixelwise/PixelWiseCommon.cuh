@@ -1,23 +1,9 @@
 #pragma once
 
-// Shared preamble for the image-space per-pixel kernels.
-//
-// PixelWise was one file (~3.7k lines) covering unrelated image-space
-// operations. It is now split by function; the parts all declare into the
-// single PixelWise.cuh via the explicit HEADER_SOURCES['PixelWise'] list in
-// generate_headers.py. See docs/codegen.md.
-//
-//   ImageConvert.cu        uint8/uint16 -> float; rendered -> expected depth
-//   ImageColorOps.cu       background blending, log map, overexposure reg
-//   DepthGeometry.cu       depth -> points / normal, depth-normal loss,
-//                          ray <-> linear depth
-//   ImageDistort.cu        distort / undistort
-//   ImageWarp.cu           wide <-> pinhole warps, incl. byte-fused
-//   GtDepthNormalWarp.cu   GT depth / normal wide -> pinhole warps
-//   Ppisp.cu               per-pixel image signal processing
-//
-// Device samplers shared across the distort/warp parts live in
-// BilinearSample.cuh.
+// Shared preamble for the image-space per-pixel kernels. The parts are split
+// by function and all declare into PixelWise.cuh; HEADER_SOURCES in
+// tools/codegen/generate_headers.py lists them. Device samplers shared by the
+// distort/warp parts live in BilinearSample.cuh.
 
 #include "kernels/pixelwise/PixelWise.cuh"
 
@@ -117,7 +103,6 @@ struct SlangPixelWiseDist<CameraDistortionType::TIER> {                         
 _SS_DEF_SLANG_PIXEL_WISE(None,      _none)
 _SS_DEF_SLANG_PIXEL_WISE(OpenCV,    _opencv)
 _SS_DEF_SLANG_PIXEL_WISE(ThinPrism, _prism)
-_SS_DEF_SLANG_PIXEL_WISE(Rational,  _rational)
 
 #undef _SS_DEF_SLANG_PIXEL_WISE
 
@@ -125,13 +110,12 @@ _SS_DEF_SLANG_PIXEL_WISE(Rational,  _rational)
 
 
 // Run BODY(tier) for the tier `name` spells; the camera model stays runtime,
-// so all four tiers are reachable for every model.
+// so every tier is reachable for every model.
 #define _SS_DISPATCH_DISTORTION(name, BODY)                                        \
     do { switch (cdt(name)) {                                                      \
         case CameraDistortionType::None:      BODY(CameraDistortionType::None);      break; \
         case CameraDistortionType::OpenCV:    BODY(CameraDistortionType::OpenCV);    break; \
         case CameraDistortionType::ThinPrism: BODY(CameraDistortionType::ThinPrism); break; \
-        case CameraDistortionType::Rational:  BODY(CameraDistortionType::Rational);  break; \
         default: throw std::runtime_error(                                         \
             "Unknown camera distortion: " + std::string(name));                    \
     } } while (0)

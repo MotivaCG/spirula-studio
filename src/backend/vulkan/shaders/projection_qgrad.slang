@@ -1,32 +1,22 @@
 // Grad-quant projection backward (Vulkan backend), mirroring
-// kernels/projection/ProjectionBwdQuantGrad_kernel.cuh: SPLAT-parallel (one thread per
-// splat, 256/block); each thread loops its cameras in registers (no
-// atomics), then folds the register gradient onto the running QUANTIZED
-// grad accumulator via decode -> add -> block-reduce bounds -> encode.
-// Codecs from optim_quant.slang (signed symmetric gradq; And+Or masked
-// sub-word stores since per-splat cell runs need not be word-aligned).
-//
-// Spec constants 0..4 from proj_bwd_common.slang, plus:
-//   kEval3d       = 1: 3DGUT screen-grad layout + VJP
-//   kGqMask       = active-attribute bitmask (1 means, 2 quats, 4 scales,
-//                   8 opac, 16 dc, 32 sh) -- folded so inactive attributes'
-//                   loads never exist (llvmpipe speculated-load rule)
-//   kWorldGradAdd = 1: add mean/quat/scale register grads onto the fp32
-//                   world-grad buffer (3DGUT; one owner thread -> plain add)
-//   kDistortion   = CameraDistortionType (0..3), declared last
-//
-// One thread per splat also for !inside tail threads: the camera loop is
-// fully skipped for them (CUDA reads out-of-bounds aabb entries harmlessly
-// from pool slack; BDA reads must stay in bounds), and every thread reaches
-// every block reduce.
+// kernels/projection/ProjectionBwdQuantGrad_kernel.cuh: one thread per splat
+// loops its cameras in registers, then folds the gradient onto the running
+// QUANTIZED accumulator: decode -> add -> block-reduce bounds -> encode.
+// kGqMask (1 means, 2 quats, 4 scales, 8 opac, 16 dc, 32 colour row) folds
+// inactive attributes' loads away (llvmpipe speculated-load rule). Tail
+// threads skip the camera loop -- BDA reads must stay in bounds, where CUDA
+// reads pool slack -- but reach every block reduce.
 
 #define CudaDeviceExport ForceInline
+#include "aabb16.slang"
 #include "int64_compat.slang"
+#include "screen.slang"
 #include "shaders/primitive_3dgs.slang"
 #include "shaders/harmonics.slang"
 #undef CudaDeviceExport
 #include "sh_quant.slang"
 #include "sh_vjp.slang"
+#include "view_color.slang"
 #include "atomic_float.slang"
 #include "proj_bwd_common.slang"
 #include "optim_quant.slang"
@@ -53,15 +43,9 @@ struct ProjectionQgradParams {
     // packed intersection ranges (kPacked; fallback otherwise)
     int* camera_id_bounds;  // [N+1]
     int* camera_ids;        // [nnz] ORIGINAL order
-    int* perm;              // [nnz] sorted_pos -> original_pos
-    float4* aabb;           // [C,N] or [nnz] (original order)
-    // screen-space gradients: 3DGS xy/depth/conic/opac/rgb; 3DGUT
-    // scale/opac/rgb in vs0..vs2 (vs3/vs4 fallback)
-    float* vs0;
-    float* vs1;
-    float* vs2;
-    float* vs3;
-    float* vs4;
+    uint2* aabb;            // [C,N] or [nnz] packed (original order)
+    // packed screen-space gradient rows (SCR2_* for 2D, SCRG_* for 3DGUT)
+    float* vs_screen;
     // fp32 world grads (kWorldGradAdd: mean/quat/scale plain add)
     float* vw_means;
     float* vw_quats;
@@ -90,7 +74,7 @@ struct ProjectionQgradParams {
     uint32_t height;
     uint32_t wgs_per_row;
     uint32_t num_sh_buffer;
-    uint32_t _pad0;
+    uint32_t sb_base;  // float3 coefficient of the first lobe in a row
 };
 
 // One non-SH attribute: decode running grad + add this sub-batch's
@@ -134,6 +118,73 @@ void _qg_nonsh<let PRIMS : int>(bool active, uint* packed, float2* bounds,
     }
 }
 
+[ForceInline]
+void _qg_color_word(uint* words, uint cell, uint first, uint last,
+                     uint code, inout uint acc) {
+    uint b = cell & 3u;
+    acc |= code << (8u * b);
+    if (b == 3u || cell + 1u == last) {
+        uint w = cell >> 2;
+        uint fb = (w == (first >> 2)) ? (first & 3u) : 0u;
+        if (fb == 0u && b == 3u) {
+            words[w] = acc;
+        } else {
+            uint mask = (0xffffffffu >> (8u * (3u - b))) &
+                        (0xffffffffu << (8u * fb));
+            InterlockedAnd(words[w], ~mask);
+            InterlockedOr(words[w], acc & mask);
+        }
+        acc = 0u;
+    }
+}
+
+[ForceInline]
+void _qg_color_cell<let encode : bool>(
+    uint* words, uint cell, uint first, uint last, float contrib,
+    float2 old_mm, float2 new_mm, inout float2 mm, inout uint acc) {
+    float nv = gradq_decode1<8>(words, cell, old_mm) + contrib;
+    if (encode) {
+        uint code = gradq_encode1<8>(nv, new_mm) & 0xffu;
+        _qg_color_word(words, cell, first, last, code, acc);
+    } else {
+        mm.x = min(mm.x, nv);
+        mm.y = max(mm.y, nv);
+    }
+}
+
+[ForceInline]
+void _qg_color_pass<let encode : bool>(
+    ProjectionQgradParams p, uint gid, PbGrads g, float2 old_mm,
+    float2 new_mm, inout float2 mm) {
+    const int num_sh = kShDegree * (kShDegree + 2);
+    const int sb_c0 = 3 * int(p.sb_base);
+    const gindex_t base = (gindex_t)(3u * p.num_sh_buffer) * (gindex_t)gid;
+    uint* words = elem_at(p.gq_sh_packed, base >> 2);
+    uint first = uint(base) & 3u;
+    uint last = first + 3u * p.num_sh_buffer;
+    uint acc = 0u;
+
+    [ForceUnroll]
+    for (int j = 0; j < kVcMaxShCoeffs; ++j) {
+        if (j >= num_sh) continue;
+        [ForceUnroll]
+        for (int ch = 0; ch < 3; ++ch)
+            _qg_color_cell<encode>(words, first + uint(3 * j + ch),
+                first, last, g.v_sh[j][ch], old_mm, new_mm, mm, acc);
+    }
+    for (int c = 3 * num_sh; c < sb_c0; ++c)
+        _qg_color_cell<encode>(words, first + uint(c), first, last,
+                               0.0f, old_mm, new_mm, mm, acc);
+    [ForceUnroll]
+    for (int j = 0; j < kVcMaxSbCoeffs; ++j) {
+        if (j >= 2 * kSbLobes) continue;
+        [ForceUnroll]
+        for (int ch = 0; ch < 3; ++ch)
+            _qg_color_cell<encode>(words, first + uint(sb_c0 + 3 * j + ch),
+                first, last, g.v_sb[j][ch], old_mm, new_mm, mm, acc);
+    }
+}
+
 // The per-splat camera loop, generic over the two projection spec axes so the
 // entry point folds them once (its block reduces stay outside).
 [ForceInline]
@@ -144,39 +195,42 @@ void _qg_camera_loop<let cam : CameraModelType, D : ICameraDistortion>(
         return;
     PbSplat s = pb_load_splat(p.means, p.quats, p.scales, p.opacities,
                               p.features_dc, gid);
-    gindex_t qbase = (gindex_t)3 * (gindex_t)p.num_sh_buffer * (gindex_t)gid;
+    ShAddrW sha = sh_quant_addr_w(p.num_sh_buffer,
+                                 i64mem_get(p.sh_value_bounds_stride));
+    ColorRow row;
+    row.fp32 =
+        elem_at(p.features_sh, (gindex_t)gid * (gindex_t)p.sh_stride_src);
+    row.packed = p.sh_value_packed;
+    row.bounds = p.sh_value_bounds;
+    row.base = sh_addr_base(sha, gid);
+    row.bounds_stride = sha.bounds_stride;
+    row.pair_pitch = sha.pair_pitch;
     for (int cid_t = cid_0; cid_t < cid_1; ++cid_t) {
-        int idx = (kPacked != 0) ? p.perm[cid_t]
-                                 : cid_t * int(p.N) + int(gid);
+        // Packed: the forward emits (gaussian, camera) order, so cid_t is
+        // the out_idx that indexes aabb / camera_ids / vs_screen.
+        int idx = (kPacked != 0) ? cid_t : cid_t * int(p.N) + int(gid);
         int cid = (kPacked != 0) ? p.camera_ids[idx] : cid_t;
-        float4 bb = p.aabb[idx];
-        if (bb.z <= bb.x || bb.w <= bb.y)
+        if (aabb16_is_empty(p.aabb[idx]))
             continue;
         PbCamera<D> c = pb_load_camera<D>(p.viewmats, p.intrins,
                                           p.dist_coeffs, uint(cid));
         if (kEval3d != 0) {
-            float3 v_ss = float3(p.vs0[3 * idx], p.vs0[3 * idx + 1],
-                                 p.vs0[3 * idx + 2]);
-            float v_so = p.vs1[idx];
-            float3 v_rgb = float3(p.vs2[3 * idx], p.vs2[3 * idx + 1],
-                                  p.vs2[3 * idx + 2]);
+            float* v_row = scrg_row(p.vs_screen, idx);
+            float3 v_ss = scrg_scale(v_row);
+            float v_so = scrg_opac(v_row);
+            float3 v_rgb = scrg_rgb(v_row);
             pb_vjp_3dgut<cam, D>(s, c, p.width, p.height, v_ss, v_so, g);
-            pb_sh_vjp<D>(s, c, p.features_sh + gid * p.sh_stride_src,
-                         p.sh_value_packed, p.sh_value_bounds, qbase,
-                         i64mem_get(p.sh_value_bounds_stride), v_rgb, g);
+            pb_color_vjp<D>(s, c, row, int(p.sb_base), v_rgb, g);
         } else {
-            float2 v_xy = float2(p.vs0[2 * idx], p.vs0[2 * idx + 1]);
-            float v_depth = p.vs1[idx];
-            float3 v_conic = float3(p.vs2[3 * idx], p.vs2[3 * idx + 1],
-                                    p.vs2[3 * idx + 2]);
-            float v_opac = p.vs3[idx];
-            float3 v_rgb = float3(p.vs4[3 * idx], p.vs4[3 * idx + 1],
-                                  p.vs4[3 * idx + 2]);
+            float* v_row = scr2_row(p.vs_screen, idx);
+            float2 v_xy = scr2_xy(v_row);
+            float v_depth = scr2_depth(v_row);
+            float3 v_conic = scr2_conic(v_row);
+            float v_opac = scr2_opac(v_row);
+            float3 v_rgb = scr2_rgb(v_row);
             pb_vjp_2d<cam, D>(s, c, p.width, p.height, v_xy, v_depth, v_conic,
                               v_opac, g);
-            pb_sh_vjp<D>(s, c, p.features_sh + gid * p.sh_stride_src,
-                         p.sh_value_packed, p.sh_value_bounds, qbase,
-                         i64mem_get(p.sh_value_bounds_stride), v_rgb, g);
+            pb_color_vjp<D>(s, c, row, int(p.sb_base), v_rgb, g);
         }
     }
 }
@@ -195,7 +249,7 @@ void projection_qgrad(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
     // writes are blk_ok-gated (optimizer.slang convention).
     bool blk_ok = block_id < (p.N + 255u) / 256u;
 
-    int cid_0 = 0, cid_1 = int(p.C);
+    int cid_0 = 0, cid_1 = inside ? int(p.C) : 0;
     if (kPacked != 0) {
         cid_0 = inside ? p.camera_id_bounds[gid] : 0;
         cid_1 = inside ? p.camera_id_bounds[gid + 1] : 0;
@@ -240,38 +294,18 @@ void projection_qgrad(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
                      block_id, gid, tid, inside, blk_ok, vd);
     }
 
-    // SH grad (8-bit): two passes over the full 3*K cells so inactive
-    // warmup bands (contribution 0) stay re-encoded against the fresh bound.
+    // Inactive warmup cells must be re-encoded against the fresh bound too.
     if ((kGqMask & 32) != 0) {
-        const int num_sh = kShDegree * (kShDegree + 2);
-        const uint sh_base = 3u * p.num_sh_buffer * gid;
-        const int total = int(3u * p.num_sh_buffer);
-        const float2 sh_old =
-            inside ? p.gq_sh_bounds[block_id] : float2(0.0f, 0.0f);
-        float2 sh_mm = float2(1e30f, -1e30f);
-        if (inside) {
-            for (int c = 0; c < total; ++c) {
-                float old = gradq_decode1<8>(p.gq_sh_packed,
-                                             sh_base + uint(c), sh_old);
-                float contrib =
-                    (c < 3 * num_sh) ? g.v_sh[c / 3][c % 3] : 0.0f;
-                float nv = old + contrib;
-                sh_mm.x = min(sh_mm.x, nv);
-                sh_mm.y = max(sh_mm.y, nv);
-            }
-        }
-        sh_mm = oq_block_reduce_mm2(sh_mm, tid);
+        float2 old_mm = inside ? p.gq_sh_bounds[block_id] : float2(0.0f);
+        float2 mm = float2(1e30f, -1e30f);
+        if (inside)
+            _qg_color_pass<false>(p, gid, g, old_mm, float2(0.0f), mm);
+        mm = oq_block_reduce_mm2(mm, tid);
         if (tid == 0 && blk_ok)
-            p.gq_sh_bounds[block_id] = sh_mm;
+            p.gq_sh_bounds[block_id] = mm;
         if (inside) {
-            for (int c = 0; c < total; ++c) {
-                float old = gradq_decode1<8>(p.gq_sh_packed,
-                                             sh_base + uint(c), sh_old);
-                float contrib =
-                    (c < 3 * num_sh) ? g.v_sh[c / 3][c % 3] : 0.0f;
-                vkq_store_u8(p.gq_sh_packed, sh_base + uint(c),
-                             gradq_encode1<8>(old + contrib, sh_mm));
-            }
+            float2 unused = float2(0.0f);
+            _qg_color_pass<true>(p, gid, g, old_mm, mm, unused);
         }
     }
 }
@@ -307,17 +341,23 @@ struct QgCamBoundsParams {  // 24 bytes: pushed directly
     uint32_t _pad0;
 };
 
+// lower_bound over the sorted list, one thread per OUTPUT slot. Filling the
+// gaps from the input side makes one thread walk every id a sub-batch never
+// saw: 478 ms/call at N=20M, nnz=0.8M against ~2 ms here.
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void qgrad_camera_id_bounds(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
                             uniform QgCamBoundsParams p) {
-    uint i = (wg.y * p.wgs_per_row + wg.x) * 256 + tid;
-    if (i > p.nnz)
+    uint k = (wg.y * p.wgs_per_row + wg.x) * 256 + tid;
+    if (k > p.N)
         return;
-    int hi = (i == p.nnz) ? int(p.N) : p.gaussian_ids_sorted[i];
-    int lo = (i == 0) ? 0 : p.gaussian_ids_sorted[i - 1] + 1;
-    for (int k = lo; k <= hi; ++k)
-        p.camera_id_bounds[k] = int(i);
+    int lo = 0, hi = int(p.nnz);
+    while (lo < hi) {
+        int mid = lo + ((hi - lo) >> 1);
+        if (p.gaussian_ids_sorted[mid] < int(k)) lo = mid + 1;
+        else hi = mid;
+    }
+    p.camera_id_bounds[k] = lo;
 }
 
 // Declared last: spec IDs follow declaration order (see dist_spec.slang).

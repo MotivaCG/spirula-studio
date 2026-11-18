@@ -22,13 +22,14 @@
 #include <fstream>
 #include <random>
 #include <vector>
+#include "backend/tests/ScreenRows.h"
 
 using backend::MemcpyKind;
 
 static constexpr int64_t N = 3000;
 static constexpr int64_t C = 2;
 static constexpr uint32_t W = 200, H = 150;
-static constexpr int NUM_SH = 15;  // degree-3 buffer
+static constexpr int NUM_SH = 24;
 
 template <typename T>
 T* upload(const std::vector<T>& host) {
@@ -58,10 +59,12 @@ int check_error(const char* where) {
     return 0;
 }
 
-DeviceTensor2D<float4> vec_to_2d_float4(const DeviceVector<float4>& vec) {
-    TorchTensorView tv{(uint64_t)vec.data_ptr(), (uint32_t)sizeof(float),
-                       {vec.size(), 1LL, 4LL}};
-    return DeviceTensor2D<float4>(tv);
+// static: the engine library these tools link defines the same helper
+// inline (engine/EngineCommon.h), and MSVC refuses the duplicate.
+static DeviceTensor2D<uint2> vec_to_2d_aabb(const DeviceVector<uint2>& vec) {
+    TorchTensorView tv{(uint64_t)vec.data_ptr(), (uint32_t)sizeof(unsigned),
+                       {vec.size(), 1LL, 2LL}};
+    return DeviceTensor2D<uint2>(tv);
 }
 
 int main(int argc, char** argv) {
@@ -124,7 +127,7 @@ int main(int argc, char** argv) {
 
     // SH value-quant buffers (same recipe as projection_parity): random
     // packed cells + per-block (min, max) bounds in both layouts.
-    const int64_t cells = N * 3 * NUM_SH;
+    const int64_t cells = sh_fpbo_cells(N, NUM_SH);
     std::vector<uint8_t> q8(cells);
     std::vector<uint16_t> q16(cells);
     for (auto& v : q8) v = (uint8_t)(rng() & 0xff);
@@ -139,7 +142,8 @@ int main(int argc, char** argv) {
         return b;
     };
     std::vector<float> bounds_cell = gen_bounds(256);
-    std::vector<float> bounds_fpbo = gen_bounds((int64_t)256 * 3 * NUM_SH);
+    std::vector<float> bounds_fpbo =
+        gen_bounds(sh_quant_addr(NUM_SH, 0).bounds_stride);
     uint8_t* d_q8 = upload(q8);
     uint16_t* d_q16 = upload(q16);
     float* d_bcell = upload(bounds_cell);
@@ -173,10 +177,12 @@ int main(int argc, char** argv) {
         {0, false, 0, 1, 3, 0, false, true},
         {1, false, 1, 2, 2, 0, false, false},
         {0, true, 2, 1, 3, 0, false, false},
-        {2, false, 0, 3, 3, 0, false, true},
+        {2, false, 0, 2, 3, 0, false, true},
         {2, true, 1, 0, 1, 0, false, false},
         {0, false, 0, 2, 3, 8, false, false},
         {2, false, 3, 0, 3, 16, true, false},
+        {0, false, 0, 0, 4, 0, false, true},
+        {0, true, 0, 0, 4, 16, true, false},
     };
 
     for (const Cfg& cfg : cfgs) {
@@ -198,14 +204,14 @@ int main(int argc, char** argv) {
 
         // --- forward: aabb (+ ids when packed) ---
         DeviceVector<int32_t> cam_ids, gauss_ids;
-        DeviceTensor2D<float4> aabb_2d;
-        DeviceVector<float4> aabb_vec;
+        DeviceTensor2D<uint2> aabb_2d;
+        DeviceVector<uint2> aabb_vec;
         int64_t n_isect = C * N;
         if (cfg.packed) {
             auto fn = cfg.prim == 0   ? projection_3dgs_packed_forward
                       : cfg.prim == 1 ? projection_mip_packed_forward
                                       : projection_3dgut_packed_forward;
-            auto out = fn(N, cfg.max_deg, splats_in, ttv(d_vm, {C, 16}),
+            auto out = fn(N, ColorBasis{cfg.max_deg, 0}, splats_in, ttv(d_vm, {C, 16}),
                           ttv(d_intr, {C, 4}), W, H, cams[cfg.cam],
                           dist_fixture::kTierNames[cfg.dist],
                           dist_tv(cfg.dist), radii, q_packed, q_bounds,
@@ -213,13 +219,13 @@ int main(int argc, char** argv) {
             cam_ids = std::get<0>(out);
             gauss_ids = std::get<1>(out);
             aabb_vec = std::get<2>(out);
-            aabb_2d = vec_to_2d_float4(aabb_vec);
+            aabb_2d = vec_to_2d_aabb(aabb_vec);
             n_isect = cam_ids.size();
         } else {
             auto fn = cfg.prim == 0   ? projection_3dgs_forward
                       : cfg.prim == 1 ? projection_mip_forward
                                       : projection_3dgut_forward;
-            auto out = fn(N, cfg.max_deg, splats_in, ttv(d_vm, {C, 16}),
+            auto out = fn(N, ColorBasis{cfg.max_deg, 0}, splats_in, ttv(d_vm, {C, 16}),
                           ttv(d_intr, {C, 4}), W, H, cams[cfg.cam],
                           dist_fixture::kTierNames[cfg.dist],
                           dist_tv(cfg.dist), radii, q_packed, q_bounds,
@@ -238,11 +244,10 @@ int main(int argc, char** argv) {
             for (auto& v : vs) v = uf(-0.1f, 0.1f);
             for (auto& v : vo) v = uf(-0.5f, 0.5f);
             for (auto& v : vr) v = uf(-1.f, 1.f);
-            v_screen = {
-                DeviceTensorFloatND(ttv(upload(vs), {n_isect, 3, 1})),
-                DeviceTensorFloatND(ttv(upload(vo), {n_isect, 1, 1})),
-                DeviceTensorFloatND(ttv(upload(vr), {n_isect, 3, 1})),
-            };
+            auto rows = interleave_screen(n_isect, SCRG_STRIDE,
+                {{SCRG_SCALE, &vs}, {SCRG_OPAC, &vo}, {SCRG_RGB, &vr}});
+            v_screen = {DeviceTensorFloatND(
+                ttv(upload(rows), {n_isect, SCRG_STRIDE, 1}))};
         } else {
             std::vector<float> vxy(n_isect * 2), vd(n_isect),
                 vc(n_isect * 3), vo(n_isect), vr(n_isect * 3);
@@ -251,13 +256,11 @@ int main(int argc, char** argv) {
             for (auto& v : vc) v = uf(-0.02f, 0.02f);
             for (auto& v : vo) v = uf(-0.5f, 0.5f);
             for (auto& v : vr) v = uf(-1.f, 1.f);
-            v_screen = {
-                DeviceTensorFloatND(ttv(upload(vxy), {n_isect, 2, 1})),
-                DeviceTensorFloatND(ttv(upload(vd), {n_isect, 1, 1})),
-                DeviceTensorFloatND(ttv(upload(vc), {n_isect, 3, 1})),
-                DeviceTensorFloatND(ttv(upload(vo), {n_isect, 1, 1})),
-                DeviceTensorFloatND(ttv(upload(vr), {n_isect, 3, 1})),
-            };
+            auto rows = interleave_screen(n_isect, SCR2_STRIDE,
+                {{SCR2_XY, &vxy}, {SCR2_DEPTH, &vd}, {SCR2_CONIC, &vc},
+                 {SCR2_OPAC, &vo}, {SCR2_RGB, &vr}});
+            v_screen = {DeviceTensorFloatND(
+                ttv(upload(rows), {n_isect, SCR2_STRIDE, 1}))};
         }
 
         // --- zeroed world-gradient outputs + optional viewmat grad ---
@@ -277,7 +280,7 @@ int main(int argc, char** argv) {
         auto bwd = cfg.prim == 0   ? projection_3dgs_backward
                    : cfg.prim == 1 ? projection_mip_backward
                                    : projection_3dgut_backward;
-        bwd(N, cfg.max_deg, splats_in, ttv(d_vm, {C, 16}),
+        bwd(N, ColorBasis{cfg.max_deg, 0}, splats_in, ttv(d_vm, {C, 16}),
             ttv(d_intr, {C, 4}), W, H, cams[cfg.cam],
             dist_fixture::kTierNames[cfg.dist], dist_tv(cfg.dist),
             cam_ids, gauss_ids, aabb_2d, v_screen, v_world,

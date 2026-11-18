@@ -79,7 +79,11 @@ enum RawLossIndex {
     RenderNormalMaskTotal,
     DepthNormalMaskTotal,
     NormalRegMaskTotal,
-    AlphaMaskTotal,
+    // Alpha supervision scores only half the image each: "should be empty"
+    // pixels for AlphaSup, "should be solid" ones for AlphaSupUnder. Each is a
+    // mean over its own half, so the weights do not shift with subject size.
+    AlphaOverTotal,
+    AlphaUnderTotal,
     // median-depth mask totals
     MeanMedianDepthMaskTotal,
     MedianDepthNormalMaskTotal,
@@ -148,6 +152,7 @@ float[RawLossIndex::length] per_pixel_losses(
     float3 median_normal,
     bool ref_alpha,
     no_diff bool has_mask,
+    no_diff float saturation_threshold,
     no_diff float[LossWeightIndex::length] weights
 ) {
     float[RawLossIndex::length] losses;
@@ -156,15 +161,20 @@ float[RawLossIndex::length] per_pixel_losses(
     // so the mean-vs-median L1 term sees the raw linear depth.
     float mean_depth_raw = render_depth;
 
-    // Derive per-pixel validity masks (was passed in as 4 separate bool buffers).
-    //   mask         (RGB)          : 1 if no external mask, else gt_alpha.
-    //   depth_mask                  : ref_depth != 0 (sentinel for "no gt").
-    //   normal_mask                 : sum(ref_normal) > -2.366 (sentinel).
-    //   alpha_mask  (alpha sup)     : same as depth_mask (current semantics).
+    // Per-pixel validity. 0 depth is the "no gt" sentinel; normal_mask is
+    // gt_normal_valid, spelled out here because core/Interpolation.cuh is
+    // CUDA-only. No mask means ref_alpha is false everywhere, not "empty".
     bool mask = has_mask ? ref_alpha : true;
+    // Both images clipped at the same ceiling: nothing about the pixel is
+    // recoverable, so it leaves the loss the way a masked pixel does.
+    if (saturation_threshold > 0.0f &&
+        min(min(render_rgb.x, render_rgb.y), render_rgb.z) > saturation_threshold &&
+        min(min(ref_rgb.x, ref_rgb.y), ref_rgb.z) > saturation_threshold)
+        mask = false;
     bool depth_mask = (ref_depth != 0.0f);
-    bool normal_mask = (ref_normal.x + ref_normal.y + ref_normal.z > -2.366f);
-    bool alpha_mask = (ref_depth != 0.0f);
+    bool normal_mask = (ref_normal.x + ref_normal.y + ref_normal.z > -2.366f &&
+                        dot(ref_normal, ref_normal) > 0.25f);
+    bool alpha_mask = has_mask;
 
     // RGB - L1 and L2, plus YUV (BT.601) per-channel L1/L2, for training.
     // RgbL2 stays plain-RGB (PSNR calculation).
@@ -211,7 +221,7 @@ float[RawLossIndex::length] per_pixel_losses(
     losses[RawLossIndex::DepthNormalSup] = weights[LossWeightIndex::NormalSup] *
         float(depth_normal_mask & normal_mask) * normal_loss(depth_normal, ref_normal);
     losses[RawLossIndex::NormalReg] = weights[LossWeightIndex::NormalReg] *
-        float(render_normal_mask & depth_normal_mask) * normal_loss(render_normal, depth_normal);
+        float(render_normal_mask & depth_normal_mask & mask) * normal_loss(render_normal, depth_normal);
 
     // Median depth - L1 to mean depth + normal consistency against the depth
     // normal, ref normal, and render normal. median_normal is the normal
@@ -220,17 +230,21 @@ float[RawLossIndex::length] per_pixel_losses(
     median_normal = normalize_normal(median_normal, median_normal_mask);
     // 1) mean vs median depth L1, only where both depths are nonzero
     bool mean_median_mask = mask && (mean_depth_raw > 1e-10f) && (median_depth > 1e-10f);
+    // Clamped INSIDE the log: where the mask is 0 a depth is 0 too, and
+    // 0 * log(0) is a NaN -- every pixel of the loss_full densify error map
+    // on a run with no median depth.
     losses[RawLossIndex::MeanMedianDepthSup] = weights[LossWeightIndex::MeanMedianDepthSup] *
-        float(mean_median_mask) * abs(log(mean_depth_raw) - log(median_depth));
+        float(mean_median_mask) * abs(log(max(mean_depth_raw, 1e-10f)) -
+                                      log(max(median_depth, 1e-10f)));
     // 2) median normal vs depth (mean) normal
     losses[RawLossIndex::MedianDepthNormalReg] = weights[LossWeightIndex::MedianDepthNormalReg] *
-        float(median_normal_mask & depth_normal_mask) * normal_loss(median_normal, depth_normal);
+        float(median_normal_mask & depth_normal_mask & mask) * normal_loss(median_normal, depth_normal);
     // 3) median normal vs reference normal
     losses[RawLossIndex::MedianNormalSup] = weights[LossWeightIndex::MedianNormalSup] *
         float(median_normal_mask & normal_mask) * normal_loss(median_normal, ref_normal);
     // 4) median normal vs render normal (render_normal is a placeholder for now)
     losses[RawLossIndex::MedianRenderNormalReg] = weights[LossWeightIndex::MedianRenderNormalReg] *
-        float(median_normal_mask & render_normal_mask) * normal_loss(median_normal, render_normal);
+        float(median_normal_mask & render_normal_mask & mask) * normal_loss(median_normal, render_normal);
 
     // Alpha - loss with mask + regularization to go to 0 or 1
     float render_alpha = clamp(1.0f-render_Ts, 0.0f, 1.0f);
@@ -239,15 +253,15 @@ float[RawLossIndex::length] per_pixel_losses(
     losses[RawLossIndex::AlphaSupUnder] = weights[LossWeightIndex::AlphaSupUnder] *
         float(alpha_mask) * alpha_loss(1.0 - render_alpha, 1.0 - float(ref_alpha));
     losses[RawLossIndex::AlphaReg] = weights[LossWeightIndex::AlphaReg] *
-        4.0f * render_alpha * (1.0f - render_alpha);  // TODO: support push-to-1 mode
+        float(mask) * 4.0f * render_alpha * (1.0f - render_alpha);  // TODO: push-to-1 mode
 
     // Distortion regularization
     losses[RawLossIndex::RgbDistReg] = weights[LossWeightIndex::RgbDistReg] *
-        mean3(rgb_dist);// / max(render_alpha, 1e-12);
+        float(mask) * mean3(rgb_dist);// / max(render_alpha, 1e-12);
     losses[RawLossIndex::DepthDistReg] = weights[LossWeightIndex::DepthDistReg] *
-        depth_dist;// / max(render_alpha, 1e-12);
+        float(mask) * depth_dist;// / max(render_alpha, 1e-12);
     losses[RawLossIndex::NormalDistReg] = weights[LossWeightIndex::NormalDistReg] *
-        mean3(normal_dist);// / max(render_alpha, 1e-12);
+        float(mask) * mean3(normal_dist);// / max(render_alpha, 1e-12);
 
     // Mask total
     losses[RawLossIndex::PixelsTotal] = 1.0f;  // required for patched batching
@@ -255,12 +269,13 @@ float[RawLossIndex::length] per_pixel_losses(
     losses[RawLossIndex::DepthMaskTotal] = float(depth_mask);
     losses[RawLossIndex::RenderNormalMaskTotal] = float(render_normal_mask & normal_mask);
     losses[RawLossIndex::DepthNormalMaskTotal] = float(depth_normal_mask & normal_mask);
-    losses[RawLossIndex::NormalRegMaskTotal] = float(render_normal_mask & depth_normal_mask);
-    losses[RawLossIndex::AlphaMaskTotal] = float(alpha_mask);
+    losses[RawLossIndex::NormalRegMaskTotal] = float(render_normal_mask & depth_normal_mask & mask);
+    losses[RawLossIndex::AlphaOverTotal] = float(alpha_mask && !ref_alpha);
+    losses[RawLossIndex::AlphaUnderTotal] = float(alpha_mask && ref_alpha);
     losses[RawLossIndex::MeanMedianDepthMaskTotal] = float(mean_median_mask);
-    losses[RawLossIndex::MedianDepthNormalMaskTotal] = float(median_normal_mask & depth_normal_mask);
+    losses[RawLossIndex::MedianDepthNormalMaskTotal] = float(median_normal_mask & depth_normal_mask & mask);
     losses[RawLossIndex::MedianNormalMaskTotal] = float(median_normal_mask & normal_mask);
-    losses[RawLossIndex::MedianRenderNormalMaskTotal] = float(median_normal_mask & render_normal_mask);
+    losses[RawLossIndex::MedianRenderNormalMaskTotal] = float(median_normal_mask & render_normal_mask & mask);
     losses[RawLossIndex::DarknessWeightTotal] = float(mask) * dark_w;
 
     return losses;
@@ -283,6 +298,7 @@ void per_pixel_losses_bwd(
     float3 median_normal,
     bool ref_alpha,
     bool has_mask,
+    float saturation_threshold,
     no_diff float[LossWeightIndex::length] weights,
     float[RawLossIndex::length] v_losses,
     out float3 v_render_rgb,
@@ -328,6 +344,7 @@ void per_pixel_losses_bwd(
         dp_median_normal,
         ref_alpha,
         has_mask,
+        saturation_threshold,
         weights,
         v_losses
     );
@@ -409,9 +426,11 @@ float[LossIndex::length] per_pixel_losses_reduce(
             int(raw_losses[RawLossIndex::DepthNormalMaskTotal] > 0.5), 1);
 
     // alpha supervision loss
-    losses[LossIndex::AlphaSup] = (
-        raw_losses[RawLossIndex::AlphaSup] + raw_losses[RawLossIndex::AlphaSupUnder]
-    ) / max(raw_losses[RawLossIndex::AlphaMaskTotal], 1);
+    losses[LossIndex::AlphaSup] =
+        raw_losses[RawLossIndex::AlphaSup] /
+            max(raw_losses[RawLossIndex::AlphaOverTotal], 1) +
+        raw_losses[RawLossIndex::AlphaSupUnder] /
+            max(raw_losses[RawLossIndex::AlphaUnderTotal], 1);
 
     // normal regularization
     losses[LossIndex::NormalReg] =
@@ -420,15 +439,15 @@ float[LossIndex::length] per_pixel_losses_reduce(
     // alpha regularization
     // TODO: push-to-1 mode for random background
     losses[LossIndex::AlphaReg] =
-        raw_losses[RawLossIndex::AlphaReg] / max(raw_losses[RawLossIndex::PixelsTotal], 1);
+        raw_losses[RawLossIndex::AlphaReg] / max(raw_losses[RawLossIndex::MaskTotal], 1);
 
     // distortion regularizations
     losses[LossIndex::RgbDistReg] =
-        raw_losses[RawLossIndex::RgbDistReg] / max(raw_losses[RawLossIndex::PixelsTotal], 1);
+        raw_losses[RawLossIndex::RgbDistReg] / max(raw_losses[RawLossIndex::MaskTotal], 1);
     losses[LossIndex::DepthDistReg] =
-        raw_losses[RawLossIndex::DepthDistReg] / max(raw_losses[RawLossIndex::PixelsTotal], 1);
+        raw_losses[RawLossIndex::DepthDistReg] / max(raw_losses[RawLossIndex::MaskTotal], 1);
     losses[LossIndex::NormalDistReg] =
-        raw_losses[RawLossIndex::NormalDistReg] / max(raw_losses[RawLossIndex::PixelsTotal], 1);
+        raw_losses[RawLossIndex::NormalDistReg] / max(raw_losses[RawLossIndex::MaskTotal], 1);
 
     // median-depth losses, each normalized by its own mask total
     losses[LossIndex::MeanMedianDepthSup] =

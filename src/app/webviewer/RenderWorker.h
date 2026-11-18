@@ -14,6 +14,7 @@
 // (try_get_result, GUI frame loop).
 
 #include "data/DatasetParser.h"
+#include "data/CameraWire.h"
 
 #include <array>
 #include <atomic>
@@ -26,6 +27,8 @@
 #include <vector>
 
 // Static per-run info the render path needs (subset of model config).
+namespace spirula { struct RegionOverlay; }
+
 struct ViewerRenderConfig {
     std::string primitive = "3dgs";
     bool  packed = false;
@@ -43,13 +46,21 @@ struct ViewerRenderConfig {
     // Viewer-client c2w remap into the training frame.
     float train_frame_scale = 1.0f;
     std::array<float, 16> train_to_normalized{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
-    // Unscaled frustum size from the camera-kNN heuristic (the return value
-    // of viewer_upload_cameras). Multiplied by ViewRequest::cam_size_scale
-    // per render; 0 disables live frustum-size updates.
+    // Unscaled frustum size (the return value of viewer_upload_cameras),
+    // multiplied by ViewRequest::cam_size_scale per render; 0 disables live
+    // frustum-size updates.
     float base_camera_size = 0.0f;
     // Which engine scene slot this worker renders (Engine.h "Viewer scenes").
     // < 0 = whatever is bound, which is what a training session wants.
     int scene_slot = -1;
+    // What the client's view orbits about and Reset frames, one point per
+    // dsparse::CenterMode in the client's normalized frame. `center_cameras`
+    // is false over a file, which has none, so those modes are not offered.
+    dsparse::CenterTable centers{};
+    bool center_cameras = false;
+    bool orbit_navigation = true;
+    bool focus_pivot = false;   // orbit about the camera-focus centre
+    std::vector<dsparse::CameraWireSegment> held_out_cameras;
 };
 
 struct ViewerHooks {
@@ -88,6 +99,9 @@ struct ViewRequest {
     // Frustum-size multiplier applied to cfg.base_camera_size when
     // show_cams is on (user-facing "camera size" slider).
     float cam_size_scale = 1.0f;
+    // The region of interest's outline (RenderWorker::set_region_overlay),
+    // pinhole views only.
+    bool show_roi = false;
     // Double-click pick: when >= 0, also return the 3D point under this
     // pixel (render resolution), read from the ray-depth channel the render
     // already downloads -- no extra VRAM or render pass.
@@ -102,12 +116,25 @@ struct ViewRequest {
     // render in flight is never half-switched.
     std::string primitive;    // "" = ViewerRenderConfig::primitive
     int sh_degree = -1;       // < 0 = the warmup schedule
+
+    // ---- a frame for a file rather than for the screen ----
+    // No overlays and no display transform: ViewResult::rgba8 comes back as
+    // the render premultiplied over nothing, alpha = 1 - transmittance.
+    bool raw = false;
+    // The lens distortion tier by name ("NONE" / "OPENCV" / "THIN_PRISM")
+    // and its coefficients in that tier's order.
+    std::string distortion = "NONE";
+    float dist[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    // Run under the engine lock around this render, with its scene bound:
+    // an effect that rewrites the splats for one frame puts them back after.
+    std::function<void()> before_render, after_render;
 };
 
 struct ViewResult {
     uint64_t id = 0;
     int W = 0, H = 0;
     std::vector<uint8_t> rgb8;   // [H, W, 3]
+    std::vector<uint8_t> rgba8;  // [H, W, 4], ViewRequest::raw only
     std::string error;           // non-empty on failure
     // Pick result (ViewRequest::pick_px/py): point under the pixel in the
     // client's normalized frame; pick_hit false = background / invalid ray.
@@ -134,8 +161,14 @@ public:
     bool wait_result(uint64_t id, ViewResult& out, double timeout_s);
     // Non-blocking: true when the result of request `id` is available.
     bool try_get_result(uint64_t id, ViewResult& out);
+    // The same, handing the result over rather than copying it -- a frame's
+    // pixels, for the one consumer that asked; 0 s does not wait.
+    bool take_result(uint64_t id, ViewResult& out, double timeout_s);
 
     const ViewerRenderConfig& config() const;
+    // Drawn over frames that ask for it (ViewRequest::show_roi), in the
+    // training frame; null for none.
+    void set_region_overlay(std::shared_ptr<const spirula::RegionOverlay> ov);
 
     // Viewable buffer keys for this config (the Python /buffers set; the
     // distortion buffers appear only when a distortion regularizer is
@@ -148,23 +181,20 @@ private:
 };
 
 // One-shot upload of the post-split camera table for frustum annotation +
-// thumbnails (annotation.ensure_viewer_initialized port: engine_viewer_init
-// + the camera_size kNN heuristic). Call after engine_setup_data_manager,
-// before rendering with show_cams. Returns the kNN-based camera size, for
-// ViewerRenderConfig::base_camera_size.
+// thumbnails. Call after engine_setup_data_manager, before rendering with
+// show_cams. Returns the frustum size, for ViewerRenderConfig::base_camera_size.
 float viewer_upload_cameras(const PostSplitCameras& post);
 
-// The kNN camera-size heuristic on its own (0.2 * median 4-NN camera
-// distance), for renderers that draw frusta without the engine (the GUI's
-// dataset preview).
+// The frustum size alone (camhost::frustum_display_size in the training
+// frame), for renderers that draw frusta without the engine.
 float viewer_camera_size_heuristic(const PostSplitCameras& post);
 
-// Unit ray direction (CV convention: x right, y down, z forward) for a
-// viewer pixel, u = (px - cx)/fx, v = (py - cy)/fy. Host port of
-// projection_utils generate_ray for the distortion-free display models
-// 0 pinhole / 1 fisheye-equidistant / 2 equisolid / 3 equirectangular;
-// false when the pixel is outside the model's domain.
+// Unit CV direction for u = (px-cx)/fx, v = (py-cy)/fy.
+// Orthographic origins are (u,v,0); false outside the model's domain.
 bool viewer_pixel_ray(int camera_model, float u, float v, float dir[3]);
+
+// Camera-space point to normalized image coordinates; false behind the horizon.
+bool viewer_ray_pixel(int camera_model, const float dir[3], float& u, float& v);
 
 // One-shot upload of the axes/grid overlay (engine_viewer_set_grid). The
 // grid is axis-aligned in the engine's training frame -- the frame splats

@@ -5,7 +5,115 @@
 #include "kernels/projection/ProjectionBwdQuantGrad_kernel.cuh"
 
 template void projection_bwd_quantgrad_kernel_wrapper<
-    MipSplatting<2>,
+    Vanilla3DGS<3>,
+    CameraModelType::FISHEYE,
+    CameraDistortionType::None
+>(
+    cudaStream_t stream,
+    const uint32_t C,
+    const uint32_t N,
+    const uint32_t num_sh_buffer,
+    Vanilla3DGS<3>::WorldBuffer splats_world,
+    const float * viewmats,
+    const float4 * intrins,
+    const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const int32_t * camera_id_bounds,
+    const int32_t * camera_ids,
+    const uint2 * aabb,
+    Vanilla3DGS<3>::WorldBuffer v_splats_world,
+    Vanilla3DGS<3>::ScreenBuffer v_splats_screen,
+    GradQuantBuffers gq,
+    const uint8_t* sh_value_packed,
+    const float2* sh_value_bounds,
+    const int64_t sh_value_bounds_stride,
+    const int sh_value_bits
+);
+
+template void projection_bwd_quantgrad_kernel_wrapper<
+    Vanilla3DGS<3>,
+    CameraModelType::FISHEYE,
+    CameraDistortionType::OpenCV
+>(
+    cudaStream_t stream,
+    const uint32_t C,
+    const uint32_t N,
+    const uint32_t num_sh_buffer,
+    Vanilla3DGS<3>::WorldBuffer splats_world,
+    const float * viewmats,
+    const float4 * intrins,
+    const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const int32_t * camera_id_bounds,
+    const int32_t * camera_ids,
+    const uint2 * aabb,
+    Vanilla3DGS<3>::WorldBuffer v_splats_world,
+    Vanilla3DGS<3>::ScreenBuffer v_splats_screen,
+    GradQuantBuffers gq,
+    const uint8_t* sh_value_packed,
+    const float2* sh_value_bounds,
+    const int64_t sh_value_bounds_stride,
+    const int sh_value_bits
+);
+
+template void projection_bwd_quantgrad_kernel_wrapper<
+    Vanilla3DGS<3>,
+    CameraModelType::FISHEYE,
+    CameraDistortionType::ThinPrism
+>(
+    cudaStream_t stream,
+    const uint32_t C,
+    const uint32_t N,
+    const uint32_t num_sh_buffer,
+    Vanilla3DGS<3>::WorldBuffer splats_world,
+    const float * viewmats,
+    const float4 * intrins,
+    const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const int32_t * camera_id_bounds,
+    const int32_t * camera_ids,
+    const uint2 * aabb,
+    Vanilla3DGS<3>::WorldBuffer v_splats_world,
+    Vanilla3DGS<3>::ScreenBuffer v_splats_screen,
+    GradQuantBuffers gq,
+    const uint8_t* sh_value_packed,
+    const float2* sh_value_bounds,
+    const int64_t sh_value_bounds_stride,
+    const int sh_value_bits
+);
+
+template void projection_bwd_quantgrad_kernel_wrapper<
+    Vanilla3DGS<3>,
+    CameraModelType::EQUISOLID,
+    CameraDistortionType::None
+>(
+    cudaStream_t stream,
+    const uint32_t C,
+    const uint32_t N,
+    const uint32_t num_sh_buffer,
+    Vanilla3DGS<3>::WorldBuffer splats_world,
+    const float * viewmats,
+    const float4 * intrins,
+    const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const int32_t * camera_id_bounds,
+    const int32_t * camera_ids,
+    const uint2 * aabb,
+    Vanilla3DGS<3>::WorldBuffer v_splats_world,
+    Vanilla3DGS<3>::ScreenBuffer v_splats_screen,
+    GradQuantBuffers gq,
+    const uint8_t* sh_value_packed,
+    const float2* sh_value_bounds,
+    const int64_t sh_value_bounds_stride,
+    const int sh_value_bits
+);
+
+template void projection_bwd_quantgrad_kernel_wrapper<
+    Vanilla3DGS<3>,
     CameraModelType::EQUISOLID,
     CameraDistortionType::OpenCV
 >(
@@ -13,7 +121,7 @@ template void projection_bwd_quantgrad_kernel_wrapper<
     const uint32_t C,
     const uint32_t N,
     const uint32_t num_sh_buffer,
-    MipSplatting<2>::WorldBuffer splats_world,
+    Vanilla3DGS<3>::WorldBuffer splats_world,
     const float * viewmats,
     const float4 * intrins,
     const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
@@ -21,10 +129,9 @@ template void projection_bwd_quantgrad_kernel_wrapper<
     const uint32_t image_height,
     const int32_t * camera_id_bounds,
     const int32_t * camera_ids,
-    const int32_t * perm,
-    const float4 * aabb,
-    MipSplatting<2>::WorldBuffer v_splats_world,
-    MipSplatting<2>::ScreenBuffer v_splats_screen,
+    const uint2 * aabb,
+    Vanilla3DGS<3>::WorldBuffer v_splats_world,
+    Vanilla3DGS<3>::ScreenBuffer v_splats_screen,
     GradQuantBuffers gq,
     const uint8_t* sh_value_packed,
     const float2* sh_value_bounds,
@@ -33,7 +140,7 @@ template void projection_bwd_quantgrad_kernel_wrapper<
 );
 
 template void projection_bwd_quantgrad_kernel_wrapper<
-    MipSplatting<2>,
+    Vanilla3DGS<3>,
     CameraModelType::EQUISOLID,
     CameraDistortionType::ThinPrism
 >(
@@ -41,7 +148,7 @@ template void projection_bwd_quantgrad_kernel_wrapper<
     const uint32_t C,
     const uint32_t N,
     const uint32_t num_sh_buffer,
-    MipSplatting<2>::WorldBuffer splats_world,
+    Vanilla3DGS<3>::WorldBuffer splats_world,
     const float * viewmats,
     const float4 * intrins,
     const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
@@ -49,10 +156,9 @@ template void projection_bwd_quantgrad_kernel_wrapper<
     const uint32_t image_height,
     const int32_t * camera_id_bounds,
     const int32_t * camera_ids,
-    const int32_t * perm,
-    const float4 * aabb,
-    MipSplatting<2>::WorldBuffer v_splats_world,
-    MipSplatting<2>::ScreenBuffer v_splats_screen,
+    const uint2 * aabb,
+    Vanilla3DGS<3>::WorldBuffer v_splats_world,
+    Vanilla3DGS<3>::ScreenBuffer v_splats_screen,
     GradQuantBuffers gq,
     const uint8_t* sh_value_packed,
     const float2* sh_value_bounds,
@@ -61,7 +167,7 @@ template void projection_bwd_quantgrad_kernel_wrapper<
 );
 
 template void projection_bwd_quantgrad_kernel_wrapper<
-    MipSplatting<2>,
+    Vanilla3DGS<3>,
     CameraModelType::EQUIRECTANGULAR,
     CameraDistortionType::None
 >(
@@ -69,7 +175,7 @@ template void projection_bwd_quantgrad_kernel_wrapper<
     const uint32_t C,
     const uint32_t N,
     const uint32_t num_sh_buffer,
-    MipSplatting<2>::WorldBuffer splats_world,
+    Vanilla3DGS<3>::WorldBuffer splats_world,
     const float * viewmats,
     const float4 * intrins,
     const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
@@ -77,10 +183,9 @@ template void projection_bwd_quantgrad_kernel_wrapper<
     const uint32_t image_height,
     const int32_t * camera_id_bounds,
     const int32_t * camera_ids,
-    const int32_t * perm,
-    const float4 * aabb,
-    MipSplatting<2>::WorldBuffer v_splats_world,
-    MipSplatting<2>::ScreenBuffer v_splats_screen,
+    const uint2 * aabb,
+    Vanilla3DGS<3>::WorldBuffer v_splats_world,
+    Vanilla3DGS<3>::ScreenBuffer v_splats_screen,
     GradQuantBuffers gq,
     const uint8_t* sh_value_packed,
     const float2* sh_value_bounds,
@@ -89,7 +194,7 @@ template void projection_bwd_quantgrad_kernel_wrapper<
 );
 
 template void projection_bwd_quantgrad_kernel_wrapper<
-    Vanilla3DGS<3>,
+    MipSplatting<3>,
     CameraModelType::PINHOLE,
     CameraDistortionType::None
 >(
@@ -97,7 +202,7 @@ template void projection_bwd_quantgrad_kernel_wrapper<
     const uint32_t C,
     const uint32_t N,
     const uint32_t num_sh_buffer,
-    Vanilla3DGS<3>::WorldBuffer splats_world,
+    MipSplatting<3>::WorldBuffer splats_world,
     const float * viewmats,
     const float4 * intrins,
     const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
@@ -105,10 +210,9 @@ template void projection_bwd_quantgrad_kernel_wrapper<
     const uint32_t image_height,
     const int32_t * camera_id_bounds,
     const int32_t * camera_ids,
-    const int32_t * perm,
-    const float4 * aabb,
-    Vanilla3DGS<3>::WorldBuffer v_splats_world,
-    Vanilla3DGS<3>::ScreenBuffer v_splats_screen,
+    const uint2 * aabb,
+    MipSplatting<3>::WorldBuffer v_splats_world,
+    MipSplatting<3>::ScreenBuffer v_splats_screen,
     GradQuantBuffers gq,
     const uint8_t* sh_value_packed,
     const float2* sh_value_bounds,
@@ -117,7 +221,7 @@ template void projection_bwd_quantgrad_kernel_wrapper<
 );
 
 template void projection_bwd_quantgrad_kernel_wrapper<
-    Vanilla3DGS<3>,
+    MipSplatting<3>,
     CameraModelType::PINHOLE,
     CameraDistortionType::OpenCV
 >(
@@ -125,7 +229,7 @@ template void projection_bwd_quantgrad_kernel_wrapper<
     const uint32_t C,
     const uint32_t N,
     const uint32_t num_sh_buffer,
-    Vanilla3DGS<3>::WorldBuffer splats_world,
+    MipSplatting<3>::WorldBuffer splats_world,
     const float * viewmats,
     const float4 * intrins,
     const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
@@ -133,122 +237,9 @@ template void projection_bwd_quantgrad_kernel_wrapper<
     const uint32_t image_height,
     const int32_t * camera_id_bounds,
     const int32_t * camera_ids,
-    const int32_t * perm,
-    const float4 * aabb,
-    Vanilla3DGS<3>::WorldBuffer v_splats_world,
-    Vanilla3DGS<3>::ScreenBuffer v_splats_screen,
-    GradQuantBuffers gq,
-    const uint8_t* sh_value_packed,
-    const float2* sh_value_bounds,
-    const int64_t sh_value_bounds_stride,
-    const int sh_value_bits
-);
-
-template void projection_bwd_quantgrad_kernel_wrapper<
-    Vanilla3DGS<3>,
-    CameraModelType::PINHOLE,
-    CameraDistortionType::ThinPrism
->(
-    cudaStream_t stream,
-    const uint32_t C,
-    const uint32_t N,
-    const uint32_t num_sh_buffer,
-    Vanilla3DGS<3>::WorldBuffer splats_world,
-    const float * viewmats,
-    const float4 * intrins,
-    const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
-    const uint32_t image_width,
-    const uint32_t image_height,
-    const int32_t * camera_id_bounds,
-    const int32_t * camera_ids,
-    const int32_t * perm,
-    const float4 * aabb,
-    Vanilla3DGS<3>::WorldBuffer v_splats_world,
-    Vanilla3DGS<3>::ScreenBuffer v_splats_screen,
-    GradQuantBuffers gq,
-    const uint8_t* sh_value_packed,
-    const float2* sh_value_bounds,
-    const int64_t sh_value_bounds_stride,
-    const int sh_value_bits
-);
-
-template void projection_bwd_quantgrad_kernel_wrapper<
-    Vanilla3DGS<3>,
-    CameraModelType::PINHOLE,
-    CameraDistortionType::Rational
->(
-    cudaStream_t stream,
-    const uint32_t C,
-    const uint32_t N,
-    const uint32_t num_sh_buffer,
-    Vanilla3DGS<3>::WorldBuffer splats_world,
-    const float * viewmats,
-    const float4 * intrins,
-    const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
-    const uint32_t image_width,
-    const uint32_t image_height,
-    const int32_t * camera_id_bounds,
-    const int32_t * camera_ids,
-    const int32_t * perm,
-    const float4 * aabb,
-    Vanilla3DGS<3>::WorldBuffer v_splats_world,
-    Vanilla3DGS<3>::ScreenBuffer v_splats_screen,
-    GradQuantBuffers gq,
-    const uint8_t* sh_value_packed,
-    const float2* sh_value_bounds,
-    const int64_t sh_value_bounds_stride,
-    const int sh_value_bits
-);
-
-template void projection_bwd_quantgrad_kernel_wrapper<
-    Vanilla3DGS<3>,
-    CameraModelType::FISHEYE,
-    CameraDistortionType::None
->(
-    cudaStream_t stream,
-    const uint32_t C,
-    const uint32_t N,
-    const uint32_t num_sh_buffer,
-    Vanilla3DGS<3>::WorldBuffer splats_world,
-    const float * viewmats,
-    const float4 * intrins,
-    const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
-    const uint32_t image_width,
-    const uint32_t image_height,
-    const int32_t * camera_id_bounds,
-    const int32_t * camera_ids,
-    const int32_t * perm,
-    const float4 * aabb,
-    Vanilla3DGS<3>::WorldBuffer v_splats_world,
-    Vanilla3DGS<3>::ScreenBuffer v_splats_screen,
-    GradQuantBuffers gq,
-    const uint8_t* sh_value_packed,
-    const float2* sh_value_bounds,
-    const int64_t sh_value_bounds_stride,
-    const int sh_value_bits
-);
-
-template void projection_bwd_quantgrad_kernel_wrapper<
-    Vanilla3DGS<3>,
-    CameraModelType::FISHEYE,
-    CameraDistortionType::OpenCV
->(
-    cudaStream_t stream,
-    const uint32_t C,
-    const uint32_t N,
-    const uint32_t num_sh_buffer,
-    Vanilla3DGS<3>::WorldBuffer splats_world,
-    const float * viewmats,
-    const float4 * intrins,
-    const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
-    const uint32_t image_width,
-    const uint32_t image_height,
-    const int32_t * camera_id_bounds,
-    const int32_t * camera_ids,
-    const int32_t * perm,
-    const float4 * aabb,
-    Vanilla3DGS<3>::WorldBuffer v_splats_world,
-    Vanilla3DGS<3>::ScreenBuffer v_splats_screen,
+    const uint2 * aabb,
+    MipSplatting<3>::WorldBuffer v_splats_world,
+    MipSplatting<3>::ScreenBuffer v_splats_screen,
     GradQuantBuffers gq,
     const uint8_t* sh_value_packed,
     const float2* sh_value_bounds,

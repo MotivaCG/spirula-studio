@@ -29,6 +29,7 @@ namespace SlangProjectionUtils {
 #include "core/CameraDistortion.cuh"
 
 #include <core/Common.cuh>
+#include "core/AabbQuant.cuh"
 
 #include "primitives/Primitive.cuh"
 
@@ -52,7 +53,8 @@ template<
     CameraDistortionType distortion,
 #endif
     DistortionType dist_type,
-    bool output_median
+    bool output_median,
+    bool output_score
 >
 #if IS_EVAL3D
 __global__ void rasterize_to_pixels_eval3d_fwd_kernel(
@@ -69,19 +71,22 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     const float *__restrict__ viewmats, // [B, C, 4, 4]
     const float4 *__restrict__ intrins,  // [B, C, 4], fx, fy, cx, cy
     const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
-    const float4 *__restrict__ aabb,  // [..., N] projected 2D AABB (xmin,ymin,xmax,ymax)
+    const uint2 *__restrict__ aabb,   // [..., N] packed, core/AabbQuant.cuh
 #endif
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_width,
     const uint32_t tile_height,
+    const int macro_log2,
     const int32_t *__restrict__ tile_offsets, // [I, tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
     RenderOutput::Buffer render_colors, // [I, image_height, image_width, ...]
     float * render_Ts, // [I, image_height, image_width, 1]
     int32_t *__restrict__ last_ids, // [I, image_height, image_width]
     RenderOutput::Buffer render_distortions, // [I, image_height, image_width, ...]
-    float * render_median // [I, image_height, image_width, 1], optional
+    float * render_median, // [I, image_height, image_width, 1], optional
+    const SplatScoreRender score,
+    const float kernel_cut  // Primitive3DGS::kernel_vis; the 2D path only
 ) {
     auto block = cg::this_thread_block();
     uint32_t tid = threadIdx.x;  // 0 .. TILE_AREA-1, one per pixel
@@ -90,7 +95,8 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     // one block per micro-tile; recover the macro tile it belongs to for binning
     uint32_t mt_y = blockIdx.y;  // micro-tile row
     uint32_t mt_x = blockIdx.z;  // micro-tile col
-    int32_t tile_id = (mt_y / MACRO_TILE_SIZE_Y) * tile_width + (mt_x / MACRO_TILE_SIZE_X);
+    int32_t tile_id =
+        (int32_t)((mt_y >> macro_log2) * tile_width + (mt_x >> macro_log2));
 
     tile_offsets += image_id * tile_height * tile_width;
     render_Ts += image_id * image_height * image_width;
@@ -129,6 +135,8 @@ __global__ void rasterize_to_pixels_fwd_kernel(
         (int)camera_model, dist_coeffs,
         &raydir
     );
+    if constexpr (camera_model == CameraModelType::ORTHOGRAPHIC)
+        ray_o += SlangProjectionUtils::transform_ray_d(R, {(px-cx)/fx, (py-cy)/fy, 0.0f});
     float3 ray_d = SlangProjectionUtils::transform_ray_d(R, raydir);
 #endif
 
@@ -150,6 +158,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
 
     RenderOutput pix_out = RenderOutput::zero();   // C = sum_j w_j c_j (raw)
     RenderOutput pix2_out = RenderOutput::zero();  // S = sum_j w_j c_j^2
+    [[maybe_unused]] float pix_score = 0.0f;
 
     // gaussians overlapping this micro-tile's macro tile
     int32_t range_start = tile_offsets[tile_id];
@@ -168,6 +177,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     // whether the loaded gaussian's footprint reaches this micro-tile (uniform
     // across the whole block, so skipping it is divergence-free)
     __shared__ bool splat_hit[TILE_AREA];
+    [[maybe_unused]] __shared__ float splat_score[output_score ? TILE_AREA : 1];
 
     // collect and process batches of gaussians, one thread loads one gaussian
     for (uint32_t b = 0; b < num_batches; ++b) {
@@ -189,9 +199,8 @@ __global__ void rasterize_to_pixels_fwd_kernel(
             float opac = splat_sbuffer.opacities(g);
             if (opac > ALPHA_THRESHOLD) {
                 float3 conic = splat_sbuffer.scales(g);
-                float4 bb = aabb[g];
-                float ecx = 0.5f * (bb.x + bb.z);
-                float ecy = 0.5f * (bb.y + bb.w);
+                float2 ec = aabb16_center(aabb[g], image_width, image_height);
+                float ecx = ec.x, ecy = ec.y;
                 float kk = 0.5f / __logf(opac / ALPHA_THRESHOLD);
                 float3 inv_cov = { conic.x * kk, conic.y * kk, conic.z * kk };
                 hit = ellipse_box_overlap_test(inv_cov,
@@ -206,13 +215,19 @@ __global__ void rasterize_to_pixels_fwd_kernel(
             splat_batch[tid].load(splat_wbuffer, splat_sbuffer, wi, g);
             const typename SplatPrimitive::FragmentFwd& sp = splat_batch[tid];
             if (sp.opac > ALPHA_THRESHOLD) {
-                float kk = 0.5f / __logf(sp.opac / ALPHA_THRESHOLD);
+                float kk = 0.5f / kernel_reach(sp.opac, kernel_cut);
                 float3 inv_cov = { sp.conic.x * kk, sp.conic.y * kk, sp.conic.z * kk };
                 hit = ellipse_box_overlap_test(inv_cov,
                     mt_bx0 - sp.xy.x, mt_bx0 + TILE_SIZE_X - sp.xy.x,
                     mt_by0 - sp.xy.y, mt_by0 + TILE_SIZE_Y - sp.xy.y);
             }
         #endif
+            if constexpr (output_score) {
+                if (hit) {
+                    const float2 a = score.score[wi];
+                    splat_score[tid] = a.y > 0.0f ? __powf(a.x, score.exponent) : score.prior;
+                }
+            }
         }
         splat_hit[tid] = hit;
 
@@ -230,7 +245,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
         #if IS_EVAL3D
             float alpha = splat.evaluate_alpha(ray_o, ray_d);
         #else
-            float alpha = splat.evaluate_alpha(px, py);
+            float alpha = splat.evaluate_alpha(px, py, kernel_cut);
         #endif
             if (alpha <= ALPHA_THRESHOLD)
                 continue;
@@ -277,6 +292,8 @@ __global__ void rasterize_to_pixels_fwd_kernel(
                 if constexpr (dist_any(dist_type))
                     pix2_out += acc * acc * vis;
                 pix_out += acc * vis;
+                if constexpr (output_score)
+                    pix_score += vis * splat_score[t];
                 cur_idx = batch_start + t;
                 T = next_T;
             } else done = true;
@@ -288,6 +305,8 @@ __global__ void rasterize_to_pixels_fwd_kernel(
         render_Ts[pix_id] = T;
         if constexpr (output_median)
             render_median[pix_id] = median_depth;
+        if constexpr (output_score)
+            score.out[pix_id_global] = pix_score / fmaxf(1.0f - T, 1e-10f);
         // distortion: closed form D = W*S - C^2, with W = 1 - T_final and the
         // raw (un-normalized) accumulators C = pix_out, S = pix2_out. Must be
         // evaluated before the depth channel of C is normalized below.
@@ -319,7 +338,8 @@ template<
     CameraDistortionType distortion,
 #endif
     DistortionType dist_type,
-    bool output_median
+    bool output_median,
+    bool output_score
 >
 #if IS_EVAL3D
 void rasterize_to_pixels_eval3d_fwd_kernel_wrapper(
@@ -337,24 +357,27 @@ void rasterize_to_pixels_fwd_kernel_wrapper(
     const float *__restrict__ viewmats, // [B, C, 4, 4]
     const float4 *__restrict__ intrins,  // [B, C, 4], fx, fy, cx, cy
     const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
-    const float4 *__restrict__ aabb,  // [..., N] projected 2D AABB (xmin,ymin,xmax,ymax)
+    const uint2 *__restrict__ aabb,   // [..., N] packed, core/AabbQuant.cuh
 #endif
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_width,
     const uint32_t tile_height,
+    const int macro_log2,
     const int32_t *__restrict__ tile_offsets, // [I, tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
     RenderOutput::Buffer render_colors, // [I, image_height, image_width, ...]
     float *__restrict__ render_Ts, // [I, image_height, image_width, 1]
     int32_t *__restrict__ last_ids, // [I, image_height, image_width]
     RenderOutput::Buffer render_distortions, // [I, image_height, image_width, ...]
-    float *__restrict__ render_median // [I, image_height, image_width, 1], optional
+    float *__restrict__ render_median, // [I, image_height, image_width, 1], optional
+    const SplatScoreRender score,
+    const float kernel_cut  // Primitive3DGS::kernel_vis; the 2D path only
 ) {
-    // One block per micro-tile. The macro tile spans MACRO_TILE_SIZE_{X,Y}
-    // micro-tiles, so the grid is the macro-tile grid scaled up accordingly.
+    // One block per micro-tile. The macro tile spans 1 << macro_log2 micro
+    // tiles per axis, so the grid is the macro-tile grid scaled up by that.
     dim3 threads = {TILE_AREA, 1, 1};
-    dim3 grid = {I, tile_height * MACRO_TILE_SIZE_Y, tile_width * MACRO_TILE_SIZE_X};
+    dim3 grid = {I, tile_height << macro_log2, tile_width << macro_log2};
 
 #if IS_EVAL3D
     rasterize_to_pixels_eval3d_fwd_kernel<
@@ -366,17 +389,20 @@ void rasterize_to_pixels_fwd_kernel_wrapper(
         camera_model, distortion,
     #endif
         dist_type,
-        output_median
+        output_median,
+        output_score
     ><<<grid, threads, 0, stream>>>(
         I, N, n_isects,
         gaussian_ids, splat_wbuffer, splat_sbuffer,
     #if IS_EVAL3D
         viewmats, intrins, dist_coeffs_buffer, aabb,
     #endif
-        image_width, image_height, tile_width, tile_height, tile_offsets, flatten_ids,
+        image_width, image_height, tile_width, tile_height, macro_log2,
+        tile_offsets, flatten_ids,
         render_colors, render_Ts, last_ids,
         render_distortions,
-        render_median
+        render_median,
+        score, kernel_cut
     );
 }
 

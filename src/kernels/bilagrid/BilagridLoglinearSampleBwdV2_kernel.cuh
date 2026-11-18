@@ -7,15 +7,17 @@
 // Reads grid values from the g_id slot; scatters grad into the per-batch buffer
 // indexed by ni. See BilagridBackwardSelection.md and
 // BilagridLoglinearSampleBwdV1_kernel.cuh.
+template <int kF = -1>
 __global__ void bilagrid_loglinear_uniform_sample_backward_v2_kernel(
     BilagridReader bilagrid,               // [N_grids,L,H,W,9]
-    const float* __restrict__ rgb_in,      // [N,h,w,3]
+    PixelPtr rgb_in,      // [N,h,w,3]
     const float* __restrict__ v_rgb_out,   // [N,h,w,3]
     float* __restrict__ v_bilagrid,        // [N,L,H,W,9] (per-batch, accumulated)
     float* __restrict__ v_rgb_in,          // [N,h,w,3]
     int N, int L, int H, int W, int h, int w,
     const int* __restrict__ grid_indices   // [N], or nullptr -> identity
 ) {
+    if constexpr (kF >= 0) rgb_in.f = (PixelFormat)kF;
     int idx = blockIdx.x * kBilagridBwdV1RgbThreads + threadIdx.x;
     int total = N * h * w;
     if (idx >= total) return;
@@ -28,6 +30,17 @@ __global__ void bilagrid_loglinear_uniform_sample_backward_v2_kernel(
 
     float sr = rgb_in[g_off + 0], sg = rgb_in[g_off + 1], sb = rgb_in[g_off + 2];
     float dr = v_rgb_out[g_off + 0], dg = v_rgb_out[g_off + 1], db = v_rgb_out[g_off + 2];
+
+    // Both gradients are linear in the incoming one, so a zero one -- a
+    // masked pixel, mostly -- contributes nothing anywhere.
+    if (dr == 0.0f && dg == 0.0f && db == 0.0f) {
+        if (v_rgb_in != nullptr) {
+            v_rgb_in[g_off + 0] = 0.0f;
+            v_rgb_in[g_off + 1] = 0.0f;
+            v_rgb_in[g_off + 2] = 0.0f;
+        }
+        return;
+    }
 
     float x = (float)wi / (float)(w - 1) * (float)(W - 1);
     float y = (float)hi / (float)(h - 1) * (float)(H - 1);

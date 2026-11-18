@@ -6,38 +6,11 @@
 //   CUDA build:   ./msloss_parity dump ref.bin
 //   Vulkan build: ./msloss_parity compare ref.bin   (per device)
 //
-// Ref format: [nf tight floats] [nl loose floats].
-//
-// Channel assignment:
-//  - tight: per-pixel gradients (deterministic given the raw-loss sums; the
-//    sums enter grads only through smooth reduce math, so cross-backend
-//    rounding stays ~1e-5 relative), the densification loss map in every
-//    mode (per-pixel L1/aux + SSIM map, canny, robust-canny -- the quantile
-//    selector is bit-exact integer radix-select), equal-shape v_ref_depth /
-//    v_ref_normal (single-tap scatter -> one atomic per cell), and the
-//    quantile outputs.
-//  - loose: LossValues (atomic raw-loss accumulation with different block
-//    geometries), the SSIM display scalar, and scaled-GT v_ref_depth /
-//    v_ref_normal (multi-tap atomic scatter).
-//  - skipped: the SSIM scalar when a mask is present -- CUDA's masked-pixel
-//    path overwrites a thread's whole accumulator with 3.0 ("TODO: mask
-//    this"), making the total depend on the thread->pixel mapping, which
-//    differs between CUDA's 24x24 and Vulkan's 16x16 tiles.
-//
-// Known EXPECTED mismatches (display-only SSIM scalar; stay within the loose
-// failure budget): (a) CUDA sums ssim over tile-grid positions, so images
-// whose dims aren't multiples of the tile pick up zero-padded out-of-image
-// contributions that differ between 24- and 16-wide tiles ("ssim_cs" cfg);
-// (b) CUDA's blockAtomicAdd<576> reduces its 18 warp partials with
-// power-of-two shuffle strides (9/4/2/1), silently dropping warps 8 and 17
-// -- the Vulkan 256-tree value matches a numpy brute-force of the same
-// center set exactly, the CUDA value is ~4% low ("scaled_gt" cfg).
-//
-// LossValues / the SSIM scalar are read through one-iteration-behind async
-// readouts on both backends, so every config runs the identical computation
-// twice and compares the second return value.
+// Ref format: [nf tight floats] [nl loose floats]. Which values go in which
+// channel, and the one expected CUDA/Vulkan mismatch: docs/testing.md.
 
 #include <kernels/loss/PerPixelLoss.cuh>
+#include <kernels/densify/Densify.cuh>
 #include <core/Tensor.h>
 
 #include <array>
@@ -53,6 +26,11 @@ using backend::MemcpyKind;
 
 template <bool invert_quantile>
 int batch_quantile_masked_radix_select(
+    const float* d_x, int B, int N, float q, float* d_out, uint32_t* temp,
+    backend::Stream stream);
+
+template <bool invert_quantile>
+int batch_quantile_positive_radix_select(
     const float* d_x, int B, int N, float q, float* d_out, uint32_t* temp,
     backend::Stream stream);
 
@@ -117,6 +95,12 @@ struct MsCfg {
     bool minimal;         // rgb+Ts only (all other modalities null)
     int loss_map_mode;    // DensifyLossMapMode
     float quantile;
+    float nms_falloff;    // *_nms modes only; 0 = the hard canny suppression
+    float sat;            // blown-highlight cutoff; <= 0 disables it
+    int loss = 0;         // PerceptualLoss
+    int rgb_pattern = 0;
+    int mask_pattern = 0;
+    bool half_rgb = false;
 };
 
 void run_ms_cfg(Rng& r, const MsCfg& c) {
@@ -126,8 +110,43 @@ void run_ms_cfg(Rng& r, const MsCfg& c) {
     const int64_t Ha = c.Ha ? c.Ha : c.H, Wa = c.Wa ? c.Wa : c.W;
     const int64_t npd = c.B * Hd * Wd, npn = c.B * Hn * Wn, npa = c.B * Ha * Wa;
 
-    float* render_rgb = upload(r.vec(3 * np, 0.0f, 1.0f));
-    float* ref_rgb = upload(r.vec(3 * np, 0.0f, 1.0f));
+    auto rgb1 = r.vec(3 * np, 0.0f, 1.0f);
+    auto rgb2 = r.vec(3 * np, 0.0f, 1.0f);
+    if (c.rgb_pattern == 3) {
+        for (size_t i = 0; i < rgb1.size(); ++i) rgb2[i] = rgb1[i] + 0.0001f;
+    }
+    else if (c.rgb_pattern != 0) {
+        for (int64_t i = 0; i < 3 * np; ++i) {
+            const int64_t x = (i / 3) % c.W, y = (i / 3 / c.W) % c.H;
+            const float value = c.rgb_pattern == 1 ? 0.5f
+                : 0.1f + 0.6f * float(x) / float(c.W - 1) + 0.1f * float(i % 3);
+            rgb1[i] = value;
+            rgb2[i] = value + (c.rgb_pattern == 2 ? 0.001f * float(y % 3 - 1) : 0.0001f);
+        }
+    }
+    if (c.sat > 0.0f) {
+        // One contiguous blown-out block rather than scattered pixels, so the
+        // window coverage divide is exercised across its edge too.
+        for (int64_t b = 0; b < c.B; b++)
+            for (int64_t y = c.H / 4; y < c.H / 2; y++)
+                for (int64_t x = c.W / 4; x < c.W / 2; x++)
+                    for (int k = 0; k < 3; k++) {
+                        size_t i = (size_t)((b * c.H + y) * c.W + x) * 3 + k;
+                        rgb1[i] = 0.985f + 0.015f * r.uf(0.0f, 1.0f);
+                        rgb2[i] = 0.985f + 0.015f * r.uf(0.0f, 1.0f);
+                    }
+    }
+    auto rgb_view = [&](const std::vector<float>& values) {
+        if (!c.half_rgb) return ttv(upload(values), {c.B, c.H, c.W, 3});
+        std::vector<uint16_t> half(values.size());
+        for (auto& x : half) {
+            const uint32_t bits = r.rng();
+            x = (uint16_t)(((10 + (bits >> 10) % 5) << 10) | (bits & 0x3ff));
+        }
+        return TorchTensorView{(uint64_t)upload(half), 2u, {c.B, c.H, c.W, 3}};
+    };
+    const auto render_rgb = rgb_view(rgb1);
+    const auto ref_rgb = rgb_view(rgb2);
     float* render_Ts = upload(r.vec(np, 0.0f, 1.0f));
 
     float* render_depth = nullptr;
@@ -168,6 +187,11 @@ void run_ms_cfg(Rng& r, const MsCfg& c) {
     if (c.with_alpha) {
         std::vector<uint8_t> m(npa);
         for (auto& x : m) x = r.uf(0, 1) < 0.8f ? 1 : 0;
+        if (c.mask_pattern != 0) {
+            for (int64_t i = 0; i < npa; ++i)
+                m[i] = c.mask_pattern == 1 && (i / (Ha * Wa)) % 3 != 0 &&
+                       (i % Wa) >= Wa / 8;
+        }
         ref_alpha = upload(m);
     }
 
@@ -215,8 +239,7 @@ void run_ms_cfg(Rng& r, const MsCfg& c) {
     auto run_once = [&]() -> LossValues {
         return compute_multi_scale_per_pixel_losses(
             c.num_scales,
-            ttv(render_rgb, {c.B, c.H, c.W, 3}),
-            ttv(ref_rgb, {c.B, c.H, c.W, 3}),
+            render_rgb, ref_rgb,
             render_depth ? ttv(render_depth, {c.B, c.H, c.W, 1}) : ttv_null(),
             ref_depth ? ttv(ref_depth, {c.B, Hd, Wd, 1}) : ttv_null(),
             render_normal ? ttv(render_normal, {c.B, c.H, c.W, 3})
@@ -234,11 +257,11 @@ void run_ms_cfg(Rng& r, const MsCfg& c) {
                 ? std::make_tuple((uint64_t)ref_alpha, (uint32_t)1,
                                   std::vector<int64_t>{c.B, Ha, Wa, 1})
                 : ttv_null(),
-            /*has_mask=*/c.with_alpha, weights, w_ssim,
+            /*has_mask=*/c.with_alpha, weights, w_ssim, c.loss, c.sat,
             ttv(v_losses, {(int)LossIndex::length}), needs, num_train,
             cams ? ttv(cams, {c.B}) : ttv_null(),
             ttv(loss_map_out, {c.B, c.H, c.W, 1}), c.loss_map_mode,
-            c.quantile, grads);
+            c.quantile, c.nms_falloff, grads);
     };
 
     run_once();  // primes the one-behind readouts
@@ -266,7 +289,6 @@ void run_ms_cfg(Rng& r, const MsCfg& c) {
     }
     if (c.loss_map_mode != (int)DensifyLossMapMode::None)
         readback_f(g_tight, loss_map_out, np);
-
     g_loose.push_back(lv.rgb_loss);
     g_loose.push_back(lv.rgb_psnr);
     g_loose.push_back(lv.depth_sup);
@@ -281,8 +303,9 @@ void run_ms_cfg(Rng& r, const MsCfg& c) {
     g_loose.push_back(lv.median_depth_normal_reg);
     g_loose.push_back(lv.median_normal_sup);
     g_loose.push_back(lv.median_render_normal_reg);
-    if (!c.with_alpha)  // masked SSIM scalar is not cross-backend comparable
-        g_loose.push_back(lv.ssim);
+    g_loose.push_back(lv.ssim);
+    g_loose.push_back(lv.delta_e);
+    g_loose.push_back(lv.flip);
 
     (void)n_grads;
     std::printf("msloss_parity: cfg %-12s done\n", c.name);
@@ -307,15 +330,62 @@ void run_quantile(Rng& r) {
     for (float q : {0.5f, 0.9f}) {
         float* out_a = alloc_zero<float>(B);
         float* out_b = alloc_zero<float>(B);
+        float* out_c = alloc_zero<float>(B);
         batch_quantile_masked_radix_select<false>(d_x, B, N, q, out_a, temp,
                                                   backend::kDefaultStream);
         batch_quantile_masked_radix_select<true>(d_x, B, N, q, out_b, temp,
                                                  backend::kDefaultStream);
+        // Same rows, negatives dropped instead of folded in as |x|.
+        batch_quantile_positive_radix_select<false>(d_x, B, N, q, out_c, temp,
+                                                    backend::kDefaultStream);
         backend::device_synchronize();
         readback_f(g_tight, out_a, B);
         readback_f(g_tight, out_b, B);
+        readback_f(g_tight, out_c, B);
     }
     std::printf("msloss_parity: cfg %-12s done\n", "quantile");
+}
+
+// ---------------------------------------------------------------------------
+// Loss-map conditioning (median normalize + quantile clip), in place.
+// ---------------------------------------------------------------------------
+
+void run_normalize_clip(Rng& r) {
+    const int64_t B = 3, H = 37, W = 53, N = H * W;
+    std::vector<float> h = r.vec(B * N, 0.0f, 1.0f);
+    // The population the quantiles are taken over excludes these. The tiny
+    // negatives are the real map's flat-region background: folded in as |x|
+    // they would put the median in the noise floor.
+    for (size_t i = 0; i < h.size(); i += 3) h[i] = -h[i] * 1e-8f;
+    for (size_t i = 0; i < h.size(); i += 11) h[i] = 0.0f;
+    for (size_t i = 5; i < h.size(); i += 401)
+        h[i] = std::numeric_limits<float>::infinity();
+    for (size_t i = 7; i < h.size(); i += 509)
+        h[i] = std::numeric_limits<float>::quiet_NaN();
+    // Spikes: what the clip exists to flatten.
+    for (size_t i = 3; i < h.size(); i += 257) h[i] = 1e4f;
+
+    const struct { bool norm; float q; float p; } cases[] = {
+        {true, 1.0f, 1.0f}, {false, 0.98f, 1.0f}, {true, 0.98f, 1.0f},
+        {false, 1.0f, 1.0f}, {false, 1.0f, 0.5f}, {true, 0.98f, 2.0f},
+    };
+    // The learned score's rendered map: zeros where nothing explains the
+    // error yet, so the ratio cap is exercised too.
+    std::vector<float> fit(h.size());
+    for (size_t i = 0; i < fit.size(); i++)
+        fit[i] = i % 13 == 0 ? 0.0f : 1e-3f * (float)(1 + (i * 7919) % 997);
+    float* d_fit = upload(fit);
+    for (const auto& c : cases) {
+        for (bool with_fit : {false, true}) {
+            float* d = upload(h);
+            normalize_clip_map_inplace_tensor(
+                ttv(d, {B, H, W, 1}), c.norm, c.q, c.p,
+                with_fit ? ttv(d_fit, {B, H, W, 1}) : TorchTensorView{});
+            backend::device_synchronize();
+            readback_f(g_tight, d, B * N);
+        }
+    }
+    std::printf("msloss_parity: cfg %-12s done\n", "norm_clip");
 }
 
 int main(int argc, char** argv) {
@@ -331,28 +401,106 @@ int main(int argc, char** argv) {
     const MsCfg cfgs[] = {
         // Full modality set, equal-shape GT, mask, 3 scales, LossFull map.
         {"full", 2, 64, 80, 3, 0, 0, 0, 0, 0, 0, true, false, false,
-         (int)DensifyLossMapMode::LossFull, 0.9f},
+         (int)DensifyLossMapMode::LossFull, 0.9f, 0.5f, -1.0f},
         // Scaled GT modalities (bilinear paths), camera indices, no mask,
         // 2 scales, full-SSIM map; checks the SSIM scalar.
         {"scaled_gt", 2, 40, 48, 2, 80, 96, 30, 36, 0, 0, false, true, false,
-         (int)DensifyLossMapMode::SsimFull, 0.9f},
+         (int)DensifyLossMapMode::SsimFull, 0.9f, 0.5f, -1.0f},
         // Minimal modalities, robust edge-aware map (residual + quantile +
         // tukey + canny), equal-res mask (canny indexes the mask at render
         // resolution), single scale.
         {"robust_edge", 1, 48, 64, 1, 0, 0, 0, 0, 0, 0, true, false, true,
-         (int)DensifyLossMapMode::RobustEdgeAware, 0.85f},
+         (int)DensifyLossMapMode::RobustEdgeAware, 0.85f, 0.5f, -1.0f},
         // Plain edge-aware map (canny of GT rgb), 2 scales.
         {"edge_aware", 1, 32, 32, 2, 0, 0, 0, 0, 0, 0, true, false, true,
-         (int)DensifyLossMapMode::EdgeAware, 0.9f},
+         (int)DensifyLossMapMode::EdgeAware, 0.9f, 0.5f, -1.0f},
         // SSIM contrast*structure and structure-only map variants; the
         // latter with a smaller-resolution mask (SSIM's clamped mask path).
         {"ssim_cs", 1, 32, 32, 1, 0, 0, 0, 0, 0, 0, false, false, true,
-         (int)DensifyLossMapMode::SsimContrastStruct, 0.9f},
+         (int)DensifyLossMapMode::SsimContrastStruct, 0.9f, 0.5f, -1.0f},
         {"ssim_str", 1, 32, 32, 1, 0, 0, 0, 0, 16, 16, true, false, true,
-         (int)DensifyLossMapMode::SsimStructure, 0.9f},
+         (int)DensifyLossMapMode::SsimStructure, 0.9f, 0.5f, -1.0f},
+        // The NMS variants: same maps, thinned to their ridges. Multi-scale
+        // on the loss_full one, since NMS runs per scale.
+        {"loss_nms", 1, 40, 48, 2, 0, 0, 0, 0, 0, 0, true, false, false,
+         (int)DensifyLossMapMode::LossFullNms, 0.9f, 0.5f, -1.0f},
+        {"ssim_f_nms", 1, 32, 32, 1, 0, 0, 0, 0, 0, 0, false, false, true,
+         (int)DensifyLossMapMode::SsimFullNms, 0.9f, 0.0f, -1.0f},
+        {"ssim_cs_nms", 1, 32, 32, 1, 0, 0, 0, 0, 0, 0, false, false, true,
+         (int)DensifyLossMapMode::SsimContrastStructNms, 0.9f, 0.25f, -1.0f},
+        {"ssim_str_nms", 1, 32, 32, 1, 0, 0, 0, 0, 16, 16, true, false, true,
+         (int)DensifyLossMapMode::SsimStructureNms, 0.9f, 1.0f, -1.0f},
+        // Blown-highlight cutoff: the drop-and-renormalize path the mask takes,
+        // once with a mask over it and once alone (the no-mask coverage divide).
+        // Dims are multiples of both SSIM tile edges at every scale.
+        {"sat_mask", 2, 96, 96, 2, 0, 0, 0, 0, 0, 0, true, false, false,
+         (int)DensifyLossMapMode::LossFull, 0.9f, 0.5f, 0.98f},
+        {"sat_only", 1, 48, 48, 1, 0, 0, 0, 0, 0, 0, false, false, false,
+         (int)DensifyLossMapMode::SsimFull, 0.9f, 0.5f, 0.98f},
+        // S-CIELAB as the trained term: its own map with a mask (the coverage
+        // pass) over two scales; LossFull with the clip test and no mask; and
+        // each family's map taken while the other one trains.
+        {"scielab", 2, 40, 48, 2, 0, 0, 0, 0, 0, 0, true, false, true,
+         (int)DensifyLossMapMode::SCielab, 0.9f, 0.5f, -1.0f,
+         (int)PerceptualLoss::SCielab},
+        {"scielab_lf", 1, 48, 48, 2, 0, 0, 0, 0, 0, 0, false, false, false,
+         (int)DensifyLossMapMode::LossFull, 0.9f, 0.5f, 0.98f,
+         (int)PerceptualLoss::SCielab},
+        {"scielab_xcs", 1, 37, 53, 1, 0, 0, 0, 0, 16, 16, true, false, true,
+         (int)DensifyLossMapMode::SsimContrastStruct, 0.9f, 0.5f, -1.0f,
+         (int)PerceptualLoss::SCielab},
+        {"ssim_xsc_nms", 1, 37, 53, 1, 0, 0, 0, 0, 0, 0, false, false, true,
+         (int)DensifyLossMapMode::SCielabNms, 0.9f, 0.25f, -1.0f},
+        // FLIP likewise: its feature map (the auto default) with a mask over
+        // two scales, LossFull with the clip test, and the cross-family maps.
+        {"flip", 2, 40, 48, 2, 0, 0, 0, 0, 0, 0, true, false, true,
+         (int)DensifyLossMapMode::FlipFeature, 0.9f, 0.5f, -1.0f,
+         (int)PerceptualLoss::Flip},
+        {"flip_lf", 1, 48, 48, 2, 0, 0, 0, 0, 0, 0, false, false, false,
+         (int)DensifyLossMapMode::LossFull, 0.9f, 0.5f, 0.98f,
+         (int)PerceptualLoss::Flip},
+        {"flip_xsc", 1, 37, 53, 1, 0, 0, 0, 0, 16, 16, true, false, true,
+         (int)DensifyLossMapMode::SCielab, 0.9f, 0.5f, -1.0f,
+         (int)PerceptualLoss::Flip},
+        {"ssim_xfl_nms", 1, 37, 53, 1, 0, 0, 0, 0, 0, 0, false, false, true,
+         (int)DensifyLossMapMode::FlipNms, 0.9f, 0.25f, -1.0f},
+        {"sc_xff_nms", 1, 37, 53, 1, 0, 0, 0, 0, 16, 16, true, false, true,
+         (int)DensifyLossMapMode::FlipFeatureNms, 0.9f, 0.5f, -1.0f,
+         (int)PerceptualLoss::SCielab},
+        // Blur-tolerant SSIM: its cs map (the auto default) with a mask over
+        // three scales, where the blur shrinks per scale, and LossFull with
+        // the clip test and a smaller mask.
+        {"ssim_bt", 2, 40, 48, 3, 0, 0, 0, 0, 0, 0, true, false, true,
+         (int)DensifyLossMapMode::SsimContrastStruct, 0.9f, 0.5f, -1.0f,
+         (int)PerceptualLoss::SsimBlurTolerant},
+        {"ssim_bt_lf", 1, 37, 53, 2, 0, 0, 0, 0, 16, 16, true, false, false,
+         (int)DensifyLossMapMode::LossFull, 0.9f, 0.5f, 0.98f,
+         (int)PerceptualLoss::SsimBlurTolerant},
+        {"ssim_bt_str", 1, 32, 32, 1, 0, 0, 0, 0, 0, 0, false, false, true,
+         (int)DensifyLossMapMode::SsimStructure, 0.9f, 0.5f, -1.0f,
+         (int)PerceptualLoss::SsimBlurTolerant},
     };
     for (const MsCfg& c : cfgs) run_ms_cfg(r, c);
+    const char* masked_cases[] = {"robust_half_random", "robust_half_partial", "robust_half_empty"};
+    for (int mask = 0; mask <= 2; ++mask) {
+        MsCfg c{masked_cases[mask], 9, 67, 91, 4, 0, 0, 0, 0, 0, 0,
+            true, false, true, (int)DensifyLossMapMode::RobustEdgeAware,
+            0.85f, 0.5f, -1.0f, (int)PerceptualLoss::SsimBlurTolerant};
+        c.mask_pattern = mask;
+        c.half_rgb = true;
+        run_ms_cfg(r, c);
+    }
     run_quantile(r);
+    run_normalize_clip(r);
+    // Near-identical windows expose cancellation hidden by unrelated noise.
+    Rng matched(260729u);
+    for (int pattern = 1; pattern <= 3; ++pattern) {
+        MsCfg c{"ssim_bt_matched", 1, 53, 79, 1, 0, 0, 0, 0, 0, 0,
+            false, false, true, (int)DensifyLossMapMode::SsimContrastStruct,
+            0.9f, 0.5f, -1.0f, (int)PerceptualLoss::SsimBlurTolerant};
+        c.rgb_pattern = pattern;
+        run_ms_cfg(matched, c);
+    }
 
     auto write_all = [&](const char* path) {
         std::ofstream f(path, std::ios::binary);
@@ -396,11 +544,15 @@ int main(int argc, char** argv) {
     std::vector<float> lref(nl);
     f.read((char*)lref.data(), nl * 4);
 
+    // Paired with a relative-RMS gate: the NMS / quantile / clip modes make
+    // discrete per-pixel choices that flip where an architecture's rounding
+    // differs, so a few large outliers are expected (docs/testing.md).
     auto cmp_f = [](const std::vector<float>& got,
                     const std::vector<float>& want, int64_t& viol,
-                    double& max_abs) {
+                    double& max_abs, double& rel_rms) {
         viol = 0;
         max_abs = 0;
+        double se = 0, sr = 0;
         for (size_t i = 0; i < got.size(); i++) {
             bool gfin = std::isfinite(got[i]), wfin = std::isfinite(want[i]);
             if (!gfin || !wfin) {
@@ -411,21 +563,25 @@ int main(int argc, char** argv) {
             double tol = 5e-3 + 1e-3 * std::fabs((double)want[i]);
             max_abs = std::max(max_abs, d);
             if (d > tol) viol++;
+            se += d * d;
+            sr += (double)want[i] * (double)want[i];
         }
+        rel_rms = sr > 0 ? std::sqrt(se / sr) : 0.0;
     };
     int64_t fviol = 0, lviol = 0;
-    double fmax = 0, lmax = 0;
-    cmp_f(g_tight, ref, fviol, fmax);
-    cmp_f(g_loose, lref, lviol, lmax);
+    double fmax = 0, lmax = 0, frms = 0, lrms = 0;
+    cmp_f(g_tight, ref, fviol, fmax, frms);
+    cmp_f(g_loose, lref, lviol, lmax, lrms);
     double ffrac = nf ? (double)fviol / (double)nf : 0.0;
     double lfrac = nl ? (double)lviol / (double)nl : 0.0;
     std::printf(
         "msloss_parity: %lld tight floats (max_abs %.3g, violations %lld = "
-        "%.5f%%), %lld loose floats (max_abs %.3g, violations %lld = "
-        "%.5f%%)\n",
-        (long long)nf, fmax, (long long)fviol, 100.0 * ffrac, (long long)nl,
-        lmax, (long long)lviol, 100.0 * lfrac);
-    bool pass = ffrac <= 2e-3 && lfrac <= 2e-2;
+        "%.5f%%, rel_rms %.3g), %lld loose floats (max_abs %.3g, violations "
+        "%lld = %.5f%%, rel_rms %.3g)\n",
+        (long long)nf, fmax, (long long)fviol, 100.0 * ffrac, frms,
+        (long long)nl, lmax, (long long)lviol, 100.0 * lfrac, lrms);
+    bool pass = ffrac <= 5e-3 && frms <= 5e-3 &&
+                lfrac <= 2e-2 && lrms <= 5e-2;
     std::printf(pass ? "msloss_parity: PASSED\n" : "msloss_parity: FAILED\n");
     return pass ? 0 : 1;
 }

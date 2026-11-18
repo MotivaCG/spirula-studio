@@ -35,7 +35,6 @@ inline __device__ void mcmc_relocation(float& opacity, float3& scale, int n_idx)
     n_idx = min(n_idx, 50);  // log_factorial only fits to 50
 
     opacity = sigmoid(opacity);
-    scale = {__expf(scale.x), __expf(scale.y), __expf(scale.z)};
 
     float new_opacity = 1.0f - powf(1.0f-opacity, 1.0f / n_idx);
 
@@ -47,20 +46,25 @@ inline __device__ void mcmc_relocation(float& opacity, float3& scale, int n_idx)
                 powf(new_opacity, k+1);
         }
     }
-    float coeff = (opacity / denom_sum);
+    // log(coeff * exp(s)) == log(coeff) + s, kept in log space: the round trip
+    // out and back flushes a splat near FLT_MIN to -inf, which per_splat_losses
+    // then turns into a NaN (shaders/per_splat_losses.slang).
+    float log_coeff = __logf(opacity / denom_sum);
 
-    opacity = new_opacity;
-    scale = coeff * scale;
-
-    opacity = logit(opacity);
-    scale = {__logf(scale.x), __logf(scale.y), __logf(scale.z)};
+    opacity = logit(new_opacity);
+    scale = make_float3(scale.x + log_coeff, scale.y + log_coeff,
+                        scale.z + log_coeff);
 }
 
 
+// `weight` (null = 1) scales a live splat's draw; a dead one stays at 0,
+// which is the flag the index map reads, so the weight must never be 0.
 __global__ void mcmc_compute_relocation_probabilities_kernel(
     uint32_t num_splats,
     float min_opacity,
     const float* __restrict__ opacs,
+    const float3* __restrict__ scales,
+    const float* __restrict__ weight,
     float* __restrict__ probs
 ) {
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -69,8 +73,11 @@ __global__ void mcmc_compute_relocation_probabilities_kernel(
 
     float opac = sigmoid(opacs[tid]);
 
-    if (opac <= min_opacity || !isfinite(opac))
+    if (opac <= min_opacity || !isfinite(opac) ||
+        SlangDensify::splat_scale_is_dead(scales[tid]))
         opac = 0.0f;
+    else if (weight != nullptr)
+        opac *= fmaxf(weight[tid], 1e-30f);
 
     probs[tid] = opac;
 }
@@ -189,7 +196,8 @@ __global__ void mcmc_update_relocation_kernel(
     float3*__restrict__ scales,
     float*__restrict__ opacs,
     float3*__restrict__ features_dc,
-    int num_sh, float3*__restrict__ features_sh
+    int num_sh, float3*__restrict__ features_sh,
+    float4* projective_state, float* projective_information
 ) {
     uint32_t id_dst = blockIdx.x * blockDim.x + threadIdx.x;
     if (id_dst >= num_splats)
@@ -200,7 +208,10 @@ __global__ void mcmc_update_relocation_kernel(
     if (id_src == id_dst)
         return;
 
-    // copy components
+    if (projective_state) {
+        projective_state[id_dst] = projective_state[id_src];
+        projective_information[id_dst] = projective_information[id_src];
+    }
     means[id_dst] = means[id_src];
     quats[id_dst] = quats[id_src];
     scales[id_dst] = scales[id_src];
@@ -233,15 +244,21 @@ void relocate_splats_mcmc_tensor(
     bool sh_value_bounds_per_splat,
     int  num_sh_buffer,
     NonShQuantState non_sh,
-    uint32_t seed
+    DeviceVector<float4> projective_state, DeviceVector<float> projective_information,
+    uint32_t seed,
+    DeviceVector<float> draw_weight   // [N] or empty: scales each live splat's draw
 ) {
     int32_t* bias_correction_steps_ptr = bias_correction_steps.data_ptr();
+    const size_t n4 = 4 * (size_t)cur_num_splats;
+    pool_begin_phase(PoolPhase::Densify, DevicePool::arena_span({n4, n4, n4, n4}));
     float* sample_probs = DevicePool::global().acquire<float>(
         PoolSlot::DensifyMcmcSampleProbs, cur_num_splats);
     mcmc_compute_relocation_probabilities_kernel<<<_LAUNCH_ARGS_1D(cur_num_splats, 256)>>>(
         cur_num_splats,
         min_opacity,
         opacs.data_ptr(),
+        scales.data_ptr(),
+        draw_weight.data_ptr(),
         sample_probs
     );
     CHECK_DEVICE_ERROR(cudaGetLastError());
@@ -305,7 +322,7 @@ void relocate_splats_mcmc_tensor(
         scales.data_ptr(),
         opacs.data_ptr(),
         features_dc.data_ptr(),
-        num_sh, features_sh.data_ptr()
+        num_sh, features_sh.data_ptr(), projective_state.data_ptr(), projective_information.data_ptr()
     );
     CHECK_DEVICE_ERROR(cudaGetLastError());
 
@@ -389,7 +406,8 @@ __global__ void mcmc_update_add_kernel(
     const float4* __restrict__ sh_quant_bounds,
     bool sh_bounds_per_splat,
     NonShQuantState non_sh,
-    int32_t* __restrict__ bias_correction_steps
+    int32_t* __restrict__ bias_correction_steps,
+    float4* projective_state, float* projective_information
 ) {
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_add)
@@ -398,7 +416,10 @@ __global__ void mcmc_update_add_kernel(
     uint32_t id_dst = tid + num_splats;
     uint32_t id_src = index_map[tid];
 
-    // copy components
+    if (projective_state) {
+        projective_state[id_dst] = projective_state[id_src];
+        projective_information[id_dst] = projective_information[id_src];
+    }
     means[id_dst] = means[id_src];
     quats[id_dst] = quats[id_src];
     scales[id_dst] = scales[id_src];
@@ -464,11 +485,16 @@ void add_splats_mcmc_tensor(
     bool sh_value_bounds_per_splat,
     int  num_sh_buffer,
     NonShQuantState non_sh,
-    uint32_t seed
+    DeviceVector<float4> projective_state, DeviceVector<float> projective_information,
+    uint32_t seed,
+    DeviceVector<float> draw_weight   // [N] or empty: scales each live splat's draw
 ) {
     if (num_add == 0)
         return;
     int32_t* bias_correction_steps_ptr = bias_correction_steps.data_ptr();
+    const size_t n4 = 4 * (size_t)cur_num_splats;
+    pool_begin_phase(PoolPhase::Densify,
+                     DevicePool::arena_span({n4, n4, 4 * (size_t)num_add, n4}));
 
     float* sample_probs = DevicePool::global().acquire<float>(
         PoolSlot::DensifyMcmcAddSampleProbs, cur_num_splats);
@@ -476,6 +502,8 @@ void add_splats_mcmc_tensor(
         cur_num_splats,
         min_opacity,
         opacs.data_ptr(),
+        scales.data_ptr(),
+        draw_weight.data_ptr(),
         sample_probs
     );
     CHECK_DEVICE_ERROR(cudaGetLastError());
@@ -533,7 +561,7 @@ void add_splats_mcmc_tensor(
             num_sh, features_sh.data_ptr(), (T*)g1_features_sh.data_ptr(), (T*)g2_features_sh.data_ptr(), \
             bnd_ptr, bps, \
             non_sh, \
-            bias_correction_steps_ptr)
+            bias_correction_steps_ptr, projective_state.data_ptr(), projective_information.data_ptr())
     if      (sh_optim_bits == 32) _DENSIFY_MCMC_ADD_LAUNCH(float3, nullptr, false);
     else if (sh_optim_bits == 8)  _DENSIFY_MCMC_ADD_LAUNCH(short3, sh_quant_bounds.data_ptr(), sh_bounds_per_splat);
     else if (sh_optim_bits == 4)  _DENSIFY_MCMC_ADD_LAUNCH(uchar3, sh_quant_bounds.data_ptr(), sh_bounds_per_splat);
@@ -555,7 +583,7 @@ void add_splats_mcmc_tensor(
 
 __global__ void mcmc_add_noise_3dgs_kernel(
     long num_splats,
-    float scaler,
+    float scaler, uint32_t seed,
     float3* __restrict__ means,
     const float3* __restrict__ log_scales,
     const float4* __restrict__ quats,
@@ -567,18 +595,22 @@ __global__ void mcmc_add_noise_3dgs_kernel(
 
     SlangDensify::mcmc_add_noise_3dgs(
         scaler,
-        &means[idx], log_scales[idx], quats[idx], logit_opacs[idx]
+        &means[idx], log_scales[idx], quats[idx], logit_opacs[idx],
+        make_uint4(hash_uint3(seed ^ 0x9e3779b9u, idx, 0), hash_uint3(seed ^ 0x9e3779b9u, idx, 1),
+                   hash_uint3(seed ^ 0x9e3779b9u, idx, 2), hash_uint3(seed ^ 0x9e3779b9u, idx, 3))
     );
 }
 
 __global__ void revised_add_noise_3dgs_kernel(
     long num_splats,
-    float scaler,
+    float scaler, uint32_t seed,
     const float* __restrict__ radii,
     float3* __restrict__ means,
     const float3* __restrict__ log_scales,
     const float4* __restrict__ quats,
-    const float* __restrict__ logit_opacs
+    const float* __restrict__ logit_opacs,
+    const float* __restrict__ peak_weight,  // null: gate on opacity alone
+    float peak_weight_scale
 ) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_splats)
@@ -586,7 +618,10 @@ __global__ void revised_add_noise_3dgs_kernel(
 
     SlangDensify::revised_add_noise_3dgs(
         scaler, radii[idx],
-        &means[idx], log_scales[idx], quats[idx], logit_opacs[idx]
+        &means[idx], log_scales[idx], quats[idx], logit_opacs[idx],
+        peak_weight ? peak_weight[idx] * peak_weight_scale : 1.0f,
+        make_uint4(hash_uint3(seed ^ 0x9e3779b9u, idx, 0), hash_uint3(seed ^ 0x9e3779b9u, idx, 1),
+                   hash_uint3(seed ^ 0x9e3779b9u, idx, 2), hash_uint3(seed ^ 0x9e3779b9u, idx, 3))
     );
 }
 
@@ -616,10 +651,11 @@ void mcmc_add_noise_tensor(
     DeviceVector<float3> means,
     DeviceVector<float3> log_scales,
     DeviceVector<float4> quats,
-    DeviceVector<float> opacs
+    DeviceVector<float> opacs,
+    uint32_t seed
 ) {
     mcmc_add_noise_3dgs_kernel<<<_LAUNCH_ARGS_1D(num_splats, 256)>>>(
-        num_splats, scaler,
+        num_splats, scaler, seed,
         means.data_ptr(),
         log_scales.data_ptr(),
         quats.data_ptr(),
@@ -629,6 +665,8 @@ void mcmc_add_noise_tensor(
 }
 
 
+// peak_weight: the engine's running peak alpha * T (stored values times peak_weight_scale);
+// empty gates the noise on opacity alone.
 /*[AutoHeaderGeneratorExport]*/
 void revised_add_noise_tensor(
     int64_t num_splats,
@@ -637,15 +675,20 @@ void revised_add_noise_tensor(
     DeviceVector<float3> means,
     DeviceVector<float3> log_scales,
     DeviceVector<float4> quats,
-    DeviceVector<float> opacs
+    DeviceVector<float> opacs,
+    DeviceVector<float> peak_weight,
+    float peak_weight_scale,
+    uint32_t seed
 ) {
     revised_add_noise_3dgs_kernel<<<_LAUNCH_ARGS_1D(num_splats, 256)>>>(
-        num_splats, scaler,
+        num_splats, scaler, seed,
         radii.data_ptr(),
         means.data_ptr(),
         log_scales.data_ptr(),
         quats.data_ptr(),
-        opacs.data_ptr()
+        opacs.data_ptr(),
+        peak_weight.data_ptr(),
+        peak_weight_scale
     );
     CHECK_DEVICE_ERROR(cudaGetLastError());
 }

@@ -13,6 +13,7 @@ constexpr int kLoglinearBlockSize   = (int)kBilagridBwdV1BlockX
                                     * (int)kBilagridBwdV1BlockZ;
 #endif
 
+template <int kF = -1>
 #ifdef PATCHED
 __global__ void bilagrid_loglinear_patched_sample_backward_v1_kernel_bilagrid(
 #else
@@ -20,10 +21,10 @@ __global__ void bilagrid_loglinear_uniform_sample_backward_v1_kernel_bilagrid(
 #endif
     BilagridReader bilagrid,  // [N,L,H,W,9]
 #ifdef PATCHED
-    const float* __restrict__ rgb,       // [N,m,h,w,3]
+    PixelPtr rgb,       // [N,m,h,w,3]
     const float* __restrict__ v_output,  // [N,m,h,w,3]
 #else
-    const float* __restrict__ rgb,       // [N,h,w,3]
+    PixelPtr rgb,       // [N,h,w,3]
     const float* __restrict__ v_output,  // [N,h,w,3]
 #endif
     float* __restrict__ v_bilagrid,      // [N,L,H,W,9]
@@ -44,6 +45,7 @@ __global__ void bilagrid_loglinear_uniform_sample_backward_v1_kernel_bilagrid(
     , const int* __restrict__ grid_indices  // [N], or nullptr -> identity
 #endif
 ) {
+    if constexpr (kF >= 0) rgb.f = (PixelFormat)kF;
     // 1. Block-uniform decode.
 #ifdef PATCHED
     const int block_z_total = N * m_batch_stride * L;
@@ -238,6 +240,10 @@ __global__ void bilagrid_loglinear_uniform_sample_backward_v1_kernel_bilagrid(
             float dg = v_output[g_off + 1];
             float db = v_output[g_off + 2];
 
+            // Every grid gradient this pixel gives is linear in its incoming
+            // one, so a zero one -- a masked pixel, mostly -- gives nothing.
+            if (dr == 0.0f && dg == 0.0f && db == 0.0f) continue;
+
             // Original kernel iterates ci over the full 9 channels but only
             // diagonal entries (si == di) multiply by __expf(diags[si]); the
             // other 6 contribute zero to the writeback path because they're
@@ -289,6 +295,7 @@ __global__ void bilagrid_loglinear_uniform_sample_backward_v1_kernel_bilagrid(
 }
 
 
+template <int kF = -1>
 #ifdef PATCHED
 __global__ void bilagrid_loglinear_patched_sample_backward_v1_kernel_rgb(
 #else
@@ -296,11 +303,11 @@ __global__ void bilagrid_loglinear_uniform_sample_backward_v1_kernel_rgb(
 #endif
     BilagridReader bilagrid,  // [N,L,H,W,9]
 #ifdef PATCHED
-    const float* __restrict__ rgb,  // [N,m,h,w,3]
+    PixelPtr rgb,  // [N,m,h,w,3]
     const float* __restrict__ v_output,  // [N,m,h,w,3]
     float* __restrict__ v_rgb,  // [N,m,h,w,3]
 #else
-    const float* __restrict__ rgb,  // [N,h,w,3]
+    PixelPtr rgb,  // [N,h,w,3]
     const float* __restrict__ v_output,  // [N,h,w,3]
     float* __restrict__ v_rgb,  // [N,h,w,3]
 #endif
@@ -317,6 +324,7 @@ __global__ void bilagrid_loglinear_uniform_sample_backward_v1_kernel_rgb(
     , const int* __restrict__ grid_indices  // [N], or nullptr -> identity
 #endif
 ) {
+    if constexpr (kF >= 0) rgb.f = (PixelFormat)kF;
     int idx = blockIdx.x * kBilagridBwdV1RgbThreads + threadIdx.x;
 #ifdef PATCHED
     int total = N * m * h * w;
@@ -349,7 +357,17 @@ __global__ void bilagrid_loglinear_uniform_sample_backward_v1_kernel_rgb(
     float sb = rgb[g_off+2];
     float dr = v_output[g_off+0];
     float dg = v_output[g_off+1];
-    float db = v_output[g_off+2]; 
+    float db = v_output[g_off+2];
+
+    // The image gradient is linear in the incoming one, so a zero one -- a
+    // masked pixel, mostly -- is zero out and skips the corner loads.
+    if (dr == 0.0f && dg == 0.0f && db == 0.0f) {
+        v_rgb[g_off+0] = 0.0f;
+        v_rgb[g_off+1] = 0.0f;
+        v_rgb[g_off+2] = 0.0f;
+        return;
+    }
+
     float vr = 0.0, vg = 0.0, vb = 0.0;
 
     // grid coords

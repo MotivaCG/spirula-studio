@@ -46,18 +46,20 @@
 #include <utility>
 #include <vector>
 
-#include "sfm/core/HostMemory.h"
+#include "core/HardwareThreads.h"
+#include "core/HostMemory.h"
 #include "sfm/core/Image.h"
 
 namespace sfm {
 
 struct ImageLoadOptions {
     int max_image_size = 3200;    // long-edge clamp, COLMAP's default
-    int num_threads = 0;          // 0 = hardware_concurrency, 1 = decode inline
+    int num_threads = 0;          // 0 = hardware_threads(), 1 = decode inline
     bool want_color = false;      // also decode a downscaled RGB buffer (for point colors)
     // The files' colour space; decoded pixels are converted to sRGB.
     std::string gamut;
     std::optional<bool> is_linear;
+    colorspace::Exposure exposure;
     // Keypoint masks (sfm/core/Mask.h), one per entry of the `paths` passed to
     // loadImagesInOrder and in the same order; "" means "no mask for this
     // image". Empty (the default) skips mask decoding entirely. Masks are
@@ -65,6 +67,13 @@ struct ImageLoadOptions {
     // order of magnitude -- doing them serially on the consumer thread would
     // hand the GPU stage back the decode cost the pool exists to hide.
     std::vector<std::string> mask_paths;
+    // --feature-masks, laid out as mask_paths and intersected into them.
+    std::vector<std::string> feature_mask_paths;
+    // Swap keep and ignore in every decoded mask (sfm/core/Mask.h). On the pool
+    // rather than the consumer thread, which the mask decode is already on.
+    bool flip_mask = false;
+    // Turn every image by its EXIF Orientation (sfm/core/Image.h).
+    bool apply_exif_orientation = false;
     // Host memory the decoder may use for in-flight images. Half is charged to
     // concurrent decodes, half to the ready window; both are then at least 1,
     // so a single image larger than the budget still loads (it just runs alone).
@@ -83,7 +92,7 @@ struct ImageLoadOptions {
 // very files being decoded. Falls back to the historical 1 GiB when the
 // platform will not say how much memory it has.
 inline size_t defaultDecodeBudget() {
-    const size_t total = physicalRamBytes();
+    const size_t total = spirula::physicalRamBytes();
     if (total == 0) return 1ull << 30;
     return std::min<size_t>(std::max<size_t>(total / 4, 1ull << 30), 8ull << 30);
 }
@@ -133,13 +142,16 @@ inline ImageLoadPlan planImageLoad(const std::vector<std::pair<int, int>>& dims,
     // or below the image resolution in every convention we have seen, and
     // 1 B/px against the image's 3 B/px leaves the budget dominated by the
     // image either way.
-    const size_t mask_bytes = opt.mask_paths.empty() ? 0 : maxOutPix * 2;
-    plan.decode_peak_bytes =
-        maxPix * 3 + maxOutPix * (opt.want_color ? 7 : 4) + mask_bytes;
-    plan.held_bytes = maxOutPix * (opt.want_color ? 7 : 4)  // gray float (+ RGB u8)
-                    + (opt.mask_paths.empty() ? 0 : maxOutPix);
+    const size_t masks = (opt.mask_paths.empty() ? 0 : 1) +
+                         (opt.feature_mask_paths.empty() ? 0 : 1);
+    // An exposure keeps the unexposed colour beside the exposed (GrayImage::color).
+    const size_t colours = opt.want_color ? (opt.exposure.active() ? 2 : 1) : 0;
+    plan.decode_peak_bytes = maxPix * 3 * (colours > 1 ? 2 : 1) +
+                             maxOutPix * (4 + 3 * colours) + maxOutPix * 2 * masks;
+    plan.held_bytes = maxOutPix * (4 + 3 * colours)  // gray float (+ RGB u8)
+                    + (masks ? maxOutPix : 0);
 
-    unsigned hc = std::thread::hardware_concurrency();
+    unsigned hc = spirula::hardware_threads();
     int want = opt.num_threads > 0 ? opt.num_threads : (hc > 0 ? (int)hc : 1);
     const size_t budget =
         opt.memory_budget_bytes ? opt.memory_budget_bytes : defaultDecodeBudget();
@@ -172,9 +184,12 @@ inline void loadImagesInOrder(const std::vector<std::string>& paths, const Image
     auto decodeOne = [&](size_t i, GrayImage& out, std::string& err) {
         static const std::string kNoMask;
         const std::string& mp = i < opt.mask_paths.size() ? opt.mask_paths[i] : kNoMask;
+        const std::string& fmp =
+            i < opt.feature_mask_paths.size() ? opt.feature_mask_paths[i] : kNoMask;
         try {
             out = loadGrayImage(paths[i], opt.max_image_size, opt.want_color, mp,
-                                opt.gamut, opt.is_linear);
+                                opt.gamut, opt.is_linear, opt.flip_mask,
+                                opt.apply_exif_orientation, fmp, opt.exposure);
         } catch (const std::exception& e) {
             err = e.what();
         }
@@ -198,6 +213,7 @@ inline void loadImagesInOrder(const std::vector<std::string>& paths, const Image
     std::vector<std::string> errors(n);
     std::vector<char> ready(n, 0);
     std::atomic<size_t> next_claim{0};
+    std::atomic<bool> stop{false};
     size_t next_consume = 0;  // guarded by mtx
     std::mutex mtx;
     std::condition_variable cv_ready, cv_window;
@@ -208,11 +224,14 @@ inline void loadImagesInOrder(const std::vector<std::string>& paths, const Image
         workers.emplace_back([&] {
             for (;;) {
                 size_t i = next_claim.fetch_add(1);
-                if (i >= n) return;
+                if (i >= n || stop) return;
                 {   // decode-ahead gate: keep the in-flight set bounded
                     std::unique_lock<std::mutex> lk(mtx);
-                    cv_window.wait(lk, [&] { return i < next_consume + (size_t)plan.window; });
+                    cv_window.wait(lk, [&] {
+                        return stop || i < next_consume + (size_t)plan.window;
+                    });
                 }
+                if (stop) return;
                 GrayImage img;
                 std::string err;
                 decodeOne(i, img, err);
@@ -227,25 +246,42 @@ inline void loadImagesInOrder(const std::vector<std::string>& paths, const Image
         });
     }
 
-    for (size_t i = 0; i < n; i++) {
-        GrayImage img;
-        std::string err;
+    // A throwing consumer must not unwind past `workers`: destroying a joinable
+    // thread calls terminate, which on MSVC exits 0xC0000409 with no message
+    // and no chance for the caller's catch to print the real error.
+    auto join_workers = [&] {
         {
-            std::unique_lock<std::mutex> lk(mtx);
-            cv_ready.wait(lk, [&] { return ready[i] != 0; });
-            img = std::move(slots[i]);
-            slots[i] = GrayImage();  // release the window slot immediately
-            err = std::move(errors[i]);
-            next_consume = i + 1;
+            std::lock_guard<std::mutex> lk(mtx);
+            stop = true;
         }
         cv_window.notify_all();
-        if (!err.empty()) {
-            if (on_error) on_error(i, err);
-            continue;
+        for (std::thread& w : workers) w.join();
+    };
+
+    try {
+        for (size_t i = 0; i < n; i++) {
+            GrayImage img;
+            std::string err;
+            {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv_ready.wait(lk, [&] { return ready[i] != 0; });
+                img = std::move(slots[i]);
+                slots[i] = GrayImage();  // release the window slot immediately
+                err = std::move(errors[i]);
+                next_consume = i + 1;
+            }
+            cv_window.notify_all();
+            if (!err.empty()) {
+                if (on_error) on_error(i, err);
+                continue;
+            }
+            consume(i, img);
         }
-        consume(i, img);
+    } catch (...) {
+        join_workers();
+        throw;
     }
-    for (std::thread& w : workers) w.join();
+    join_workers();
 }
 
 }  // namespace sfm

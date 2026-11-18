@@ -22,16 +22,29 @@ namespace backend {
 // counter/table are shared across all translation units. Allocation is pooled
 // upstream (Tensor.h), so this map is touched rarely, not per frame.
 namespace detail {
+// Leaked on purpose: DevicePool::global() is constructed before the first
+// device_malloc, so it is destroyed after these and frees through them.
 inline std::mutex& alloc_mutex() {
-    static std::mutex m;
-    return m;
+    static std::mutex* m = new std::mutex();
+    return *m;
 }
 inline std::unordered_map<void*, size_t>& alloc_sizes() {
-    static std::unordered_map<void*, size_t> m;
-    return m;
+    static auto* m = new std::unordered_map<void*, size_t>();
+    return *m;
 }
 inline std::atomic<uint64_t>& device_bytes() {
     static std::atomic<uint64_t> v{0};
+    return v;
+}
+inline std::atomic<uint64_t>& device_peak_bytes() {
+    static std::atomic<uint64_t> v{0};
+    return v;
+}
+// The ordinal a successful device_select picked, for device_bind to re-apply
+// on another thread. -1 until then: no selection means no rebinding, so an
+// app that never selects keeps the runtime's default device. One per program.
+inline std::atomic<int>& selected_ordinal() {
+    static std::atomic<int> v{-1};
     return v;
 }
 }  // namespace detail
@@ -65,6 +78,16 @@ inline bool device_select(int index) {
         cudaGetLastError();
         return false;
     }
+    detail::selected_ordinal().store(index, std::memory_order_relaxed);
+    return true;
+}
+inline bool device_bind() {
+    const int index = detail::selected_ordinal().load(std::memory_order_relaxed);
+    if (index < 0) return true;  // nothing selected: default device stands
+    if (cudaSetDevice(index) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
     return true;
 }
 inline int device_current() {
@@ -88,8 +111,14 @@ inline MemoryUsage memory_usage() {
         cudaGetLastError();
     }
     m.process_bytes = detail::device_bytes().load(std::memory_order_relaxed);
+    m.process_peak_bytes = detail::device_peak_bytes().load(std::memory_order_relaxed);
     m.has_process = true;
     return m;
+}
+
+inline void memory_peak_reset() {
+    detail::device_peak_bytes().store(detail::device_bytes().load(std::memory_order_relaxed),
+                                      std::memory_order_relaxed);
 }
 
 inline cudaMemcpyKind _to_cuda(MemcpyKind kind) {
@@ -129,7 +158,10 @@ inline void* device_malloc(size_t bytes) {
     if (ptr) {
         std::lock_guard<std::mutex> lock(detail::alloc_mutex());
         detail::alloc_sizes()[ptr] = bytes;
-        detail::device_bytes().fetch_add(bytes, std::memory_order_relaxed);
+        const uint64_t now =
+            detail::device_bytes().fetch_add(bytes, std::memory_order_relaxed) + bytes;
+        if (now > detail::device_peak_bytes().load(std::memory_order_relaxed))
+            detail::device_peak_bytes().store(now, std::memory_order_relaxed);
     }
     return ptr;
 }
@@ -200,16 +232,16 @@ inline void memset_async(void* dst, int value, size_t bytes, Stream stream) {
 // --- synchronization ---
 inline void device_synchronize() {
     if (prof::enabled()) {
-        prof::Scope s(prof::DEVSYNC);
-        cudaDeviceSynchronize();
+        { prof::Scope s(prof::DEVSYNC); cudaDeviceSynchronize(); }
+        if (prof::g_kernel_resolve) prof::g_kernel_resolve();
         return;
     }
     cudaDeviceSynchronize();
 }
 inline void stream_synchronize(Stream stream) {
     if (prof::enabled()) {
-        prof::Scope s(prof::DEVSYNC);
-        cudaStreamSynchronize(_to_cuda(stream));
+        { prof::Scope s(prof::DEVSYNC); cudaStreamSynchronize(_to_cuda(stream)); }
+        if (prof::g_kernel_resolve) prof::g_kernel_resolve();
         return;
     }
     cudaStreamSynchronize(_to_cuda(stream));
@@ -242,5 +274,8 @@ inline float event_elapsed_ms(Event* start, Event* end) {
                          reinterpret_cast<cudaEvent_t>(end));
     return ms;
 }
+
+inline void dispatch_timing_arm() {}
+inline bool dispatch_timing_collect(std::vector<DispatchTime>&) { return false; }
 
 }  // namespace backend

@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -97,9 +98,9 @@ int main(int argc, char** argv) {
         return lo + (hi - lo) * (float)(rng() & 0xffffff) / 16777215.0f;
     };
 
-    static constexpr int64_t N = 3000;   // splats
+    static constexpr int64_t N = 3001;   // splats
     static constexpr int64_t S = 3;      // stride
-    static constexpr int64_t NUMEL = N * S;  // 9000 -> 36 blocks, partial tail
+    static constexpr int64_t NUMEL = N * S;  // 9003 cells: partial word and block
 
     std::vector<float> acc;        // float outputs
     std::vector<int32_t> codes;    // quantized-cell codes (tol +-1)
@@ -135,7 +136,7 @@ int main(int argc, char** argv) {
                         ttv(d_g1, {N, S, 1}), ttv(d_g2, {N, S, 1}),
                         case_i ? 3e-3f : 1e-2f, 7, steps,
                         case_i ? 0.01f : 0.f, case_i ? 0.1f : 0.f,
-                        case_i ? 0.5f : 1.f, case_i == 1);
+                        SbOptimCells{}, case_i ? 0.5f : 1.f, case_i == 1);
         backend::device_synchronize();
         readback_f(acc, d_param, NUMEL);
         readback_f(acc, d_g1, NUMEL);
@@ -162,6 +163,19 @@ int main(int argc, char** argv) {
 
     // ---- fused_adam_step_quantized (bits 4, 8) ----
     const int64_t n_blocks = (NUMEL + 255) / 256;
+
+    // Linear working colour space: the SH cells get the sRGB-Jacobian carry
+    // and the per-splat trust-region clip. stride S == 3, so one coefficient.
+    ColorTrustState ct{};
+    {
+        std::vector<float> dc(3 * N), opacs(N);
+        for (auto& v : dc) v = uf(-1.5f, 1.5f);
+        for (auto& v : opacs) v = uf(-4.f, 4.f);
+        ct.enabled = true;
+        ct.eps_tr = 1e-4f;
+        ct.features_dc = upload(dc);
+        ct.opacities = upload(opacs);
+    }
     for (int bits : {4, 8}) {
         const int64_t packed_bytes = NUMEL * (bits == 8 ? 2 : 1);
         std::vector<uint8_t> packed(packed_bytes);
@@ -184,7 +198,8 @@ int main(int argc, char** argv) {
                                   ttv(d_grad, {N, S, 1}), d_packed,
                                   (float4*)d_bounds, 1e-2f, 12,
                                   DeviceVector<int32_t>{}, 0.f, 0.f, bits,
-                                  1.f, false);
+                                  bits == 8 ? ct : ColorTrustState{},
+                                  SbOptimCells{}, 1.f, false);
         backend::device_synchronize();
         readback_f(acc, d_param, NUMEL);
         readback_f(acc, d_bounds, n_blocks * 4);
@@ -229,10 +244,17 @@ int main(int argc, char** argv) {
         float* d_ob = upload(obounds);
         uint8_t* d_val = upload(val_packed);
         float* d_vb = upload(vbounds);
+        DeviceVector<int32_t> qq_steps;
+        if (gq) {
+            std::vector<int32_t> steps(N);
+            for (int64_t i = 0; i < N; ++i) steps[i] = 1 + (int32_t)(i % 37);
+            qq_steps = DeviceVector<int32_t>(ttv(upload(steps), {N, 1}));
+        }
         fused_adam_step_quantized_value(
             N, NUMEL, ttv(d_grad, {N, S, 1}), d_gq, (const float2*)d_gb, d_opt,
             (float4*)d_ob, d_val, (float2*)d_vb, 1e-2f, 9,
-            DeviceVector<int32_t>{}, 0.f, 0.f, obits, vbits, 1.f, !gq);
+            qq_steps, 0.f, 0.f, obits, vbits,
+            vbits == 16 ? ct : ColorTrustState{}, SbOptimCells{}, 1.f, !gq);
         backend::device_synchronize();
         readback_f(acc, d_ob, n_blocks * 4);
         readback_f(acc, d_vb, n_blocks * 2);
@@ -242,7 +264,7 @@ int main(int argc, char** argv) {
         if (!gq) readback_f(acc, d_grad, NUMEL);  // zero_grad untouched here
     }
 
-    // ---- float_add_into / increment_int32_inplace ----
+    // ---- float_add_into / float_max_into / increment_int32_inplace ----
     {
         const int64_t n = 5000;
         std::vector<float> dst(n), src(n);
@@ -254,6 +276,12 @@ int main(int argc, char** argv) {
                        DeviceVector<float>(ttv(d_src, {n, 1})), n);
         backend::device_synchronize();
         readback_f(acc, d_dst, n);
+
+        float* d_dst_m = upload(dst);
+        float_max_into(DeviceVector<float>(ttv(d_dst_m, {n, 1})),
+                       DeviceVector<float>(ttv(d_src, {n, 1})), n);
+        backend::device_synchronize();
+        readback_f(acc, d_dst_m, n);
 
         const int64_t ni = 4097;
         std::vector<int32_t> data(ni);
@@ -291,30 +319,83 @@ int main(int argc, char** argv) {
         auto dv_f2 = [&](float* p, int64_t n) {
             return DeviceVector<float2>(ttv(p, {n, 2}));
         };
-        // (score_mode, use opacs, use w2): Mean, Max, Geom fully compared.
-        const int dcases[3][3] = {{0, 0, 0}, {1, 1, 0}, {3, 1, 1}};
+        // (score_mode, use opacs, use w2, score_power x10): Mean, Max, Geom
+        // fully compared.
+        const int dcases[4][4] = {
+            {0, 0, 0, 10}, {1, 1, 0, 10}, {3, 1, 1, 10}, {0, 0, 0, 5}};
+        std::vector<float> over0(N, 0.f);
         for (auto& c : dcases) {
             float* d_accum = upload(accum);
+            float* d_over = upload(over0);
             densify_update_weight(
                 N, dv_f(d_radii, N), nullptr, c[1] ? d_opacs : nullptr,
                 dv_f(d_w1, N),
                 c[2] ? dv_f(d_w2, N) : DeviceVector<float>{},
-                c[2] ? 0.3f : 0.f, dv_f2(d_accum, N), c[0]);
+                c[2] ? 0.3f : 0.f, 0.1f * (float)c[3], dv_f2(d_accum, N),
+                c[0], 5.0f, dv_f(d_over, N));
             backend::device_synchronize();
             readback_f(acc, d_accum, N * 2);
+            readback_f(acc, d_over, N);
         }
         // Median: hash-dependent random walk; compare only the count.
         {
             float* d_accum = upload(accum);
             densify_update_weight(N, dv_f(d_radii, N), nullptr, d_opacs,
                                   dv_f(d_w1, N), DeviceVector<float>{}, 0.f,
-                                  dv_f2(d_accum, N), 2);
+                                  1.0f, dv_f2(d_accum, N), 2, 5.0f,
+                                  DeviceVector<float>{});
             backend::device_synchronize();
             std::vector<float> got(N * 2);
             backend::memcpy_sync(got.data(), d_accum, N * 2 * 4,
                                  MemcpyKind::DeviceToHost);
             for (int64_t i = 0; i < N; i++) got[2 * i] = 0.f;
             acc.insert(acc.end(), got.begin(), got.end());
+        }
+
+        // ---- densify_learned_score ----
+        // Ratios past the cap both ways, splats with no weight this step, and
+        // ones with no update yet (start from the prior).
+        {
+            std::vector<float> ratio(N * 2), lacc(N * 2);
+            for (int64_t i = 0; i < N; i++) {
+                ratio[i] = i % 11 == 0 ? 0.f : i % 13 == 0 ? 1e6f : uf(0.05f, 20.f);
+                ratio[N + i] = i % 7 == 0 ? 0.f : uf(0.01f, 3.f);
+                lacc[2 * i] = uf(0.f, 1.f);
+                lacc[2 * i + 1] = i % 4 == 0 ? 0.f : (float)(int)uf(1.f, 30.f);
+            }
+            float* d_ratio = upload(ratio);
+            float* d_lacc = upload(lacc);
+            float* d_over = upload(over0);
+            float* d_stats = upload(std::vector<float>(2, 0.f));
+            densify_learned_score_tensor(N, 0.4f, 0.1f, -3.0f, 0.02f, dv_f(d_radii, N),
+                                         dv_f(d_ratio, 2 * N), dv_f2(d_lacc, N),
+                                         5.0f, dv_f(d_over, N), dv_f(d_stats, 2));
+            backend::device_synchronize();
+            readback_f(acc, d_lacc, N * 2);
+            readback_f(acc, d_over, N);
+            readback_f(acc, d_stats, 2);
+        }
+
+        // ---- densify_clip_score ----
+        // (quantile, power): quantile 1 must still run the power pass, and a
+        // non-null score_out must leave the accumulator's own .x un-powered.
+        std::vector<float> score(N * 2);
+        for (int64_t i = 0; i < N; i++) {
+            score[2 * i] = uf(0.f, 5.f);
+            score[2 * i + 1] = (float)(int)uf(0.f, 4.f);
+        }
+        score[6] = -1e-9f;
+        score[8] = std::numeric_limits<float>::quiet_NaN();
+        const float ccases[4][2] = {
+            {0.95f, 1.0f}, {1.0f, 0.5f}, {0.95f, 2.0f}, {1.0f, 1.0f}};
+        for (auto& c : ccases) {
+            float* d_score = upload(score);
+            float* d_out = upload(std::vector<float>(N * 2, 0.f));
+            densify_clip_score_tensor(N, dv_f2(d_score, N), c[0], c[1],
+                                      dv_f2(d_out, N));
+            backend::device_synchronize();
+            readback_f(acc, d_score, N * 2);
+            readback_f(acc, d_out, N * 2);
         }
     }
 

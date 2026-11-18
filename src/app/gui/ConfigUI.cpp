@@ -19,11 +19,13 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <type_traits>
 #include <vector>
 
+namespace fs = std::filesystem;
 namespace msg = spirula::i18n::msg::gui;
 namespace fld = spirula::i18n::msg::field;
 using spirula::i18n::Msg;
@@ -172,22 +174,24 @@ bool draw_value(const char*, float& v, const char*) {
     return ui::InputFloatRaw("##v", &v, "%g");
 }
 
-bool draw_value(const char* key, std::string& v, const char* choices) {
-    std::string ch = choices;
-    if (ch.empty() || ch == "none") {
+// `blank_none`: the "none" token IS the empty value, true where the default is
+// empty. Where the default is a real word "none" is a value like any other,
+// and writing "" gives the trainer a spelling no parser knows.
+bool draw_value(const char* key, std::string& v, const char* choices,
+                bool blank_none = true) {
+    if (train_choices_free_form(choices)) {
         ImGui::SetNextItemWidth(kFieldWidth);
         return ui::InputTextRaw("##v", &v);
     }
-    // Literal[...] -> dropdown; the "none" token maps to the empty string.
     std::vector<std::string> opts = split_choices(choices);
-    std::string cur = v.empty() ? "none" : v;
+    std::string cur = (blank_none && v.empty()) ? "none" : v;
     bool changed = false;
     ImGui::SetNextItemWidth(kFieldWidth);
     if (ui::BeginComboRaw("##v", choice_display(key, cur).c_str())) {
         for (const auto& o : opts) {
             bool sel = (o == cur);
             if (ui::SelectableRaw(choice_display(key, o), sel)) {
-                v = (o == "none") ? "" : o;
+                v = (blank_none && o == "none") ? "" : o;
                 changed = true;
             }
             if (sel) ImGui::SetItemDefaultFocus();
@@ -265,8 +269,46 @@ bool draw_value(const char* key, std::optional<T>& v, const char* choices) {
     return changed;
 }
 
+// A vec3 whose flag ends in `_color` is an RGB colour: a swatch and three
+// channel sliders, not three boxes of numbers. A convention, not a field
+// list, so the next colour flag gets it with no GUI work.
+bool is_color_key(const char* key) {
+    size_t n = std::strlen(key);
+    return n > 6 && !std::strcmp(key + n - 6, "_color");
+}
+
+// A swatch that opens ImGui's picker, then absolute sliders. NOT ColorEdit3's
+// own channel fields: those are drags at 1/255 per pixel, so 0 -> 1 costs 255
+// pixels of travel instead of landing where the cursor is.
+bool draw_color3(std::array<float, 3>& v) {
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float gap = st.ItemInnerSpacing.x;
+    const float slider_w =
+        (kFieldWidth + 90 - ImGui::GetFrameHeight() - 3 * gap) / 3.0f;
+    static const char* kChannel[3] = {"R %.3f", "G %.3f", "B %.3f"};
+
+    // Grouped so the row's tooltip and its right-click reset still hang off
+    // the whole control rather than off the last slider.
+    ImGui::BeginGroup();
+    bool changed = ui::ColorEdit3Raw("##v", v.data(),
+                                     ImGuiColorEditFlags_NoInputs |
+                                     ImGuiColorEditFlags_Float);
+    for (int i = 0; i < 3; i++) {
+        ImGui::SameLine(0.0f, gap);
+        ImGui::SetNextItemWidth(slider_w);
+        ImGui::PushID(i);
+        changed |= ui::SliderFloatRaw("##ch", &v[i], 0.0f, 1.0f, kChannel[i]);
+        ImGui::PopID();
+    }
+    ImGui::EndGroup();
+    return changed;
+}
+
 template <size_t N>
-bool draw_value(const char*, std::array<float, N>& v, const char*) {
+bool draw_value(const char* key, std::array<float, N>& v, const char*) {
+    if constexpr (N == 3) {
+        if (is_color_key(key)) return draw_color3(v);
+    }
     ImGui::SetNextItemWidth(kFieldWidth + 90);
     return ImGui::InputScalarN("##v", ImGuiDataType_Float, v.data(), (int)N,
                                nullptr, nullptr, "%g");
@@ -278,14 +320,90 @@ bool draw_value(const char*, std::array<int, N>& v, const char*) {
     return ImGui::InputScalarN("##v", ImGuiDataType_S32, v.data(), (int)N);
 }
 
+// ---- paths ------------------------------------------------------------------
+
+// What a path row needs besides its value: the folder "<data>/" means, and
+// where to leave a "..." click.
+struct PathRow {
+    const Msg& name;
+    const std::string& data;
+    PathPick& pick;
+};
+
+// The value's own folder, or the nearest existing one above it.
+std::string pick_start(const std::string& value, const TrainPathSpec& spec,
+                       const std::string& data) {
+    fs::path p = value;
+    if (spec.in_data && !data.empty() && p.is_relative()) p = fs::path(data) / p;
+    std::error_code ec;
+    while (!p.empty() && !fs::is_directory(p, ec)) {
+        if (p == p.parent_path()) return {};
+        p = p.parent_path();
+    }
+    return p.string();
+}
+
+bool draw_path(const char* key, std::string& v, const TrainPathSpec& spec,
+               PathRow& row) {
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float gap = style.ItemInnerSpacing.x;
+    const float button_w = ImGui::CalcTextSize("...").x + 2 * style.FramePadding.x;
+    // Grouped so the row's tooltip and right-click reset cover the button too.
+    ImGui::BeginGroup();
+    ImGui::SetNextItemWidth(kFieldWidth + 90 - gap - button_w);
+    const bool changed = ui::InputTextRaw("##v", &v);
+    ImGui::SameLine(0.0f, gap);
+    if (ui::ButtonRaw("...##pick")) {
+        row.pick.field = key;
+        row.pick.title = row.name.get();
+        row.pick.folder = spec.folder;
+        row.pick.extensions.clear();
+        if (*spec.extension) row.pick.extensions.push_back(spec.extension);
+        row.pick.start_dir = pick_start(v, spec, row.data);
+    }
+    ImGui::EndGroup();
+    return changed;
+}
+
+template <typename T>
+void store_path(T&, const std::string&, const char*, const std::string&) {}
+
+void store_path(std::string& v, const std::string& path, const char* choices,
+                const std::string& data) {
+    v = path;
+    if (!train_path_spec(choices).in_data || data.empty()) return;
+    std::error_code ec;
+    const fs::path rel = fs::path(path).lexically_normal().lexically_relative(
+        fs::absolute(data, ec).lexically_normal());
+    if (!rel.empty() && *rel.begin() != "..") v = rel.generic_string();
+}
+
 // ---- one field row -----------------------------------------------------------
+
+// Only a string widget cares what the default is, and it wants the BASE one:
+// a preset filling the field in does not stop "none" meaning unset, and the
+// word where "" belongs is what the trainer then has to reject.
+template <typename T>
+bool draw_value_of(const char* key, T& v, const T&, const char* choices,
+                   PathRow&) {
+    return draw_value(key, v, choices);
+}
+
+bool draw_value_of(const char* key, std::string& v, const std::string& base,
+                   const char* choices, PathRow& row) {
+    const TrainPathSpec spec = train_path_spec(choices);
+    if (spec.is_path) return draw_path(key, v, spec, row);
+    return draw_value(key, v, choices, /*blank_none=*/base.empty());
+}
 
 template <typename T>
 bool field_row(const char* cli_key, const Msg& name, const Msg& help,
-               T& v, const T& def, const char* choices) {
+               T& v, const T& def, const T& base, const char* choices,
+               const std::string& data, PathPick& pick) {
     bool modified = !(v == def);
     ImGui::PushID(cli_key);
-    bool changed = draw_value(cli_key, v, choices);
+    PathRow row{name, data, pick};
+    bool changed = draw_value_of(cli_key, v, base, choices, row);
     bool hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort |
                                         ImGuiHoveredFlags_AllowWhenDisabled);
     ImGui::OpenPopupOnItemClick("ctx", ImGuiPopupFlags_MouseButtonRight);
@@ -427,7 +545,9 @@ bool draw_config_editor(TrainConfig& cfg, const TrainConfig& defaults,
         for (int i = 0; i < kTrainNumSections; i++)
             if (vis[i]) st.open[i] = true;
 
-    // Pass 2: draw.
+    // Pass 2: draw. `base` is the field table's own defaults, before any
+    // preset; only the "none means unset" question reads it.
+    static const TrainConfig base{};
     bool any_changed = false;
     const char* cur_section = "";
     bool section_open = false;
@@ -451,7 +571,8 @@ bool draw_config_editor(TrainConfig& cfg, const TrainConfig& defaults,
         passes(kField_##member, #member, tier,                                 \
                !(cfg.member == defaults.member)) &&                            \
         field_row(#member, fld::member, fld::member##_help,                    \
-                  cfg.member, defaults.member, choices)) {                     \
+                  cfg.member, defaults.member, base.member, choices,           \
+                  cfg.data, st.pick)) {                                        \
         any_changed = true;                                                    \
         st.touched.insert(#member);                                            \
         if (searching) st.sticky[cur_index] = 1;                               \
@@ -460,6 +581,18 @@ bool draw_config_editor(TrainConfig& cfg, const TrainConfig& defaults,
 #undef SS_DRAW
 
     return any_changed;
+}
+
+void apply_path_pick(TrainConfig& cfg, ConfigUIState& st,
+                     const std::string& field, const std::string& path) {
+#define SS_STORE_PATH(type, member, default_, section, tier, choices)          \
+    if (field == #member) {                                                    \
+        store_path(cfg.member, path, choices, cfg.data);                       \
+        st.touched.insert(#member);                                            \
+        return;                                                                \
+    }
+    SS_CONFIG_FIELDS(SS_STORE_PATH)
+#undef SS_STORE_PATH
 }
 
 }  // namespace gui

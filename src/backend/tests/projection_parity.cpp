@@ -21,6 +21,7 @@
 #include <fstream>
 #include <random>
 #include <vector>
+#include "backend/tests/ScreenRows.h"
 
 using backend::MemcpyKind;
 
@@ -39,6 +40,23 @@ T* upload(const std::vector<T>& host) {
 
 TorchTensorView ttv(const void* p, std::vector<int64_t> shape) {
     return std::make_tuple((uint64_t)p, (uint32_t)4, std::move(shape));
+}
+
+// The AABB rides as 16-bit fixed point (core/AabbQuant.cuh); compare the
+// quantized edges themselves, so a mismatch reads as whole steps.
+void readback_aabb(std::vector<float>& acc, const uint2* d, int64_t n) {
+    if (d == nullptr || n == 0) return;
+    std::vector<uint2> q((size_t)n);
+    backend::memcpy_sync(q.data(), d, q.size() * sizeof(uint2),
+                         backend::MemcpyKind::DeviceToHost);
+    size_t o = acc.size();
+    acc.resize(o + (size_t)n * 4);
+    for (int64_t i = 0; i < n; i++) {
+        acc[o + i * 4 + 0] = (float)(q[(size_t)i].x & 0xffffu);
+        acc[o + i * 4 + 1] = (float)(q[(size_t)i].y & 0xffffu);
+        acc[o + i * 4 + 2] = (float)(q[(size_t)i].x >> 16);
+        acc[o + i * 4 + 3] = (float)(q[(size_t)i].y >> 16);
+    }
 }
 
 void readback(std::vector<float>& acc, const float* d, int64_t n) {
@@ -78,6 +96,15 @@ int main(int argc, char** argv) {
     }
     for (auto& v : sh) v = uf(-0.3f, 0.3f);
 
+    for (int i = 0; i < 4; i++) {
+        means[3*i] = 0.1f;
+        means[3*i+1] = 0.2f;
+        means[3*i+2] = i < 2 ? float(i * 10) : -4.0f - float(i - 2);
+        for (int k = 0; k < 4; k++) quats[4*i+k] = k == 0 ? 1.0f : 0.0f;
+        for (int k = 0; k < 3; k++) scales[3*i+k] = -3.0f;
+        opac[i] = 2.0f;
+    }
+
     // Cameras: identity+z-offset and a mild y-rotation. Row-major [R|t].
     const float cy_ = std::cos(0.2f), sy_ = std::sin(0.2f);
     std::vector<float> vm = {
@@ -109,8 +136,8 @@ int main(int argc, char** argv) {
     };
     DeviceVector<float> radii(ttv(d_radii, {N, 1}));
 
-    const char* cams[4] = {"PINHOLE", "FISHEYE", "EQUISOLID",
-                           "EQUIRECTANGULAR"};
+    const char* cams[5] = {"PINHOLE", "FISHEYE", "EQUISOLID",
+                           "EQUIRECTANGULAR", "ORTHOGRAPHIC"};
 
     auto dist_tv = [&](int tier) {
         return ttv(d_dist + dist_fixture::row_offset(tier, C),
@@ -119,7 +146,7 @@ int main(int argc, char** argv) {
 
     std::vector<float> acc;
     for (int prim = 0; prim < 3; prim++)
-        for (int ci = 0; ci < 4; ci++)
+        for (int ci = 0; ci < 5; ci++)
             for (int shd = 0; shd <= 3; shd += 3)
                 // The tier is orthogonal to SH degree: sweep the compiled
                 // tiers at degree 3 and keep degree 0 on the NONE fast path,
@@ -132,7 +159,7 @@ int main(int argc, char** argv) {
                               : prim == 1 ? projection_mip_forward
                                           : projection_3dgut_forward;
                     auto out = fn(
-                        N, shd, in_splats, ttv(d_vm, {C, 16}),
+                        N, ColorBasis{shd, 0}, in_splats, ttv(d_vm, {C, 16}),
                         ttv(d_intr, {C, 4}), W, H, cams[ci],
                         dist_fixture::kTierNames[tier],
                         shd ? dist_tv(tier)
@@ -146,23 +173,43 @@ int main(int argc, char** argv) {
                     auto& aabb = std::get<0>(out);
                     auto& depths = std::get<1>(out);
                     auto& screen = std::get<2>(out);
-                    readback(acc, (const float*)aabb.data_ptr(), C * N * 4);
+                    if (ci == 4) {
+                        uint2 boxes[4];
+                        backend::memcpy_sync(boxes, aabb.data_ptr(), sizeof boxes,
+                                             MemcpyKind::DeviceToHost);
+                        if (boxes[0].x != boxes[1].x || boxes[0].y != boxes[1].y ||
+                            boxes[2].x || boxes[2].y || boxes[3].x || boxes[3].y) {
+                            std::fprintf(stderr, "orthographic footprint/culling failed\n");
+                            return 1;
+                        }
+                        if (prim != 2) {
+                            float rows[2 * SCR2_STRIDE];
+                            backend::memcpy_sync(rows, screen[0].data_ptr(), sizeof rows,
+                                                 MemcpyKind::DeviceToHost);
+                            if (std::abs(rows[SCR2_XY] - 460.0f) > 1e-3f ||
+                                std::abs(rows[SCR2_XY+1] - 422.0f) > 1e-3f ||
+                                std::abs(rows[SCR2_DEPTH] - 4.0f) > 1e-5f ||
+                                std::abs(rows[SCR2_STRIDE+SCR2_DEPTH] - 14.0f) > 1e-5f) {
+                                std::fprintf(stderr, "orthographic coordinates/depth failed\n");
+                                return 1;
+                            }
+                        }
+                    }
+                    readback_aabb(acc, aabb.data_ptr(), (int64_t)C * N);
                     readback(acc, depths.data_ptr(), C * N);
                     readback(acc, d_radii, N);
-                    const int chans_2d[5] = {2, 1, 3, 1, 3};  // xy/d/conic/o/rgb
-                    const int chans_ut[3] = {3, 1, 3};        // scale/o/rgb
-                    const int* chans = prim == 2 ? chans_ut : chans_2d;
-                    for (size_t s = 0; s < screen.size(); s++)
-                        readback(acc, screen[s].data_ptr(),
-                                 C * N * chans[s]);
+                    if (prim == 2)
+                        readback_screen(acc, screen[0], SCRG_STRIDE,
+                                        SCREEN_ROWS_GUT_COMPS);
+                    else
+                        readback_screen(acc, screen[0], SCR2_STRIDE,
+                                        SCREEN_ROWS_2D_COMPS);
                 }
 
     // --- SH value-quant (q8/q16) fused configs ---
-    // Codec-layout inputs: packed cells (cell = base(i) + 3*j + ch, base =
-    // i * 3 * NUM_SH) plus per-block (min, max) bounds in both layouts:
-    // per-cell-block (stride 256) and FPBO per-splat-block (stride arg 0).
+    // Packed cells + bounds for both layouts (docs/notes/sh-quant-layout.md);
     // features_sh becomes a shape-only null descriptor, as in the engine.
-    const int64_t cells = N * 3 * NUM_SH;
+    const int64_t cells = sh_fpbo_cells(N, NUM_SH);
     std::vector<uint8_t> q8(cells);
     std::vector<uint16_t> q16(cells);
     for (auto& v : q8) v = (uint8_t)(rng() & 0xff);
@@ -177,7 +224,8 @@ int main(int argc, char** argv) {
         return b;
     };
     std::vector<float> bounds_cell = gen_bounds(256);
-    std::vector<float> bounds_fpbo = gen_bounds((int64_t)256 * 3 * NUM_SH);
+    std::vector<float> bounds_fpbo =
+        gen_bounds(sh_quant_addr(NUM_SH, 0).bounds_stride);
     uint8_t* d_q8 = upload(q8);
     uint16_t* d_q16 = upload(q16);
     float* d_bcell = upload(bounds_cell);
@@ -210,7 +258,7 @@ int main(int argc, char** argv) {
                                       : projection_3dgut_forward;
                 auto [packed_tv, bounds_tv] = quant_args(bits, fpbo);
                 auto out = fn(
-                    N, 3, in_splats_q, ttv(d_vm, {C, 16}),
+                    N, ColorBasis{3, 0}, in_splats_q, ttv(d_vm, {C, 16}),
                     ttv(d_intr, {C, 4}), W, H, cams[prim],
                     dist_fixture::kTierNames[tier], dist_tv(tier), radii,
                     packed_tv, bounds_tv,
@@ -223,27 +271,28 @@ int main(int argc, char** argv) {
                 auto& aabb = std::get<0>(out);
                 auto& depths = std::get<1>(out);
                 auto& screen = std::get<2>(out);
-                readback(acc, (const float*)aabb.data_ptr(), C * N * 4);
+                readback_aabb(acc, aabb.data_ptr(), (int64_t)C * N);
                 readback(acc, depths.data_ptr(), C * N);
                 readback(acc, d_radii, N);
-                const int chans_2d[5] = {2, 1, 3, 1, 3};
-                const int chans_ut[3] = {3, 1, 3};
-                const int* chans = prim == 2 ? chans_ut : chans_2d;
-                for (size_t s = 0; s < screen.size(); s++)
-                    readback(acc, screen[s].data_ptr(), C * N * chans[s]);
+                if (prim == 2)
+                    readback_screen(acc, screen[0], SCRG_STRIDE,
+                                    SCREEN_ROWS_GUT_COMPS);
+                else
+                    readback_screen(acc, screen[0], SCR2_STRIDE,
+                                    SCREEN_ROWS_2D_COMPS);
             }
 
     // --- packed projection: nnz-compacted outputs (ids exact via float) ---
     for (int prim = 0; prim < 3; prim++)
         for (int ci = 0; ci < 4; ci += 3) {  // PINHOLE + EQUIRECTANGULAR
-            // PINHOLE walks the three distorted tiers across the primitives;
-            // EQUIRECTANGULAR has no lens distortion.
-            const int tier = ci == 0 ? 1 + prim : 0;
+            // PINHOLE alternates its two distorted tiers across the
+            // primitives; EQUIRECTANGULAR has no lens distortion.
+            const int tier = ci == 0 ? 1 + prim % 2 : 0;
             backend::memset_sync(d_radii, 0, N * sizeof(float));
             auto fn = prim == 0   ? projection_3dgs_packed_forward
                       : prim == 1 ? projection_mip_packed_forward
                                   : projection_3dgut_packed_forward;
-            auto out = fn(N, 3, in_splats, ttv(d_vm, {C, 16}),
+            auto out = fn(N, ColorBasis{3, 0}, in_splats, ttv(d_vm, {C, 16}),
                           ttv(d_intr, {C, 4}), W, H, cams[ci],
                           dist_fixture::kTierNames[tier], dist_tv(tier),
                           radii, std::nullopt, std::nullopt, 0, 32, 0);
@@ -265,14 +314,15 @@ int main(int argc, char** argv) {
             backend::memcpy_sync(ids.data() + nnz, gauss_ids.data_ptr(),
                                  nnz * 4, MemcpyKind::DeviceToHost);
             for (int32_t v : ids) acc.push_back((float)v);
-            readback(acc, (const float*)aabb.data_ptr(), nnz * 4);
+            readback_aabb(acc, aabb.data_ptr(), nnz);
             readback(acc, depths.data_ptr(), nnz);
             readback(acc, d_radii, N);
-            const int chans_2d[5] = {2, 1, 3, 1, 3};
-            const int chans_ut[3] = {3, 1, 3};
-            const int* chans = prim == 2 ? chans_ut : chans_2d;
-            for (size_t s = 0; s < screen.size(); s++)
-                readback(acc, screen[s].data_ptr(), nnz * chans[s]);
+            if (prim == 2)
+                readback_screen(acc, screen[0], SCRG_STRIDE,
+                                SCREEN_ROWS_GUT_COMPS);
+            else
+                readback_screen(acc, screen[0], SCR2_STRIDE,
+                                SCREEN_ROWS_2D_COMPS);
         }
 
     // --- packed + quant: one q8 cell-block and one q16 FPBO config ---
@@ -280,13 +330,13 @@ int main(int argc, char** argv) {
         const int prim = k == 0 ? 0 : 2;
         const int bits = k == 0 ? 8 : 16;
         const int fpbo = k;
-        // PINHOLE rational, then FISHEYE thin-prism.
-        const int tier = k == 0 ? 3 : 2;
+        // PINHOLE opencv, then FISHEYE thin-prism.
+        const int tier = k == 0 ? 1 : 2;
         backend::memset_sync(d_radii, 0, N * sizeof(float));
         auto fn = prim == 0 ? projection_3dgs_packed_forward
                             : projection_3dgut_packed_forward;
         auto [packed_tv, bounds_tv] = quant_args(bits, fpbo);
-        auto out = fn(N, 3, in_splats_q, ttv(d_vm, {C, 16}),
+        auto out = fn(N, ColorBasis{3, 0}, in_splats_q, ttv(d_vm, {C, 16}),
                       ttv(d_intr, {C, 4}), W, H, cams[k],
                       dist_fixture::kTierNames[tier], dist_tv(tier), radii,
                       packed_tv, bounds_tv,
@@ -309,14 +359,15 @@ int main(int argc, char** argv) {
         backend::memcpy_sync(ids.data() + nnz, gauss_ids.data_ptr(), nnz * 4,
                              MemcpyKind::DeviceToHost);
         for (int32_t v : ids) acc.push_back((float)v);
-        readback(acc, (const float*)aabb.data_ptr(), nnz * 4);
+        readback_aabb(acc, aabb.data_ptr(), nnz);
         readback(acc, depths.data_ptr(), nnz);
         readback(acc, d_radii, N);
-        const int chans_2d[5] = {2, 1, 3, 1, 3};
-        const int chans_ut[3] = {3, 1, 3};
-        const int* chans = prim == 2 ? chans_ut : chans_2d;
-        for (size_t s = 0; s < screen.size(); s++)
-            readback(acc, screen[s].data_ptr(), nnz * chans[s]);
+        if (prim == 2)
+            readback_screen(acc, screen[0], SCRG_STRIDE,
+                            SCREEN_ROWS_GUT_COMPS);
+        else
+            readback_screen(acc, screen[0], SCR2_STRIDE,
+                            SCREEN_ROWS_2D_COMPS);
     }
 
     if (dumping) {

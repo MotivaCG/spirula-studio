@@ -51,6 +51,7 @@ public:
     std::string file();          // the .ply actually opened
     int64_t num_splats() const { return _num_splats.load(); }
     int sh_degree() const { return _sh_degree.load(); }
+    int sb_lobes() const { return _sb_lobes.load(); }
 
     // Valid once ready(). The client navigates in a normalized frame centred
     // on the model and sized so it is about one unit across, exactly as it
@@ -66,10 +67,19 @@ public:
     const float* frame_center() const { return _center; }
     float frame_unit() const { return _unit; }
 
-    // Valid once ready() with kind() == Points: a dataset with no cameras and
-    // the cloud in it, which is all PreviewRenderer needs.
+    // Valid once ready() with kind() == Points: the parsed cloud, plus the
+    // dataset folder it came out of when it came out of one -- which is what
+    // an edit of it is written back into (data/SparseEdit.h).
     const ParsedDataset& points() const { return _points; }
     const PostSplitCameras& post() const { return _post; }
+    std::string dataset_dir();
+
+    // What an editor needs to reach the same model this is showing.
+    int scene_slot() const { return _scene_slot.load(); }
+    std::mutex* engine_mutex() const { return _engine_mutex; }
+    // The file's own frame into the normalized one the viewport navigates,
+    // row-major 3x4 -- what a selection projects through.
+    void to_view_frame(float out[12]) const;
 
     // Valid once ready() with kind() == Mesh: the triangles, and the
     // similarity that maps them into the normalized frame the viewport
@@ -78,15 +88,14 @@ public:
     const float* mesh_to_normalized() const { return _mesh_t2n; }
     int64_t num_faces() const { return _num_faces.load(); }
 
-    // Re-run the engine's linear / wide-gamut setup for the OPEN model.
-    // The viewer offers it because a PLY records no color space: a model
-    // trained in ACEScg looks wrong until it is told so, and the only way to
-    // find out is to try. Takes the engine lock; call from the GUI thread.
-    // `gamut` is a gamut_to_rec709 name, "" for Rec.709.
-    void set_color_space(const char* gamut, bool linear);
+    // Re-run the engine's transfer / gamut setup for the OPEN model. A PLY
+    // records neither, so trying is the only way to find out. Takes the engine
+    // lock; `gamut` is a gamut_to_rec709 name, "" for Rec.709.
+    void set_color_space(const char* gamut, int transfer, bool linear);
     // What the run's config.json said, so the controls open on the right
     // setting rather than on "none".
     std::string gamut() const;
+    int transfer() const;
     bool linear_color() const;
 
     // Hand the previous primitive's screen buffers back after a primitive
@@ -105,6 +114,7 @@ private:
     std::atomic<Kind> _kind{Kind::Splats};
     std::atomic<int64_t> _num_splats{0};
     std::atomic<int> _sh_degree{0};
+    std::atomic<int> _sb_lobes{0};
     std::atomic<int64_t> _num_faces{0};
     // The engine scene slot this object filled, or < 0 for none: what close()
     // has to free, and what says a half-finished load still left one behind.
@@ -114,7 +124,9 @@ private:
 
     std::mutex _mu;                    // guards everything below
     std::string _error, _path, _file;
+    std::string _dataset_dir;          // "" unless a dataset folder was opened
     std::string _gamut;                // "" = Rec.709
+    int _transfer = 0;                 // colorspace::Transfer
     bool _linear = false;
     ViewerRenderConfig _cfg;
     std::vector<std::string> _log;

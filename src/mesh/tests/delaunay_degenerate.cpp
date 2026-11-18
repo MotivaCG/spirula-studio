@@ -3,11 +3,12 @@
 // Gaussian (centre + 6 axis endpoints), collinear, coplanar and cospherical by
 // construction. See docs/notes/delaunay-degeneracy.md.
 //
-//   ./build/delaunay_degenerate [threads]
+//   ./build_vulkan/delaunay_degenerate [threads]
 //
 // Each case runs under a watchdog: the failure guarded against is a walk that
 // never ends, not a wrong answer.
 
+#include "core/HardwareThreads.h"
 #include "mesh/Delaunay3D.h"
 
 #include <atomic>
@@ -135,7 +136,7 @@ int check(const std::vector<double>& pts, int threads, const char* what,
 
     std::vector<char> used((size_t)n, 0);
     for (int t = 0; t < tri.nb_cells; t++) {
-        const int* c = &tri.cell_vertices[(size_t)t * 4];
+        const int* c = (const int*)&tri.cell_vertices[(size_t)t * 4];
         for (int i = 0; i < 4; i++) {
             if (c[i] < 0 || c[i] >= n) {
                 std::printf("BAD  %s t%d: tet %d vertex %d out of range (%d)\n", what,
@@ -175,7 +176,7 @@ int check(const std::vector<double>& pts, int threads, const char* what,
 }  // namespace
 
 int main(int argc, char** argv) {
-    const int hw = (int)std::thread::hardware_concurrency();
+    const int hw = (int)spirula::hardware_threads();
     std::vector<int> thread_counts = {1, hw > 1 ? hw : 4};
     if (argc > 1) thread_counts = {std::atoi(argv[1])};
 

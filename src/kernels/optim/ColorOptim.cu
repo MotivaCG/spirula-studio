@@ -106,6 +106,8 @@ __global__ void fused_adamtr_rgb_optim_kernel(
     const float bias_correction2,
     const float eps,
     const float eps_tr,
+    const float dc_reg_weight,
+    const float sh_reg_weight,
     const float grad_scale,
     const int step
 ) {
@@ -123,6 +125,12 @@ __global__ void fused_adamtr_rgb_optim_kernel(
         v = grad_scale * v;
         float3 m_val = exp_avg[idx];
         float3 v_val = exp_avg_sq[idx];
+
+        const float dc_off = 0.5f / kSh0;
+        const float under_reg_weight = dc_reg_weight + sh_reg_weight;
+        v.x += dc_reg_weight * fmaxf(x.x - dc_off, 0.f) + under_reg_weight * fminf(x.x + dc_off, 0.f);
+        v.y += dc_reg_weight * fmaxf(x.y - dc_off, 0.f) + under_reg_weight * fminf(x.y + dc_off, 0.f);
+        v.z += dc_reg_weight * fmaxf(x.z - dc_off, 0.f) + under_reg_weight * fminf(x.z + dc_off, 0.f);
 
         // Carry the gradient to x = splat_dc_encode(dc), the space Adam and
         // its moments live in when the working colour space is linear.
@@ -185,6 +193,8 @@ void fused_adamtr_linear_rgb_optim(
     float beta2,
     float eps,
     float eps_tr,
+    float dc_reg_weight,
+    float sh_reg_weight,
     int step,
     float grad_scale, bool zero_grad
 ) {
@@ -208,6 +218,8 @@ void fused_adamtr_linear_rgb_optim(
         1.0f - powf(beta2, step),
         eps,
         eps_tr,
+        2.0f * dc_reg_weight / 3.0f,
+        2.0f * sh_reg_weight / (float)(3 * num_gs),
         grad_scale,
         step
     );
@@ -226,6 +238,8 @@ void fused_adamtr_rgb_optim(
     float beta2,
     float eps,
     float eps_tr,
+    float dc_reg_weight,
+    float sh_reg_weight,
     int step,
     float grad_scale, bool zero_grad
 ) {
@@ -249,6 +263,8 @@ void fused_adamtr_rgb_optim(
         1.0f - powf(beta2, step),
         eps,
         eps_tr,
+        2.0f * dc_reg_weight / 3.0f,
+        2.0f * sh_reg_weight / (float)(3 * num_gs),
         grad_scale,
         step
     );
@@ -262,7 +278,7 @@ void fused_adamtr_rgb_optim(
 
 template<bool is_linear, bool zero_grad>
 __global__ void fused_adamtr_rgb_sh_optim_kernel(
-    const int num_params,
+    const int64_t num_params,
     const int num_sh,
     float* __restrict__ param,  // [N, K, 3]
     float* __restrict__ grad,  // [N, K, 3]
@@ -277,10 +293,11 @@ __global__ void fused_adamtr_rgb_sh_optim_kernel(
     const float bias_correction2,
     const float eps,
     const float eps_tr,
+    const float sh_reg_weight,
     const float grad_scale,
     const int step
 ) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
 
     if (idx < num_params) {
         // Bias correction terms
@@ -288,10 +305,10 @@ __global__ void fused_adamtr_rgb_sh_optim_kernel(
         const float step_size = lr / bias_correction1;
 
         // Load values
-        // float x = param[idx];
+        float x = param[idx];
         float v = grad[idx];
         if constexpr (zero_grad) grad[idx] = 0.0f;
-        v = grad_scale * v;
+        v = grad_scale * v + sh_reg_weight * x;
         float m_val = exp_avg[idx];
         float v_val = exp_avg_sq[idx];
 
@@ -318,7 +335,7 @@ __global__ void fused_adamtr_rgb_sh_optim_kernel(
 
         // clip and update
         delta = fminf(fmaxf(delta, -clip), clip);
-        param[idx] += delta;
+        param[idx] = x + (isfinite(delta) ? delta : 0.0f);
         exp_avg[idx] = m_val;
         exp_avg_sq[idx] = v_val;
     }
@@ -337,17 +354,20 @@ void fused_adamtr_linear_rgb_sh_optim(
     float beta2,
     float eps,
     float eps_tr,
+    float sh_reg_weight,
     int step,
+    SbOptimCells sb,
     float grad_scale, bool zero_grad
 ) {
+    sh_only_cells(sb, "fused_adamtr_linear_rgb_sh_optim");
     int64_t colors_numel = _tv_numel(colors);
-    const int num_gs = (int)(colors_numel / 3);
+    const int64_t num_gs = colors_numel / 3;
     if (num_gs == 0)
         return;
     const int num_sh = (int)(_tv_numel(param) / colors_numel);
     if (num_sh == 0)
         return;
-    const int num_params = num_gs * num_sh * 3;
+    const int64_t num_params = num_gs * num_sh * 3;
 
     auto kfn = zero_grad ? fused_adamtr_rgb_sh_optim_kernel<true,  true>
                          : fused_adamtr_rgb_sh_optim_kernel<true,  false>;
@@ -367,6 +387,7 @@ void fused_adamtr_linear_rgb_sh_optim(
         1.0f - powf(beta2, step),
         eps,
         eps_tr,
+        2.0f * sh_reg_weight / (float)(3 * num_gs),
         grad_scale,
         step
     );
@@ -386,17 +407,20 @@ void fused_adamtr_rgb_sh_optim(
     float beta2,
     float eps,
     float eps_tr,
+    float sh_reg_weight,
     int step,
+    SbOptimCells sb,
     float grad_scale, bool zero_grad
 ) {
+    sh_only_cells(sb, "fused_adamtr_rgb_sh_optim");
     int64_t colors_numel = _tv_numel(colors);
-    const int num_gs = (int)(colors_numel / 3);
+    const int64_t num_gs = colors_numel / 3;
     if (num_gs == 0)
         return;
     const int num_sh = (int)(_tv_numel(param) / colors_numel);
     if (num_sh == 0)
         return;
-    const int num_params = num_gs * num_sh * 3;
+    const int64_t num_params = num_gs * num_sh * 3;
 
     auto kfn = zero_grad ? fused_adamtr_rgb_sh_optim_kernel<false, true>
                          : fused_adamtr_rgb_sh_optim_kernel<false, false>;
@@ -416,6 +440,7 @@ void fused_adamtr_rgb_sh_optim(
         1.0f - powf(beta2, step),
         eps,
         eps_tr,
+        2.0f * sh_reg_weight / (float)(3 * num_gs),
         grad_scale,
         step
     );
@@ -437,9 +462,7 @@ void increment_int32_inplace(DeviceVector<int32_t> data, int64_t n) {
 }
 
 
-// dst[i] += src[i] for i in [0, n). Used by the sub-batched training
-// dispatcher to accumulate per-sub-batch raster-bwd accum_weight buffers
-// into a persistent buffer that densify consumes at the end of the step.
+// dst[i] += src[i] for i in [0, n).
 __global__ void float_add_into_kernel(float* __restrict__ dst,
                                       const float* __restrict__ src,
                                       int64_t n) {
@@ -451,5 +474,22 @@ __global__ void float_add_into_kernel(float* __restrict__ dst,
 void float_add_into(DeviceVector<float> dst, DeviceVector<float> src, int64_t n) {
     if (n == 0 || dst.data_ptr() == nullptr || src.data_ptr() == nullptr) return;
     float_add_into_kernel<<<(n + 255) / 256, 256>>>(dst.data_ptr(), src.data_ptr(), n);
+    CHECK_DEVICE_ERROR(cudaGetLastError());
+}
+
+// dst[i] = max(dst[i], src[i]). Folds per-sub-batch accum_weight the way
+// raster_bwd folds a batch's cameras (atomicMax): a sum would score a splat
+// by how many cameras saw it rather than by its error.
+__global__ void float_max_into_kernel(float* __restrict__ dst,
+                                      const float* __restrict__ src,
+                                      int64_t n) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = fmaxf(dst[idx], src[idx]);
+}
+
+/*[AutoHeaderGeneratorExport]*/
+void float_max_into(DeviceVector<float> dst, DeviceVector<float> src, int64_t n) {
+    if (n == 0 || dst.data_ptr() == nullptr || src.data_ptr() == nullptr) return;
+    float_max_into_kernel<<<(n + 255) / 256, 256>>>(dst.data_ptr(), src.data_ptr(), n);
     CHECK_DEVICE_ERROR(cudaGetLastError());
 }

@@ -3,6 +3,9 @@
 
 #include <core/Tensor.h>
 
+#include <stdexcept>
+#include <string>
+
 enum class RawPPISPRegLossIndex {
     SumExposure,
     SumVignettingCrSquared,
@@ -40,6 +43,19 @@ enum class RawPPISPRegLossIndexNoCRF {
     SumVignettingAlpha0ChannelVariance,
     SumVignettingAlpha1ChannelVariance,
     SumVignettingAlpha2ChannelVariance,
+    SumColorBx,
+    SumColorBy,
+    SumColorRx,
+    SumColorRy,
+    SumColorGx,
+    SumColorGy,
+    SumColorNx,
+    SumColorNy,
+    length
+};
+
+enum class RawPPISPRegLossIndexNoCRFNoVig {
+    SumExposure,
     SumColorBx,
     SumColorBy,
     SumColorRx,
@@ -89,6 +105,95 @@ enum class PPISPRegLossIndex {
 };
 
 
+// Parameter table layout a PPISP mode uses. The output clamp is orthogonal to
+// it (same table, one extra step), so it stays out of the enum and off the
+// kernel template.
+enum class PpispParamLayout : int {
+    Original = 0,
+    RQS = 1,
+    NoCRF = 2,
+    NoCRFNoVig = 3,
+};
+
+struct PpispParamSpec {
+    PpispParamLayout layout;
+    bool clamp_output;
+    int num_params;
+    int num_raw_losses;
+};
+
+constexpr int ppisp_layout_num_params(PpispParamLayout layout) {
+    return layout == PpispParamLayout::Original ? 36
+         : layout == PpispParamLayout::RQS      ? 39
+         : layout == PpispParamLayout::NoCRF    ? 24
+                                                : 9;
+}
+
+// The one decoder for a `param_type` string, shared by both backends and the
+// engine so a mode name cannot mean two things.
+inline PpispParamSpec ppisp_param_spec(const std::string& param_type) {
+    if (param_type == "original" || param_type.empty())
+        return {PpispParamLayout::Original, false, 36,
+                (int)RawPPISPRegLossIndex::length};
+    if (param_type == "rqs")
+        return {PpispParamLayout::RQS, false, 39,
+                (int)RawPPISPRegLossIndexRQS::length};
+    if (param_type == "no_crf")
+        return {PpispParamLayout::NoCRF, false, 24,
+                (int)RawPPISPRegLossIndexNoCRF::length};
+    if (param_type == "no_crf_clamp")
+        return {PpispParamLayout::NoCRF, true, 24,
+                (int)RawPPISPRegLossIndexNoCRF::length};
+    if (param_type == "no_crf_no_vig")
+        return {PpispParamLayout::NoCRFNoVig, false, 9,
+                (int)RawPPISPRegLossIndexNoCRFNoVig::length};
+    if (param_type == "no_crf_no_vig_clamp")
+        return {PpispParamLayout::NoCRFNoVig, true, 9,
+                (int)RawPPISPRegLossIndexNoCRFNoVig::length};
+    throw std::runtime_error(
+        "invalid PPISP param_type \"" + param_type +
+        "\", must be one of original, rqs, no_crf, no_crf_clamp, "
+        "no_crf_no_vig, no_crf_no_vig_clamp");
+}
+
+
+// Everything between the rasterizer and the bilateral grid (background blend,
+// PPISP either side of the display encode, the encode) as one launch each way.
+// The backward recomputes the stages instead of keeping an image per stage.
+enum class AppearanceBg : int { None = 0, Color = 1, Noise = 2, Image = 3 };
+enum class AppearancePpisp : int { Off = 0, BeforeEncode = 1, AfterEncode = 2 };
+
+struct AppearanceChainParams {
+    AppearanceBg bg = AppearanceBg::None;
+    float bg_color[3] = {0.0f, 0.0f, 0.0f};   // Color: working space
+    // Noise: the draw blend_background_noise_forward makes from the same values.
+    int bg_transfer = 0;
+    int bg_is_linear = 0;
+    int bg_blocky = 0;
+    uint32_t bg_block_px = 0;
+    uint32_t bg_seed = 0;
+    float bg_randomize_weight = 0.0f;
+    const float* bg_exponent_by_cam = nullptr;  // power per parameter slot; null = 1
+    const float* bg_image = nullptr;            // Image: [B, H, W, 3]
+    float* v_bg_image = nullptr;                // Image, backward: [B, H, W, 3]
+
+    int cs_enabled = 0;                         // working space -> display
+    int cs_transfer = 0;
+    int cs_is_linear = 0;
+    const float* cs_matrix = nullptr;           // [3, 3] row-major
+
+    AppearancePpisp ppisp = AppearancePpisp::Off;
+    PpispParamLayout ppisp_layout = PpispParamLayout::Original;
+    int ppisp_clamp = 0;
+    const float* ppisp_params = nullptr;        // [N_cam, P]
+    float* v_ppisp_params = nullptr;            // [N_cam, P]; the backward adds
+    const float* intrins = nullptr;             // [B, 4]
+
+    const int32_t* cam_indices = nullptr;       // [B] parameter slot per image
+    float overexposure_weight = 0.0f;           // backward only
+};
+
+
 /* == AUTO HEADER GENERATOR - DO NOT EDIT THIS LINE OR ANYTHING BELOW THIS LINE == */
 
 
@@ -130,9 +235,10 @@ void blend_background_forward(
 
 
 void blend_background_backward(
-    DeviceTensor3D<float3> rgb,              // [B, H, W, 3]
+    DeviceTensor3D<float3> rgb,              // [B, H, W, 3] PRE-blend
     DeviceTensor3D<float>  transmittance,    // [B, H, W, 1]
     DeviceTensor3D<float3> background,       // [B, H, W, 3]
+    float overexposure_weight,               // fused image-space reg, 0 = off
     DeviceTensor3D<float3> v_out_rgb,        // [B, H, W, 3]
     DeviceTensor3D<float3> v_rgb,            // [B, H, W, 3]
     DeviceTensor3D<float>  v_transmittance,  // [B, H, W, 1]
@@ -141,37 +247,69 @@ void blend_background_backward(
 
 
 void blend_background_noise_forward(
+    int transfer,
     bool is_linear,
+    bool blocky,                          // tiled RGB corners instead of U[0,1)
+    unsigned block_px,                    // cell side; 0 = one cell per image
     DeviceTensor3D<float3> rgb,           // [B, H, W, 3]
     DeviceTensor3D<float>  transmittance, // [B, H, W, 1]
     float randomize_weight,
     uint32_t seed,
+    const float* exponent_by_cam,         // power per camera slot; null = 1
+    const int32_t* cam_indices,           // [B] slot per image
     DeviceTensor3D<float3> out_rgb        // [B, H, W, 3]
 );
 
 
 void blend_background_noise_backward(
+    int transfer,
     bool is_linear,
-    DeviceTensor3D<float3> rgb,              // [B, H, W, 3]
+    bool blocky,                             // tiled RGB corners instead of noise
+    unsigned block_px,                       // cell side; 0 = one cell per image
+    DeviceTensor3D<float3> rgb,              // [B, H, W, 3] PRE-blend
     DeviceTensor3D<float>  transmittance,    // [B, H, W, 1]
     float randomize_weight,
     uint32_t seed,
+    const float* exponent_by_cam,            // as in the forward
+    const int32_t* cam_indices,
+    float overexposure_weight,               // fused image-space reg, 0 = off
     DeviceTensor3D<float3> v_out_rgb,        // [B, H, W, 3]
     DeviceTensor3D<float3> v_rgb,            // [B, H, W, 3]
     DeviceTensor3D<float>  v_transmittance   // [B, H, W, 1]
 );
 
 
-void rgb_to_srgb_forward(
-    bool is_input_linear,
+void blend_background_color_forward(
+    DeviceTensor3D<float3> rgb,           // [B, H, W, 3]
+    DeviceTensor3D<float>  transmittance, // [B, H, W, 1]
+    float3 background,                    // working color space
+    DeviceTensor3D<float3> out_rgb        // [B, H, W, 3]
+);
+
+
+void blend_background_color_backward(
+    DeviceTensor3D<float3> rgb,              // [B, H, W, 3] PRE-blend
+    DeviceTensor3D<float>  transmittance,    // [B, H, W, 1]
+    float3 background,                       // working color space
+    float overexposure_weight,               // fused image-space reg, 0 = off
+    DeviceTensor3D<float3> v_out_rgb,        // [B, H, W, 3]
+    DeviceTensor3D<float3> v_rgb,            // [B, H, W, 3]
+    DeviceTensor3D<float>  v_transmittance   // [B, H, W, 1]
+);
+
+
+void working_to_display_forward(
+    int transfer,                        // colorspace::Transfer
+    bool is_linear,                      // does the source store linear light
     DeviceTensor3D<float3> rgb,          // [B, H, W, 3]
     DeviceTensor2D<float3> color_matrix, // [3, 3] stored as 3 float3
     DeviceTensor3D<float3> out_rgb       // [B, H, W, 3]
 );
 
 
-void rgb_to_srgb_backward(
-    bool is_input_linear,
+void working_to_display_backward(
+    int transfer,
+    bool is_linear,
     DeviceTensor3D<float3> rgb,          // [B, H, W, 3]
     DeviceTensor2D<float3> color_matrix, // [3, 3] stored as 3 float3
     DeviceTensor3D<float3> v_out_rgb,    // [B, H, W, 3]
@@ -180,9 +318,27 @@ void rgb_to_srgb_backward(
 
 
 void overexposure_grad_add(
-    DeviceTensor3D<float3> rgb,    // [B, H, W, 3]
+    TorchTensorView rgb,           // [B, H, W, 3], float32 or float16
     float weight,                  // L = weight * mean(max(-x, x-1, 0)^2)
     DeviceTensor3D<float3> v_rgb   // [B, H, W, 3], in/out
+);
+
+
+void appearance_chain_forward(
+    const AppearanceChainParams& p,
+    TorchTensorView rgb,                   // [B, H, W, 3] raw render, float32 or float16
+    DeviceTensor3D<float> transmittance,   // [B, H, W, 1]
+    TorchTensorView out_rgb,               // [B, H, W, 3] float32 or float16
+    TorchTensorView raw16                  // a float16 copy of `rgb`, or null
+);
+
+
+void appearance_chain_backward(
+    const AppearanceChainParams& p,
+    TorchTensorView rgb,                     // [B, H, W, 3] as the forward read it
+    DeviceTensor3D<float>  transmittance,    // [B, H, W, 1]
+    DeviceTensor3D<float3> v_rgb,            // in: d/d output, out: d/d raw render
+    DeviceTensor3D<float>  v_transmittance   // [B, H, W, 1], added into
 );
 
 
@@ -331,26 +487,6 @@ void undistort_image_tensor(
 );
 
 
-void warp_image_wide_to_pinhole_tensor(
-    std::string camera_model,
-    std::string distortion,
-    TorchTensorView intrins,            // [B, 4]
-    TorchTensorView dist_coeffs,        // [B, 8]
-    TorchTensorView wide_image,         // [B, H, W, C] (float)
-    TorchTensorView axes,               // [K, 3, 3]
-    int out_w, int out_h,
-    TorchTensorView pinhole_images      // [B, K, H, W, C] (float)
-);
-
-
-void warp_image_equirectangular_to_pinhole_tensor(
-    TorchTensorView equirectangular_image,  // [B, H, W, C] (float)
-    TorchTensorView axes,                   // [K, 3, 3]
-    int out_w, int out_h,
-    TorchTensorView pinhole_images          // [B, K, H, W, C] (float)
-);
-
-
 void launch_warp_byte_to_float_wide(
     std::string camera_model,
     std::string distortion,
@@ -361,13 +497,16 @@ void launch_warp_byte_to_float_wide(
     const void* d_byte, bool input_is_u16,
     int B, int Hin, int Win, int C,
     float* d_float_out, int K, int Hout, int Wout,
-    const float* d_axes);
+    const float* d_post_intrins,           // [B*K, 4]
+    const float* d_axes                    // [B*K, 3, 3]
+);
 
 
 void launch_warp_byte_to_float_equi(
     const void* d_byte, bool input_is_u16,
     int B, int Hin, int Win, int C,
     float* d_float_out, int K, int Hout, int Wout,
+    const float* d_post_intrins,
     const float* d_axes);
 
 
@@ -381,6 +520,7 @@ void launch_warp_mask_wide(
     const uint8_t* d_byte_mask,
     int B, int Hin, int Win,
     uint8_t* d_byte_out, int K, int Hout, int Wout,
+    const float* d_post_intrins,
     const float* d_axes);
 
 
@@ -388,6 +528,7 @@ void launch_warp_mask_equi(
     const uint8_t* d_byte_mask,
     int B, int Hin, int Win,
     uint8_t* d_byte_out, int K, int Hout, int Wout,
+    const float* d_post_intrins,
     const float* d_axes);
 
 
@@ -455,6 +596,7 @@ void launch_warp_depth_wide(
     int B, int Hin, int Win,
     int in_H, int in_W,
     float* d_float_out, int K, int Hout, int Wout,
+    const float* d_post_intrins,
     const float* d_axes, bool input_is_ray_depth);
 
 
@@ -462,6 +604,7 @@ void launch_warp_depth_equi(
     const void* d_depth, uint32_t elem_size,
     int B, int Hin, int Win,
     float* d_float_out, int K, int Hout, int Wout,
+    const float* d_post_intrins,
     const float* d_axes, bool input_is_ray_depth);
 
 
@@ -476,6 +619,7 @@ void launch_warp_normal_wide(
     int B, int Hin, int Win,
     int in_H, int in_W,
     float* d_float_out, int K, int Hout, int Wout,
+    const float* d_post_intrins,
     const float* d_axes);
 
 
@@ -483,67 +627,8 @@ void launch_warp_normal_equi(
     const void* d_normal, uint32_t elem_size,
     int B, int Hin, int Win,
     float* d_float_out, int K, int Hout, int Wout,
+    const float* d_post_intrins,
     const float* d_axes);
-
-
-void warp_image_pinhole_to_wide_tensor(
-    std::string camera_model,
-    std::string distortion,
-    TorchTensorView intrins,            // [B, 4]
-    TorchTensorView dist_coeffs,        // [B, 8]
-    TorchTensorView pinhole_images,     // [B, K, H, W, C]
-    TorchTensorView axes,               // [K, 3, 3]
-    int out_w, int out_h,
-    TorchTensorView wide_image          // [B, H, W, C]
-);
-
-
-void warp_linear_depth_pinhole_to_wide_tensor(
-    std::string camera_model,
-    std::string distortion,
-    TorchTensorView intrins,            // [B, 4]
-    TorchTensorView dist_coeffs,        // [B, 8]
-    TorchTensorView pinhole_images,     // [B, K, H, W, 1]
-    TorchTensorView axes,               // [K, 3, 3]
-    int out_w, int out_h,
-    TorchTensorView wide_image          // [B, H, W, 1]
-);
-
-
-void warp_ray_depth_pinhole_to_wide_tensor(
-    std::string camera_model,
-    std::string distortion,
-    TorchTensorView intrins,            // [B, 4]
-    TorchTensorView dist_coeffs,        // [B, 8]
-    TorchTensorView pinhole_images,     // [B, K, H, W, 1]
-    TorchTensorView axes,               // [K, 3, 3]
-    int out_w, int out_h,
-    TorchTensorView wide_image          // [B, H, W, 1]
-);
-
-
-void warp_points_pinhole_to_wide_tensor(
-    std::string camera_model,
-    std::string distortion,
-    TorchTensorView intrins,            // [B, 4]
-    TorchTensorView dist_coeffs,        // [B, 8]
-    TorchTensorView pinhole_images,     // [B, K, H, W, 3]
-    TorchTensorView axes,               // [K, 3, 3]
-    int out_w, int out_h,
-    TorchTensorView wide_image          // [B, H, W, 3]
-);
-
-
-void warp_depth_pinhole_to_wide_scale_matrix_tensor(
-    std::string camera_model,
-    std::string distortion,
-    TorchTensorView intrins,            // [B, 4]
-    TorchTensorView dist_coeffs,        // [B, 8]
-    TorchTensorView pinhole_images,     // [B, K, H, W, 1]
-    TorchTensorView axes,               // [K, 3, 3]
-    int out_w, int out_h,
-    TorchTensorView matrix              // [B, K, K] (must be pre-zeroed)
-);
 
 
 void ppisp_forward(
@@ -576,6 +661,7 @@ void compute_ppsip_regularization_forward(
     TorchTensorView ppisp_params,       // [B, PPISP_NUM_PARAMS]
     const std::array<float, (int)PPISPRegLossIndex::length> loss_weights_0,
     std::string param_type,
+    bool exposure_arithmetic_mean,      // log2(mean gain) = 0, else mean(log2 gain) = 0
     TorchTensorView losses,             // [PPISPRegLossIndex::length] (must be pre-zeroed)
     TorchTensorView raw_losses          // [B+1, RawPPISPRegLossIndex::length] (must be pre-zeroed)
 );
@@ -587,5 +673,6 @@ void compute_ppsip_regularization_backward(
     TorchTensorView raw_losses,         // [B+1, RawPPISPRegLossIndex::length]
     TorchTensorView v_losses,           // [PPISPRegLossIndex::length]
     std::string param_type,
+    bool exposure_arithmetic_mean,
     TorchTensorView v_ppisp_params      // [B, PPISP_NUM_PARAMS] (must be pre-zeroed)
 );

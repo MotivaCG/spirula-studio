@@ -1,17 +1,16 @@
-// Engine checkpoint save.
-//   * splat.ply -- inference artifact (filtered, dequantized Gaussians).
-//   * state.tar -- resume payload: a zero-dep ustar of state.json + one flat
-//     typed .npy per saved pool buffer, selected by SaveClass metadata:
-//       full_dump=false -> Always slots (appearance/inference params)
-//       full_dump=true  -> Always + Resume (world raw + all optimizer state)
-//     The dump is metadata-driven (DevicePool::saved) so it can never fall out
-//     of sync with the buffer set, and it copies device->host in chunks with no
-//     extra device memory.
+// Streamed PLY export and native training-state archives; docs/training-resume.md.
 
 #include "engine/Engine.h"
 #include "engine/EngineInternal.h"
 #include "engine/EngineState.h"
 
+#include "checkpoint/BackgroundExport.h"
+#include "checkpoint/SplatPly.h"
+#include "checkpoint/SplatYUp.h"
+#include "checkpoint/Resume.h"
+#include "core/BufferedFile.h"
+#include <future>
+#include "core/AtomicFile.h"
 #include "core/CheckpointIO.h"
 #include "external/npy.hpp"
 #include <cmath>
@@ -23,6 +22,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 
 namespace {
@@ -66,10 +68,7 @@ static npy::shape_t _ckpt_shape_5d(const DeviceTensor5D<T>& t) {
     };
 }
 
-// Runtime + validation manifest embedded in state.tar. JSON. Holds only what
-// the loader needs that config.json cannot supply (cur_num_splats, active SH
-// bands, allocated appearance dims) plus fields to fail-fast on a config /
-// checkpoint mismatch. Deliberately NOT a config duplicate.
+// Runtime scalars and layout validation; run configuration lives in config.json.
 static std::string _build_state_json(EngineState& s, int step, bool full) {
     std::ostringstream j;
     auto b = [](bool v) { return v ? 1 : 0; };
@@ -85,6 +84,7 @@ static std::string _build_state_json(EngineState& s, int step, bool full) {
     j << "  \"max_num_splats\": " << s.max_num_splats << ",\n";
     j << "  \"num_sh\": " << s.num_sh << ",\n";
     j << "  \"sh_degree\": " << s.sh_degree << ",\n";
+    j << "  \"sb_lobes\": " << s.sb_lobes << ",\n";
     j << "  \"packed\": " << b(s.packed) << ",\n";
     j << "  \"sh_optim_bits\": " << s.optim.sh_optim_bits << ",\n";
     j << "  \"sh_value_bits\": " << s.world.sh_value_bits << ",\n";
@@ -117,6 +117,16 @@ static std::string _build_state_json(EngineState& s, int step, bool full) {
     emit_bg("bilagrid_rgb",    s.bilagrid_rgb,    &s.bilagrid_rgb.type, s.bilagrid_rgb.C);
     emit_bg("bilagrid_depth",  s.bilagrid_depth,  nullptr, 0);
     emit_bg("bilagrid_normal", s.bilagrid_normal, nullptr, 0);
+    j << "  \"background\": {\"mode\": "
+      << (s.background.mode == EngineBackground::Mode::Sh ? "\"sh\"" : "\"other\"")
+      << ", \"sh_degree\": " << s.background.sh_degree
+      << ", \"splat_transfer\": " << s.background.splat_transfer
+      << ", \"splat_is_linear\": " << b(s.background.splat_is_linear)
+      << "},\n";
+    j << "  \"calib_warp\": {\"enabled\": " << b(s.calib_warp.enabled);
+    if (s.calib_warp.enabled)
+        j << ", \"grid\": " << s.calib_warp.grid_n << ", \"D\": " << s.calib_warp.D;
+    j << "},\n";
     j << "  \"ppisp\": {\"enabled\": " << b(s.ppisp.enabled);
     if (s.ppisp.enabled)
         j << ", \"param_type\": \"" << s.ppisp.param_type << "\""
@@ -152,14 +162,39 @@ static std::string _json_str(const std::string& s, const std::string& key) {
     return (e == std::string::npos) ? "" : s.substr(v + 1, e - v - 1);
 }
 
+// Interrupted writes must not look complete to viewers or --resume.
+// Files keep a .tmp suffix until every stream has closed successfully.
+struct StagedFiles {
+    std::vector<fs::path> finals;
+
+    static fs::path temp_of(const fs::path& p) { return fs::path(p).concat(".tmp"); }
+    fs::path add(const fs::path& final_path) {
+        finals.push_back(final_path);
+        return temp_of(final_path);
+    }
+    void publish() {
+        for (const fs::path& p : finals) spirula::replace_file(temp_of(p), p);
+        finals.clear();
+    }
+    ~StagedFiles() {
+        std::error_code ec;
+        for (const fs::path& p : finals) fs::remove(temp_of(p), ec);
+    }
+};
+
 } // anon namespace
 
 
 void engine_save_checkpoint(
     std::string output_dir,
     bool full_dump,
-    int step
+    int step,
+    int background_export_height,
+    std::string basename,
+    bool y_up
 ) {
+    if (background_export_height < 1 || background_export_height > 8192)
+        throw std::runtime_error("background_export_height must be in [1, 8192]");
     EngineState& s = engine();
 
     fs::path out_root(output_dir);
@@ -169,229 +204,180 @@ void engine_save_checkpoint(
 
     const int64_t N = s.cur_num_splats;
     const int K = s.num_sh;
-
-    // --- D->H copy world splat tensors at s.cur_num_splats ---
-    auto h_means        = _ckpt_d2h<float3>(s.world.means.data_ptr(),        (size_t)N);
-    auto h_quats        = _ckpt_d2h<float4>(s.world.quats.data_ptr(),        (size_t)N);
-    auto h_scales       = _ckpt_d2h<float3>(s.world.scales.data_ptr(),       (size_t)N);
-    auto h_opacities    = _ckpt_d2h<float >(s.world.opacities.data_ptr(),    (size_t)N);
-    auto h_features_dc  = _ckpt_d2h<float3>(s.world.features_dc.data_ptr(),  (size_t)N);
-    // features_sh is stored [max_N, K] contiguous; copying first N rows = N*K float3.
-    // When sh_value_bits != 32 the canonical store is the packed buffer
-    // (`features_sh_quant{8,16}{,_fpbo}`); decode it on the host into the
-    // PLY row directly so we don't pay the ~N*K*12B fp32 staging allocation.
-    // The packed copy is ~N*3*K bytes (8-bit) or 2x (16-bit), much smaller
-    // than the fp32 staging would be.
-    const bool quant_sh_value = (K > 0) && s.world.sh_value_quantize_enabled();
-    const int  sh_value_bits  = s.world.sh_value_bits;
-
-    std::vector<float3> h_features_sh;            // fp32 path only
-    std::vector<uint8_t> h_value_packed;          // quant path only
-    std::vector<float2>  h_value_bounds;          // quant path only
-    int64_t  bounds_stride = 256;                 // quant path: cell-block vs fpbo
-    if (K > 0 && !quant_sh_value) {
-        h_features_sh = _ckpt_d2h<float3>(s.world.features_sh.data_ptr(), (size_t)(N * K));
-    } else if (quant_sh_value) {
-        // Pick the populated layout. FPBO (per-splat-block) takes precedence
-        // since that's what `_ensure_optim_state` allocates when FPBO is on.
-        bool fpbo_layout = false;
-        const uint8_t* dev_packed = nullptr;
-        const float2*  dev_bounds = nullptr;
-        int64_t        dev_n_bounds = 0;
-        if (sh_value_bits == 8) {
-            if (s.world.features_sh_quant8_fpbo.initialized()) {
-                dev_packed = s.world.features_sh_quant8_fpbo.packed.data_ptr();
-                dev_bounds = s.world.features_sh_quant8_fpbo.bounds.data_ptr();
-                dev_n_bounds = s.world.features_sh_quant8_fpbo.n_bounds;
-                fpbo_layout = true;
-            } else if (s.world.features_sh_quant8.initialized()) {
-                dev_packed = s.world.features_sh_quant8.packed.data_ptr();
-                dev_bounds = s.world.features_sh_quant8.bounds.data_ptr();
-                dev_n_bounds = s.world.features_sh_quant8.n_bounds;
-            }
-        } else /* sh_value_bits == 16 */ {
-            if (s.world.features_sh_quant16_fpbo.initialized()) {
-                dev_packed = s.world.features_sh_quant16_fpbo.packed.data_ptr();
-                dev_bounds = s.world.features_sh_quant16_fpbo.bounds.data_ptr();
-                dev_n_bounds = s.world.features_sh_quant16_fpbo.n_bounds;
-                fpbo_layout = true;
-            } else if (s.world.features_sh_quant16.initialized()) {
-                dev_packed = s.world.features_sh_quant16.packed.data_ptr();
-                dev_bounds = s.world.features_sh_quant16.bounds.data_ptr();
-                dev_n_bounds = s.world.features_sh_quant16.n_bounds;
-            }
-        }
-        if (dev_packed != nullptr && dev_bounds != nullptr) {
-            // Copy only the bytes needed for the first N splats (skip the
-            // tail of the over-allocated max_N buffer).
-            const int64_t cells_needed = (int64_t)N * 3 * K;
-            const int bytes_per_cell = (sh_value_bits == 8) ? 1 : 2;
-            h_value_packed.resize((size_t)(cells_needed * bytes_per_cell));
-            backend::memcpy_sync(h_value_packed.data(), dev_packed,
-                       (size_t)(cells_needed * bytes_per_cell),
-                       backend::MemcpyKind::DeviceToHost);
-            // Bounds layout: cell-block bounds_stride = 256;
-            //                fpbo (per-splat-block) bounds_stride = 256 * 3 * K.
-            int64_t n_bounds_needed;
-            if (fpbo_layout) {
-                bounds_stride = (int64_t)256 * 3 * (int64_t)K;
-                n_bounds_needed = (N + 255) / 256;
-            } else {
-                bounds_stride = 256;
-                n_bounds_needed = (cells_needed + 255) / 256;
-            }
-            // Don't run off the allocated bounds array.
-            n_bounds_needed = std::min(n_bounds_needed, dev_n_bounds);
-            h_value_bounds.resize((size_t)n_bounds_needed);
-            backend::memcpy_sync(h_value_bounds.data(), dev_bounds,
-                       (size_t)n_bounds_needed * sizeof(float2),
-                       backend::MemcpyKind::DeviceToHost);
-        }
-    }
-
-    // Decode one SH cell value on the host. Inlined into the PLY write loop
-    // below; safe no-op (returns 0) if quant buffers weren't populated.
-    auto decode_sh = [&](int64_t splat_i, int j, int ch) -> float {
-        if (h_value_packed.empty() || h_value_bounds.empty()) return 0.0f;
-        const int64_t cell = splat_i * (int64_t)3 * (int64_t)K + (int64_t)3 * j + (int64_t)ch;
-        const int64_t b_idx = cell / bounds_stride;
-        if (b_idx >= (int64_t)h_value_bounds.size()) return 0.0f;
-        const float2 mm = h_value_bounds[(size_t)b_idx];
-        if (sh_value_bits == 8) {
-            const uint8_t q = h_value_packed[(size_t)cell];
-            return mm.x + (mm.y - mm.x) * ((float)q * (1.0f / 255.0f));
-        } else {
-            const uint16_t* p16 = reinterpret_cast<const uint16_t*>(h_value_packed.data());
-            const uint16_t q = p16[(size_t)cell];
-            return mm.x + (mm.y - mm.x) * ((float)q * (1.0f / 65535.0f));
-        }
+    ColorBasis basis{0, s.sb_lobes};
+    while (ColorBasis::sh_coeffs_of(basis.sh_degree + 1) <= K - basis.sb_coeffs())
+        basis.sh_degree++;
+    if (basis.coeffs() != K || basis.sh_degree > spirula::ShRotation::kMaxDegree)
+        throw std::runtime_error("engine_save_checkpoint: invalid colour basis");
+    const bool quant = K > 0 && s.world.sh_value_quantize_enabled();
+    const int bits = s.world.sh_value_bits;
+    const uint8_t* packed = nullptr;
+    const float2* bounds = nullptr;
+    bool fpbo = false;
+    auto use_quant = [&](const auto& q, bool fused) {
+        if (!q.initialized()) return;
+        packed = q.packed.data_ptr();
+        bounds = q.bounds.data_ptr();
+        fpbo = fused;
     };
-
-    // --- Filter mask: NaN/Inf + low-opacity (logit < logit(1/255) ~= -5.5373) ---
-    const float OPA_MIN = -5.5373f;
-    auto fin1 = [](float v) { return std::isfinite(v); };
-    auto fin3 = [&](const float3& v) { return fin1(v.x) && fin1(v.y) && fin1(v.z); };
-    auto fin4 = [&](const float4& v) { return fin1(v.x) && fin1(v.y) && fin1(v.z) && fin1(v.w); };
-
-    std::vector<char> keep((size_t)N, 1);
-    int64_t kept = 0, nan_dropped = 0, lowopa_dropped = 0;
-    for (int64_t i = 0; i < N; i++) {
-        bool ok = fin3(h_means[i]) && fin4(h_quats[i]) && fin3(h_scales[i])
-                  && fin1(h_opacities[i]) && fin3(h_features_dc[i]);
-        // Quant-decoded SH values are finite by construction (byte to fp32
-        // linear interp from finite bounds), so skip the NaN check on that
-        // path. The fp32 path still validates each coef.
-        if (ok && K > 0 && !quant_sh_value) {
-            for (int j = 0; j < K; j++) {
-                if (!fin3(h_features_sh[i*K + j])) { ok = false; break; }
-            }
+    if (quant) {
+        if (bits == 8) {
+            use_quant(s.world.features_sh_quant8, false);
+            use_quant(s.world.features_sh_quant8_fpbo, true);
+        } else {
+            use_quant(s.world.features_sh_quant16, false);
+            use_quant(s.world.features_sh_quant16_fpbo, true);
         }
-        if (!ok) { keep[i] = 0; nan_dropped++; continue; }
-        if (h_opacities[i] < OPA_MIN) { keep[i] = 0; lowopa_dropped++; continue; }
-        kept++;
+        if (!packed || !bounds) throw std::runtime_error("checkpoint: missing quantized colour buffers");
     }
-
-    // --- PLY (binary little-endian) ---
-    const int vertex_floats = 3 + 3 + 3 + 3 * K + 1 + 3 + 4;  // pos + normal + dc + sh + opa + scale + rot
-    fs::path ply_path = out_root / "splat.ply";
+    const ShQuantAddr addr = sh_quant_addr((uint32_t)K, fpbo ? 0 : 256);
+    const int row_floats = spirula::splat_ply_row_floats(basis);
+    // Both quantization layouts restart on a 256-splat boundary.
+    const int64_t chunk_rows = std::max<size_t>(256,
+        spirula::kFileBufferBytes / (row_floats * sizeof(float)) / 256 * 256);
+    StagedFiles staged;
+    const fs::path ply_path = staged.add(out_root / (basename.empty() ? "splat.ply" : basename + ".ply"));
     {
         std::ofstream ply(ply_path, std::ios::binary);
         if (!ply) throw std::runtime_error("Failed to open PLY for write: " + ply_path.string());
-        ply << "ply\n";
-        ply << "format binary_little_endian 1.0\n";
-        ply << "element vertex " << kept << "\n";
-        ply << "property float x\nproperty float y\nproperty float z\n";
-        ply << "property float nx\nproperty float ny\nproperty float nz\n";
-        ply << "property float f_dc_0\nproperty float f_dc_1\nproperty float f_dc_2\n";
-        for (int j = 0; j < 3 * K; j++) ply << "property float f_rest_" << j << "\n";
-        ply << "property float opacity\n";
-        ply << "property float scale_0\nproperty float scale_1\nproperty float scale_2\n";
-        ply << "property float rot_0\nproperty float rot_1\nproperty float rot_2\nproperty float rot_3\n";
-        ply << "end_header\n";
-
-        // Buffer multiple rows per write for throughput.
-        constexpr int ROWS_PER_FLUSH = 1024;
-        std::vector<float> buf((size_t)vertex_floats * ROWS_PER_FLUSH);
-        int rows_in_buf = 0;
-        auto flush = [&]() {
-            if (rows_in_buf == 0) return;
-            ply.write(reinterpret_cast<const char*>(buf.data()),
-                      (std::streamsize)rows_in_buf * vertex_floats * sizeof(float));
-            rows_in_buf = 0;
+        ply << spirula::splat_ply_header(0, basis, s.primitive, y_up);
+        const spirula::SplatYUp turn;
+        std::vector<float3> means, scales, dc, sh;
+        std::vector<float4> quats;
+        std::vector<float> opacity, buf(chunk_rows * row_floats), writing(buf.size());
+        std::vector<uint8_t> values;
+        std::vector<float2> limits;
+        std::vector<int64_t> indices(chunk_rows);
+        std::future<void> pending;
+        int64_t kept = 0;
+        auto copy = [](auto& host, const auto* device, size_t count) {
+            host.resize(count);
+            if (count) backend::memcpy_sync(host.data(), device, count * sizeof(*device),
+                                           backend::MemcpyKind::DeviceToHost);
         };
-        for (int64_t i = 0; i < N; i++) {
-            if (!keep[i]) continue;
-            float* row = buf.data() + (size_t)rows_in_buf * vertex_floats;
-            int p = 0;
-            row[p++] = h_means[i].x; row[p++] = h_means[i].y; row[p++] = h_means[i].z;
-            row[p++] = 0.f; row[p++] = 0.f; row[p++] = 0.f;  // nx, ny, nz
-            row[p++] = h_features_dc[i].x; row[p++] = h_features_dc[i].y; row[p++] = h_features_dc[i].z;
-            // SH rest in (3, K) order: r0..r_{K-1}, g0..g_{K-1}, b0..b_{K-1}.
-            // Branch hoisted out of the inner loops so the codec decode only
-            // runs when value-quant is active.
-            if (quant_sh_value) {
-                for (int j = 0; j < K; j++) row[p++] = decode_sh(i, j, 0);
-                for (int j = 0; j < K; j++) row[p++] = decode_sh(i, j, 1);
-                for (int j = 0; j < K; j++) row[p++] = decode_sh(i, j, 2);
-            } else {
-                for (int j = 0; j < K; j++) row[p++] = h_features_sh[i*K + j].x;
-                for (int j = 0; j < K; j++) row[p++] = h_features_sh[i*K + j].y;
-                for (int j = 0; j < K; j++) row[p++] = h_features_sh[i*K + j].z;
+        for (int64_t first = 0; first < N; first += chunk_rows) {
+            const int64_t n = std::min(chunk_rows, N-first);
+            copy(means, s.world.means.data_ptr()+first, n);
+            copy(quats, s.world.quats.data_ptr()+first, n);
+            copy(scales, s.world.scales.data_ptr()+first, n);
+            copy(opacity, s.world.opacities.data_ptr()+first, n);
+            copy(dc, s.world.features_dc.data_ptr()+first, n);
+            if (quant) {
+                const int64_t cells = fpbo ? sh_fpbo_cells(n, K) : n*3*K;
+                const int64_t start = fpbo ? sh_fpbo_cells(first, K) : first*3*K;
+                copy(values, packed+start*(bits/8), cells*(bits/8));
+                copy(limits, bounds+(fpbo ? first : start)/256,
+                     ((fpbo ? n : cells)+255)/256);
+            } else if (K > 0) {
+                copy(sh, s.world.features_sh.data_ptr()+first*K, n*K);
             }
-            row[p++] = h_opacities[i];
-            row[p++] = h_scales[i].x; row[p++] = h_scales[i].y; row[p++] = h_scales[i].z;
-            row[p++] = h_quats[i].x; row[p++] = h_quats[i].y; row[p++] = h_quats[i].z; row[p++] = h_quats[i].w;
-            rows_in_buf++;
-            if (rows_in_buf == ROWS_PER_FLUSH) flush();
+            auto finite3 = [](const float3& v) {
+                return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+            };
+            int rows = 0;
+            for (int64_t i = 0; i < n; ++i) {
+                const auto& q = quats[i];
+                bool valid = finite3(means[i]) && finite3(scales[i]) && finite3(dc[i]) &&
+                    std::isfinite(opacity[i]) && std::isfinite(q.x) && std::isfinite(q.y) &&
+                    std::isfinite(q.z) && std::isfinite(q.w);
+                if (!quant)
+                    for (int j = 0; valid && j < K; ++j) valid = finite3(sh[i*K+j]);
+                if (valid && opacity[i] >= -5.5373f &&
+                    std::max({scales[i].x, scales[i].y, scales[i].z}) > -40.0f)
+                    indices[rows++] = i;
+            }
+#pragma omp parallel num_threads(8) if(rows >= 4096)
+            {
+                std::vector<float> rest(3*K);
+#pragma omp for schedule(static)
+                for (int r = 0; r < rows; ++r) {
+                    const int64_t i = indices[r];
+                    for (int j = 0; j < 3*K; ++j) {
+                        if (quant) {
+                            const int64_t cell = addr.cell(addr.base(i), j);
+                            const auto mm = limits[fpbo ? i/256 : cell/256];
+                            uint16_t q = values[cell];
+                            if (bits == 16) std::memcpy(&q, values.data()+2*cell, 2);
+                            rest[j] = mm.x + (mm.y-mm.x) * (float(q) / (bits == 8 ? 255.f : 65535.f));
+                        } else rest[j] = (&sh[i*K].x)[j];
+                    }
+                    float mean[3] = {means[i].x, means[i].y, means[i].z};
+                    float quat[4] = {quats[i].x, quats[i].y, quats[i].z, quats[i].w};
+                    if (y_up) turn.apply(mean, quat, K ? rest.data() : nullptr, basis);
+                    float* row = buf.data() + size_t(r)*row_floats;
+                    std::copy(mean, mean+3, row);
+                    std::fill(row+3, row+6, 0.f);
+                    row[6] = dc[i].x; row[7] = dc[i].y; row[8] = dc[i].z;
+                    if (K) spirula::splat_ply_put_rest(rest.data(), basis, row+9);
+                    int p = 9+3*K;
+                    row[p++] = opacity[i];
+                    row[p++] = scales[i].x; row[p++] = scales[i].y; row[p++] = scales[i].z;
+                    std::copy(quat, quat+4, row+p);
+                }
+            }
+            if (pending.valid()) pending.get();
+            buf.swap(writing);
+            pending = std::async(std::launch::async, [&, rows] {
+                ply.write(reinterpret_cast<const char*>(writing.data()),
+                          std::streamsize(rows)*row_floats*sizeof(float));
+                if (!ply) throw std::runtime_error("Failed to write " + ply_path.string());
+            });
+            kept += rows;
         }
-        flush();
+        if (pending.valid()) pending.get();
+        // The fixed-width vertex count lets filtering finish in a single pass.
+        ply.seekp(0);
+        ply << spirula::splat_ply_header(kept, basis, s.primitive, y_up);
+        ply.close();
+        if (!ply) throw std::runtime_error("Failed to write " + ply_path.string());
     }
 
     // --- state.tar: metadata-driven resume payload (see file header) ---------
-    // Which buffers to serialize: Always (base) or Always+Resume (full resume).
     const SaveClass save_min = full_dump ? SaveClass::Resume : SaveClass::Always;
 
-    std::ofstream tar((out_root / "state.tar").string(), std::ios::binary);
+    const fs::path tar_path = staged.add(out_root / (basename.empty() ? "state.tar" : basename + ".tar"));
+    std::ofstream tar(tar_path, std::ios::binary);
     if (!tar)
-        throw std::runtime_error("Failed to open state.tar for write: "
-                                 + (out_root / "state.tar").string());
+        throw std::runtime_error("Failed to open state.tar for write: " + tar_path.string());
 
-    // state.json -- runtime + validation manifest (config lives in config.json).
     {
         std::string sj = _build_state_json(s, step, full_dump);
         ckpt::tar_write_bytes(tar, "state.json", sj.data(), sj.size());
     }
 
-    // One flat typed .npy per saved pool slot. Chunked D->H copy through a small
-    // reusable host buffer -- bounded host RAM, ZERO extra device memory.
     std::vector<char> host_stage;
     for (const auto& sl : DevicePool::global().saved(save_min)) {
         ckpt::tar_write_npy_device(tar, sl.name + ".npy",
                                    sl.ptr, sl.nbytes, sl.dtype_tag, host_stage);
     }
     ckpt::tar_finish(tar);
+    tar.close();
+    if (!tar) throw std::runtime_error("Failed to write " + tar_path.string());
+
+    if (s.background.mode == EngineBackground::Mode::Sh && s.background.sh_coeffs.size() > 0) {
+        std::vector<float3> h_bg((size_t)s.background.sh_coeffs.size());
+        backend::memcpy_sync(h_bg.data(), s.background.sh_coeffs.data_ptr(),
+                             h_bg.size() * sizeof(float3),
+                             backend::MemcpyKind::DeviceToHost);
+        std::vector<float> matrix;
+        if (s.color_space.splat_enabled)
+            matrix = _ckpt_d2h(reinterpret_cast<const float*>(s.color_space.splat_color_matrix.data_ptr()), 9);
+        const fs::path webp_path = staged.add(out_root / "background.webp");
+        if (!ckpt::export_background_sh_webp(webp_path, h_bg.data(),
+                                        s.background.sh_degree, 2 * background_export_height, background_export_height,
+                                        s.background.splat_transfer,
+                                        s.background.splat_is_linear,
+                                        matrix.empty() ? nullptr : matrix.data()))
+            throw std::runtime_error("failed to write " + webp_path.string());
+    }
+    staged.publish();
 }
 
 
-// Restore engine state from a checkpoint's state.tar for resuming training.
-//
-// Preconditions (established by the resume flow from config.json): the engine
-// skeleton is configured -- world buffers seeded/allocated at max_num_splats
-// (set_data_3dgs), and any bilagrid/PPISP channels present in the checkpoint
-// initialized (engine_init_bilagrid_*/engine_init_ppisp). This function then:
-//   1. reads state.json and installs runtime scalars + the optimizer-state
-//      layout flags (quant bits, FPBO, bias correction),
-//   2. force-allocates optimizer + appearance-optimizer buffers to that layout
-//      (no training step is run; the _ensure_* calls only allocate + zero, and
-//      no-op for absent components),
-//   3. memcpies every saved .npy back into its pool slot by name (chunked
-//      H->D, no extra device memory), validating byte sizes,
-//   4. leaves *_initialized flags set so the lazy guards won't re-zero data.
-// Returns the saved training `step`.
-int engine_load_checkpoint(std::string input_dir) {
+int engine_load_checkpoint(std::string input_dir, bool restore_projective_depth) {
     EngineState& s = engine();
 
-    fs::path tarpath = fs::path(input_dir) / "state.tar";
+    fs::path tarpath = ckpt::resolve_checkpoint(input_dir).tar_path;
     std::ifstream in(tarpath.string(), std::ios::binary);
     if (!in)
         throw std::runtime_error("engine_load_checkpoint: cannot open " + tarpath.string());
@@ -409,6 +395,7 @@ int engine_load_checkpoint(std::string input_dir) {
     const int64_t max_n         = _json_int(sj, "max_num_splats", 0);
     const int     num_sh        = (int)_json_int(sj, "num_sh", 0);
     const int     sh_degree     = (int)_json_int(sj, "sh_degree", 0);
+    const int     sb_lobes      = (int)_json_int(sj, "sb_lobes", 0);
     const int     packed        = (int)_json_int(sj, "packed", 0);
     const int     sh_opt_bits   = (int)_json_int(sj, "sh_optim_bits", 32);
     const int     sh_val_bits   = (int)_json_int(sj, "sh_value_bits", 32);
@@ -427,8 +414,16 @@ int engine_load_checkpoint(std::string input_dir) {
     // Install runtime scalars + optimizer layout from the checkpoint.
     s.cur_num_splats = cur_n;
     s.max_num_splats = max_n;
+    DevicePool::global().set_splat_counts(cur_n, max_n);
+    if (s.num_sh != 0 && (s.num_sh != num_sh || s.sb_lobes != sb_lobes))
+        throw std::runtime_error(
+            "engine_load_checkpoint: colour row mismatch (engine " +
+            std::to_string(s.num_sh) + " coefficients, " +
+            std::to_string(s.sb_lobes) + " lobes vs checkpoint " +
+            std::to_string(num_sh) + ", " + std::to_string(sb_lobes) + ")");
     s.num_sh         = num_sh;
     s.sh_degree      = sh_degree;
+    s.sb_lobes       = sb_lobes;
     s.packed         = (packed != 0);
     if (!primitive.empty()) s.primitive = primitive;
     s.optim.use_per_splat_bias_correction = (bias != 0);
@@ -440,9 +435,24 @@ int engine_load_checkpoint(std::string input_dir) {
     _ensure_bilagrid_optim_state();
     _ensure_ppisp_optim_state();
 
+    for (const auto& m : members) {
+        if (m.name == "eng.bg_sky.sh_coeffs.npy") {
+            int deg = 0;
+            int bg_transfer = s.background.splat_transfer;
+            bool bg_is_linear = s.background.splat_is_linear;
+            std::vector<float3> coefficients;
+            if (!ckpt::load_background_sh(tarpath, deg, coefficients, bg_transfer, bg_is_linear))
+                throw std::runtime_error("engine_load_checkpoint: invalid SH background");
+            engine_init_background_sh(deg, bg_transfer, bg_is_linear);
+            break;
+        }
+    }
+    _ensure_bg_sh_optim_state();
+
     // Restore each saved .npy into its pool slot by name.
     std::vector<char> host_stage;
     int restored = 0;
+    if (!restore_projective_depth) engine_clear_projective_depth();
     for (auto& m : members) {
         const std::string& fn = m.name;
         if (fn.size() < 4 || fn.compare(fn.size() - 4, 4, ".npy") != 0) continue;
@@ -451,6 +461,13 @@ int engine_load_checkpoint(std::string input_dir) {
         PoolSlot slot; uint32_t sub;
         if (!parse_saved_name(base, slot, sub))
             throw std::runtime_error("engine_load_checkpoint: unknown slot '" + base + "'");
+
+        if (!restore_projective_depth &&
+            (slot == PoolSlot::EngProjectiveState || slot == PoolSlot::EngProjectiveInformation)) continue;
+        if (slot == PoolSlot::EngProjectiveState)
+            s.projective_state.resize(slot,s.max_num_splats);
+        if (slot == PoolSlot::EngProjectiveInformation)
+            s.projective_information.resize(slot,s.max_num_splats);
 
         void*  ptr    = nullptr;
         size_t nbytes = 0;

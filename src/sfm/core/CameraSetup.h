@@ -61,12 +61,42 @@ struct CameraOverride {
     CamModel model = CamModel::OpenCV;
     bool has_focal = false;
     double focal = 0;
+    // Starting distortion coefficients, in the model's BA order
+    // (sfm/core/Camera.h packIntrinsics). Empty = start at zero.
+    bool has_extra = false;
+    std::vector<double> extra;
+    std::vector<double> params;
 };
 
-// Parse "MODEL" or "PREFIX=MODEL" (likewise "F" / "PREFIX=F") into `out`,
-// merging into an existing entry for the same prefix so --camera-model and
-// --focal can name the same group.
-inline bool parseCameraOverride(const std::string& arg, bool is_focal,
+// Which of the three per-group settings a `PREFIX=VALUE` argument carries.
+enum class OverrideKind { Model, Focal, Distortion };
+
+// "k1,k2,..." -> coefficients in the camera model's BA order. False on an empty
+// list or any token that is not wholly a number.
+inline bool parseDistortion(const std::string& v, std::vector<double>& out) {
+    out.clear();
+    if (v.empty()) return false;
+    for (size_t i = 0;;) {
+        size_t c = v.find(',', i);
+        if (c == std::string::npos) c = v.size();
+        const std::string tok = v.substr(i, c - i);
+        try {
+            size_t used = 0;
+            out.push_back(std::stod(tok, &used));
+            if (used != tok.size()) return false;
+        } catch (const std::exception&) {
+            return false;
+        }
+        if (c == v.size()) break;
+        i = c + 1;
+    }
+    return true;
+}
+
+// Parse "VALUE" or "PREFIX=VALUE" into `out`, merging into an existing entry
+// for the same prefix so --camera-model, --focal and --distortion can name the
+// same group. A distortion value is a comma-separated list.
+inline bool parseCameraOverride(const std::string& arg, OverrideKind kind,
                                 std::vector<CameraOverride>& out) {
     std::string prefix, value = arg;
     size_t eq = arg.find('=');
@@ -77,13 +107,16 @@ inline bool parseCameraOverride(const std::string& arg, bool is_focal,
     }
     CamModel m = CamModel::OpenCV;
     double f = 0;
-    if (is_focal) {
+    std::vector<double> extra;
+    if (kind == OverrideKind::Focal) {
         try {
             f = std::stod(value);
         } catch (const std::exception&) {
             return false;
         }
         if (!(f > 0)) return false;
+    } else if (kind == OverrideKind::Distortion) {
+        if (!parseDistortion(value, extra)) return false;
     } else if (!parseCamModelName(value, m)) {
         return false;
     }
@@ -95,8 +128,11 @@ inline bool parseCameraOverride(const std::string& arg, bool is_focal,
         e = &out.back();
         e->prefix = prefix;
     }
-    if (is_focal) { e->has_focal = true; e->focal = f; }
-    else { e->has_model = true; e->model = m; }
+    switch (kind) {
+        case OverrideKind::Focal: e->has_focal = true; e->focal = f; break;
+        case OverrideKind::Distortion: e->has_extra = true; e->extra = std::move(extra); break;
+        case OverrideKind::Model: e->has_model = true; e->model = m; break;
+    }
     return true;
 }
 
@@ -106,6 +142,10 @@ struct CameraSetupOptions {
     // the group starts at Camera::defaultFor's geometric guess.
     CamModel model = CamModel::OpenCV;
     double focal = 0;
+    std::vector<double> params;
+    // Dataset-wide starting distortion, in the model's BA order; a group an
+    // override names uses that instead. Empty = start at zero, as COLMAP does.
+    std::vector<double> extra;
     std::vector<CameraOverride> overrides;
     // Use the focal length EXIF recorded (features.bin v3) when no explicit
     // --focal covers the group. On by default: it is a measurement of the lens
@@ -158,6 +198,9 @@ struct CameraSetup {
     size_t exif_focal_images = 0;               // images that carried an EXIF focal
     size_t exif_camera_images = 0;              // images that carried an EXIF identity
     size_t dim_buckets = 0;                     // distinct frame sizes, 2% tolerance
+    // Groups --camera-mode asked for that hold more than one frame size, and
+    // were therefore split further.
+    size_t size_split_groups = 0;
     CameraMode mode_used = CameraMode::Folder;  // after any automatic switch
     bool mode_switched = false;                 // ... and whether there was one
 
@@ -323,25 +366,32 @@ inline CameraSetup buildCameras(const std::vector<ImageEntry>& images,
     // EXIF split needs all of a group's focals before it can say which of them
     // are the same lens setting, so it happens between the passes.
     std::vector<std::string> base_key(images.size());
+    std::map<std::string, std::set<size_t>> group_sizes;  // mode key -> buckets
     for (size_t i = 0; i < images.size(); i++) {
         const std::string& name = images[i].name;
         const CameraOverride* ovr = detail::cameraOverrideFor(name, opt.overrides);
+        const size_t bucket = dimBucket(feats[i].width, feats[i].height);
         char dims[64];
-        snprintf(dims, sizeof dims, "r%zu", dimBucket(feats[i].width, feats[i].height));
-        std::string key;
+        snprintf(dims, sizeof dims, "r%zu", bucket);
+        std::string key, group;
         switch (mode) {
             case CameraMode::Single: key = dims; break;
             case CameraMode::Image:  key = name; break;
             // The *full* relative parent path, so nested sub-folders are
             // distinct cameras (images/rig/cam0 != images/rig/cam1 !=
             // images/rig), which is how per-camera captures are laid out.
-            case CameraMode::Folder: key = detail::parentPath(name) + "|" + dims; break;
+            case CameraMode::Folder: group = detail::parentPath(name);
+                                     key = group + "|" + dims; break;
         }
+        if (mode != CameraMode::Image) group_sizes[group].insert(bucket);
         // An override splits the group it names off from everything else even
         // when the mode would have merged them (one folder holding two lenses).
         if (ovr && !ovr->prefix.empty()) key += "|@" + ovr->prefix;
         base_key[i] = key;
     }
+
+    for (const auto& kv : group_sizes)
+        if (kv.second.size() > 1) out.size_split_groups++;
 
     // Cluster each base group's EXIF focals independently: the question "is
     // this the same lens setting as that?" is only meaningful among images that
@@ -408,6 +458,18 @@ inline CameraSetup buildCameras(const std::vector<ImageEntry>& images,
             given = true;
         }
         out.cameras[id] = Camera::defaultFor(id, feats[i].width, feats[i].height, focal, model);
+        const auto& params = ovr && !ovr->params.empty() ? ovr->params
+                            : model == opt.model ? opt.params : std::vector<double>{};
+        if (!params.empty()) {
+            unpackColmap(out.cameras[id], params.data());
+            if (ovr && ovr->has_focal) out.cameras[id].setFocal(ovr->focal);
+            else if (opt.focal > 0 && !(ovr && !ovr->params.empty()))
+                out.cameras[id].setFocal(opt.focal);
+            given = known = true;
+        }
+        if (ovr && ovr->has_extra) setExtraParams(out.cameras[id], ovr->extra);
+        else if (!opt.extra.empty() && !(ovr && !ovr->params.empty()))
+            setExtraParams(out.cameras[id], opt.extra);
         // A spherical camera has no focal length: the image dimensions are the
         // calibration, exactly, so it counts as known however the run was
         // invoked. That is what keeps both focal searches (the two-view one
@@ -437,9 +499,11 @@ inline CameraSetup buildCameras(const std::vector<ImageEntry>& images,
 inline void storeCameraSetup(MatchesDatabase& db, const CameraSetup& cs) {
     db.cameras.clear();
     db.focal_prior.clear();
+    db.focal_measured.clear();
     for (const auto& kv : cs.cameras) {
         db.cameras.push_back(kv.second);
         db.focal_prior.push_back(cs.focal_known.count(kv.first) ? 1 : 0);
+        db.focal_measured.push_back(cs.focal_measured.count(kv.first) ? 1 : 0);
     }
     db.camera_ids = cs.ids;
 }
@@ -453,6 +517,14 @@ inline bool loadCameraSetup(const MatchesDatabase& db, CameraSetup& cs) {
         const Camera& cam = db.cameras[i];
         cs.cameras[cam.id] = cam;
         const bool prior = i < db.focal_prior.size() && db.focal_prior[i];
+        // A focal the two-view stage measured is deliberately NOT `given`: the
+        // mapper still probes and refines it, and a reader that promoted it
+        // would reconstruct differently from the run that wrote the file.
+        if (i < db.focal_measured.size() && db.focal_measured[i]) {
+            cs.focal_measured.insert(cam.id);
+            cs.focal_known.insert(cam.id);
+            continue;
+        }
         // A focal that differs from the geometric default was measured -- by the
         // two-view search, by EXIF, or by hand -- and the search has nothing to
         // add to it. One that does not is still a guess, and is reported as one.

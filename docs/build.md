@@ -16,20 +16,27 @@ compiling its own copy.
 
 Always build through the dev scripts.
 
+`spirula --licenses` prints the embedded AprilTag BSD-2-Clause license and
+the OpenCV Apache-2.0 license for its ArUco tables, including their copyright
+notices. These texts travel with the executable on both backends, including
+headless builds. `tools/gen_license_texts.py` reads the vendored license files
+directly; regenerate its committed output when those files change.
+
 ## CMake layout
 
 `CMakeLists.txt` is just the running order; the logic lives in `cmake/`:
 
 | file | what it does |
 |---|---|
-| `SsOptions.cmake` | options (`SS_BUILD_CLI/GUI`, `SS_DEBUG_SYMBOLS`, …), backend selection, tree paths (`SS_ROOT`, `SS_CSRC`, …) |
+| `SsOptions.cmake` | options (`SS_BUILD_GUI`, `SS_DEBUG_SYMBOLS`, …), backend selection, tree paths (`SS_ROOT`, `SS_CSRC`, …) |
 | `SsSources.cmake` | `ss_collect_sources()` — expands `sources.txt` with `CONFIGURE_DEPENDS` |
 | `SsBackendCuda.cmake` | Torch probe, CUDA arch detection, flags, the `csrc` library, CUDA-side parity tools |
-| `SsBackendVulkan.cmake` | portable engine object lib, slangc + SPIR-V embed, `ss_backend_vulkan`, the Vulkan-side tests |
+| `SsBackendVulkan.cmake` | portable engine static library, slangc + SPIR-V embed, `ss_backend_vulkan`, the Vulkan-side tests |
 | `SsSlang.cmake` | `ss_find_slangc()` — pinned version, PATH lookup, fetch on miss |
 | `SsEmbed.cmake` | `ss_embed_file()` — bake a file into a byte-array header |
 | `SsApps.cmake` | the `spirula` executable — every tool the build has, in one binary (backend-agnostic) |
 | `SsPackage.cmake` | the `macos_app` / `macos_dmg` targets ([Packaging](#packaging)) |
+| `SsMacBundle.cmake` | `ss_mac_prefer_static()` — the static linking a one-file bundle depends on ([Packaging](#packaging)) |
 | `SsChecks.cmake` | the source lints ([Lints](#lints)) — included last, so every target above depends on them |
 
 Exactly one backend module runs. It leaves behind `SS_WITH_TORCH` and
@@ -46,61 +53,72 @@ build_develop.bat [cmake args...]
 
 Both run codegen first (skipped gracefully if `python3` is missing — the
 generated files are committed), then the [lints](#lints), then configure +
-build into `build/`. `build_develop.bash` additionally caps the job count by
-available RAM (~750 MB/job).
+build into the tree `SS_BACKEND` names: `build_cuda/` or `build_vulkan/`.
+macOS has one backend and uses a single `build/`. The scripts pick the
+directory themselves — a `-B` of your own reaches CMake but not the build step
+that follows, so select the tree with `SS_BACKEND`, not with `-B`.
+`build_develop.bash` additionally caps the job count by available RAM
+(~750 MB/job).
 
 ## The matrix
 
 | goal | command |
 |---|---|
-| CUDA CLI + GUI | `bash build_develop.bash -DSS_BUILD_CLI=ON -DSS_BUILD_GUI=ON -DSS_BACKEND=cuda` |
-| Vulkan CLI + GUI | `bash build_develop.bash -DSS_BUILD_CLI=ON -DSS_BUILD_GUI=ON -DSS_BACKEND=vulkan` |
+| CUDA CLI + GUI | `bash build_develop.bash -DSS_BACKEND=cuda` |
+| Vulkan CLI + GUI | `bash build_develop.bash -DSS_BACKEND=vulkan` |
+| Vulkan, no window | `bash build_develop.bash -DSS_BACKEND=vulkan -DSS_BUILD_GUI=OFF` |
 | parity tests | add `-DSS_BUILD_BACKEND_TESTS=ON` (Vulkan builds them unconditionally) |
-| Vulkan GUI, everything on | `bash build_develop.bash -DSS_BUILD_CLI=ON -DSS_BUILD_GUI=ON -DSS_BACKEND=vulkan -DSS_ENABLE_PATENTED=ON` |
+| Vulkan GUI, everything on | `bash build_develop.bash -DSS_BACKEND=vulkan -DSS_ENABLE_PATENTED=ON` |
 
-Keep the two backends in **separate build directories** so you can test both
-without reconfiguring, e.g. `-B build_cuda` and `-B build`.
+The two backends land in **separate trees**, so both can be built and tested
+from one checkout and neither reconfigures the other.
 
 ## Options
 
 | option | default | effect |
 |---|---|---|
-| `SS_BACKEND` | `cuda` | `cuda` \| `vulkan`. `vulkan` builds the portable engine layer + `backend/vulkan/` **without the CUDA toolkit**, and forces `SS_BUILD_CLI=ON`. |
-| `SS_BUILD_CLI` | `OFF` | the command-line tools (`spirula train`, `spirula mesh`) |
-| `SS_BUILD_GUI` | `OFF` | the graphical application (`spirula` with no arguments); FetchContent's GLFW 3.4 + Dear ImGui v1.92.8 (needs network once) |
+| `SS_BACKEND` | `cuda` | `cuda` \| `vulkan`. `vulkan` builds the portable engine layer + `backend/vulkan/` **without the CUDA toolkit**. |
+| `SS_BUILD_GUI` | `ON` | the graphical application (`spirula` with no arguments); FetchContent's GLFW 3.4 + Dear ImGui v1.92.8 (needs network once). `OFF` builds only the command-line tools, which need neither a display nor GL and fetch nothing. |
 | `SS_SEPARATE_TOOLS` | `OFF` | *also* build `spirula-sfm` and `spirula-sam` standalone — same code, but neither links the engine (24 MB vs the combined 61 MB) |
 | `SS_BUILD_BACKEND_TESTS` | `OFF` | build `backend/tests/*` (CUDA branch; Vulkan always builds them) |
 | `SS_DEBUG_SYMBOLS` | `OFF` | host `-g`, CUDA cubin lineinfo, `slangc -g2`. Bloats binaries substantially — profiling/debugging only. |
 | `SS_CUDA_EMBED_PTX` | `OFF` | embed PTX beside the cubin in the CUDA fatbin. Only buys JIT onto an architecture the binary was not built for, and costs about a third of every object; the build already detects the local GPU. Turn on for a redistributable binary. |
 | `SS_SLANGC` | *(empty)* | path to a `slangc` to use; empty means find on PATH and fetch the pinned release on miss/mismatch |
 | `SS_BUILD_SFM` | `ON` for `vulkan`, `OFF` for `cuda` | `ss_sfm` + `spirula sfm` + `sfm_*_test`. Vulkan-only; a CUDA build can opt in if the Vulkan SDK is present. |
-| `SS_BUILD_SAM` | `ON` for `vulkan`, `OFF` for `cuda` | `ss_nn` + `ss_sam` + `spirula sam` + `nn_ops_test` / `sam_pipeline_test`, and the GUI's in-process masking. Same rule as SfM. |
-| `SS_ENABLE_PATENTED` | `OFF` | `ss_video` — container demux + `VK_KHR_video_decode_*`. **Read the note below before turning it on.** |
+| `SS_BUILD_SAM` | `ON` for `vulkan`, `OFF` for `cuda` | `ss_nn` + `ss_sam` + `spirula sam` + `nn_ops_test` / `sam_pipeline_test`, the GUI's in-process masking, and LPIPS in the eval pass (`ss_lpips`). Same rule as SfM. |
+| `SS_ENABLE_PATENTED` | `OFF` | `ss_video` — container demux (HEIF stills included) + `VK_KHR_video_decode_*`, and the `VK_KHR_video_encode_*` encoder behind `spirula encode`. **Read the note below before turning it on.** |
 | `SS_SFM_REALS` / `SS_SFM_LOSSES` | all | trim the bundle-adjustment shader variant matrix while iterating (`src/sfm/README.md`) |
 | `SS_CHECK_COMMENTS` | `ON` | run the comment-length lint on every build ([Lints](#lints)) |
 
 ### `SS_ENABLE_PATENTED`
 
 Off by default, and deliberately. This repository is GPLv3, and `src/video/` —
-the H.264 / H.265 / AV1 bitstream parsers and the Vulkan Video driver — is the
-one part of it carrying third-party patent exposure (H.264/H.265 via MPEG LA
-and Access Advance, AV1 via the claims asserted against AOMedia). With it off,
-that directory is neither compiled nor linked, and everything that wanted it
-falls back to an external **ffmpeg**: `spirula sam extract` and `spirula sam
-video` say so and exit, and the GUI extracts frames with ffmpeg and tells the
-user why.
+the H.264 / H.265 / AV1 bitstream parsers, the HEIF container reader, the
+Vulkan Video decode driver and the H.264 / H.265 encoder — is the one part of
+it carrying third-party patent exposure (H.264/H.265 via MPEG LA and Access
+Advance, AV1 via the claims asserted against AOMedia, and HEIF's container has
+claims of its own). With it off, that directory is neither compiled nor
+linked, and everything that wanted it falls back to an external **ffmpeg**:
+`spirula sam extract` and the GUI extract frames with ffmpeg (the GUI tells
+the user why), `spirula sam video` says so and exits, the render mode encodes
+its videos with ffmpeg (or writes frames when there is none), and HEIC photos
+are converted to JPEG by ffmpeg 7.0 or newer — without their EXIF, so SfM
+starts with no focal-length prior.
 
-Turning it on buys in-process GPU decoding: roughly 15× faster frame
-extraction (a 127-second 1080p30 clip in ten seconds rather than minutes),
-`spirula sam extract`'s masking riding along on the same device pass, and no
-ffmpeg to install. Nothing else in the build changes.
+Turning it on buys in-process GPU decoding and encoding: roughly 15× faster
+frame extraction (a 127-second 1080p30 clip in ten seconds rather than
+minutes), `spirula encode` for the render mode's videos, and no FFmpeg
+dependency for inputs supported by the device. Devices without a video queue
+(including MoltenVK on macOS) and unsupported codec profiles still decode
+with external FFmpeg.
+Nothing else in the build changes.
 
 If you distribute binaries, decide for your jurisdiction and your users before
 shipping one built with it on.
 
 ## Lints
 
-Five checks guard the source. Each fails the build, and each skips itself when
+Seven checks guard the source. Each fails the build, and each skips itself when
 its interpreter is missing — none of them is a dependency of a fresh checkout.
 
 | check | what it refuses |
@@ -109,14 +127,16 @@ its interpreter is missing — none of them is a dependency of a fresh checkout.
 | `tools/check_i18n.sh` | a text-bearing ImGui call that skipped the `ui::` wrappers |
 | `tools/check_font_coverage.py` | a translation that outgrew the embedded font subsets |
 | `tools/check_comments.sh` | a comment citing a file that is not in the tree |
+| `tools/check_file_macro.sh` | a bare `__FILE__` where [`SS_FILE`](../src/core/SourcePath.h) belongs |
 | `tools/check_comment_length.py` | a comment block over the [budget](../AGENTS.md#budget) |
+| `tools/check_winmacro.py` | an identifier `<windows.h>` defines as a macro ([`tools/windows_macros.txt`](../tools/windows_macros.txt)) |
 
-The first four run from `build_develop.bash` only. The comment-length check
-also runs from CMake (`cmake/SsChecks.cmake`) as the `ss_check_comment_length`
-target, which every other target is made to depend on — so a bare `ninja`, a
-`make`, or `cmake --build build --target spirula` fails on it just as the dev
-scripts do. `build_develop.bat` runs it directly, and the standalone viewer
-build includes the same module.
+The first five run from `build_develop.bash` only. The last two also run from
+CMake (`cmake/SsChecks.cmake`) as the `ss_check_comment_length` and
+`ss_check_winmacro` targets, which every other target is made to depend on — so
+a bare `ninja`, a `make`, or `cmake --build build --target spirula` fails on
+them just as the dev scripts do. `build_develop.bat` runs them directly, and
+the standalone viewer build includes the same module.
 
 ### The comment-length check
 
@@ -129,12 +149,37 @@ a block.
 ```bash
 python3 tools/check_comment_length.py          # what the build will say
 python3 tools/check_comment_length.py --all    # the whole tree, for cleanup
-SS_SKIP_COMMENT_CHECK=1 ninja -C build         # skip it for one build
-cmake -B build -DSS_CHECK_COMMENTS=OFF         # or for a whole build tree
+SS_SKIP_COMMENT_CHECK=1 ninja -C build_vulkan  # skip it for one build
+cmake -B build_vulkan -DSS_CHECK_COMMENTS=OFF  # or for a whole build tree
 ```
 
 Neither escape hatch is a fix: the comment is still over budget, and the next
 person to touch that file inherits it.
+
+### The `<windows.h>` macro check
+
+`<windows.h>` turns plain words into macros: `near` and `far` expand to
+nothing, `small` to `char`, `ERROR` to `0`, `GetObject` to `GetObjectW`. A
+variable, enumerator or method by one of those names breaks only the Windows
+build, or silently changes it. The check lexes every C-like file in the
+checkout, tracked or not, apart from build trees, `outputs/`, `src/external/`
+and dot-directories, and flags each name in
+[`tools/windows_macros.txt`](../tools/windows_macros.txt) outside a comment or a
+literal. A function-like macro such as `RGB` counts only when `(` follows it or
+the name is `#define`d, so an enumerator `RGB` passes.
+
+Three things are exempt: a branch only Windows compiles (`#ifdef _WIN32`,
+`#ifdef _MSC_VER`), where Win32 code spells `TRUE` and `INFINITE` on purpose
+and the Windows compiler sees every line; a branch Windows never compiles
+(`#ifndef _WIN32`, `#ifdef __APPLE__`); and Slang and Objective-C++ files,
+which never meet the header. The check takes about half a second and has no
+skip switch: rename the identifier. A name added to the list should come from
+the SDK headers, as the list's header describes, not from memory.
+
+A `cannot lex` or `unbalanced` report means the lexer lost its place. Either
+the file has a syntax error, or `tools/check_winmacro.py` needs a fix. It keeps
+only the first branch of an `#if` when counting brackets, and evaluates nothing
+else of the preprocessor.
 
 ## Targets
 
@@ -169,15 +214,10 @@ that stage is out of process. Masking, decoding and training are in-process.
 slangc 2026.12.0.1 hits an internal error on all three `ba_df_*` variants under
 Windows (`error[E99998]: Slang compilation aborted due to internal error`),
 deterministically; `float` and `double` are fine, and all three build on Linux.
-The double-float real is not the default (`--ba-real` defaults to `double`), so
-the workaround costs nothing on that platform:
-
-```bat
-build_develop.bat "-DSS_SFM_REALS=float;double"
-```
-
-`spirula sfm` then reports "variant not built into this binary" if something
-asks for `df`. Not yet reduced to a minimal repro or filed upstream.
+So `SS_SFM_REALS` defaults to `float;double` on Windows. The double-float real
+is not the default (`--ba-real` defaults to `double`), so this costs nothing
+unless someone asks for `--ba-real df`, which then reports "variant not built
+into this binary". Not yet reduced to a minimal repro or filed upstream.
 
 ### Known: `sfm_mask_test` fails on Windows
 
@@ -203,15 +243,19 @@ embedded into the binary. On an offline machine, transfer a matching `slangc`
 and point `-DSS_SLANGC=` at it.
 
 **macOS.** Vulkan backend only, through MoltenVK; `build_develop.bash` works
-as on Linux. Dependencies: `brew install cmake ninja`. Four things are
-macOS-only in the build: `cmake/SsVulkan.cmake` fetches a pinned universal
-MoltenVK and links it *statically* (`SS_MACOS_VULKAN=static`, the default) so
-the binary carries its own driver and copies to any Mac — the release tarball
-supplies the Vulkan headers too, so nothing comes from Homebrew;
-`cmake/SsSlang.cmake` pins a different Slang release (the one this project
-pins publishes no macOS assets); `build_develop.bash` reads free memory from
-`vm_stat` rather than `/proc`; and `ss_i18n` links CoreFoundation, which
-`i18n/Locale.cpp` asks for the user's locale.
+as on Linux. Dependencies: `brew install cmake ninja libomp`. The last is
+keg-only, so nothing finds it on its own — `build_develop.bash` passes
+`-DOpenMP_ROOT` at the keg, and a build without OpenMP runs meshing, UV unwrap
+and metrics serial. Five things are macOS-only in the build:
+`cmake/SsVulkan.cmake` fetches a pinned universal MoltenVK and links it
+*statically* (`SS_MACOS_VULKAN=static`, the default) so the binary carries its
+own driver and copies to any Mac — the release tarball supplies the Vulkan
+headers too, so nothing comes from Homebrew; `cmake/SsSlang.cmake` pins a
+different Slang release (the one this project pins publishes no macOS assets);
+`build_develop.bash` reads free memory from `vm_stat` rather than `/proc`;
+`ss_i18n` links CoreFoundation, which `i18n/Locale.cpp` asks for the user's
+locale; and `cmake/SsMacBundle.cmake` links the archive beside a dependency's
+dylib, which is what keeps the bundle one file ([Packaging](#packaging)).
 
 A static build has no loader, so it cannot load validation layers.
 `-DSS_MACOS_VULKAN=loader` links the installed loader instead (needs
@@ -236,7 +280,8 @@ suppress).
 Only macOS has a packaging step, because only macOS has a form the binary is
 not already in. A Linux or Windows build is one file that runs where it lands;
 a Mac wants an `.app`, or the Dock shows a Terminal icon and Finder has no way
-to launch it.
+to launch it. The Linux dock's equivalent is a desktop entry, which the GUI
+writes for itself when it starts (`src/app/gui/DesktopEntry.h`).
 
 ```bash
 cmake --build build --target macos_app   # build/Spirula Studio.app
@@ -248,6 +293,32 @@ Both run `tools/package_macos.sh`, which is also usable directly
 from the built `spirula` plus an icon resampled from `assets/icon.png` — via
 `sips` and `iconutil`, which are in the base system, so packaging needs no
 Xcode.
+
+### Windows: the Visual C++ runtime
+
+The Windows binary links the CRT dynamically, so the machine it lands on needs
+the Microsoft Visual C++ Redistributable (`MSVCP140.dll`, `VCRUNTIME140*.dll`,
+`VCOMP140.dll`). Most machines have one, and it is often years old.
+
+MSVC 14.40 (VS 2022 17.10) made `std::mutex`'s and `condition_variable`'s
+constructors `constexpr`: the storage is zeroed and `_Mtx_init_in_situ` is
+never called. A redistributable older than 14.40 still locks through a vptr
+that lives in that storage, so the first `lock()` reads through a null pointer
+and the process dies before it draws a frame -- an
+`ACCESS_VIOLATION ... reading 0x0` inside `MSVCP140.dll`, which
+`SymFromAddr` reports against whatever export precedes the internal
+`_Mtx_do_lock` (`Thrd_yield`, on some builds).
+
+`cmake/SsOptions.cmake` therefore defines `_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR`
+for every MSVC target, which restores the runtime-initialised constructors.
+Keep it global: one translation unit built without it is one crash. A quick
+check on a built binary --
+
+```bash
+dumpbin /imports build_vulkan/spirula.exe | findstr _Mtx_init_in_situ
+```
+
+-- must print a line. If it does not, the define did not reach the build.
 
 ### The icon
 
@@ -270,10 +341,14 @@ taskbar. The banner carries no text — the product name and tagline are drawn
 over it by ImGui, so they stay translatable.
 
 The bundle carries **one binary**. That is only honest because a default
-macOS build links MoltenVK statically (`cmake/SsVulkan.cmake`), and the script
-checks rather than trusts it: `otool -L` output naming anything outside
+macOS build links MoltenVK statically (`cmake/SsVulkan.cmake`) and swaps every
+other dependency found as a dylib for the archive beside it
+(`ss_mac_prefer_static()` in `cmake/SsMacBundle.cmake` — libomp today), and the
+script checks rather than trusts it: `otool -L` output naming anything outside
 `/usr/lib` or `/System/Library` fails the packaging, since a bundle missing a
-dylib works on the build machine and nowhere else.
+dylib works on the build machine and nowhere else. Homebrew builds its archives
+for the host alone, so a bundle linking one is arm64-only and inherits that
+keg's minimum macOS version.
 
 Signing is ad-hoc (`--sign -`) by default. That is not optional decoration:
 Apple silicon kills an unsigned arm64 binary on exec, and copying the
@@ -292,10 +367,10 @@ Notarization needs a paid Apple Developer account, so it is not wired into the
 build.
 
 One behaviour is bundle-specific: a Finder launch inherits launchd's PATH
-(`/usr/bin:/bin:/usr/sbin:/sbin`), which has no Homebrew in it, so COLMAP,
-ffmpeg and python3 would be missing from an app that finds them fine when
-started from a shell. `gui::add_desktop_search_paths()`
-(`src/app/gui/AppPaths.h`) appends the package managers' directories at
+(`/usr/bin:/bin:/usr/sbin:/sbin`), which has no Homebrew in it, so COLMAP and
+ffmpeg would be missing from an app that finds them fine when started from a
+shell. `gui::add_desktop_search_paths()`
+(`src/app/AppPaths.h`) appends the package managers' directories at
 startup, after any PATH the process actually inherited.
 
 ## Build-time cost
@@ -329,8 +404,8 @@ apart:
   that should have gone through `ss_write_if_different()`.
 - `stored deps info out of date for ...`, on *every* object, with a
   `ninja: warning: premature end of file; recovering` near the top — a corrupt
-  `build/.ninja_deps`. Ninja's recovery truncates the log but not past the bad
+  `<build dir>/.ninja_deps`. Ninja's recovery truncates the log but not past the bad
   record, so the log never heals on its own: each build's header dependencies
   are discarded when the next build loads it back. The build scripts detect
   this and repair it with `ninja -t recompact`; by hand,
-  `cmake --build build -- -t recompact` (or just delete `build/.ninja_deps`).
+  `cmake --build <build dir> -- -t recompact` (or just delete its `.ninja_deps`).

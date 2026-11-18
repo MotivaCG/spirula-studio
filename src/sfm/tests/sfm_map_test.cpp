@@ -8,9 +8,11 @@
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
+#include "sfm/core/FeatureCompaction.h"
 #include "sfm/core/Model.h"
 #include "sfm/map/Bundle.h"
 #include "sfm/map/Assemble.h"
@@ -99,9 +101,19 @@ int cmdMapSelftest(int argc, char** argv) {
             TwoViewMatches tv;
             tv.image1 = i; tv.image2 = j; tv.config = (int)TwoViewConfig::Uncalibrated;
             for (int p = 0; p < N; p++)
-                if (vis[i][p] && vis[j][p]) tv.matches.push_back({(uint32_t)p, (uint32_t)p, 0});
+                if (vis[i][p] && vis[j][p]) tv.matches.push_back({(uint32_t)p, (uint32_t)p});
             if (tv.matches.size() >= 15) db.pairs.push_back(std::move(tv));
         }
+
+    MatchesDatabase compact_db = db;
+    std::vector<FeatureSet> compact_feats(feats.size());
+    {
+        FeatureCompactionPlan plan = buildFeatureCompactionPlan(compact_db);
+        for (size_t i = 0; i < feats.size(); i++)
+            compact_feats[i] =
+                compactFeatureSet(feats[i], plan.old_to_new[i], plan.compact_counts[i]);
+        remapMatches(compact_db, plan, compact_feats);
+    }
 
     Mapper mapper(db, feats, opt);
     // The synthetic scene is one connected component, so this must stay a
@@ -116,6 +128,44 @@ int cmdMapSelftest(int argc, char** argv) {
            rec.points3D.size(), models.size());
     if (reg < (uint32_t)M) { printf("  FAIL: not all images registered\n"); fails++; }
     if (models.size() != 1) { printf("  FAIL: connected scene split into models\n"); fails++; }
+
+    Mapper compact_mapper(compact_db, compact_feats, opt);
+    std::vector<Reconstruction> compact_models = compact_mapper.run();
+    bool compact_equivalent = !compact_models.empty() && compact_models.size() == models.size();
+    const Reconstruction* compact_rec = compact_models.empty() ? nullptr : &compact_models.front();
+    if (compact_equivalent)
+        compact_equivalent = compact_rec->numRegistered() == rec.numRegistered() &&
+                             compact_rec->points3D.size() == rec.points3D.size() &&
+                             countObservations(*compact_rec) == countObservations(rec);
+    if (compact_equivalent) {
+        for (const auto& image : rec.images) {
+            auto found = compact_rec->images.find(image.first);
+            if (found == compact_rec->images.end() ||
+                found->second.registered != image.second.registered) {
+                compact_equivalent = false;
+                break;
+            }
+        }
+    }
+    if (compact_equivalent) {
+        for (const auto& camera : rec.cameras) {
+            auto found = compact_rec->cameras.find(camera.first);
+            if (found == compact_rec->cameras.end() ||
+                std::fabs(found->second.fx - camera.second.fx) > 1e-9 ||
+                std::fabs(found->second.fy - camera.second.fy) > 1e-9 ||
+                std::fabs(found->second.cx - camera.second.cx) > 1e-9 ||
+                std::fabs(found->second.cy - camera.second.cy) > 1e-9) {
+                compact_equivalent = false;
+                break;
+            }
+        }
+    }
+    printf("  unused-feature compaction A/B: %s (%u images, %zu points, %zu obs)\n",
+           compact_equivalent ? "equivalent" : "BAD",
+           compact_rec ? compact_rec->numRegistered() : 0,
+           compact_rec ? compact_rec->points3D.size() : 0,
+           compact_rec ? countObservations(*compact_rec) : 0);
+    if (!compact_equivalent) fails++;
 
     // Relative rotations are invariant to the global similarity gauge.
     double maxRelErr = 0;
@@ -250,7 +300,7 @@ int cmdMapSelftest(int argc, char** argv) {
                     tv.image2 = (uint32_t)(k * M + j);
                     tv.config = (int)TwoViewConfig::Uncalibrated;
                     for (int p = 0; p < N; p++)
-                        if (vis[i][p] && vis[j][p]) tv.matches.push_back({(uint32_t)p, (uint32_t)p, 0});
+                        if (vis[i][p] && vis[j][p]) tv.matches.push_back({(uint32_t)p, (uint32_t)p});
                     if (tv.matches.size() >= 15) db2.pairs.push_back(std::move(tv));
                 }
         }
@@ -518,7 +568,7 @@ int cmdMapSelftest(int argc, char** argv) {
                 tv.image2 = j;
                 tv.config = (int)TwoViewConfig::Uncalibrated;
                 for (int p = 0; p < Nd; p++)
-                    if (vd[i][p] && vd[j][p]) tv.matches.push_back({(uint32_t)p, (uint32_t)p, 0});
+                    if (vd[i][p] && vd[j][p]) tv.matches.push_back({(uint32_t)p, (uint32_t)p});
                 if (tv.matches.size() >= 15) dbd.pairs.push_back(std::move(tv));
             }
 
@@ -655,6 +705,102 @@ int cmdMapSelftest(int argc, char** argv) {
         if (!focal_ok) { printf("  FAIL: focal did not converge with the PP held\n"); fails++; }
     }
 
+    // ---- distortion held during mapping, found by the finishing pass (D72) ----
+    // The same arc through a lens that really distorts. Per-image intrinsics
+    // (D73) ride on the same model: eight images on one camera become eight.
+    {
+        Camera Kx = Camera::defaultFor(1, W, H, 1200, CamModel::OpenCV);
+        Kx.k1 = -0.06;
+        Kx.k2 = 0.01;
+
+        std::mt19937 r4(29);
+        std::normal_distribution<double> n4(0.0, 0.3);
+        std::vector<FeatureSet> fx(M);
+        std::vector<std::vector<char>> vx(M, std::vector<char>(N, 0));
+        for (int c = 0; c < M; c++) {
+            fx[c].width = W;
+            fx[c].height = H;
+            fx[c].keypoints.resize(N);
+            for (int p = 0; p < N; p++) {
+                Vec3 pc = mul(gt[c].R, pts[p]) + gt[c].t;
+                Vec2 px = Kx.project(pc);
+                if (pc.z > 0.1 && px.x > 0 && px.x < W && px.y > 0 && px.y < H) {
+                    fx[c].keypoints[p] = {(float)(px.x + n4(r4)), (float)(px.y + n4(r4)), 2, 0, 0};
+                    vx[c][p] = 1;
+                } else {
+                    fx[c].keypoints[p] = {-1000, -1000, 2, 0, 0};
+                }
+            }
+        }
+        MatchesDatabase dbx;
+        dbx.images.resize(M);
+        for (int c = 0; c < M; c++) dbx.images[c] = {"dis" + std::to_string(c), (uint32_t)N};
+        for (int i = 0; i < M; i++)
+            for (int j = i + 1; j < M; j++) {
+                TwoViewMatches tv;
+                tv.image1 = i;
+                tv.image2 = j;
+                tv.config = (int)TwoViewConfig::Uncalibrated;
+                for (int p = 0; p < N; p++)
+                    if (vx[i][p] && vx[j][p]) tv.matches.push_back({(uint32_t)p, (uint32_t)p});
+                if (tv.matches.size() >= 15) dbx.pairs.push_back(std::move(tv));
+            }
+
+        MapperOptions ox = opt;
+        ox.camera_model = CamModel::OpenCV;
+        ox.focal_trials = 0;
+        ox.refine_extra_params = false;
+        Mapper mx(dbx, fx, ox);
+        std::vector<Reconstruction> mxs = mx.run();
+        const Camera& ch = mxs.front().cameras.at(1);
+        const bool held = ch.k1 == 0 && ch.k2 == 0 && ch.p1 == 0 && ch.p2 == 0;
+
+        Reconstruction fin = mx.polish(mxs.front(), /*free_pp=*/false, /*free_extra=*/true);
+        const Camera& cf = fin.cameras.at(1);
+        printf("  distortion: held (%.4f, %.4f) over %u image(s); finishing pass -> "
+               "(%.4f, %.4f), truth (%.4f, %.4f)\n",
+               ch.k1, ch.k2, mxs.front().numRegistered(), cf.k1, cf.k2, Kx.k1, Kx.k2);
+        if (!held) { printf("  FAIL: BA moved a held distortion coefficient\n"); fails++; }
+        // Recovered at least halfway, which no amount of gauge freedom gives
+        // for nothing: unlike the principal point, k1 is not a rotation.
+        if (std::fabs(cf.k1 - Kx.k1) > 0.5 * std::fabs(Kx.k1)) {
+            printf("  %s: the finishing pass did not recover the distortion\n",
+                   fp64_ba ? "FAIL" : "df-limited");
+            if (fp64_ba) fails++;
+        }
+        // ... and holding them must not freeze the focal alongside.
+        if (std::fabs(ch.focal() - 1200.0) > 0.10 * 1200.0) {
+            printf("  FAIL: focal did not converge with the distortion held\n");
+            fails++;
+        }
+
+        Reconstruction per = mx.perImageIntrinsics(fin);
+        std::set<uint32_t> percam;
+        for (const auto& kv : per.images)
+            if (kv.second.registered) percam.insert(kv.second.camera_id);
+        double spread = 0;
+        for (const auto& kv : per.cameras)
+            spread = std::max(spread, std::fabs(kv.second.focal() - cf.focal()));
+        printf("  per-image intrinsics: %zu camera(s) over %u image(s), focal spread %.2f px\n",
+               percam.size(), per.numRegistered(), spread);
+        if (percam.size() != per.numRegistered() || per.cameras.size() != percam.size()) {
+            printf("  FAIL: the per-image pass did not give every image its own camera\n");
+            fails++;
+        }
+        if (per.numRegistered() != fin.numRegistered()) {
+            printf("  FAIL: the per-image pass lost images\n");
+            fails++;
+        }
+        // Free per-image intrinsics can only fit the same observations better.
+        // A synthetic capture whose lens really is shared should nonetheless
+        // stay near it, which is what makes a runaway visible.
+        if (!(spread < 0.05 * cf.focal())) {
+            printf("  %s: per-image focals ran away from the shared solution\n",
+                   fp64_ba ? "FAIL" : "df-limited");
+            if (fp64_ba) fails++;
+        }
+    }
+
     // ---- an equirectangular (360) capture (D49) ----
     // A spherical camera walking a straight line through a scene that surrounds
     // it. Three things are specific to this model and nothing else exercises
@@ -723,7 +869,7 @@ int cmdMapSelftest(int argc, char** argv) {
                 tv.image2 = j;
                 tv.config = (int)TwoViewConfig::Uncalibrated;
                 for (int p = 0; p < Ne; p++)
-                    if (ve[i][p] && ve[j][p]) tv.matches.push_back({(uint32_t)p, (uint32_t)p, 0});
+                    if (ve[i][p] && ve[j][p]) tv.matches.push_back({(uint32_t)p, (uint32_t)p});
                 if (tv.matches.size() >= 15) dbe.pairs.push_back(std::move(tv));
             }
 

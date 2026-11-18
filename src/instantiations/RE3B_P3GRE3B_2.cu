@@ -8,9 +8,9 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     Vanilla3DGUT<0>,
     CameraModelType::PINHOLE,
     CameraDistortionType::None,
-    DistortionType::RGB_D,
+    DistortionType::D,
     true,
-    false,
+    DensifyAccumMode::Max,
     true
 >(
     cudaStream_t stream,
@@ -24,11 +24,12 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     const float *__restrict__ viewmats, // [B, C, 4, 4]
     const float4 *__restrict__ intrins,  // [B, C, 4], fx, fy, cx, cy
     const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
-    const float4 *__restrict__ aabb,  // [..., N] projected 2D AABB
+    const uint2 *__restrict__ aabb,   // [..., N] packed AABB
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_width,
     const uint32_t tile_height,
+    const int macro_log2,
     const int32_t *__restrict__ tile_offsets, // [..., tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
     // fwd outputs
@@ -43,10 +44,15 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     const float *__restrict__ v_render_Ts, // [..., image_height, image_width, 1]
     const float *__restrict__ v_median, // [..., image_height, image_width, 1], optional
     RenderOutput::Buffer v_distortions_output_buffer,
+    const float v_dist_rgb_per_depth,
     // grad inputs
     Vanilla3DGUT<0>::WorldBuffer v_splat_wbuffer,
     Vanilla3DGUT<0>::ScreenBuffer v_splat_sbuffer,
     float *__restrict__ o_accum_weight,
+    float *__restrict__ o_accum_weight_den,
+    float *__restrict__ o_max_weight,
+    const float max_weight_scale,
+    const float kernel_cut,
     float *__restrict__ v_viewmats // [B, C, 4, 4]
 );
 
@@ -54,9 +60,9 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     Vanilla3DGUT<0>,
     CameraModelType::PINHOLE,
     CameraDistortionType::None,
-    DistortionType::RGB_D,
+    DistortionType::D,
     true,
-    false,
+    DensifyAccumMode::Max,
     false
 >(
     cudaStream_t stream,
@@ -70,11 +76,12 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     const float *__restrict__ viewmats, // [B, C, 4, 4]
     const float4 *__restrict__ intrins,  // [B, C, 4], fx, fy, cx, cy
     const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
-    const float4 *__restrict__ aabb,  // [..., N] projected 2D AABB
+    const uint2 *__restrict__ aabb,   // [..., N] packed AABB
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_width,
     const uint32_t tile_height,
+    const int macro_log2,
     const int32_t *__restrict__ tile_offsets, // [..., tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
     // fwd outputs
@@ -89,10 +96,15 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     const float *__restrict__ v_render_Ts, // [..., image_height, image_width, 1]
     const float *__restrict__ v_median, // [..., image_height, image_width, 1], optional
     RenderOutput::Buffer v_distortions_output_buffer,
+    const float v_dist_rgb_per_depth,
     // grad inputs
     Vanilla3DGUT<0>::WorldBuffer v_splat_wbuffer,
     Vanilla3DGUT<0>::ScreenBuffer v_splat_sbuffer,
     float *__restrict__ o_accum_weight,
+    float *__restrict__ o_accum_weight_den,
+    float *__restrict__ o_max_weight,
+    const float max_weight_scale,
+    const float kernel_cut,
     float *__restrict__ v_viewmats // [B, C, 4, 4]
 );
 
@@ -100,9 +112,9 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     Vanilla3DGUT<0>,
     CameraModelType::PINHOLE,
     CameraDistortionType::None,
-    DistortionType::RGB_D,
-    false,
+    DistortionType::D,
     true,
+    DensifyAccumMode::Sum,
     true
 >(
     cudaStream_t stream,
@@ -116,11 +128,12 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     const float *__restrict__ viewmats, // [B, C, 4, 4]
     const float4 *__restrict__ intrins,  // [B, C, 4], fx, fy, cx, cy
     const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
-    const float4 *__restrict__ aabb,  // [..., N] projected 2D AABB
+    const uint2 *__restrict__ aabb,   // [..., N] packed AABB
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_width,
     const uint32_t tile_height,
+    const int macro_log2,
     const int32_t *__restrict__ tile_offsets, // [..., tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
     // fwd outputs
@@ -135,10 +148,15 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     const float *__restrict__ v_render_Ts, // [..., image_height, image_width, 1]
     const float *__restrict__ v_median, // [..., image_height, image_width, 1], optional
     RenderOutput::Buffer v_distortions_output_buffer,
+    const float v_dist_rgb_per_depth,
     // grad inputs
     Vanilla3DGUT<0>::WorldBuffer v_splat_wbuffer,
     Vanilla3DGUT<0>::ScreenBuffer v_splat_sbuffer,
     float *__restrict__ o_accum_weight,
+    float *__restrict__ o_accum_weight_den,
+    float *__restrict__ o_max_weight,
+    const float max_weight_scale,
+    const float kernel_cut,
     float *__restrict__ v_viewmats // [B, C, 4, 4]
 );
 
@@ -146,9 +164,9 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     Vanilla3DGUT<0>,
     CameraModelType::PINHOLE,
     CameraDistortionType::None,
-    DistortionType::RGB_D,
-    false,
+    DistortionType::D,
     true,
+    DensifyAccumMode::Sum,
     false
 >(
     cudaStream_t stream,
@@ -162,11 +180,12 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     const float *__restrict__ viewmats, // [B, C, 4, 4]
     const float4 *__restrict__ intrins,  // [B, C, 4], fx, fy, cx, cy
     const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
-    const float4 *__restrict__ aabb,  // [..., N] projected 2D AABB
+    const uint2 *__restrict__ aabb,   // [..., N] packed AABB
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_width,
     const uint32_t tile_height,
+    const int macro_log2,
     const int32_t *__restrict__ tile_offsets, // [..., tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
     // fwd outputs
@@ -181,10 +200,15 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     const float *__restrict__ v_render_Ts, // [..., image_height, image_width, 1]
     const float *__restrict__ v_median, // [..., image_height, image_width, 1], optional
     RenderOutput::Buffer v_distortions_output_buffer,
+    const float v_dist_rgb_per_depth,
     // grad inputs
     Vanilla3DGUT<0>::WorldBuffer v_splat_wbuffer,
     Vanilla3DGUT<0>::ScreenBuffer v_splat_sbuffer,
     float *__restrict__ o_accum_weight,
+    float *__restrict__ o_accum_weight_den,
+    float *__restrict__ o_max_weight,
+    const float max_weight_scale,
+    const float kernel_cut,
     float *__restrict__ v_viewmats // [B, C, 4, 4]
 );
 
@@ -192,9 +216,9 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     Vanilla3DGUT<0>,
     CameraModelType::PINHOLE,
     CameraDistortionType::None,
-    DistortionType::RGB_D,
-    false,
-    false,
+    DistortionType::D,
+    true,
+    DensifyAccumMode::Avg,
     true
 >(
     cudaStream_t stream,
@@ -208,11 +232,12 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     const float *__restrict__ viewmats, // [B, C, 4, 4]
     const float4 *__restrict__ intrins,  // [B, C, 4], fx, fy, cx, cy
     const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
-    const float4 *__restrict__ aabb,  // [..., N] projected 2D AABB
+    const uint2 *__restrict__ aabb,   // [..., N] packed AABB
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_width,
     const uint32_t tile_height,
+    const int macro_log2,
     const int32_t *__restrict__ tile_offsets, // [..., tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
     // fwd outputs
@@ -227,10 +252,15 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     const float *__restrict__ v_render_Ts, // [..., image_height, image_width, 1]
     const float *__restrict__ v_median, // [..., image_height, image_width, 1], optional
     RenderOutput::Buffer v_distortions_output_buffer,
+    const float v_dist_rgb_per_depth,
     // grad inputs
     Vanilla3DGUT<0>::WorldBuffer v_splat_wbuffer,
     Vanilla3DGUT<0>::ScreenBuffer v_splat_sbuffer,
     float *__restrict__ o_accum_weight,
+    float *__restrict__ o_accum_weight_den,
+    float *__restrict__ o_max_weight,
+    const float max_weight_scale,
+    const float kernel_cut,
     float *__restrict__ v_viewmats // [B, C, 4, 4]
 );
 
@@ -238,9 +268,9 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     Vanilla3DGUT<0>,
     CameraModelType::PINHOLE,
     CameraDistortionType::None,
-    DistortionType::RGB_D,
-    false,
-    false,
+    DistortionType::D,
+    true,
+    DensifyAccumMode::Avg,
     false
 >(
     cudaStream_t stream,
@@ -254,11 +284,12 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     const float *__restrict__ viewmats, // [B, C, 4, 4]
     const float4 *__restrict__ intrins,  // [B, C, 4], fx, fy, cx, cy
     const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
-    const float4 *__restrict__ aabb,  // [..., N] projected 2D AABB
+    const uint2 *__restrict__ aabb,   // [..., N] packed AABB
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_width,
     const uint32_t tile_height,
+    const int macro_log2,
     const int32_t *__restrict__ tile_offsets, // [..., tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
     // fwd outputs
@@ -273,20 +304,25 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     const float *__restrict__ v_render_Ts, // [..., image_height, image_width, 1]
     const float *__restrict__ v_median, // [..., image_height, image_width, 1], optional
     RenderOutput::Buffer v_distortions_output_buffer,
+    const float v_dist_rgb_per_depth,
     // grad inputs
     Vanilla3DGUT<0>::WorldBuffer v_splat_wbuffer,
     Vanilla3DGUT<0>::ScreenBuffer v_splat_sbuffer,
     float *__restrict__ o_accum_weight,
+    float *__restrict__ o_accum_weight_den,
+    float *__restrict__ o_max_weight,
+    const float max_weight_scale,
+    const float kernel_cut,
     float *__restrict__ v_viewmats // [B, C, 4, 4]
 );
 
 template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     Vanilla3DGUT<0>,
     CameraModelType::PINHOLE,
-    CameraDistortionType::OpenCV,
-    DistortionType::None,
-    true,
-    true,
+    CameraDistortionType::None,
+    DistortionType::D,
+    false,
+    DensifyAccumMode::None,
     true
 >(
     cudaStream_t stream,
@@ -300,11 +336,12 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     const float *__restrict__ viewmats, // [B, C, 4, 4]
     const float4 *__restrict__ intrins,  // [B, C, 4], fx, fy, cx, cy
     const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
-    const float4 *__restrict__ aabb,  // [..., N] projected 2D AABB
+    const uint2 *__restrict__ aabb,   // [..., N] packed AABB
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_width,
     const uint32_t tile_height,
+    const int macro_log2,
     const int32_t *__restrict__ tile_offsets, // [..., tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
     // fwd outputs
@@ -319,20 +356,25 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     const float *__restrict__ v_render_Ts, // [..., image_height, image_width, 1]
     const float *__restrict__ v_median, // [..., image_height, image_width, 1], optional
     RenderOutput::Buffer v_distortions_output_buffer,
+    const float v_dist_rgb_per_depth,
     // grad inputs
     Vanilla3DGUT<0>::WorldBuffer v_splat_wbuffer,
     Vanilla3DGUT<0>::ScreenBuffer v_splat_sbuffer,
     float *__restrict__ o_accum_weight,
+    float *__restrict__ o_accum_weight_den,
+    float *__restrict__ o_max_weight,
+    const float max_weight_scale,
+    const float kernel_cut,
     float *__restrict__ v_viewmats // [B, C, 4, 4]
 );
 
 template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     Vanilla3DGUT<0>,
     CameraModelType::PINHOLE,
-    CameraDistortionType::OpenCV,
-    DistortionType::None,
-    true,
-    true,
+    CameraDistortionType::None,
+    DistortionType::D,
+    false,
+    DensifyAccumMode::None,
     false
 >(
     cudaStream_t stream,
@@ -346,11 +388,12 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     const float *__restrict__ viewmats, // [B, C, 4, 4]
     const float4 *__restrict__ intrins,  // [B, C, 4], fx, fy, cx, cy
     const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
-    const float4 *__restrict__ aabb,  // [..., N] projected 2D AABB
+    const uint2 *__restrict__ aabb,   // [..., N] packed AABB
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_width,
     const uint32_t tile_height,
+    const int macro_log2,
     const int32_t *__restrict__ tile_offsets, // [..., tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
     // fwd outputs
@@ -365,20 +408,25 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     const float *__restrict__ v_render_Ts, // [..., image_height, image_width, 1]
     const float *__restrict__ v_median, // [..., image_height, image_width, 1], optional
     RenderOutput::Buffer v_distortions_output_buffer,
+    const float v_dist_rgb_per_depth,
     // grad inputs
     Vanilla3DGUT<0>::WorldBuffer v_splat_wbuffer,
     Vanilla3DGUT<0>::ScreenBuffer v_splat_sbuffer,
     float *__restrict__ o_accum_weight,
+    float *__restrict__ o_accum_weight_den,
+    float *__restrict__ o_max_weight,
+    const float max_weight_scale,
+    const float kernel_cut,
     float *__restrict__ v_viewmats // [B, C, 4, 4]
 );
 
 template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     Vanilla3DGUT<0>,
     CameraModelType::PINHOLE,
-    CameraDistortionType::OpenCV,
-    DistortionType::None,
-    true,
+    CameraDistortionType::None,
+    DistortionType::D,
     false,
+    DensifyAccumMode::Max,
     true
 >(
     cudaStream_t stream,
@@ -392,11 +440,12 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     const float *__restrict__ viewmats, // [B, C, 4, 4]
     const float4 *__restrict__ intrins,  // [B, C, 4], fx, fy, cx, cy
     const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
-    const float4 *__restrict__ aabb,  // [..., N] projected 2D AABB
+    const uint2 *__restrict__ aabb,   // [..., N] packed AABB
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_width,
     const uint32_t tile_height,
+    const int macro_log2,
     const int32_t *__restrict__ tile_offsets, // [..., tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
     // fwd outputs
@@ -411,9 +460,14 @@ template void rasterize_to_pixels_eval3d_bwd_kernel_wrapper<
     const float *__restrict__ v_render_Ts, // [..., image_height, image_width, 1]
     const float *__restrict__ v_median, // [..., image_height, image_width, 1], optional
     RenderOutput::Buffer v_distortions_output_buffer,
+    const float v_dist_rgb_per_depth,
     // grad inputs
     Vanilla3DGUT<0>::WorldBuffer v_splat_wbuffer,
     Vanilla3DGUT<0>::ScreenBuffer v_splat_sbuffer,
     float *__restrict__ o_accum_weight,
+    float *__restrict__ o_accum_weight_den,
+    float *__restrict__ o_max_weight,
+    const float max_weight_scale,
+    const float kernel_cut,
     float *__restrict__ v_viewmats // [B, C, 4, 4]
 );

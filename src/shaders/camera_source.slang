@@ -26,6 +26,7 @@
 static const int kSourceMaxParams = 16;
 
 // COLMAP CameraModelId values. Only the ones with no exact tier appear.
+static const int kSourceFullOpenCV = 6;
 static const int kSourceFOV = 7;
 static const int kSourceRadTanThinPrismFisheye = 11;
 static const int kSourceSimpleDivision = 12;
@@ -60,6 +61,26 @@ bool source_project_fov(float p[kSourceMaxParams], float3 ray, out float2 uv) {
         factor = atan(r * 2.0f * tan(omega * 0.5f)) / (r * omega);
     }
     uv = float2(p[0] * x * factor + p[2], p[1] * y * factor + p[3]);
+    return true;
+}
+
+// COLMAP FULL_OPENCV, OpenCV's 8-coefficient rational lens. params are
+// COLMAP's own order: fx fy cx cy k1 k2 p1 p2 k3 k4 k5 k6.
+[ForceInline]
+bool source_project_full_opencv(float p[kSourceMaxParams], float3 ray, out float2 uv) {
+    uv = float2(0.0f);
+    if (ray.z < 1e-12f)
+        return false;
+    float x = ray.x / ray.z, y = ray.y / ray.z;
+    float r2 = x*x + y*y;
+    float den = 1.0f + r2*(p[9] + r2*(p[10] + r2*p[11]));
+    if (!(den > 1e-6f))
+        return false;
+    float radial = (1.0f + r2*(p[4] + r2*(p[5] + r2*p[8]))) / den;
+    float p1 = p[6], p2 = p[7];
+    float xd = x*radial + 2.0f*p1*x*y + p2*(r2 + 2.0f*x*x);
+    float yd = y*radial + 2.0f*p2*x*y + p1*(r2 + 2.0f*y*y);
+    uv = float2(p[0] * xd + p[2], p[1] * yd + p[3]);
     return true;
 }
 
@@ -124,20 +145,9 @@ bool source_project_rad_tan_thin_prism(float p[kSourceMaxParams], float3 ray,
     return true;
 }
 
-// Any supported camera plus a sensor skew, which no tier carries: Agisoft
-// Metashape's b2. Its b1 is an fx correction and is already folded into
-// params[0]; only the off-diagonal term needs re-distorting.
-//
-//   p[0..3]   fx fy cx cy
-//   p[4]      skew -- pixels of u per unit distorted y
-//   p[5..12]  coefficients, in DistThinPrism slot order (k1 k2 k3 k4 p1 p2
-//             sx1 sy1) or, when p[14] is nonzero, DistRational's (k1..k6 p1 p2)
-//   p[13]     base camera, kSkewBase*
-//   p[14]     0 = polynomial radial, 1 = rational radial
-//
-// The two radial forms and the two fisheye mappings repeat projection_utils'
-// DistThinPrism / DistRational / fisheye_proj / equisolid_proj; a change there
-// has to be made here too.
+// Any supported camera plus a sensor skew (Metashape's b2), which no tier
+// carries; its b1 is an fx correction already folded into params[0]. Parameter
+// layout: docs/datasets.md, "The skewed source camera".
 [ForceInline]
 bool source_project_skewed(float p[kSourceMaxParams], float3 ray, out float2 uv) {
     uv = float2(0.0f);
@@ -182,6 +192,8 @@ bool source_project_raw(int model_id, float params[kSourceMaxParams],
         return source_project_skewed(params, ray, uv);
     if (model_id == kSourceFOV)
         return source_project_fov(params, ray, uv);
+    if (model_id == kSourceFullOpenCV)
+        return source_project_full_opencv(params, ray, uv);
     if (model_id == kSourceSimpleDivision)
         return source_project_division(params, true, ray, uv);
     if (model_id == kSourceDivision)

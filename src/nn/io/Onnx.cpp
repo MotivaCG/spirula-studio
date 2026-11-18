@@ -4,6 +4,7 @@
 #include "nn/core/Half.h"
 #include "nn/core/Log.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -257,7 +258,8 @@ struct Loader {
     }
 };
 
-OnnxTensor read_tensor_proto(Loader& L, Reader r) {
+OnnxTensor read_tensor_proto(Loader& L, Reader r,
+                           std::vector<std::string>* external_files = nullptr) {
     OnnxTensor t;
     int32_t dt = 0;
     Reader raw{}, float_data{};
@@ -269,6 +271,7 @@ OnnxTensor read_tensor_proto(Loader& L, Reader r) {
     while (next_field(r, f)) {
         switch (f.number) {
             case 1:  // dims: repeated int64, packed or not
+                if (external_files) break;
                 if (f.wire == 0) {
                     t.shape.push_back((int64_t)f.value);
                 } else if (f.wire == 2) {
@@ -309,6 +312,17 @@ OnnxTensor read_tensor_proto(Loader& L, Reader r) {
                 break;  // segment, string_data, doc_string, ...
         }
     }
+    if (external_files) {
+        if (location == kLocationExternal) {
+            NN_CHECK(!ext.location.empty(), "initializer '%s' is external with no location",
+                     t.name.c_str());
+            const std::string full = L.dir + ext.location;
+            if (std::find(external_files->begin(), external_files->end(), full) ==
+                external_files->end())
+                external_files->push_back(full);
+        }
+        return t;
+    }
 
     const char* name = t.name.empty() ? "<unnamed>" : t.name.c_str();
     const int64_t count = t.numel();
@@ -333,6 +347,40 @@ OnnxTensor read_tensor_proto(Loader& L, Reader r) {
                  dtype_name(dt));
     }
     return t;
+}
+
+// ValueInfo -> Type -> tensor_type -> shape -> repeated Dimension, each a
+// dim_value (field 1) or a symbolic dim_param (field 2); the second is what
+// -1 records, and is how a baked-in input size is told from a dynamic axis.
+void scan_value_info(Reader r, OnnxValueInfo& out) {
+    Field f;
+    while (next_field(r, f)) {
+        if (f.number == 1 && f.wire == 2) {
+            out.name = to_string(f.bytes);
+        } else if (f.number == 2 && f.wire == 2) {
+            Reader type = f.bytes;
+            Field tf;
+            while (next_field(type, tf)) {
+                if (tf.number != 1 || tf.wire != 2) continue;   // tensor_type
+                Reader tt = tf.bytes;
+                Field ttf;
+                while (next_field(tt, ttf)) {
+                    if (ttf.number != 2 || ttf.wire != 2) continue;   // shape
+                    Reader shape = ttf.bytes;
+                    Field sf;
+                    while (next_field(shape, sf)) {
+                        if (sf.number != 1 || sf.wire != 2) continue;   // dim
+                        Reader dim = sf.bytes;
+                        Field df;
+                        int64_t v = -1;
+                        while (next_field(dim, df))
+                            if (df.number == 1 && df.wire == 0) v = (int64_t)df.value;
+                        out.shape.push_back(v);
+                    }
+                }
+            }
+        }
+    }
 }
 
 // NodeProto: input is repeated field 1, output repeated field 2, name field 3,
@@ -403,9 +451,14 @@ OnnxFile walk(const std::string& path, bool want_nodes,
         if (f.number == 5 && f.wire == 2) {
             ++n_init;
             if (sink) (*sink)(read_tensor_proto(L, f.bytes));
+            else read_tensor_proto(L, f.bytes, &out.external_files);
         } else if (f.number == 1 && f.wire == 2 && want_nodes) {
             out.nodes.emplace_back();
             scan_node(f.bytes, out.nodes.back(), out.bn_epsilon);
+        } else if ((f.number == 11 || f.number == 12) && f.wire == 2) {
+            std::vector<OnnxValueInfo>& into = (f.number == 11) ? out.inputs : out.outputs;
+            into.emplace_back();
+            scan_value_info(f.bytes, into.back());
         }
     }
     NN_CHECK(n_init != 0, "'%s' has no initializers", path.c_str());
@@ -426,6 +479,18 @@ std::string OnnxTensor::shapeString() const {
 const OnnxTensor* OnnxFile::find(const std::string& name) const {
     for (const OnnxTensor& t : initializers)
         if (t.name == name) return &t;
+    return nullptr;
+}
+
+const OnnxValueInfo* OnnxFile::input(const std::string& name) const {
+    for (const OnnxValueInfo& v : inputs)
+        if (v.name == name) return &v;
+    return nullptr;
+}
+
+const OnnxValueInfo* OnnxFile::output(const std::string& name) const {
+    for (const OnnxValueInfo& v : outputs)
+        if (v.name == name) return &v;
     return nullptr;
 }
 
@@ -471,6 +536,8 @@ OnnxFile read_onnx(const std::string& path) {
     OnnxFile structure = walk(path, /*want_nodes=*/true, &sink);
     out.nodes = std::move(structure.nodes);
     out.bn_epsilon = std::move(structure.bn_epsilon);
+    out.inputs = std::move(structure.inputs);
+    out.outputs = std::move(structure.outputs);
 
     size_t elems = 0;
     for (const OnnxTensor& t : out.initializers) elems += t.data.size();

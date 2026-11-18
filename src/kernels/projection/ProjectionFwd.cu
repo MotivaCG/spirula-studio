@@ -21,7 +21,7 @@ void projection_fused_fwd_kernel_wrapper(
     const uint32_t image_width,
     const uint32_t image_height,
     // outputs
-    float4 *__restrict__ aabbs,         // [C, N, 4]
+    uint2 *__restrict__ aabbs,          // [C, N] packed
     float *__restrict__ sorting_depths,  // [C, N, 1]
     float *__restrict__ radii,  // [N, 1]
     typename SplatPrimitive::ScreenBuffer splats_screen,
@@ -39,7 +39,7 @@ void projection_fused_fwd_kernel_wrapper(
 
 template<typename SplatPrimitive>
 inline std::tuple<
-    DeviceTensor2D<float4>,  // aabb [C, N]
+    DeviceTensor2D<uint2>,   // aabb [C, N] packed, core/AabbQuant.cuh
     DeviceTensor2D<float>,   // sorting_depths [C, N]
     std::vector<DeviceTensorFloatND>  // out splats
 > launch_projection_fused_fwd_kernel(
@@ -64,7 +64,7 @@ inline std::tuple<
 ) {
     typename SplatPrimitive::WorldBuffer splats_world(in_splats);
 
-    DeviceTensor2D<float4> aabb;
+    DeviceTensor2D<uint2> aabb;
     aabb.resize(PoolSlot::ProjAabb, C, N);
     DeviceTensor2D<float> sorting_depths;
     sorting_depths.resize(PoolSlot::ProjDepths, C, N);
@@ -85,7 +85,7 @@ inline std::tuple<
         if (camera_model == CameraModelType::M && distortion == CameraDistortionType::D) \
             projection_fused_fwd_kernel_wrapper<SplatPrimitive, \
                 CameraModelType::M, CameraDistortionType::D> _LAUNCH_ARGS; else
-    SS_FOR_EACH_CAMERA_VARIANT(_DISPATCH)
+    SS_FOR_EACH_FORWARD_CAMERA_VARIANT(_DISPATCH)
         throw std::runtime_error("Unsupported camera model / distortion tier");
     #undef _DISPATCH
     CHECK_DEVICE_ERROR(cudaGetLastError());
@@ -102,9 +102,9 @@ inline std::tuple<
 
 /*[AutoHeaderGeneratorExport]*/
 std::tuple<
-    DeviceTensor2D<float4>, DeviceTensor2D<float>, std::vector<DeviceTensorFloatND>
+    DeviceTensor2D<uint2>, DeviceTensor2D<float>, std::vector<DeviceTensorFloatND>
 > projection_3dgs_forward(
-    const int64_t num_splats, const int max_sh_degree,
+    const int64_t num_splats, const ColorBasis color,
     const std::vector<DeviceTensorFloatND> &in_splats,
     TorchTensorView viewmats, TorchTensorView intrins,
     const uint32_t image_width, const uint32_t image_height,
@@ -120,6 +120,7 @@ std::tuple<
     // layout. Plumbed unchanged from EngineForward.cpp.
     const int64_t sh_bounds_stride
 ) {
+    const int max_sh_degree = sh_only_degree(color, "projection_3dgs_forward");
     int sh_degree = Vanilla3DGS<0>::WorldBuffer(in_splats).sh_degree();
     sh_degree = min(sh_degree, max_sh_degree);
     uint32_t C = (uint32_t)std::get<2>(viewmats)[0];
@@ -145,9 +146,9 @@ std::tuple<
 
 /*[AutoHeaderGeneratorExport]*/
 std::tuple<
-    DeviceTensor2D<float4>, DeviceTensor2D<float>, std::vector<DeviceTensorFloatND>
+    DeviceTensor2D<uint2>, DeviceTensor2D<float>, std::vector<DeviceTensorFloatND>
 > projection_mip_forward(
-    const int64_t num_splats, const int max_sh_degree,
+    const int64_t num_splats, const ColorBasis color,
     const std::vector<DeviceTensorFloatND> &in_splats,
     TorchTensorView viewmats, TorchTensorView intrins,
     const uint32_t image_width, const uint32_t image_height,
@@ -163,6 +164,7 @@ std::tuple<
     // layout. Plumbed unchanged from EngineForward.cpp.
     const int64_t sh_bounds_stride
 ) {
+    const int max_sh_degree = sh_only_degree(color, "projection_mip_forward");
     int sh_degree = MipSplatting<0>::WorldBuffer(in_splats).sh_degree();
     sh_degree = min(sh_degree, max_sh_degree);
     uint32_t C = (uint32_t)std::get<2>(viewmats)[0];
@@ -189,9 +191,9 @@ std::tuple<
 
 /*[AutoHeaderGeneratorExport]*/
 std::tuple<
-    DeviceTensor2D<float4>, DeviceTensor2D<float>, std::vector<DeviceTensorFloatND>
+    DeviceTensor2D<uint2>, DeviceTensor2D<float>, std::vector<DeviceTensorFloatND>
 > projection_3dgut_forward(
-    const int64_t num_splats, const int max_sh_degree,
+    const int64_t num_splats, const ColorBasis color,
     const std::vector<DeviceTensorFloatND> &in_splats,
     TorchTensorView viewmats, TorchTensorView intrins,
     const uint32_t image_width, const uint32_t image_height,
@@ -207,6 +209,7 @@ std::tuple<
     // layout. Plumbed unchanged from EngineForward.cpp.
     const int64_t sh_bounds_stride
 ) {
+    const int max_sh_degree = sh_only_degree(color, "projection_3dgut_forward");
     int sh_degree = Vanilla3DGUT<0>::WorldBuffer(in_splats).sh_degree();
     sh_degree = min(sh_degree, max_sh_degree);
     uint32_t C = (uint32_t)std::get<2>(viewmats)[0];

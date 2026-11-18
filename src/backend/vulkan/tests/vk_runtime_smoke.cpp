@@ -5,10 +5,14 @@
 // error channel. Run on each available device via SS_VK_DEVICE.
 
 #include "backend/api/BackendRuntime.h"
+#include "backend/vulkan/VulkanContext.h"
+#include "core/SourcePath.h"
+#include "kernels/bilagrid/BilagridBwdTiming.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 static int g_failures = 0;
@@ -16,7 +20,7 @@ static int g_failures = 0;
 #define CHECK(cond)                                                       \
     do {                                                                  \
         if (!(cond)) {                                                    \
-            std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);   \
+            std::printf("FAIL %s:%d: %s\n", SS_FILE, __LINE__, #cond);    \
             g_failures++;                                                 \
         }                                                                 \
     } while (0)
@@ -26,13 +30,23 @@ static int g_failures = 0;
         const char* err_ = backend::last_error();                         \
         if (err_) {                                                       \
             std::printf("FAIL %s:%d: unexpected backend error: %s\n",     \
-                        __FILE__, __LINE__, err_);                        \
+                        SS_FILE, __LINE__, err_);                         \
             g_failures++;                                                 \
         }                                                                 \
     } while (0)
 
 int main() {
     using namespace backend;
+    CHECK(!device_select_identity("9999"));
+    const std::string detail = device_selection_error();
+    CHECK(!detail.empty());
+    CHECK(detail.find("9999") != std::string::npos);
+    CHECK(detail.find("does not exist") != std::string::npos ||
+          detail.find("range") != std::string::npos);
+    const std::string selector = device_current_selector();
+    CHECK(!selector.empty());
+    CHECK(device_select_identity(selector.c_str()));
+    CHECK(device_selection_error().empty());
 
     // --- allocation + classification ---
     const size_t N = 1 << 20;  // 1M floats = 4MB
@@ -143,16 +157,48 @@ int main() {
     event_record(t1, kDefaultStream);
     event_synchronize(t1);
     float ms = event_elapsed_ms(t0, t1);
-    const char* timing_err = last_error();
-    if (timing_err) {
-        std::printf("note: event timing unavailable on this device (%s)\n",
-                    timing_err);
-    } else {
-        CHECK(ms >= 0.0f && ms < 10000.0f);
-        std::printf("note: 4MB D2D took %.3f ms\n", ms);
-    }
+    CHECK_NO_ERROR();
+    CHECK(ms >= 0.0f && ms < 10000.0f);
+    std::printf("note: 4MB D2D took %.3f ms\n", ms);
     event_destroy(t0);
     event_destroy(t1);
+
+    auto& caps = const_cast<vk::Capabilities&>(vk::Context::get().caps());
+    const bool timestamps = caps.timestamps;
+    caps.timestamps = false;
+    t0 = event_create(true);
+    t1 = event_create(true);
+    event_record(t0);
+    memset_async(dev_a, 0, N * sizeof(float));
+    event_record(t1);
+    event_synchronize(t1);
+    CHECK(event_elapsed_ms(t0, t1) == 0.0f);
+    CHECK_NO_ERROR();
+    memcpy_sync(dst.data(), dev_a, N * sizeof(float), MemcpyKind::DeviceToHost);
+    CHECK(dst[0] == 0.0f && dst[N - 1] == 0.0f);
+    event_destroy(t0);
+    event_destroy(t1);
+    {
+        using namespace spirula::bilagrid;
+        BwdTimingRing ring;
+        std::vector<BwdMeasurement> measurements;
+        for (int i = 0; i < 2; ++i) {
+            ring.begin(BWD_RGB, ContextKey{0, 64, 64, 8, 16, 16}, 0, kDefaultStream);
+            memset_async(dev_a, 0, N * sizeof(float));
+            ring.end(BWD_RGB, kDefaultStream);
+            ring.harvest(measurements);
+            CHECK(measurements.empty());
+            CHECK_NO_ERROR();
+        }
+    }
+    caps.timestamps = timestamps;
+
+    CHECK(event_elapsed_ms(nullptr, nullptr) == 0.0f);
+    CHECK(last_error() != nullptr);
+    evt = event_create(false);
+    CHECK(event_elapsed_ms(evt, evt) == 0.0f);
+    CHECK(last_error() != nullptr);
+    event_destroy(evt);
 
     // --- error channel: bad free reports, then clears ---
     device_free((char*)dev_a + 64);  // not a base pointer

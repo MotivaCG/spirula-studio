@@ -5,11 +5,41 @@
 
 #include <GLFW/glfw3.h>
 
+#include "imgui.h"
+
+#include <cctype>
 #include <cmath>
+#include <cstring>
 
 namespace gui {
 
 namespace {
+
+constexpr float kGamepadDeadzone = 0.1f;
+
+// One pad, triggers rescaled to the browser's [0,1]. GLFW leaves an axis the
+// mapping omits at 0 while a real trigger rests at -1, so rest is tracked per
+// pad: a device with one trigger mapped would otherwise roll the view forever.
+bool read_pad(int jid, GLFWgamepadstate& st, float& lt, float& rt) {
+    static float rest[GLFW_JOYSTICK_LAST + 1][2];
+    static bool seen[GLFW_JOYSTICK_LAST + 1];
+    if (!glfwGetGamepadState(jid, &st)) {
+        seen[jid] = false;
+        return false;
+    }
+    const float l = st.axes[GLFW_GAMEPAD_AXIS_LEFT_TRIGGER];
+    const float r = st.axes[GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER];
+    if (!seen[jid]) {
+        rest[jid][0] = l;
+        rest[jid][1] = r;
+        seen[jid] = true;
+    }
+    rest[jid][0] = std::fmin(rest[jid][0], l);
+    rest[jid][1] = std::fmin(rest[jid][1], r);
+    lt = 0.5f * (l - rest[jid][0]);
+    rt = 0.5f * (r - rest[jid][1]);
+    return true;
+}
 
 // ---- v3 (viewer.html) -------------------------------------------------------
 
@@ -26,6 +56,9 @@ void v_cross(const float a[3], const float b[3], float o[3]) {
     o[0] = a[1]*b[2] - a[2]*b[1];
     o[1] = a[2]*b[0] - a[0]*b[2];
     o[2] = a[0]*b[1] - a[1]*b[0];
+}
+float v_dot(const float a[3], const float b[3]) {
+    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
 }
 float v_len(const float a[3]) {
     return std::sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]);
@@ -98,12 +131,43 @@ void mat3_to_quat(const float m[9], float o[4]) {
     }
 }
 
-const float kWorldUp[3] = {0, 0, 1};
-
 }  // namespace
 
 
 float NavCamera::speed() const { return std::pow(10.0f, speed_exp); }
+
+void NavCamera::transform(const float S[12]) {
+    const float s = std::sqrt(S[0]*S[0] + S[4]*S[4] + S[8]*S[8]);
+    if (!(s > 1e-20f)) return;
+    auto apply = [&](float p[3]) {
+        const float q[3] = {p[0], p[1], p[2]};
+        for (int r = 0; r < 3; r++)
+            p[r] = S[r*4]*q[0] + S[r*4+1]*q[1] + S[r*4+2]*q[2] + S[r*4+3];
+    };
+    apply(pos);
+    apply(target);
+    float m[9];   // column-major, for mat3_to_quat
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++) m[c*3 + r] = S[r*4 + c] / s;
+    float q[4];
+    mat3_to_quat(m, q);
+    q_norm(q);
+    q_mul(q, rot, rot);
+    q_norm(rot);
+    // speed_exp += std::log10(s);
+}
+
+void NavCamera::level_roll() {
+    float f[3], r[3], want[3];
+    axis_forward(f);
+    axis_right(r);
+    v_cross(f, world_up, want);
+    if (v_len(want) < 1e-3f) return;
+    v_norm(want, want);
+    float c[3];
+    v_cross(r, want, c);
+    roll(std::atan2(v_dot(c, f), v_dot(r, want)));
+}
 
 void NavCamera::c2w(float out[12]) const {
     float x = rot[0], y = rot[1], z = rot[2], w = rot[3];
@@ -131,7 +195,7 @@ void NavCamera::orbit(float dx, float dy) {
     float right[3], up[3];
     axis_right(right);
     if (mode == Trackball) axis_up(up);
-    else { up[0] = kWorldUp[0]; up[1] = kWorldUp[1]; up[2] = kWorldUp[2]; }
+    else { up[0] = world_up[0]; up[1] = world_up[1]; up[2] = world_up[2]; }
     float qa[4], qb[4], qab[4];
     q_from_axis_angle(up, -dx * sensitivity, qa);
     q_from_axis_angle(right, -dy * sensitivity, qb);
@@ -154,19 +218,21 @@ void NavCamera::look(float dx, float dy) {
     float up[3], right[3], qa[4], qb[4];
     axis_up(up);
     axis_right(right);
-    q_from_axis_angle(up, -dx * s, qa);
-    q_from_axis_angle(right, -dy * s, qb);
     if (mode == Fps) {
-        // Constrain roll: yaw around local-y, pitch around (old) local-x.
-        const float local_y[3] = {0, 1, 0};
-        float qy[4];
-        q_from_axis_angle(local_y, -dx * s, qy);
-        q_mul(rot, qy, rot);
-        q_norm(rot);
-        q_mul(qb, rot, rot);
+        // Yaw about world_up, pitch about the camera's own right: neither tilts
+        // the right axis, so circling the mouse cannot build up roll. Upside
+        // down, the yaw flips so the view still turns the way the drag goes.
+        const float local_x[3] = {1, 0, 0};
+        const float sign = v_dot(up, world_up) < 0.0f ? -1.0f : 1.0f;
+        q_from_axis_angle(world_up, -dx * s * sign, qa);
+        q_from_axis_angle(local_x, -dy * s, qb);
+        q_mul(qa, rot, rot);
+        q_mul(rot, qb, rot);
         q_norm(rot);
     } else {
         float qab[4];
+        q_from_axis_angle(up, -dx * s, qa);
+        q_from_axis_angle(right, -dy * s, qb);
         q_mul(qa, qb, qab);
         q_mul(qab, rot, rot);
         q_norm(rot);
@@ -214,26 +280,21 @@ void NavCamera::roll(float delta) {
 bool NavCamera::keyboard_tick(float dt, const Keys& k) {
     const float s = speed() * dt * 1.0f;   // translate speed
     const float sr = dt * 1.0f;            // rotate speed
-    float fwd[3], right[3], up[3];
+    float fwd[3], right[3];
     axis_forward(fwd);
     axis_right(right);
-    if (mode == Turntable || mode == Fps) {
-        up[0] = kWorldUp[0]; up[1] = kWorldUp[1]; up[2] = kWorldUp[2];
-    } else {
-        axis_up(up);
-    }
     float move[3] = {0, 0, 0}, step[3];
     float rotate = 0.0f;
     if (k.w || k.up)    { v_scale(fwd, s, step);    v_add(move, step, move); }
     if (k.s || k.down)  { v_scale(fwd, -s, step);   v_add(move, step, move); }
     if (k.a || k.left)  { v_scale(right, -s, step); v_add(move, step, move); }
     if (k.d || k.right) { v_scale(right, s, step);  v_add(move, step, move); }
-    if (mode == Fly) {
+    if (mode == Fly || mode == Trackball) {
         if (k.e) rotate -= sr;
         if (k.q) rotate += sr;
     } else {
-        if (k.e) { v_scale(up, s, step);  v_add(move, step, move); }
-        if (k.q) { v_scale(up, -s, step); v_add(move, step, move); }
+        if (k.e) { v_scale(world_up, s, step);  v_add(move, step, move); }
+        if (k.q) { v_scale(world_up, -s, step); v_add(move, step, move); }
     }
     bool moved = false;
     if (v_len(move) > 1e-12f) {
@@ -252,20 +313,17 @@ bool NavCamera::gamepad_tick(float dt) {
     bool moved = false;
     for (int jid = GLFW_JOYSTICK_1; jid <= GLFW_JOYSTICK_LAST; jid++) {
         GLFWgamepadstate st;
-        if (!glfwGetGamepadState(jid, &st)) continue;
+        float lt = 0.0f, rt = 0.0f;
+        if (!read_pad(jid, st, lt, rt)) continue;
         float lx = st.axes[GLFW_GAMEPAD_AXIS_LEFT_X];
         float ly = st.axes[GLFW_GAMEPAD_AXIS_LEFT_Y];
         float rx = st.axes[GLFW_GAMEPAD_AXIS_RIGHT_X];
         float ry = st.axes[GLFW_GAMEPAD_AXIS_RIGHT_Y];
-        // W3C gamepad buttons[6]/[7] = analog triggers in [0,1]; GLFW
-        // exposes them as axes in [-1,1].
-        float lt = 0.5f * (st.axes[GLFW_GAMEPAD_AXIS_LEFT_TRIGGER] + 1.0f);
-        float rt = 0.5f * (st.axes[GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER] + 1.0f);
         float roll_input = lt - rt;
-        const float deadzone = 0.1f;
         // Movement (triggers only apply while the left stick is deflected,
         // matching the browser implementation).
-        if (std::fabs(lx) > deadzone || std::fabs(ly) > deadzone) {
+        if (std::fabs(lx) > kGamepadDeadzone ||
+            std::fabs(ly) > kGamepadDeadzone) {
             const float s = speed() * dt * 1.0f;
             float fwd[3], right[3], move[3], step[3];
             axis_forward(fwd);
@@ -274,24 +332,67 @@ bool NavCamera::gamepad_tick(float dt) {
             v_scale(fwd, -ly * s, step);
             v_add(move, step, move);
             float up_step[3];
-            v_scale(kWorldUp, (rt - lt) * s, up_step);
+            v_scale(world_up, (rt - lt) * s, up_step);
             v_add(move, up_step, move);
             v_add(pos, move, pos);
             v_add(target, move, target);
             moved = true;
         }
         // Look
-        if (std::fabs(rx) > deadzone || std::fabs(ry) > deadzone) {
+        if (std::fabs(rx) > kGamepadDeadzone ||
+            std::fabs(ry) > kGamepadDeadzone) {
             look(rx * dt * 400.0f, ry * dt * 400.0f);
             moved = true;
         }
         // Roll
-        if (std::fabs(roll_input) > deadzone) {
+        if (std::fabs(roll_input) > kGamepadDeadzone) {
             roll(roll_input * dt * 1.0f);
             moved = true;
         }
     }
     return moved;
+}
+
+// Stick and trigger input reaches no window event, so the GUI loop cannot
+// pace its frame rate on events alone.
+bool gamepad_deflected() {
+    for (int jid = GLFW_JOYSTICK_1; jid <= GLFW_JOYSTICK_LAST; jid++) {
+        GLFWgamepadstate st;
+        float lt = 0.0f, rt = 0.0f;
+        if (!read_pad(jid, st, lt, rt)) continue;
+        if (std::fabs(st.axes[GLFW_GAMEPAD_AXIS_LEFT_X]) > kGamepadDeadzone ||
+            std::fabs(st.axes[GLFW_GAMEPAD_AXIS_LEFT_Y]) > kGamepadDeadzone ||
+            std::fabs(st.axes[GLFW_GAMEPAD_AXIS_RIGHT_X]) > kGamepadDeadzone ||
+            std::fabs(st.axes[GLFW_GAMEPAD_AXIS_RIGHT_Y]) > kGamepadDeadzone ||
+            std::fabs(lt - rt) > kGamepadDeadzone)
+            return true;
+    }
+    return false;
+}
+
+// GLFW keys are US positions; this is the letter imgui_impl_glfw re-translates
+// that position to, with its fallbacks, so the two cannot disagree.
+int fly_key(char us_letter) {
+    const int untranslated = ImGuiKey_A + (us_letter - 'a');
+    const char* name = glfwGetKeyName(GLFW_KEY_A + (us_letter - 'a'), 0);
+    if (!name || !name[0] || name[1]) return untranslated;
+    const char c = (char)std::tolower((unsigned char)name[0]);
+    if (c >= 'a' && c <= 'z') return ImGuiKey_A + (c - 'a');
+    if (c >= '0' && c <= '9') return ImGuiKey_0 + (c - '0');
+    static const char punct[] = "`-=[]\\,;'./";
+    static const ImGuiKey punct_keys[] = {
+        ImGuiKey_GraveAccent, ImGuiKey_Minus,        ImGuiKey_Equal,
+        ImGuiKey_LeftBracket, ImGuiKey_RightBracket, ImGuiKey_Backslash,
+        ImGuiKey_Comma,       ImGuiKey_Semicolon,    ImGuiKey_Apostrophe,
+        ImGuiKey_Period,      ImGuiKey_Slash};
+    if (const char* p = std::strchr(punct, c)) return punct_keys[p - punct];
+    return untranslated;
+}
+
+bool is_fly_key(int imgui_key) {
+    for (const char* c = "wasdqe"; *c; c++)
+        if (fly_key(*c) == imgui_key) return true;
+    return false;
 }
 
 void NavCamera::look_at(const float eye[3], const float tgt[3],

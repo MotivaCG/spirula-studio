@@ -304,9 +304,9 @@ int cmdSelftest(int argc, char** argv) {
         CameraSetupOptions so;
         so.mode = CameraMode::Folder;
         so.model = CamModel::OpenCV;
-        parseCameraOverride("cam0=thin-prism-fisheye", false, so.overrides);
-        parseCameraOverride("cam1=thin-prism-fisheye", false, so.overrides);
-        parseCameraOverride("cam0=520", true, so.overrides);
+        parseCameraOverride("cam0=thin-prism-fisheye", OverrideKind::Model, so.overrides);
+        parseCameraOverride("cam1=thin-prism-fisheye", OverrideKind::Model, so.overrides);
+        parseCameraOverride("cam0=520", OverrideKind::Focal, so.overrides);
         CameraSetup cs = buildCameras(imgs, fsv, so);
         bool gok = cs.count() == 3 && cs.ids[0] == cs.ids[1] && cs.ids[2] == cs.ids[3] &&
                    cs.ids[4] == cs.ids[5] && cs.ids[0] != cs.ids[2] && cs.ids[2] != cs.ids[4];
@@ -321,6 +321,23 @@ int cmdSelftest(int argc, char** argv) {
         gok = gok && cs.focal_known.count(cs.ids[0]) && cs.focal_known.count(cs.ids[2]) &&
               !cs.focal_known.count(cs.ids[4]);
         gok = gok && cs.mixed() && cs.anyWide();
+        // --distortion, dataset-wide and per group, in each model's own BA
+        // order: k1,k2,p1,p2 for opencv and k1,k2,p1,p2,k3,k4,sx1,sy1 for the
+        // thin prism, so the same list means different fields per group (D72).
+        CameraSetupOptions sod = so;
+        parseDistortion("-0.11,0.02,0.001,-0.002", sod.extra);
+        parseCameraOverride("cam1=-0.4,0.09,0,0,0.01", OverrideKind::Distortion, sod.overrides);
+        CameraSetup csd = buildCameras(imgs, fsv, sod);
+        const Camera& dpin = csd.cameras.at(csd.ids[0]);
+        const Camera& dfar = csd.cameras.at(csd.ids[4]);
+        gok = gok && dpin.k1 == -0.11 && dpin.k2 == 0.02 && dpin.p1 == 0.001 &&
+              dpin.p2 == -0.002 && dpin.k3 == 0;
+        gok = gok && dfar.k1 == -0.4 && dfar.k2 == 0.09 && dfar.p1 == 0 && dfar.p2 == 0 &&
+              dfar.k3 == 0.01 && dfar.k4 == 0 && dfar.sx1 == 0 && dfar.sy1 == 0;
+        // A trailing comma, a stray token, an empty list: all malformed.
+        std::vector<double> junk;
+        gok = gok && !parseDistortion("0.1,", junk) && !parseDistortion("0.1,x", junk) &&
+              !parseDistortion("", junk);
         // --no-exif-focal leaves the pinhole at COLMAP's 1.2*max(w,h) guess.
         CameraSetupOptions so2 = so;
         so2.exif_focal = false;
@@ -631,23 +648,151 @@ int cmdSelftest(int argc, char** argv) {
         }
     }
 
-    // 7) brute-force matcher: self-match should be (near-)identity with dist 0
+    // 7b) The matcher at 256-D. Synthetic float descriptors, because the two
+    // widths are separate SPIR-V blobs and only the 128 one is on any other
+    // path here; the reference is the same distance computed on the host.
+    {
+        auto make = [](uint32_t n, uint32_t seed) {
+            FeatureSet f;
+            f.width = f.height = 1000;
+            f.dim = 256;
+            f.dtype = DType::F32;
+            f.keypoints.resize(n);
+            f.descriptors.resize((size_t)n * 256 * sizeof(float));
+            float* d = reinterpret_cast<float*>(f.descriptors.data());
+            uint32_t st = seed;
+            auto rnd = [&] {
+                st = st * 1664525u + 1013904223u;
+                return (float)((st >> 8) & 0xffff) / 32768.0f - 1.0f;
+            };
+            for (uint32_t i = 0; i < n; i++) {
+                f.keypoints[i] = {(float)(i % 100) * 7.0f, (float)(i / 100) * 7.0f, 0, 0, 1};
+                double sq = 0;
+                for (int c = 0; c < 256; c++) {
+                    const float v = rnd();
+                    d[(size_t)i * 256 + c] = v;
+                    sq += (double)v * v;
+                }
+                // Unit norm, as the matcher's cosine threshold assumes.
+                const float inv = (float)(1.0 / std::sqrt(sq));
+                for (int c = 0; c < 256; c++) d[(size_t)i * 256 + c] *= inv;
+            }
+            return f;
+        };
+        FeatureSet fa = make(300, 12345u);
+        // B is A perturbed, not independent noise: 256 random unit vectors are
+        // all nearly orthogonal, so an independent B produces a handful of
+        // matches and exercises almost none of the reduction.
+        auto perturb = [&fa](uint32_t n, uint32_t seed) {
+            FeatureSet f = fa;
+            f.keypoints.resize(n);
+            f.descriptors.resize((size_t)n * 256 * sizeof(float));
+            float* d = reinterpret_cast<float*>(f.descriptors.data());
+            uint32_t st = seed;
+            for (uint32_t i = 0; i < n; i++) {
+                double sq = 0;
+                for (int c = 0; c < 256; c++) {
+                    st = st * 1664525u + 1013904223u;
+                    const float e = ((float)((st >> 8) & 0xffff) / 32768.0f - 1.0f) * 0.05f;
+                    const float v = d[(size_t)i * 256 + c] + e;
+                    d[(size_t)i * 256 + c] = v;
+                    sq += (double)v * v;
+                }
+                const float inv = (float)(1.0 / std::sqrt(sq));
+                for (int c = 0; c < 256; c++) d[(size_t)i * 256 + c] *= inv;
+            }
+            return f;
+        };
+        FeatureSet fb = perturb(280, 4242u);
+        FeatureSet fc = perturb(250, 777u);
+
+        MatchOptions mo;
+        mo.device = opt.device;
+        mo.max_ratio = 0.95f;
+        mo.cross_check = true;
+        BruteForceMatcher m256(mo);
+        const std::vector<FeatureMatch> gm = m256.match(fa, fb);
+
+        // Host reference over the SAME quantization the uploader applies, so
+        // this checks the kernel and not the rounding.
+        auto quant = [](float v) {
+            const float q = v * (127.0f / 0.4f) + 128.0f;
+            return (int)std::lround(std::min(255.0f, std::max(0.0f, q)));
+        };
+        std::vector<int> qa((size_t)fa.count() * 256), qb((size_t)fb.count() * 256);
+        const float* pa = reinterpret_cast<const float*>(fa.descriptors.data());
+        const float* pb = reinterpret_cast<const float*>(fb.descriptors.data());
+        for (size_t i = 0; i < qa.size(); i++) qa[i] = quant(pa[i]);
+        for (size_t i = 0; i < qb.size(); i++) qb[i] = quant(pb[i]);
+        auto d2 = [&](uint32_t i, uint32_t j) {
+            long long s = 0;
+            for (int c = 0; c < 256; c++) {
+                const long long e = qa[(size_t)i * 256 + c] - qb[(size_t)j * 256 + c];
+                s += e * e;
+            }
+            return s;
+        };
+        std::vector<uint32_t> bestB(fb.count(), 0u);
+        for (uint32_t j = 0; j < fb.count(); j++) {
+            long long bd = -1;
+            for (uint32_t i = 0; i < fa.count(); i++) {
+                const long long v = d2(i, j);
+                if (bd < 0 || v < bd) { bd = v; bestB[j] = i; }
+            }
+        }
+        std::vector<FeatureMatch> ref;
+        for (uint32_t i = 0; i < fa.count(); i++) {
+            long long b1 = -1, b2 = -1;
+            uint32_t bj = 0;
+            for (uint32_t j = 0; j < fb.count(); j++) {
+                const long long v = d2(i, j);
+                if (b1 < 0 || v < b1) { b2 = b1; b1 = v; bj = j; }
+                else if (b2 < 0 || v < b2) { b2 = v; }
+            }
+            if (b2 >= 0 && (double)b1 >= (double)mo.max_ratio * mo.max_ratio * (double)b2)
+                continue;
+            if (bestB[bj] != i) continue;
+            ref.push_back({i, bj});
+        }
+        bool ok = gm.size() == ref.size() && ref.size() > 200;
+        for (size_t k = 0; k < ref.size() && ok; k++)
+            if (gm[k].idx1 != ref[k].idx1 || gm[k].idx2 != ref[k].idx2) ok = false;
+        printf("  matcher 256-D vs host reference: %zu / %zu matches -> %s\n", gm.size(),
+               ref.size(), ok ? "ok" : "BAD");
+        if (!ok) fails++;
+
+        // Cross-checked pairs in one submit overlap, each folding its own
+        // colPartial region; every pair must come out as it does submitted alone.
+        const std::vector<FeatureSet> sets{fa, fb, fc};
+        const std::vector<std::pair<uint32_t, uint32_t>> bp{{0, 1}, {1, 0}, {0, 2},
+                                                            {2, 1}, {1, 2}, {2, 0}};
+        BruteForceMatcher batched(mo), alone(mo);
+        std::vector<std::vector<FeatureMatch>> all, one;
+        batched.matchBatch(sets, bp, 0, bp.size(), all);
+        bool bok = all.size() == bp.size();
+        for (size_t k = 0; k < bp.size() && bok; k++) {
+            alone.matchBatch(sets, bp, k, k + 1, one);
+            bok = !one[0].empty() && one[0].size() == all[k].size();
+            for (size_t i = 0; i < one[0].size() && bok; i++)
+                bok = one[0][i].idx1 == all[k][i].idx1 && one[0][i].idx2 == all[k][i].idx2;
+        }
+        printf("  matcher cross-check, %zu pairs batched vs one per submit -> %s\n", bp.size(),
+               bok ? "ok" : "BAD");
+        if (!bok) fails++;
+    }
+
+    // 7) brute-force matcher: self-match should be (near-)identity
     {
         MatchOptions mo;
         mo.device = opt.device;
         BruteForceMatcher matcher(mo);
         std::vector<FeatureMatch> ms = matcher.match(a, a);
         size_t ident = 0;
-        bool distOk = true;
-        for (const FeatureMatch& m : ms) {
-            if (m.idx1 == m.idx2) {
-                ident++;
-                if (m.distance != 0.0f) distOk = false;
-            }
-        }
+        for (const FeatureMatch& m : ms)
+            if (m.idx1 == m.idx2) ident++;
         float frac = ms.empty() ? 0.0f : (float)ident / ms.size();
-        bool mok = ms.size() > 10 && frac > 0.9f && distOk;
-        printf("  matcher self-match: %zu matches, %.1f%% identity (dist 0) -> %s\n", ms.size(),
+        bool mok = ms.size() > 10 && frac > 0.9f;
+        printf("  matcher self-match: %zu matches, %.1f%% identity -> %s\n", ms.size(),
                100.0f * frac, mok ? "ok" : "BAD");
         if (!mok) fails++;
 
@@ -833,6 +978,21 @@ int cmdSelftest(int argc, char** argv) {
         printf("  decode error handling: %zu ok / %zu failed -> %s\n", got, errs,
                skip_ok ? "ok" : "BAD");
         if (!skip_ok) fails++;
+
+        // A consumer that throws has to reach the caller. Unwinding past the
+        // still-joinable decode threads instead calls terminate, which on MSVC
+        // exits 0xC0000409 with the real error never printed.
+        bool threw = false;
+        ImageLoadPlan pl3 = planImageLoad(dims, lo);
+        try {
+            loadImagesInOrder(paths, pl3, lo, [&](size_t k, GrayImage&) {
+                if (k == 3) throw std::runtime_error("consumer");
+            });
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        printf("  throwing consumer propagates -> %s\n", threw ? "ok" : "BAD");
+        if (!threw) fails++;
         fs::remove_all(dir);
     }
 

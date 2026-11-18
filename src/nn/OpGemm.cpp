@@ -5,6 +5,7 @@
 #include <cstring>
 #include "core/Env.h"
 #include "nn/core/Log.h"
+#include "nn/OpMetal.h"
 #include "nn/Ops.h"
 #include "nn/vk/Memory.h"
 #include "nn/vk/Stream.h"
@@ -26,8 +27,19 @@ struct GemmParams {
     float    alpha;
     uint32_t x_row_stride;
     uint32_t groups_per_row;
+    float    x_scale;
+    uint32_t _pad0;
+    uint64_t nbr;
+    uint32_t taps, n_in;
 };
-static_assert(sizeof(GemmParams) == 64, "GemmParams layout");
+static_assert(sizeof(GemmParams) == 88, "GemmParams layout");
+
+// A sparse convolution's implicit im2col (kGatherCi): x is [n_in, Ci] and row
+// m, column t*Ci + c of the operand is x[nbr[m, t], c].
+struct Gather {
+    Tensor  nbr;   // [M, taps] i32; invalid -> a dense GEMM
+    int64_t ci = 0;
+};
 
 // Below this many rows the 64x64 tiling has nothing to chew on and a
 // thread-per-K reduction wins. SAM 3 hits this constantly: every MLP head runs
@@ -76,7 +88,7 @@ void dispatch_tile(const TileKernel& k, const vk::SpecList& spec, int64_t M, int
                "gemm: %lldx%lld output exceeds the dispatch grid cap", (long long)M,
                (long long)N);
     vk::Stream::get().dispatch(k.entry, spec, k.n_on_x ? tn : tm, k.n_on_x ? tm : tn, 1,
-                               &p, sizeof(p));
+                               &p, sizeof(p), 2.0 * M * N * p.K);
 }
 
 double time_tile(const TileKernel& k, const vk::SpecList& spec, int64_t M, int64_t N,
@@ -116,6 +128,8 @@ TileKernels probe_tile_kernels() {
     p.K = (uint32_t)K;
     p.alpha = 1.0f;
     p.x_row_stride = (uint32_t)K;
+    p.x_scale = 1.0f;
+    p.nbr = vk::or_fallback(0);
     vk::Stream::get().fill(p.x, 0x3f000000u, (uint64_t)M * K * 4);
     vk::Stream::get().fill(p.w, 0x38003800u, (uint64_t)N * K * 2);
 
@@ -151,7 +165,7 @@ const TileKernels& tile_kernels() {
 
 void dispatch_gemm(const Tensor& out, const Tensor& x_in, const Tensor& w_in,
                    const Tensor& bias, const Tensor& residual, Act act, float alpha,
-                   int64_t x_row_stride) {
+                   int64_t x_row_stride, float x_scale, const Gather& g = {}) {
     // Weights keep their PyTorch rank in the store; a [Cout, Cin, kh, kw] conv
     // kernel is the same bytes as the [Cout, Cin*kh*kw] matrix this wants.
     const Tensor w = w_in.asMatrix();
@@ -163,17 +177,28 @@ void dispatch_gemm(const Tensor& out, const Tensor& x_in, const Tensor& w_in,
     NN_CHECK(out.dtype == DType::F32, "gemm output must be f32");
     NN_CHECK(w.rows() == N, "gemm: weight is [%lld, %lld] but out has %lld columns",
                (long long)w.rows(), (long long)K, (long long)N);
-    NN_CHECK(x.cols() == K || x_row_stride > 0,
-               "gemm: x has %lld columns but the weight expects %lld",
-               (long long)x.cols(), (long long)K);
-    NN_CHECK(x.rows() == M || x_row_stride > 0,
-               "gemm: x has %lld rows but out has %lld", (long long)x.rows(),
-               (long long)M);
+    const bool gather = g.nbr.valid();
+    if (gather) {
+        NN_CHECK(x.dtype == DType::F32 && g.nbr.dtype == DType::I32 && g.nbr.rows() == M &&
+                     x.cols() == g.ci && g.ci % 16 == 0 && g.nbr.cols() * g.ci == K,
+                 "gemm: a %lld-tap gather over %lld channels does not fit a K of %lld",
+                 (long long)g.nbr.cols(), (long long)x.cols(), (long long)K);
+    } else {
+        NN_CHECK(x.cols() == K || x_row_stride > 0,
+                 "gemm: x has %lld columns but the weight expects %lld",
+                 (long long)x.cols(), (long long)K);
+        NN_CHECK(x.rows() == M || x_row_stride > 0,
+                 "gemm: x has %lld rows but out has %lld", (long long)x.rows(),
+                 (long long)M);
+    }
     if (residual.valid())
         NN_CHECK(residual.numel() >= M * N, "gemm: residual is too small");
     if (bias.valid())
         NN_CHECK(bias.numel() >= N, "gemm: bias has %lld entries, need %lld",
                    (long long)bias.numel(), (long long)N);
+    // MPSGraph has no neighbour gather; those stay on the Vulkan kernel.
+    if (!gather && metal_gemm(out, x, w, bias, residual, act, alpha, x_row_stride, x_scale))
+        return;
 
     GemmParams p{};
     p.out = out.ptr;
@@ -188,41 +213,74 @@ void dispatch_gemm(const Tensor& out, const Tensor& x_in, const Tensor& w_in,
     p.K = (uint32_t)K;
     p.alpha = alpha;
     p.x_row_stride = (uint32_t)(x_row_stride > 0 ? x_row_stride : K);
+    p.x_scale = x_scale;
+    p.nbr = vk::or_fallback(g.nbr.ptr);
+    p.taps = (uint32_t)(gather ? g.nbr.cols() : 0);
+    p.n_in = (uint32_t)x.rows();
 
     vk::SpecList spec{(uint32_t)(w.dtype == DType::F16),
                       (uint32_t)(x.dtype == DType::F16),
                       (uint32_t)act,
                       (uint32_t)(bias.valid() ? 1 : 0),
-                      (uint32_t)(residual.valid() ? 1 : 0)};
+                      (uint32_t)(residual.valid() ? 1 : 0),
+                      (uint32_t)(gather ? g.ci : 0)};
+
+    check_span("gemm", {w, bias});
+    if (gather) check_span("gemm", {x, g.nbr});
+    const int64_t x_elem = x.dtype == DType::F16 ? 2 : 4;
+
+    // Row tiles take one grid axis (65535 cap: a full-resolution 1x1 conv passes
+    // 4.2 M rows), each call must stay inside one pointer span and one submit's
+    // work budget. Rows are independent, so a tall GEMM is the same call again.
+    auto by_rows = [&](int64_t tile_m, const char* entry, const vk::SpecList& kspec,
+                       const auto& run) {
+        // A row tile is the dispatch granularity, so the span is counted in tiles.
+        const int64_t pitch = std::max(N * 4, (int64_t)p.x_row_stride * x_elem);
+        const int64_t tiles = span_rows("gemm", pitch * tile_m);
+        const double tile_work = 2.0 * tile_m * N * K;
+        const double cap = vk::Stream::get().workCap(entry, kspec);
+        const int64_t budget_tiles = std::max<int64_t>(1, (int64_t)(cap / tile_work));
+        const int64_t per_call =
+            std::min({tiles, budget_tiles, (int64_t)65535}) * tile_m;
+        for (int64_t m0 = 0; m0 < M; m0 += per_call) {
+            const int64_t rows = std::min(per_call, M - m0);
+            GemmParams q = p;
+            q.M = (uint32_t)rows;
+            q.out = p.out + (uint64_t)m0 * N * 4;
+            // A gathered x is indexed by neighbour id, so its table moves instead.
+            if (gather) q.nbr = p.nbr + (uint64_t)m0 * p.taps * 4;
+            else q.x = p.x + (uint64_t)m0 * p.x_row_stride * x_elem;
+            if (residual.valid()) q.residual = p.residual + (uint64_t)m0 * N * 4;
+            run(q, rows);
+        }
+    };
 
     // Tensor cores, when the device has them and the shape is big enough to
     // amortize a 128-wide column tile. Everything below this is the fp32 path,
     // unchanged and still the only path on a device without the extension.
     const vk::Context& ctx = vk::Context::get();
-    // N and K multiples of 16: the weight's fragments are read straight out of
-    // the matrix, and a cooperative-matrix load does no bounds checking, so a
-    // 16x16 block must lie either wholly inside W or wholly outside it.
-    //
-    // The alignment test is not paranoia about a case that happens -- every
-    // weight and every arena tensor is 256-byte aligned -- but the fragment
-    // load carries an Aligned 16 decoration, and a buffer that ever stopped
-    // being aligned would be undefined behaviour rather than a wrong answer.
-    // Falling back is always correct, so it costs nothing to check.
+    // N and K multiples of 16: a cooperative-matrix load does no bounds check,
+    // so a 16x16 block of W must lie wholly inside it or wholly outside. The
+    // fragment load's Aligned 16 decoration is why w.ptr is checked as well.
     if (coop_matrix_enabled() && w.dtype == DType::F16 && N % 16 == 0 && K % 16 == 0 &&
         M >= kBigTileLimit && N >= kBigTileLimit && w.ptr % 16 == 0) {
         const int64_t tile_m = coop_tile_m(ctx.preferredSubgroupSize());
-        const uint32_t tm = (uint32_t)((M + tile_m - 1) / tile_m);
         const uint32_t tn = (uint32_t)((N + kCoopTileN - 1) / kCoopTileN);
-        if (tm <= 65535 && tn <= 65535) {
+        if (tn <= 65535) {
             // NOTE: a different constant list from gemm.slang's -- no
             // kWeightF16 (always fp16 here), plus the subgroup-row count.
             vk::SpecList cspec{(uint32_t)(x.dtype == DType::F16),
                                (uint32_t)act,
                                (uint32_t)(bias.valid() ? 1 : 0),
                                (uint32_t)(residual.valid() ? 1 : 0),
-                               (uint32_t)(tile_m / 32)};
-            vk::Stream::get().dispatch("gemm_coop.gemm_nt_coop", cspec, tn, tm, 1, &p,
-                                       sizeof(p));
+                               (uint32_t)(tile_m / 32),
+                               (uint32_t)(gather ? g.ci : 0)};
+            const char* entry = "gemm_coop.gemm_nt_coop";
+            by_rows(tile_m, entry, cspec, [&](const GemmParams& q, int64_t rows) {
+                vk::Stream::get().dispatch(entry, cspec, tn,
+                                           (uint32_t)((rows + tile_m - 1) / tile_m), 1,
+                                           &q, sizeof(q), 2.0 * rows * N * K);
+            });
             return;
         }
     }
@@ -230,18 +288,22 @@ void dispatch_gemm(const Tensor& out, const Tensor& x_in, const Tensor& w_in,
     if (M <= kThinRowLimit) {
         // One workgroup per output element, so N alone can exceed the 65535
         // grid cap; fold it across x and y and give the row to z.
+        check_span("gemm", {out, x, residual});
         const uint32_t per_row = (uint32_t)std::min<int64_t>(N, 65535);
         const uint32_t rows = (uint32_t)((N + per_row - 1) / per_row);
         p.groups_per_row = per_row;
         vk::Stream::get().dispatch("gemm.gemm_nt_thin", spec, per_row, rows, (uint32_t)M, &p,
-                                   sizeof(p));
+                                   sizeof(p), 2.0 * M * N * K);
     } else {
         // gemm_nt_big keeps the weight tile packed as fp16 in shared, so it has
         // nothing to offer an fp32 second operand (a matmul against another
         // activation) and does not handle one.
         const bool wide =
             M >= kBigTileLimit && N >= kBigTileLimit && w.dtype == DType::F16;
-        dispatch_tile(wide ? tile_kernels().f16 : tile_kernels().any, spec, M, N, p);
+        const TileKernel& k = wide ? tile_kernels().f16 : tile_kernels().any;
+        by_rows(k.tile, k.entry, spec, [&](const GemmParams& q, int64_t rows) {
+            dispatch_tile(k, spec, rows, N, q);
+        });
     }
 }
 
@@ -261,12 +323,18 @@ void set_coop_matrix_enabled(bool on) {
 }
 
 void linear(const Tensor& out, const Tensor& x, const Tensor& w, const LinearOpts& o) {
-    dispatch_gemm(out, x, w, o.bias, o.residual, o.act, o.alpha, o.x_row_stride);
+    dispatch_gemm(out, x, w, o.bias, o.residual, o.act, o.alpha, o.x_row_stride, o.x_scale);
 }
 
 void matmul_nt(const Tensor& out, const Tensor& a, const Tensor& b, float alpha,
                Act act) {
-    dispatch_gemm(out, a, b, {}, {}, act, alpha, 0);
+    dispatch_gemm(out, a, b, {}, {}, act, alpha, 0, 1.0f);
+}
+
+void sparse_conv(const Tensor& out, const Tensor& x, const Tensor& nbr, const Tensor& w,
+                 const LinearOpts& o) {
+    NN_CHECK(o.alpha == 1.0f && o.x_row_stride == 0, "sparse_conv: no alpha or stride");
+    dispatch_gemm(out, x, w, o.bias, o.residual, o.act, 1.0f, 0, 1.0f, Gather{nbr, x.cols()});
 }
 
 }  // namespace nn

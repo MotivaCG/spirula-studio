@@ -31,6 +31,7 @@ __device__ inline void warp_reduce_and_atomicAdd(int addr, float val, float *bas
 #endif
 
 
+template <int kF = -1>
 #ifdef PATCHED
 __global__ void bilagrid_patched_sample_backward_v2_kernel(
 #else
@@ -38,10 +39,10 @@ __global__ void bilagrid_uniform_sample_backward_v2_kernel(
 #endif
     BilagridReader bilagrid,  // [N,L,H,W,12]
 #ifdef PATCHED
-    const float* __restrict__ rgb,  // [N,m,h,w,3]
+    PixelPtr rgb,  // [N,m,h,w,3]
     const float* __restrict__ v_output,  // [N,m,h,w,3]
 #else
-    const float* __restrict__ rgb,  // [N,h,w,3]
+    PixelPtr rgb,  // [N,h,w,3]
     const float* __restrict__ v_output,  // [N,h,w,3]
 #endif
     float* __restrict__ v_bilagrid,  // [N,L,H,W,12]
@@ -62,6 +63,7 @@ __global__ void bilagrid_uniform_sample_backward_v2_kernel(
     , const int* __restrict__ grid_indices  // [N], or nullptr -> identity
 #endif
 ) {
+    if constexpr (kF >= 0) rgb.f = (PixelFormat)kF;
 #ifdef PATCHED
     // potentially higher cache hit rate
   #if 0
@@ -137,6 +139,18 @@ __global__ void bilagrid_uniform_sample_backward_v2_kernel(
     dr = isfinite(dr) ? dr : 0.0f;
     dg = isfinite(dg) ? dg : 0.0f;
     db = isfinite(db) ? db : 0.0f;
+
+    // Both gradients are linear in the incoming one, so a zero one -- a
+    // masked pixel, mostly -- contributes nothing anywhere.
+    if (dr == 0.0f && dg == 0.0f && db == 0.0f) {
+        if (v_rgb != nullptr && inside) {
+            v_rgb[g_off+0] = 0.0f;
+            v_rgb[g_off+1] = 0.0f;
+            v_rgb[g_off+2] = 0.0f;
+        }
+        return;
+    }
+
     float vr = 0.0, vg = 0.0, vb = 0.0;
 
     // spatial derivatives for coords

@@ -29,13 +29,14 @@ std::tuple<
     const std::string camera_model,
     const std::string distortion,
     const TorchTensorView dist_coeffs,
-    DeviceTensor2D<float4> aabb,  // [..., N] projected 2D AABB, for sub-tile culling
+    DeviceTensor2D<uint2> aabb,  // [..., N] projected 2D AABB, for sub-tile culling
     // image size
     const uint32_t image_width,
     const uint32_t image_height,
     // intersections
     const DeviceTensor3D<int32_t> tile_offsets, // [I, tile_height, tile_width]
     const DeviceVector<int32_t> flatten_ids,    // [n_isects]
+    int macro_log2,               // binning granularity
     // forward outputs
     const DeviceTensor3D<float> render_Ts,  // [I, image_height, image_width]
     const DeviceTensor3D<int32_t> last_ids, // [I, image_height, image_width]
@@ -44,11 +45,17 @@ std::tuple<
     DistortionType dist_type,  // distortion channel set (None/D/RGB_D; DN/RGB_DN need a normal primitive)
     DeviceTensor3D<float> loss_map,  // [..., image_height, image_width, 1]
     DeviceTensor3D<float> accum_weight_map,  // [I, H, W]
+    DensifyAccumMode accum_mode,
+    // [num_splats] running peak of alpha * T, atomic-maxed times
+    // max_weight_scale; empty to skip.
+    DeviceVector<float> max_weight,
+    float max_weight_scale,
     // gradients of outputs
     RenderOutput::TensorTuple v_render_outputs,
     const DeviceTensor3D<float> v_render_Ts, // [..., image_height, image_width, 1]
     const DeviceTensor3D<float> v_median, // [..., image_height, image_width], optional
     std::optional<RenderOutput::TensorTuple> v_distortion_outputs,
+    float v_dist_rgb_per_depth,  // used when v_distortion_outputs has no rgb
     std::optional<std::vector<DeviceTensorFloatND>> v_splats_w,
     std::optional<std::vector<DeviceTensorFloatND>> v_splats_s,
     bool need_viewmat_grad

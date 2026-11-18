@@ -9,7 +9,11 @@
 
 #include "backend/vulkan/kernels/KernelCommon.h"
 
+#include <core/Env.h>
+
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 namespace {
 
@@ -19,8 +23,10 @@ struct FusedAdamParams {
     float lr, decay, decay_offset, grad_scale;
     int32_t scalar_step;
     uint32_t has_steps, numel, stride, zero_grad, wgs_per_row;
+    uint32_t sb_first;
+    float sb_lr;
 };
-static_assert(sizeof(FusedAdamParams) == 5 * 8 + 10 * 4,
+static_assert(sizeof(FusedAdamParams) == 5 * 8 + 12 * 4,
               "params layout must match the slang struct");
 
 // Mirrors AdagradParams.
@@ -35,24 +41,28 @@ static_assert(sizeof(AdagradParams) == 3 * 8 + 3 * 4 + 4 /*pad*/,
 // Mirrors QAdamParams.
 struct QAdamParams {
     uint64_t param, grad, packed, quant_bounds, steps;
-    float lr, decay, decay_offset, grad_scale;
+    uint64_t ct_features_dc, ct_opacities;
+    float lr, decay, decay_offset, grad_scale, ct_eps_tr;
     int32_t scalar_step;
     uint32_t has_steps, numel, stride, zero_grad, num_blocks, wgs_per_row;
-    uint32_t _pad0;
+    uint32_t sb_first;
+    float sb_lr;
 };
-static_assert(sizeof(QAdamParams) == 5 * 8 + 12 * 4,
+static_assert(sizeof(QAdamParams) == 7 * 8 + 14 * 4,
               "params layout must match the slang struct");
 
 // Mirrors QQAdamParams.
 struct QQAdamParams {
     uint64_t grad, grad_q_packed, grad_q_bounds, optim_packed, optim_bounds,
         value_packed, value_bounds, steps;
-    float lr, decay, decay_offset, grad_scale;
+    uint64_t ct_features_dc, ct_opacities;
+    float lr, decay, decay_offset, grad_scale, ct_eps_tr;
     int32_t scalar_step;
     uint32_t has_steps, grad_quant, numel, stride, zero_grad, num_blocks,
-        wgs_per_row;
+        wgs_per_row, sb_first;
+    float sb_lr;
 };
-static_assert(sizeof(QQAdamParams) == 8 * 8 + 12 * 4,
+static_assert(sizeof(QQAdamParams) == 10 * 8 + 15 * 4 + 4 /*pad*/,
               "params layout must match the slang struct");
 
 // Mirrors FloatAddParams.
@@ -76,6 +86,42 @@ uint32_t checked_u32_numel(int64_t numel, const char* what) {
     return (uint32_t)numel;
 }
 
+// Cells per launch for the per-cell optimizer entries, whose cell index is
+// u32: whole 256-cell blocks of whole splats, so a later slice only advances
+// pointers. Only SH reaches two; SS_OPTIM_SLICE_CELLS forces more, for tests.
+int64_t optim_slice_cells(int64_t stride) {
+    const int64_t grain = 256 * (stride > 0 ? stride : 1);
+    static const int64_t cap = [] {
+        const char* v = spirula::env("OPTIM_SLICE_CELLS");
+        const int64_t n = v ? std::atoll(v) : 0;
+        return n > 0 ? n : ((int64_t)1 << 30);
+    }();
+    const int64_t n = cap / grain * grain;
+    return n > 0 ? n : grain;
+}
+
+// The lobe fields of a per-cell optimizer's params, and the SH regularizer
+// rescaled to average over a row's SH cells only, as FPBO does; the lobes
+// take none. Returns the SH cells' decay.
+struct SbFields {
+    uint32_t first;
+    float lr;
+};
+
+SbFields sb_fields(const SbOptimCells& sb, int64_t num_splats, int64_t stride,
+                   float l2_reg, float* decay) {
+    *decay = 2.0f * l2_reg / (float)(num_splats * 3);  // per RGB coefficient, as fused_adam_step
+    if (sb.first_cell < 0)
+        return {0xffffffffu, 0.0f};
+    const int64_t lobe_cells = stride - sb.first_cell;
+    if (sb.first_cell > stride || lobe_cells % 6 != 0)
+        throw std::runtime_error(
+            "optimizer: spherical-beta cells " +
+            std::to_string(sb.first_cell) + ".." + std::to_string(stride) +
+            " are not whole lobes");
+    return {(uint32_t)sb.first_cell, sb.lr};
+}
+
 }  // namespace
 
 /* API definitions matching kernels/optim/Optimizer.cuh (engine-referenced subset) */
@@ -90,6 +136,7 @@ void fused_adam_step(
     int32_t step, DeviceVector<int32_t> per_splat_steps,
     float l2_reg,
     float l2_reg_offset,
+    SbOptimCells sb,
     float grad_scale, bool zero_grad
 ) {
     int64_t param_numel = param.numel();
@@ -99,6 +146,9 @@ void fused_adam_step(
     int64_t numel = num_splats * stride;
 
     FusedAdamParams p{};
+    const SbFields sbf = sb_fields(sb, num_splats, stride, l2_reg, &p.decay);
+    p.sb_first = sbf.first;
+    p.sb_lr = sbf.lr;
     p.param = (uint64_t)param.data_ptr();
     p.grad = (uint64_t)grad.data_ptr();
     p.exp_avg = (uint64_t)exp_avg.data_ptr();
@@ -106,15 +156,25 @@ void fused_adam_step(
     p.steps = vkk::or_fallback(per_splat_steps.data_ptr());
     p.has_steps = per_splat_steps.data_ptr() ? 1u : 0u;
     p.lr = lr;
-    p.decay = 2.0f * l2_reg / (float)numel;
     p.decay_offset = l2_reg_offset;
     p.grad_scale = grad_scale;
     p.scalar_step = step;
-    p.numel = checked_u32_numel(numel, "fused_adam_step");
     p.stride = (uint32_t)stride;
     p.zero_grad = zero_grad ? 1u : 0u;
-    vkk::dispatch_flat("optimizer.fused_adam_fwd", backend::vk::SpecList{},
-                       numel, 256, &p, sizeof(p), &p.wgs_per_row);
+    const int64_t slice = optim_slice_cells(stride);
+    const uint64_t b_param = p.param, b_grad = p.grad;
+    const uint64_t b_m = p.exp_avg, b_v = p.exp_avg_sq, b_steps = p.steps;
+    for (int64_t base = 0; base < numel; base += slice) {
+        const int64_t n = std::min(slice, numel - base);
+        p.param = b_param + 4u * (uint64_t)base;
+        p.grad = b_grad + 4u * (uint64_t)base;
+        p.exp_avg = b_m + 4u * (uint64_t)base;
+        p.exp_avg_sq = b_v + 4u * (uint64_t)base;
+        if (p.has_steps) p.steps = b_steps + 4u * (uint64_t)(base / stride);
+        p.numel = checked_u32_numel(n, "fused_adam_step");
+        vkk::dispatch_flat("optimizer.fused_adam_fwd", backend::vk::SpecList{},
+                           n, 256, &p, sizeof(p), &p.wgs_per_row);
+    }
 }
 
 void fused_adagrad_step(
@@ -146,6 +206,8 @@ void fused_adam_step_quantized(
     float l2_reg,
     float l2_reg_offset,
     int bits,
+    ColorTrustState color_trust,
+    SbOptimCells sb,
     float grad_scale, bool zero_grad
 ) {
     int64_t param_numel = param.numel();
@@ -159,6 +221,9 @@ void fused_adam_step_quantized(
     int64_t numel = num_splats * stride;
 
     QAdamParams p{};
+    const SbFields sbf = sb_fields(sb, num_splats, stride, l2_reg, &p.decay);
+    p.sb_first = sbf.first;
+    p.sb_lr = sbf.lr;
     p.param = (uint64_t)param.data_ptr();
     p.grad = (uint64_t)grad.data_ptr();
     p.packed = (uint64_t)packed;
@@ -166,18 +231,42 @@ void fused_adam_step_quantized(
     p.steps = vkk::or_fallback(per_splat_steps.data_ptr());
     p.has_steps = per_splat_steps.data_ptr() ? 1u : 0u;
     p.lr = lr;
-    p.decay = 2.0f * l2_reg / (float)numel;
     p.decay_offset = l2_reg_offset;
     p.grad_scale = grad_scale;
     p.scalar_step = step;
-    p.numel = checked_u32_numel(numel, "fused_adam_step_quantized");
     p.stride = (uint32_t)stride;
     p.zero_grad = zero_grad ? 1u : 0u;
-    p.num_blocks = (uint32_t)((numel + 255) / 256);
-    // Spec IDs: 0 = kOptimBits (kValueBits unused by this entry).
-    vkk::dispatch_flat("optimizer.fused_adam_q",
-                       backend::vk::SpecList{(uint32_t)bits}, numel, 256, &p,
-                       sizeof(p), &p.wgs_per_row);
+    p.ct_features_dc = vkk::or_fallback(color_trust.features_dc);
+    p.ct_opacities = vkk::or_fallback(color_trust.opacities);
+    p.ct_eps_tr = color_trust.eps_tr;
+    const uint32_t ct = color_trust.enabled ? 1u : 0u;
+    const int64_t slice = optim_slice_cells(stride);
+    const uint64_t cell_bytes = bits == 8 ? 2u : 1u;
+    const uint64_t b_param = p.param, b_grad = p.grad;
+    const uint64_t b_packed = p.packed, b_bounds = p.quant_bounds;
+    const uint64_t b_steps = p.steps;
+    const uint64_t b_ctdc = p.ct_features_dc, b_ctop = p.ct_opacities;
+    for (int64_t base = 0; base < numel; base += slice) {
+        const int64_t n = std::min(slice, numel - base);
+        const uint64_t splat = (uint64_t)(base / stride);
+        p.param = b_param + 4u * (uint64_t)base;
+        p.grad = b_grad + 4u * (uint64_t)base;
+        p.packed = b_packed + cell_bytes * (uint64_t)base;
+        p.quant_bounds = b_bounds + 16u * (uint64_t)(base / 256);
+        if (p.has_steps) p.steps = b_steps + 4u * (uint64_t)(base / stride);
+        if (ct) {
+            p.ct_features_dc = b_ctdc + 12u * splat;
+            p.ct_opacities = b_ctop + 4u * splat;
+        }
+        p.numel = checked_u32_numel(n, "fused_adam_step_quantized");
+        p.num_blocks = (uint32_t)((n + 255) / 256);
+        // Spec IDs: 0 = kOptimBits, 1 = kValueBits (unused here, pinned so
+        // the pipeline key is stable), 2 = kColorTrust.
+        vkk::dispatch_flat(
+            "optimizer.fused_adam_q",
+            backend::vk::SpecList{(uint32_t)bits, 8u, ct}, n, 256, &p,
+            sizeof(p), &p.wgs_per_row);
+    }
 }
 
 void fused_adam_step_quantized_value(
@@ -196,6 +285,8 @@ void fused_adam_step_quantized_value(
     float l2_reg_offset,
     int optim_bits,
     int value_bits,
+    ColorTrustState color_trust,
+    SbOptimCells sb,
     float grad_scale, bool zero_grad
 ) {
     if (param_numel == 0 || num_splats == 0)
@@ -211,6 +302,9 @@ void fused_adam_step_quantized_value(
     int64_t numel = num_splats * stride;
 
     QQAdamParams p{};
+    const SbFields sbf = sb_fields(sb, num_splats, stride, l2_reg, &p.decay);
+    p.sb_first = sbf.first;
+    p.sb_lr = sbf.lr;
     p.grad = vkk::or_fallback(grad.data_ptr());
     p.grad_q_packed = vkk::or_fallback(grad_q_packed);
     p.grad_q_bounds = vkk::or_fallback(grad_q_bounds);
@@ -222,19 +316,52 @@ void fused_adam_step_quantized_value(
     p.steps = vkk::or_fallback(per_splat_steps.data_ptr());
     p.has_steps = per_splat_steps.data_ptr() ? 1u : 0u;
     p.lr = lr;
-    p.decay = 2.0f * l2_reg / (float)numel;
     p.decay_offset = l2_reg_offset;
     p.grad_scale = grad_scale;
     p.scalar_step = step;
-    p.numel = checked_u32_numel(numel, "fused_adam_step_quantized_value");
     p.stride = (uint32_t)stride;
     p.zero_grad = zero_grad ? 1u : 0u;
-    p.num_blocks = (uint32_t)((numel + 255) / 256);
-    // Spec IDs: 0 = kOptimBits, 1 = kValueBits.
-    vkk::dispatch_flat(
-        "optimizer.fused_adam_qq",
-        backend::vk::SpecList{(uint32_t)optim_bits, (uint32_t)value_bits},
-        numel, 256, &p, sizeof(p), &p.wgs_per_row);
+    p.ct_features_dc = vkk::or_fallback(color_trust.features_dc);
+    p.ct_opacities = vkk::or_fallback(color_trust.opacities);
+    p.ct_eps_tr = color_trust.eps_tr;
+    const uint32_t ct = color_trust.enabled ? 1u : 0u;
+    const int64_t slice = optim_slice_cells(stride);
+    const uint64_t optim_bytes = optim_bits == 8 ? 2u : 1u;
+    const uint64_t value_bytes = value_bits == 16 ? 2u : 1u;
+    const uint64_t b_grad = p.grad, b_gq = p.grad_q_packed;
+    const uint64_t b_gqb = p.grad_q_bounds;
+    const uint64_t b_op = p.optim_packed, b_ob = p.optim_bounds;
+    const uint64_t b_vp = p.value_packed, b_vb = p.value_bounds;
+    const uint64_t b_steps = p.steps;
+    const uint64_t b_ctdc = p.ct_features_dc, b_ctop = p.ct_opacities;
+    for (int64_t base = 0; base < numel; base += slice) {
+        const int64_t n = std::min(slice, numel - base);
+        const uint64_t splat = (uint64_t)(base / stride);
+        if (grad.data_ptr()) p.grad = b_grad + 4u * (uint64_t)base;
+        if (p.grad_quant) {
+            p.grad_q_packed = b_gq + (uint64_t)base;
+            p.grad_q_bounds = b_gqb + 8u * (splat / 256);
+        }
+        p.optim_packed = b_op + optim_bytes * (uint64_t)base;
+        p.optim_bounds = b_ob + 16u * (uint64_t)(base / 256);
+        p.value_packed = b_vp + value_bytes * (uint64_t)base;
+        p.value_bounds = b_vb + 8u * (uint64_t)(base / 256);
+        if (p.has_steps) p.steps = b_steps + 4u * splat;
+        if (ct) {
+            p.ct_features_dc = b_ctdc + 12u * splat;
+            p.ct_opacities = b_ctop + 4u * splat;
+        }
+        p.numel = checked_u32_numel(n, "fused_adam_step_quantized_value");
+        p.num_blocks = (uint32_t)((n + 255) / 256);
+        // Spec IDs: bits, value bits, colour trust, cell stride.
+        vkk::Fold f = vkk::fold_1d(n, 256);
+        p.wgs_per_row = f.per_row;
+        vkk::dispatch_ring(
+            "optimizer.fused_adam_qq",
+            backend::vk::SpecList{(uint32_t)optim_bits, (uint32_t)value_bits,
+                                  ct, p.stride},
+            f.per_row, f.rows, 1, &p, sizeof(p));
+    }
 }
 
 void float_add_into(DeviceVector<float> dst, DeviceVector<float> src,
@@ -246,6 +373,18 @@ void float_add_into(DeviceVector<float> dst, DeviceVector<float> src,
     p.src = (uint64_t)src.data_ptr();
     p.n = checked_u32_numel(n, "float_add_into");
     vkk::dispatch_flat("optimizer.float_add", backend::vk::SpecList{}, n, 256,
+                       &p, sizeof(p), &p.wgs_per_row);
+}
+
+void float_max_into(DeviceVector<float> dst, DeviceVector<float> src,
+                    int64_t n) {
+    if (n == 0 || dst.data_ptr() == nullptr || src.data_ptr() == nullptr)
+        return;
+    FloatAddParams p{};
+    p.dst = (uint64_t)dst.data_ptr();
+    p.src = (uint64_t)src.data_ptr();
+    p.n = checked_u32_numel(n, "float_max_into");
+    vkk::dispatch_flat("optimizer.float_max", backend::vk::SpecList{}, n, 256,
                        &p, sizeof(p), &p.wgs_per_row);
 }
 
@@ -263,20 +402,22 @@ namespace {
 // Mirrors AdamTrRgbParams in shaders/optim_color.slang.
 struct AdamTrRgbParams {
     uint64_t rgbs, grad, exp_avg, exp_avg_sq, opacities;
-    float lr, bias_correction1, bias_correction2, eps, eps_tr, grad_scale;
-    uint32_t is_linear, zero_grad, num_gs, wgs_per_row;
+    float lr, bias_correction1, bias_correction2, eps, eps_tr,
+        dc_reg_weight, sh_reg_weight, grad_scale;
+    uint32_t zero_grad, num_gs, wgs_per_row, _pad0;
 };
-static_assert(sizeof(AdamTrRgbParams) == 5 * 8 + 10 * 4,
+static_assert(sizeof(AdamTrRgbParams) == 5 * 8 + 12 * 4,
               "params layout must match the slang struct");
 
 // Mirrors AdamTrRgbShParams.
 struct AdamTrRgbShParams {
     uint64_t param, grad, exp_avg, exp_avg_sq, rgbs, opacities;
-    float lr, bias_correction1, bias_correction2, eps, eps_tr, grad_scale;
-    uint32_t is_linear, zero_grad, num_params, num_sh, wgs_per_row;
-    uint32_t _pad0;
+    float lr, bias_correction1, bias_correction2, eps, eps_tr,
+        sh_reg_weight, grad_scale;
+    uint32_t zero_grad, num_params, num_sh, wgs_per_row, sb_first;
+    float sb_lr;
 };
-static_assert(sizeof(AdamTrRgbShParams) == 6 * 8 + 12 * 4,
+static_assert(sizeof(AdamTrRgbShParams) == 6 * 8 + 13 * 4 + 4 /*pad*/,
               "params layout must match the slang struct");
 
 // Mirrors OptimGeoParams in shaders/optim_geometry.slang.
@@ -286,7 +427,7 @@ struct OptimGeoParams {
     uint64_t scales, v_scales, g1_scales, g2_scales;
     uint64_t opacities, v_opacities, g1_opacities, g2_opacities;
     uint64_t features_dc, v_features_dc;
-    uint64_t radii, densify_score, steps;
+    uint64_t radii, densify_score, steps, visit_counters, auxiliary_opacities;
     uint64_t gq_means_packed, gq_means_bounds, gq_quats_packed,
         gq_quats_bounds, gq_scales_packed, gq_scales_bounds, gq_opac_packed,
         gq_opac_bounds, gq_dc_packed, gq_dc_bounds;
@@ -294,15 +435,21 @@ struct OptimGeoParams {
         nq_opacities_packed, nq_dc_packed;
     uint64_t nq_means_bounds, nq_quats_bounds, nq_scales_bounds,
         nq_opacities_bounds, nq_dc_bounds;
+    uint64_t depth_states, depth_information, depth_centers, depth_cameras, depth_angular_bound;
+    float depth_lr, depth_angular_lr;
+    uint32_t has_depth, depth_photo, depth_relative, depth_has_bound;
     float lr_means, lr_quats, lr_scales, lr_opacs, lr_features_dc;
     float max_gauss_ratio, scale_regularization_weight,
         mcmc_opacity_reg_weight, mcmc_scale_reg_weight, erank_reg_weight,
-        erank_reg_weight_s3, quat_norm_reg_weight, sh_reg_weight, grad_scale;
+        erank_reg_weight_s3, quat_norm_reg_weight,
+        dc_reg_weight, sh_reg_weight, grad_scale, max_screen_size,
+        max_screen_size_penalty, eps_tr;
     int32_t scalar_step;
-    uint32_t has_steps, has_densify_score, numel, wgs_per_row;
-    uint32_t _pad0;
+    uint32_t has_steps, has_densify_score, numel, wgs_per_row, has_visit,
+        skip_unrendered_reg;
+    uint32_t has_auxiliary_opacities;
 };
-static_assert(sizeof(OptimGeoParams) == 41 * 8 + 20 * 4,
+static_assert(sizeof(OptimGeoParams) == 48 * 8 + 32 * 4,
               "params layout must match the slang struct");
 
 int64_t tv_numel(const TorchTensorView& tv) {
@@ -315,7 +462,8 @@ void launch_adamtr_rgb(bool is_linear, TorchTensorView param,
                        TorchTensorView grad, TorchTensorView exp_avg,
                        TorchTensorView exp_avg_sq, TorchTensorView opacities,
                        float lr, float beta1, float beta2, float eps,
-                       float eps_tr, int step, float grad_scale,
+                       float eps_tr, float dc_reg_weight,
+                       float sh_reg_weight, int step, float grad_scale,
                        bool zero_grad) {
     int64_t num_gs = tv_numel(param) / 3;
     if (num_gs == 0) return;
@@ -330,20 +478,23 @@ void launch_adamtr_rgb(bool is_linear, TorchTensorView param,
     p.bias_correction2 = 1.0f - std::pow(beta2, (float)step);
     p.eps = eps;
     p.eps_tr = eps_tr;
+    p.dc_reg_weight = 2.0f * dc_reg_weight / 3.0f;
+    p.sh_reg_weight = 2.0f * sh_reg_weight / (float)(3 * num_gs);
     p.grad_scale = grad_scale;
-    p.is_linear = is_linear ? 1u : 0u;
     p.zero_grad = zero_grad ? 1u : 0u;
     p.num_gs = checked_u32_numel(num_gs, "fused_adamtr_rgb_optim");
+    // Spec ID 0 = kIsLinear.
     vkk::dispatch_flat("optim_color.fused_adamtr_rgb",
-                       backend::vk::SpecList{}, num_gs, 256, &p, sizeof(p),
-                       &p.wgs_per_row);
+                       backend::vk::SpecList{is_linear ? 1u : 0u}, num_gs, 256,
+                       &p, sizeof(p), &p.wgs_per_row);
 }
 
 void launch_adamtr_rgb_sh(bool is_linear, TorchTensorView param,
                           TorchTensorView grad, TorchTensorView exp_avg,
                           TorchTensorView exp_avg_sq, TorchTensorView colors,
                           TorchTensorView opacities, float lr, float beta1,
-                          float beta2, float eps, float eps_tr, int step,
+                          float beta2, float eps, float eps_tr,
+                          float sh_reg_weight, int step, SbOptimCells sb,
                           float grad_scale, bool zero_grad) {
     int64_t colors_numel = tv_numel(colors);
     int64_t num_gs = colors_numel / 3;
@@ -352,6 +503,10 @@ void launch_adamtr_rgb_sh(bool is_linear, TorchTensorView param,
     if (num_sh == 0) return;
     int64_t num_params = num_gs * num_sh * 3;
     AdamTrRgbShParams p{};
+    const SbFields sbf =
+        sb_fields(sb, num_gs, num_sh * 3, sh_reg_weight, &p.sh_reg_weight);
+    p.sb_first = sbf.first;
+    p.sb_lr = sbf.lr;
     p.param = std::get<0>(param);
     p.grad = std::get<0>(grad);
     p.exp_avg = std::get<0>(exp_avg);
@@ -364,13 +519,28 @@ void launch_adamtr_rgb_sh(bool is_linear, TorchTensorView param,
     p.eps = eps;
     p.eps_tr = eps_tr;
     p.grad_scale = grad_scale;
-    p.is_linear = is_linear ? 1u : 0u;
     p.zero_grad = zero_grad ? 1u : 0u;
-    p.num_params = checked_u32_numel(num_params, "fused_adamtr_rgb_sh_optim");
     p.num_sh = (uint32_t)num_sh;
-    vkk::dispatch_flat("optim_color.fused_adamtr_rgb_sh",
-                       backend::vk::SpecList{}, num_params, 256, &p, sizeof(p),
-                       &p.wgs_per_row);
+    const int64_t stride = num_sh * 3;
+    const int64_t slice = optim_slice_cells(stride);
+    const uint64_t b_param = p.param, b_grad = p.grad;
+    const uint64_t b_m = p.exp_avg, b_v = p.exp_avg_sq;
+    const uint64_t b_rgbs = p.rgbs, b_opac = p.opacities;
+    for (int64_t base = 0; base < num_params; base += slice) {
+        const int64_t n = std::min(slice, num_params - base);
+        const uint64_t splat = (uint64_t)(base / stride);
+        p.param = b_param + 4u * (uint64_t)base;
+        p.grad = b_grad + 4u * (uint64_t)base;
+        p.exp_avg = b_m + 4u * (uint64_t)base;
+        p.exp_avg_sq = b_v + 4u * (uint64_t)base;
+        p.rgbs = b_rgbs + 12u * splat;
+        p.opacities = b_opac + 4u * splat;
+        p.num_params = checked_u32_numel(n, "fused_adamtr_rgb_sh_optim");
+        // Spec ID 0 = kIsLinear.
+        vkk::dispatch_flat("optim_color.fused_adamtr_rgb_sh",
+                           backend::vk::SpecList{is_linear ? 1u : 0u}, n, 256,
+                           &p, sizeof(p), &p.wgs_per_row);
+    }
 }
 
 }  // namespace
@@ -378,43 +548,47 @@ void launch_adamtr_rgb_sh(bool is_linear, TorchTensorView param,
 void fused_adamtr_linear_rgb_optim(
     TorchTensorView param, TorchTensorView grad, TorchTensorView exp_avg,
     TorchTensorView exp_avg_sq, TorchTensorView opacities, float lr,
-    float beta1, float beta2, float eps, float eps_tr, int step,
-    float grad_scale, bool zero_grad
+    float beta1, float beta2, float eps, float eps_tr, float dc_reg_weight,
+    float sh_reg_weight, int step, float grad_scale, bool zero_grad
 ) {
     launch_adamtr_rgb(true, param, grad, exp_avg, exp_avg_sq, opacities, lr,
-                      beta1, beta2, eps, eps_tr, step, grad_scale, zero_grad);
+                      beta1, beta2, eps, eps_tr, dc_reg_weight, sh_reg_weight,
+                      step, grad_scale, zero_grad);
 }
 
 void fused_adamtr_rgb_optim(
     TorchTensorView param, TorchTensorView grad, TorchTensorView exp_avg,
     TorchTensorView exp_avg_sq, TorchTensorView opacities, float lr,
-    float beta1, float beta2, float eps, float eps_tr, int step,
-    float grad_scale, bool zero_grad
+    float beta1, float beta2, float eps, float eps_tr, float dc_reg_weight,
+    float sh_reg_weight, int step, float grad_scale, bool zero_grad
 ) {
     launch_adamtr_rgb(false, param, grad, exp_avg, exp_avg_sq, opacities, lr,
-                      beta1, beta2, eps, eps_tr, step, grad_scale, zero_grad);
+                      beta1, beta2, eps, eps_tr, dc_reg_weight, sh_reg_weight,
+                      step, grad_scale, zero_grad);
 }
 
 void fused_adamtr_linear_rgb_sh_optim(
     TorchTensorView param, TorchTensorView grad, TorchTensorView exp_avg,
     TorchTensorView exp_avg_sq, TorchTensorView colors,
     TorchTensorView opacities, float lr, float beta1, float beta2, float eps,
-    float eps_tr, int step, float grad_scale, bool zero_grad
+    float eps_tr, float sh_reg_weight, int step, SbOptimCells sb,
+    float grad_scale, bool zero_grad
 ) {
     launch_adamtr_rgb_sh(true, param, grad, exp_avg, exp_avg_sq, colors,
-                         opacities, lr, beta1, beta2, eps, eps_tr, step,
-                         grad_scale, zero_grad);
+                         opacities, lr, beta1, beta2, eps, eps_tr,
+                         sh_reg_weight, step, sb, grad_scale, zero_grad);
 }
 
 void fused_adamtr_rgb_sh_optim(
     TorchTensorView param, TorchTensorView grad, TorchTensorView exp_avg,
     TorchTensorView exp_avg_sq, TorchTensorView colors,
     TorchTensorView opacities, float lr, float beta1, float beta2, float eps,
-    float eps_tr, int step, float grad_scale, bool zero_grad
+    float eps_tr, float sh_reg_weight, int step, SbOptimCells sb,
+    float grad_scale, bool zero_grad
 ) {
     launch_adamtr_rgb_sh(false, param, grad, exp_avg, exp_avg_sq, colors,
-                         opacities, lr, beta1, beta2, eps, eps_tr, step,
-                         grad_scale, zero_grad);
+                         opacities, lr, beta1, beta2, eps, eps_tr,
+                         sh_reg_weight, step, sb, grad_scale, zero_grad);
 }
 
 void fused_optim_3dgs_geometry(
@@ -431,16 +605,21 @@ void fused_optim_3dgs_geometry(
     const float max_gauss_ratio, const float scale_regularization_weight,
     const float mcmc_opacity_reg_weight, const float mcmc_scale_reg_weight,
     const float erank_reg_weight, const float erank_reg_weight_s3, const float quat_norm_reg_weight,
-    const float sh_reg_weight,
+    const float dc_reg_weight, const float sh_reg_weight,
+    const float max_screen_size, const float max_screen_size_penalty,
     bool use_scale_agnostic_mean,
+    ColorTrustState color_trust,
     NonShQuantState non_sh,
-    GradQuantBuffers gq,
+    SplatVisitState visit,
+    GradQuantBuffers gq, ProjectiveDepthOptim depth,
     int32_t step, DeviceVector<int32_t> per_splat_steps,
-    float grad_scale, bool zero_grad
+    float grad_scale, bool zero_grad, DeviceVector<float> auxiliary_opacities
 ) {
     if (num_splats == 0) return;
 
     OptimGeoParams p{};
+    p.auxiliary_opacities = vkk::or_fallback(auxiliary_opacities.data_ptr());
+    p.has_auxiliary_opacities = auxiliary_opacities.data_ptr() ? 1u : 0u;
     p.means = (uint64_t)means.data_ptr();
     p.v_means = vkk::or_fallback(v_means.data_ptr());
     p.g1_means = vkk::or_fallback(g1_means.data_ptr());
@@ -462,6 +641,19 @@ void fused_optim_3dgs_geometry(
     p.radii = vkk::or_fallback(radii.data_ptr());
     p.densify_score = vkk::or_fallback(densify_score.data_ptr());
     p.steps = vkk::or_fallback(per_splat_steps.data_ptr());
+    p.visit_counters = vkk::or_fallback(visit.counters);
+    p.has_visit = visit.counters ? 1u : 0u;
+    p.skip_unrendered_reg = visit.skip_unrendered_reg ? 1u : 0u;
+    p.depth_states = vkk::or_fallback(depth.states);
+    p.depth_information = vkk::or_fallback(depth.information);
+    p.depth_centers = vkk::or_fallback(depth.centers);
+    p.depth_cameras = vkk::or_fallback(depth.camera_indices);
+    p.depth_lr = depth.lr; p.depth_angular_lr = depth.angular_lr;
+    p.has_depth = depth.states ? 1u : 0u;
+    p.depth_photo = depth.single_photometric;
+    p.depth_relative = depth.angular_relative;
+    p.depth_angular_bound = vkk::or_fallback(depth.angular_bound);
+    p.depth_has_bound = depth.angular_bound ? 1u : 0u;
 
     uint32_t gq_mask = 0;
     p.gq_means_packed = vkk::or_fallback(gq.means_packed);
@@ -504,11 +696,16 @@ void fused_optim_3dgs_geometry(
     p.erank_reg_weight = erank_reg_weight / (float)num_splats;
     p.erank_reg_weight_s3 = erank_reg_weight_s3 / (float)num_splats;
     p.quat_norm_reg_weight = quat_norm_reg_weight / (float)num_splats;
-    p.sh_reg_weight = sh_reg_weight;
+    p.dc_reg_weight = 2.0f * dc_reg_weight / 3.0f;
+    p.sh_reg_weight = 2.0f * sh_reg_weight / (float)(3 * num_splats);
     p.grad_scale = grad_scale;
+    p.max_screen_size = max_screen_size;
+    p.max_screen_size_penalty =
+        radii.data_ptr() ? max_screen_size_penalty : 0.0f;
     p.scalar_step = step;
     p.has_steps = per_splat_steps.data_ptr() ? 1u : 0u;
     p.has_densify_score = densify_score.data_ptr() ? 1u : 0u;
+    p.eps_tr = color_trust.eps_tr;
     p.numel = checked_u32_numel(num_splats, "fused_optim_3dgs_geometry");
 
     backend::vk::SpecList spec{
@@ -516,6 +713,9 @@ void fused_optim_3dgs_geometry(
         zero_grad ? 1u : 0u,
         non_sh.enabled ? 1u : 0u,
         gq_mask,
+        // Colour trust only reaches the features_dc update, which only runs
+        // under non-SH quant.
+        (non_sh.enabled && color_trust.enabled) ? 1u : 0u,
     };
     vkk::Fold f = vkk::fold_1d(num_splats, 256);
     p.wgs_per_row = f.per_row;

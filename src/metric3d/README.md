@@ -127,10 +127,30 @@ One plan per camera, reused for every frame that shares it.
 
 Two shapes. **Undistort** is one pinhole face at the camera's own intrinsics --
 the cheap path, and the only sensible one for a perspective lens. **Split** is
-several faces covering the field of view: 5 for a fisheye, a 6-face cube map
-for a panorama. `--split auto` picks between them on
+a front face plus a ring of faces reaching the lens's edge, or a 6-face cube
+map for a panorama. `--split auto` picks between them on
 `camhost::pinhole_coverage` at 0.75, and the trainer's
 `--input-depth-is-ray-depth` resolves against the same call (AGENTS.md).
+
+The split is planned from what the lens actually holds
+(`camhost::visible_boundary`, the largest visible angle per azimuth, by the
+same validity test the trainer's warp applies), so it fits a 150-degree lens
+and a 220-degree one alike:
+
+- The front face spans 45 degrees times 1.1, cropped -- still centred -- to
+  the visible box, so a cropped frame does not hand the network a grey band.
+- The ring reaches in to 40 degrees and out to 3 degrees past the boundary.
+  Its faces are **square and upright** (the image's up as close to the
+  camera's as the tilt allows, for the networks' gravity prior), with a half
+  field of view of 30 to 40 degrees as the band needs, and as many of them as
+  that width takes to go round with 15% shared between neighbours: 8 for a
+  180-degree lens, 7 for 220. Each face tilts to its own sector's boundary; a
+  face whose band runs along an image axis is cropped to it, down to 4:3.
+- Every face is sized at the WRITTEN map's pixel density where it points,
+  raised to at least 1200 patches of 14 (MoGe's lowest token budget) as far
+  as the frame's own density allows, then capped at `--max-size`. So the cost
+  follows the map, not the capture -- "Face size" below. `--face-res source`
+  sizes them at the frame's own density instead.
 
 The faces **overlap by design**, which is the part worth reading before
 changing any of it:
@@ -139,31 +159,33 @@ changing any of it:
   re-guesses its depth scale and its horizon every call. Faces abutted edge to
   edge write that disagreement into the output as a line down the middle of the
   frame, which is what a cube map produces.
-- So each face reaches 51.3 degrees instead of the 45 it owns, leaving
-  neighbours a 6.3-degree strip. The extent lives in the LENGTH of each face's
-  two in-plane axes, so the same table drives both the resampling and the
-  cross-fade, and a table of unit axes degrades to no blending at all.
+- So the cross-fade ramps over the outer 20% of every face. The extent lives
+  in the LENGTH of each face's two in-plane axes, so the same table drives both
+  the resampling and the blend.
 - Depth is put on one scale first (`alignFaces`): the median log ratio over
   each pair's strip, then the per-face offsets that best satisfy all of them,
   which is a small graph Laplacian. Cross-fading a scale error only smears it.
+  The faces have different focals, so Metric3D's canonical depth is turned
+  into millimetres per face BEFORE the blend.
 - The blend runs in the log, where the trainer's Pearson-of-log depth loss
   reads it, and a face is weighted out wherever it saw the mid-grey fill
   instead of the frame.
-- The five fisheye faces are a fan tilted 1.27 rad, not a cube: that reaches
-  124 degrees off axis, which is a 220-degree lens with the overlap intact.
+- A pixel ANY face masked (MoGe's sky) is written as no ground truth, even
+  where another face answered: no normal loss costs the trainer less than a
+  wrong one. A face votes only where it saw the frame, not the grey fill.
 
 Uncovered pixels are written **black** in the normal map and **0** in the
 depth map, which are the two sentinels the loss masks on
-(`sum(ref_normal) > -2.366` and `ref_depth != 0`). Mid-grey is only what the
-*model's input* gets, where a black border would read as an edge; carrying it
-into the output would supervise everything behind a fisheye's dead corners
-towards a normal of zero.
+(`gt_normal_valid` and `ref_depth != 0`). Mid-grey is only what the *model's
+input* gets, where a black border would read as an edge; it is never carried
+into the output, and the loss drops it as well -- a real normal is unit
+length, and mid-grey decodes to zero.
 
 The faces are private to this warp -- the output is written in the source
 camera's frame, and a training run that splits the same capture does its own
-warp out of `dsparse::warp_axes`. `spirula geometry --check` is what tests all
-of it, by round-tripping an analytic plane and by handing the faces that plane
-at deliberately different scales to see the alignment take them back.
+split (docs/datasets.md, "The split"). `spirula geometry --check` is what
+tests all of it, by round-tripping an analytic plane and by handing the faces
+that plane at deliberately different scales to see the alignment take them back.
 
 ## Speed and memory
 
@@ -187,10 +209,10 @@ vit-large against input size, which is the lever that matters:
 Cost grows faster than the pixel count: attention is quadratic in tokens and
 the decoder's ConvGRU runs `3 * iterations` convolutions over a 1/4-resolution
 map. **1064 is the size Metric3D's own inference pipeline runs at**, is about
-2.5x quicker than 1600, and is `spirula geometry --max-size`'s default. It is a
-ceiling on one face rather than on the frame: a split sizes its faces off the
-full-resolution capture (`app/GeometryWarp.h`), so a fisheye still runs about
-as many pixels as it was shot with, in five pieces.
+2.5x quicker than 1600, and is `spirula geometry --max-size`'s default. It caps
+the written map, and a split sizes its faces to that map ("Face size" above),
+so a high-resolution 360 capture costs what its map does, not what its sensor
+does.
 
 The arena is planned up front (`Model::planArenaBytes`) because it will not
 grow while anything is live. Its peak is the DPT fuse chain's upsample stage,
@@ -199,9 +221,9 @@ not the ViT.
 ## Testing
 
 ```bash
-./build/nn_ops_test                 # the general ops, vs a scalar CPU reference
-./build/metric3d_test               # cached checkpoints, or SKIP
-./build/metric3d_test --model M --image IMG.jpg --max-size 1064 --repeat 3
+./build_vulkan/nn_ops_test                 # the general ops, vs a scalar CPU reference
+./build_vulkan/metric3d_test               # cached checkpoints, or SKIP
+./build_vulkan/metric3d_test --model M --image IMG.jpg --max-size 1064 --repeat 3
 spirula geometry --check            # the camera round trip, no network in it
 ```
 
@@ -216,7 +238,7 @@ The gate that matters is parity against onnxruntime:
 ```bash
 pip install onnx onnxruntime numpy
 SS_METRIC3D_F32_WEIGHTS=1 SS_METRIC3D_DUMP=/tmp/ours \
-    ./build/metric3d_test --model model.onnx --image IMG.jpg --max-size 616
+    ./build_vulkan/metric3d_test --model model.onnx --image IMG.jpg --max-size 616
 python3 tools/metric3d/compare_ort.py --onnx model.onnx --ours /tmp/ours
 ```
 

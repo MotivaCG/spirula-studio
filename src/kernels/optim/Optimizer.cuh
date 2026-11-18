@@ -1,7 +1,11 @@
 #pragma once
 
+#include "core/ProjectiveDepthState.h"
 #include <core/Tensor.h>
+#include "core/ColorBasis.h"
+#include "core/ColorTrustState.h"
 #include "core/NonShQuantState.h"
+#include "core/SplatVisitState.h"
 #include "kernels/projection/ProjectionBwdQuantGrad.cuh"   // GradQuantBuffers
 
 
@@ -123,9 +127,7 @@ void fused_optim_3dgs_geometry(
     DeviceVector<float4> quats, DeviceVector<float4> v_quats, DeviceVector<float4> g1_quats, DeviceVector<float4> g2_quats,
     DeviceVector<float3> scales, DeviceVector<float3> v_scales, DeviceVector<float3> g1_scales, DeviceVector<float3> g2_scales,
     DeviceVector<float> opacities, DeviceVector<float> v_opacities, DeviceVector<float> g1_opacities, DeviceVector<float> g2_opacities,
-    // features_dc + grad: consumed only when non_sh has its quant buffers
-    // populated (via non_sh.enabled flagged in `non_sh`). The fp32 path
-    // ignores them and runs the separate fused_adam_step features_dc call.
+    // The fp32 DC path uses the separate Adam launch.
     DeviceVector<float3> features_dc, DeviceVector<float3> v_features_dc,
     DeviceVector<float> radii,
     // optional [N] densification world-grad score output; empty disables.
@@ -135,12 +137,15 @@ void fused_optim_3dgs_geometry(
     const float max_gauss_ratio, const float scale_regularization_weight,
     const float mcmc_opacity_reg_weight, const float mcmc_scale_reg_weight,
     const float erank_reg_weight, const float erank_reg_weight_s3, const float quat_norm_reg_weight,
-    const float sh_reg_weight,
+    const float dc_reg_weight, const float sh_reg_weight,
+    const float max_screen_size, const float max_screen_size_penalty,
     bool use_scale_agnostic_mean,
+    ColorTrustState color_trust,
     NonShQuantState non_sh,
-    GradQuantBuffers gq,
+    SplatVisitState visit,
+    GradQuantBuffers gq, ProjectiveDepthOptim depth,
     int32_t step, DeviceVector<int32_t> per_splat_steps,
-    float grad_scale, bool zero_grad
+    float grad_scale, bool zero_grad, DeviceVector<float> auxiliary_opacities
 );
 
 
@@ -154,6 +159,7 @@ void fused_adam_step(
     int32_t step, DeviceVector<int32_t> per_splat_steps,
     float l2_reg,
     float l2_reg_offset,
+    SbOptimCells sb,
     float grad_scale, bool zero_grad
 );
 
@@ -177,6 +183,8 @@ void fused_adam_step_quantized(
     float l2_reg,
     float l2_reg_offset,
     int bits,                           // 4 or 8 -- selects QuantizedAdamState<BITS, 256>
+    ColorTrustState color_trust,
+    SbOptimCells sb,
     float grad_scale, bool zero_grad
 );
 
@@ -199,6 +207,8 @@ void fused_adam_step_quantized_value(
     float l2_reg_offset,
     int optim_bits,                     // 4 or 8
     int value_bits,                     // 8 or 16
+    ColorTrustState color_trust,
+    SbOptimCells sb,
     float grad_scale, bool zero_grad
 );
 
@@ -314,6 +324,8 @@ void fused_adamtr_linear_rgb_optim(
     float beta2,
     float eps,
     float eps_tr,
+    float dc_reg_weight,
+    float sh_reg_weight,
     int step,
     float grad_scale, bool zero_grad
 );
@@ -330,6 +342,8 @@ void fused_adamtr_rgb_optim(
     float beta2,
     float eps,
     float eps_tr,
+    float dc_reg_weight,
+    float sh_reg_weight,
     int step,
     float grad_scale, bool zero_grad
 );
@@ -347,7 +361,9 @@ void fused_adamtr_linear_rgb_sh_optim(
     float beta2,
     float eps,
     float eps_tr,
+    float sh_reg_weight,
     int step,
+    SbOptimCells sb,
     float grad_scale, bool zero_grad
 );
 
@@ -364,7 +380,9 @@ void fused_adamtr_rgb_sh_optim(
     float beta2,
     float eps,
     float eps_tr,
+    float sh_reg_weight,
     int step,
+    SbOptimCells sb,
     float grad_scale, bool zero_grad
 );
 
@@ -373,3 +391,6 @@ void increment_int32_inplace(DeviceVector<int32_t> data, int64_t n);
 
 
 void float_add_into(DeviceVector<float> dst, DeviceVector<float> src, int64_t n);
+
+
+void float_max_into(DeviceVector<float> dst, DeviceVector<float> src, int64_t n);

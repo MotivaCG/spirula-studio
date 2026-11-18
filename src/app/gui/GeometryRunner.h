@@ -22,9 +22,12 @@ namespace gui {
 
 struct GeometryJob {
     bool enable = false;
-    // A model id (geometry_models()) or a path to an .onnx file.
+    // Canonical UUID from the frozen GUI choice; children must not re-rank.
+    std::string device_uuid;
+    std::string worker_devices;
+    // A model id (geometry_models()) or a path to an .onnx or .pt file.
     std::string model = "moge2-vitb";
-    int  max_size = 1064;         // longest side of one face the network runs
+    int  max_size = 1064;         // longest side of the maps, and of one face
     int  num_tokens = 3600;       // MoGe's ViT budget; Metric3D ignores it
     bool want_normal = true;
     bool want_depth = false;
@@ -34,13 +37,15 @@ struct GeometryJob {
     // 0 auto, 1 yes, 2 no -- `spirula geometry --ray-depth` and `--split`.
     int  ray_depth = 0;
     int  split = 0;
+    int  face_res = 0;            // `--face-res`: 0 output, 1 source
     bool overwrite = false;       // recompute maps that are already on disk
     // The dataset's colour space; frames convert to sRGB before inference.
     std::string image_gamut;
     std::optional<bool> image_is_linear;
+    std::string image_exposure;
 };
 
-// One checkpoint the screen offers, MoGe's three first and each family's
+// One checkpoint the screen offers, MoGe's four first and each family's
 // largest last. Index 1 is the default -- moge2-vitb, which is metric, rejects
 // the sky, and is quicker than Metric3D's large.
 struct GeometryModel {
@@ -57,12 +62,21 @@ bool geometry_model_cached(const std::string& id);
 // resolves the second one by name, so both land in the same directory.
 std::vector<PendingDownload> geometry_model_downloads(const std::string& id);
 
+// The disk an install that is built rather than downloaded (Marigold v2) still
+// needs, beside what it has; `needed` false for every other model.
+struct GeometryDisk {
+    bool needed = false, fits = true;
+    uint64_t disk = 0, free = 0, spare = 0;
+    std::string where;
+};
+GeometryDisk geometry_model_disk(const std::string& id);
+
 // "" when this build can estimate geometry, otherwise why it cannot.
 std::string geometry_availability();
 
 // Run the step over `dataset`, reporting into `prog` and showing what it
-// writes on `reel` (null for no screen). `images` is the folder the maps
-// describe, so the reel can show each beside its photograph.
+// writes on `reel` (null for no screen). `images` is where the frames are,
+// which for photos read in place is outside the dataset.
 bool run_geometry_step(const GeometryJob& job, const std::string& dataset,
                        const std::string& images, RunProgress& prog,
                        FilmReel* reel, const std::atomic<bool>& cancel,

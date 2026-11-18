@@ -11,6 +11,9 @@
 // SfmRunner fills it by parsing the child's stdout; when the SfM module
 // becomes a library (docs/notes/sfm-port-plan.md phase 3) only that parser goes.
 
+#include "app/gui/ProgressClock.h"
+
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -21,18 +24,38 @@ namespace gui {
 // The steps a dataset run goes through, in order. Both engines report through
 // the same list; a step a run does not need is never entered.
 enum class Stage {
-    Frames, Masks, Features, Matching, Mapping, Geometry, Finishing
+    Frames, Masks, Features, Matching, Mapping, Align, Dense, Geometry, Finishing
 };
-inline constexpr int kNumStages = 7;
+inline constexpr int kNumStages = 9;
 
 enum class StageStatus { Pending, Running, Done, Skipped, Failed };
 
 struct StageProgress {
     StageStatus status = StageStatus::Pending;
-    float   fraction = -1.0f;    // 0..1, or -1 when the step cannot estimate one
+    float   fraction = -1.0f;    // 0..1 of the work, or -1 when the step cannot estimate one
     int64_t done = 0, total = 0;
     std::string detail;          // already formatted; the line under the bar
+    ProgressClock clock;         // what the bar draws: time, not `fraction`
 };
+
+// How much the view changed along one input, for the panel that watches the
+// adaptive pass. `speed` is the mean over each slice of the capture and `kept`
+// the rate the plan settled on; a folder of photographs has neither.
+struct ScanRow {
+    std::string name;
+    bool video = false;
+    int64_t frames = 0;         // source frames, or photographs
+    bool started = false;       // false for a row this run will not measure
+    float done = 0.0f;          // 0..1 through the measuring pass
+    std::vector<float> speed;
+    std::vector<int32_t> hits;  // steps that landed in each slice, for the mean
+    std::vector<float> kept;    // empty until the plan is made
+    int64_t kept_n = 0;         // frames the plan keeps
+};
+
+// Enough that a burst of motion is a spike rather than a wide block, and few
+// enough that a plan of forty frames still fills some of them.
+inline constexpr int kScanSlices = 192;
 
 // A line of a run's output. `detail` is the stream a developer reads; the rest
 // is the handful worth showing without asking for it.
@@ -46,9 +69,11 @@ class RunProgress {
 public:
     void reset();
 
-    // Enter a step. Everything before it still Pending becomes Skipped, so a
-    // run that masks nothing does not leave "Masks" looking like it is next.
+    // Enter a step; everything before it still Pending becomes Skipped. The
+    // running step entered with a new label is a new phase counting something
+    // new, and its bar and clock start over; detail() only relabels.
     void enter(Stage s, const std::string& detail);
+    void restart(Stage s);
     void count(Stage s, int64_t done, int64_t total);
     void fraction(Stage s, float f);
     void detail(Stage s, const std::string& text);
@@ -58,6 +83,16 @@ public:
 
     void note(const std::string& text, bool detail);
     void note(Stage s, const std::string& text, bool detail);
+
+    // The adaptive pass as the panel watching it draws (ScanRow): the inputs
+    // it will cover, one measured step folded in, and the spacing a row ended
+    // up with. `scanning` is what says the panel is the one worth showing.
+    void scan_reset(std::vector<ScanRow> rows);
+    void scan_open(size_t row);
+    void scan_step(size_t row, int64_t at, int64_t of, float cost);
+    void scan_kept(size_t row, std::vector<float> bars, int64_t kept);
+    std::vector<ScanRow> scan() const;
+    bool scanning() const;
 
     std::vector<RunLine> drain();
     StageProgress stage(Stage s) const;
@@ -71,6 +106,7 @@ private:
     StageProgress _st[kNumStages];
     Stage _cur = Stage::Frames;
     std::vector<RunLine> _pending;
+    std::vector<ScanRow> _scan;
 };
 
 }  // namespace gui

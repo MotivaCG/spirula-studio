@@ -67,6 +67,11 @@ struct Mask {
         return bits[(size_t)my * width + mx] != 0;
     }
 
+    // Swap keep and ignore, for the exporters that paint the region to REMOVE.
+    void invert() {
+        for (uint8_t& b : bits) b = (uint8_t)!b;
+    }
+
     // Fraction of the mask that is "keep". Reported so a run that masks away
     // almost everything (an inverted mask, the classic mistake) is visible.
     double keepFraction() const {
@@ -118,6 +123,26 @@ inline uint32_t applyMask(FeatureSet& fs, const Mask& m) {
     return n - out;
 }
 
+// Keep only what both keep (--masks and --feature-masks), on the finer of the
+// two grids with the other sampled in uv, so the two need not share a
+// resolution. An empty mask keeps everything.
+inline void intersectMask(Mask& a, const Mask& b) {
+    if (b.empty()) return;
+    if (a.empty()) {
+        a = b;
+        return;
+    }
+    const bool b_finer = b.pixels() > a.pixels();
+    Mask fine = b_finer ? b : a;
+    const Mask& coarse = b_finer ? a : b;
+    for (int y = 0; y < fine.height; y++)
+        for (int x = 0; x < fine.width; x++) {
+            uint8_t& v = fine.bits[(size_t)y * fine.width + x];
+            if (v) v = coarse.atUV((x + 0.5f) / fine.width, (y + 0.5f) / fine.height);
+        }
+    a = std::move(fine);
+}
+
 // ---- finding the mask that belongs to an image --------------------------
 
 namespace detail {
@@ -144,6 +169,18 @@ inline std::string stripMaskTag(const std::string& s) {
         if (s.size() > n && s.compare(s.size() - n, n, t) == 0) return s.substr(0, s.size() - n);
     }
     return s;
+}
+
+// RealityScan appends an index to the image's FILE name ("00002.jpg_00096");
+// "img_0012" keeps its digits, or every frame of a clip would claim "img".
+inline std::string stripIndexSuffix(const std::string& s) {
+    size_t underscore = s.rfind('_');
+    if (underscore == std::string::npos || underscore + 1 >= s.size()) return s;
+    for (size_t i = underscore + 1; i < s.size(); ++i) {
+        if (!std::isdigit((unsigned char)s[i])) return s;
+    }
+    const std::string base = s.substr(0, underscore);
+    return stripExt(base) != base ? base : s;
 }
 
 inline std::string baseName(const std::string& s) {
@@ -202,7 +239,17 @@ public:
             if (fs::exists(p, ec)) return p.string();
         }
         for (const char* e : kExts) {
-            fs::path p = dir_ / (stem + "_mask" + e);
+            fs::path p = dir_ / (rel_name + ".mask" + e);
+            if (fs::exists(p, ec)) return p.string();
+            p = dir_ / (stem + ".mask" + e);
+            if (fs::exists(p, ec)) return p.string();
+            p = dir_ / (rel_name + "_mask" + e);
+            if (fs::exists(p, ec)) return p.string();
+            p = dir_ / (stem + "_mask" + e);
+            if (fs::exists(p, ec)) return p.string();
+            p = dir_ / (rel_name + "-mask" + e);
+            if (fs::exists(p, ec)) return p.string();
+            p = dir_ / (stem + "-mask" + e);
             if (fs::exists(p, ec)) return p.string();
         }
         // Fall back to the stripped-name index.
@@ -260,19 +307,25 @@ private:
             const std::string low = lowerStr(rel);
             const std::string s1 = stripExt(low);       // "00023.jpg.png" -> "00023.jpg"
             const std::string s2 = stripExt(s1);        //                 -> "00023"
+            const std::string t1 = stripMaskTag(s1);
+            const std::string t2 = stripMaskTag(s2);
             // Levels: 0 = full name, 1 = one extension off, 2 = two off or a
             // mask marker off, +4 for the basename-only forms (which only ever
             // resolve a flat mask directory against nested images).
             claim(low, rel, 0);
             claim(s1, rel, 1);
             claim(s2, rel, 2);
-            claim(stripMaskTag(s1), rel, 2);
-            claim(stripMaskTag(s2), rel, 2);
+            claim(t1, rel, 2);
+            claim(t2, rel, 2);
+            claim(stripIndexSuffix(t1), rel, 3);
+            claim(stripIndexSuffix(t2), rel, 3);
             claim(baseName(low), rel, 4);
             claim(baseName(s1), rel, 5);
             claim(baseName(s2), rel, 6);
-            claim(baseName(stripMaskTag(s1)), rel, 6);
-            claim(baseName(stripMaskTag(s2)), rel, 6);
+            claim(baseName(t1), rel, 6);
+            claim(baseName(t2), rel, 6);
+            claim(baseName(stripIndexSuffix(t1)), rel, 7);
+            claim(baseName(stripIndexSuffix(t2)), rel, 7);
         }
     }
 

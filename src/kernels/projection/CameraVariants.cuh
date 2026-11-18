@@ -12,7 +12,6 @@
     F(PINHOLE,         None)          \
     F(PINHOLE,         OpenCV)        \
     F(PINHOLE,         ThinPrism)     \
-    F(PINHOLE,         Rational)      \
     F(FISHEYE,         None)          \
     F(FISHEYE,         OpenCV)        \
     F(FISHEYE,         ThinPrism)     \
@@ -20,3 +19,8 @@
     F(EQUISOLID,       OpenCV)        \
     F(EQUISOLID,       ThinPrism)     \
     F(EQUIRECTANGULAR, None)
+
+// Viewer-only lenses never expand the backward or fused-training kernels.
+#define SS_FOR_EACH_FORWARD_CAMERA_VARIANT(F) \
+    SS_FOR_EACH_CAMERA_VARIANT(F)             \
+    F(ORTHOGRAPHIC, None)

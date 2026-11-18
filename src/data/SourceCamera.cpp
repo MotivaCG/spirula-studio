@@ -2,9 +2,7 @@
 
 #include <cmath>
 
-// Transcribed from colmap/src/colmap/sensor/models.h (FOVCameraModel,
-// SimpleDivisionCameraModel, DivisionCameraModel, EUCMCameraModel,
-// RadTanThinPrismFisheyeModel::Distortion) and, for kSkewed, from
+// Transcribed from colmap/src/colmap/sensor/models.h and, for kSkewed, from
 // shaders/camera_source.slang. Only the forward direction is needed: the
 // fitter samples it and the re-distort kernel re-evaluates it.
 
@@ -30,6 +28,22 @@ bool project_fov(const float* prm, double X, double Y, double Z,
     }
     *u = prm[0] * x * factor + prm[2];
     *v = prm[1] * y * factor + prm[3];
+    return true;
+}
+
+// COLMAP FULL_OPENCV, OpenCV's 8-coefficient rational lens. `prm` is COLMAP's
+// own order: fx fy cx cy k1 k2 p1 p2 k3 k4 k5 k6.
+bool project_full_opencv(const float* prm, double X, double Y, double Z,
+                         double* u, double* v) {
+    if (Z < 1e-12) return false;
+    double x = X / Z, y = Y / Z;
+    double r2 = x*x + y*y;
+    double den = 1.0 + r2*(prm[9] + r2*(prm[10] + r2*prm[11]));
+    if (!(den > 1e-6)) return false;
+    double radial = (1.0 + r2*(prm[4] + r2*(prm[5] + r2*prm[8]))) / den;
+    double p1 = prm[6], p2 = prm[7];
+    *u = prm[0] * (x*radial + 2.0*p1*x*y + p2*(r2 + 2.0*x*x)) + prm[2];
+    *v = prm[1] * (y*radial + 2.0*p2*x*y + p1*(r2 + 2.0*y*y)) + prm[3];
     return true;
 }
 
@@ -126,6 +140,8 @@ bool project_raw(int model_id, const float* params,
             return project_skewed(params, X, Y, Z, u, v);
         case kColmapFOV:
             return project_fov(params, X, Y, Z, u, v);
+        case kColmapFullOpenCV:
+            return project_full_opencv(params, X, Y, Z, u, v);
         case kColmapSimpleDivision:
             return project_division(params, true, X, Y, Z, u, v);
         case kColmapDivision:
@@ -164,16 +180,25 @@ bool unfolded(int model_id, const float* params, double X, double Y, double Z,
 
 }  // namespace
 
-void rescale(int model_id, float* params, double s) {
-    if (!(s > 0.0) || s == 1.0) return;
-    // Everything else is on the normalized plane and scale-free: FOV's omega,
-    // the division models' k, EUCM's alpha/beta, the radial and tangential
-    // coefficients. SIMPLE_DIVISION is the one model with a single focal
-    // length, which shifts its principal point down a slot.
-    int n = 4;
-    if (model_id == kColmapSimpleDivision) n = 3;
-    if (model_id == kSkewed) n = 5;             // ... plus the skew
-    for (int i = 0; i < n; i++) params[i] = (float)(params[i] / s);
+// Everything not touched here is on the normalized plane and scale-free: FOV's
+// omega, the division models' k, EUCM's alpha/beta, the radial and tangential
+// coefficients.
+void rescale(int model_id, float* params, double sx, double sy) {
+    if (!(sx > 0.0) || !(sy > 0.0) || (sx == 1.0 && sy == 1.0)) return;
+    if (model_id == kColmapSimpleDivision) {
+        // One focal length for both axes, so a non-square resize cannot be
+        // represented; sx keeps the horizontal field right. cx/cy shift down a slot.
+        params[0] = (float)(params[0] * sx);
+        params[1] = (float)(params[1] * sx);
+        params[2] = (float)(params[2] * sy);
+        return;
+    }
+    params[0] = (float)(params[0] * sx);   // fx
+    params[1] = (float)(params[1] * sy);   // fy
+    params[2] = (float)(params[2] * sx);   // cx
+    params[3] = (float)(params[3] * sy);   // cy
+    if (model_id == kSkewed)
+        params[4] = (float)(params[4] * sx);   // x-pixels per unit normalized y
 }
 
 bool project(int model_id, const float* params,

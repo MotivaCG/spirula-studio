@@ -28,6 +28,7 @@ namespace SlangProjectionUtils {
 #include "core/CameraDistortion.cuh"
 
 #include <core/Common.cuh>
+#include "core/AabbQuant.cuh"
 
 
 #ifndef IS_EVAL3D
@@ -55,7 +56,7 @@ template <
 #if IS_EVAL3D
     bool output_viewmat_grad,
 #endif
-    bool output_accum_weight,
+    DensifyAccumMode accum_mode,
     bool output_median
 >
 #if IS_EVAL3D
@@ -74,12 +75,13 @@ __global__ void rasterize_to_pixels_bwd_kernel(
     const float *__restrict__ viewmats, // [B, C, 4, 4]
     const float4 *__restrict__ intrins,  // [B, C, 4], fx, fy, cx, cy
     const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
-    const float4 *__restrict__ aabb,  // [..., N] projected 2D AABB (xmin,ymin,xmax,ymax)
+    const uint2 *__restrict__ aabb,   // [..., N] packed, core/AabbQuant.cuh
 #endif
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_width,
     const uint32_t tile_height,
+    const int macro_log2,
     const int32_t *__restrict__ tile_offsets, // [..., tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
     // fwd outputs
@@ -94,10 +96,18 @@ __global__ void rasterize_to_pixels_bwd_kernel(
     const float *__restrict__ v_render_Ts, // [..., image_height, image_width, 1]
     const float *__restrict__ v_median, // [..., image_height, image_width, 1], optional
     RenderOutput::Buffer v_distortions_output_buffer,
+    // With no RGB distortion gradient buffer, that gradient is this multiple of
+    // the depth channel's (the loss gives both the same mask and normalizer).
+    const float v_dist_rgb_per_depth,
     // grad inputs
     typename SplatPrimitive::WorldBuffer v_splat_wbuffer,
     typename SplatPrimitive::ScreenBuffer v_splat_sbuffer,
-    float *__restrict__ o_accum_weight
+    float *__restrict__ o_accum_weight,
+    float *__restrict__ o_accum_weight_den,  // Avg lane 2, else null
+    // Peak alpha * T per splat, atomic-maxed times max_weight_scale; null = off.
+    float *__restrict__ o_max_weight,
+    const float max_weight_scale,
+    const float kernel_cut  // Primitive3DGS::kernel_vis; the 2D path only
 #if IS_EVAL3D
     ,
     float *__restrict__ v_viewmats // [B, C, 4, 4]
@@ -106,8 +116,12 @@ __global__ void rasterize_to_pixels_bwd_kernel(
     auto block = cg::this_thread_block();
     cg::thread_block_tile<WARP_SIZE> warp = cg::tiled_partition<WARP_SIZE>(block);
     uint32_t image_id = block.group_index().x;
-    uint32_t tile_id = (block.group_index().y * TILE_SIZE_DY / (TILE_SIZE_Y * MACRO_TILE_SIZE_Y)) * tile_width +
-        (block.group_index().z * TILE_SIZE_DX / (TILE_SIZE_X * MACRO_TILE_SIZE_X));
+    // floor(floor(a/b)/M) == floor(a/(b*M)) for non-negative ints, so the
+    // macro factor folds out of the divisor into a shift.
+    uint32_t tile_id =
+        ((block.group_index().y * TILE_SIZE_DY / TILE_SIZE_Y) >> macro_log2) *
+            tile_width +
+        ((block.group_index().z * TILE_SIZE_DX / TILE_SIZE_X) >> macro_log2);
     uint32_t thread_id = block.thread_rank();
 
     tile_offsets += image_id * tile_height * tile_width;
@@ -156,6 +170,7 @@ __global__ void rasterize_to_pixels_bwd_kernel(
     [[maybe_unused]] __shared__ DStore v_distortion_out[dist_any(dist_type) ? BLOCK_SIZE : 1];
     [[maybe_unused]] __shared__ float dist_W[dist_any(dist_type) ? BLOCK_SIZE : 1];        // 1 - T_final
 
+    constexpr bool output_accum_weight = accum_any(accum_mode);
     __shared__ float accum_weight_map[output_accum_weight ? BLOCK_SIZE : 1];
 
     // median depth backward state (per pixel). v_median = dL/d(median depth).
@@ -177,6 +192,7 @@ __global__ void rasterize_to_pixels_bwd_kernel(
     constexpr uint SPLAT_BATCH_SIZE_CONST = dist_any(dist_type) ?
         SPLAT_BATCH_SIZE_WITH_DISTORTION : SPLAT_BATCH_SIZE_NO_DISTORTION;
 
+    int32_t bin_max = -1;
     #pragma unroll
     for (uint pix_id0 = 0; pix_id0 < BLOCK_SIZE; pix_id0 += SPLAT_BATCH_SIZE_CONST) {
         static_assert(BLOCK_SIZE % SPLAT_BATCH_SIZE_CONST == 0);
@@ -211,7 +227,8 @@ __global__ void rasterize_to_pixels_bwd_kernel(
              : RenderOutput::zero());
         if constexpr (RenderOutput::has_depth(SplatPrimitive::pixelType)) {
             float inv_alpha = 1.0f / fmaxf(1.0f - render_Ts_local, 1e-10f);  // 1/W
-            float exp_depth = (inside ? render_output_buffer.depths[pix_id_image_global] : 0.0f);
+            float exp_depth = (inside && render_output_buffer.depths) ?
+                render_output_buffer.depths[pix_id_image_global] : 0.0f;
             if constexpr (dist_has_depth(dist_type)) {
                 // Log-depth render: depth = exp(m), m = C_logz/W = ln(depth).
                 // dL/dC_logz = v_d * depth / W;  dL/dT = v_d * depth * m / W.
@@ -251,9 +268,18 @@ __global__ void rasterize_to_pixels_bwd_kernel(
                 : RenderOutput::zero());
             float invW = W > 1e-10f ? (1.0f / W) : 0.0f;
             pix2_colors[pix_id_local] = (Dval + C * C) * invW;
-            v_distortion_out[pix_id_local] = (inside ?
-                v_distortions_output_buffer.loadDistortion<dist_type>(pix_id_image_global)
-                : RenderOutput::zero());
+            RenderOutput v_d = RenderOutput::zero();
+            if (inside) {
+                if (dist_has_rgb(dist_type) && v_distortions_output_buffer.rgbs == nullptr) {
+                    constexpr DistortionType no_rgb = dist_has_normal(dist_type) ?
+                        DistortionType::DN : DistortionType::D;
+                    v_d = v_distortions_output_buffer.loadDistortion<no_rgb>(pix_id_image_global);
+                    v_d.rgb = make_float3(v_d.depth * v_dist_rgb_per_depth);
+                } else {
+                    v_d = v_distortions_output_buffer.loadDistortion<dist_type>(pix_id_image_global);
+                }
+            }
+            v_distortion_out[pix_id_local] = v_d;
             dist_W[pix_id_local] = W;
         }
 
@@ -275,7 +301,9 @@ __global__ void rasterize_to_pixels_bwd_kernel(
             median_pending_zfar[pix_id_local] = 0.0f;
             median_pending_Tfar[pix_id_local] = 0.0f;
         }
+        bin_max = max(bin_max, bin_final);
     }
+    bin_max = cg::reduce(warp, bin_max, cg::greater<int32_t>());
     block.sync();
 
     // threads fist load splats, then swept through pixels
@@ -293,20 +321,16 @@ __global__ void rasterize_to_pixels_bwd_kernel(
         SPLAT_BATCH_SIZE = min(SPLAT_BATCH_SIZE_CONST, max(SPLAT_BATCH_SIZE, 1u));
     }
     // ---- microtile survivor compaction ------------------------------------
-    // The block owns one TILE_SIZE_DX x TILE_SIZE_DY sub-tile, but the macro-tile
-    // range it reads is >80% gaussians that never touch this sub-tile. The
-    // diagonal sweep length is fixed by the number of gaussians processed, so
-    // per-thread culling alone gives no speedup (culled lanes just idle while the
-    // warp still iterates). Instead we scan the range back-to-front, compact the
-    // survivors (same ellipse-vs-box test as the forward sub-tile mask) into
-    // shared, and only sweep those. surv[] is kept strictly back-to-front so the
-    // per-pixel undo stays a continuous back-to-front walk across batches.
+    // >80% of the macro-tile range never touches this sub-tile, and culled lanes
+    // only idle: compact back-to-front so each pixel's undo stays one walk.
+
     constexpr int SURV_CAP = 8 * (int)WARP_SIZE;
     __shared__ int32_t surv[SURV_CAP];
     const float cull_bx0 = (float)(blockIdx.z * TILE_SIZE_DX);
     const float cull_by0 = (float)(blockIdx.y * TILE_SIZE_DY);
 
-  for (int32_t scan_end = range_end - 1; scan_end >= range_start; ) {
+  // Nothing past the tile's deepest surviving fragment can contribute.
+  for (int32_t scan_end = min(range_end - 1, bin_max); scan_end >= range_start; ) {
 
     // fill surv[] with up to SURV_CAP survivors (back-to-front). The loop bounds
     // (s, count) are warp-uniform, so __ballot_sync stays convergent.
@@ -322,9 +346,8 @@ __global__ void rasterize_to_pixels_bwd_kernel(
             // the AABB center (matches the tile intersector / forward mask).
             float c_opac = splat_sbuffer.opacities(sid);
             float3 c_conic = splat_sbuffer.scales(sid);
-            float4 c_bb = aabb[sid];
-            float c_ex = 0.5f * (c_bb.x + c_bb.z);
-            float c_ey = 0.5f * (c_bb.y + c_bb.w);
+            float2 c_ec = aabb16_center(aabb[sid], image_width, image_height);
+            float c_ex = c_ec.x, c_ey = c_ec.y;
         #else
             float c_opac = splat_sbuffer.opac(sid);
             float3 c_conic = splat_sbuffer.conic(sid);
@@ -332,7 +355,7 @@ __global__ void rasterize_to_pixels_bwd_kernel(
             float c_ex = c_xy.x, c_ey = c_xy.y;
         #endif
             if (c_opac > ALPHA_THRESHOLD) {
-                float kk = 0.5f / __logf(c_opac / ALPHA_THRESHOLD);
+                float kk = 0.5f / kernel_reach(c_opac, IS_EVAL3D ? 0.f : kernel_cut);
                 float3 inv_cov = { c_conic.x*kk, c_conic.y*kk, c_conic.z*kk };
                 ok = ellipse_box_overlap_test(inv_cov,
                     cull_bx0 - c_ex, cull_bx0 + TILE_SIZE_DX - c_ex,
@@ -370,6 +393,12 @@ __global__ void rasterize_to_pixels_bwd_kernel(
         // accumulate gradient
         typename SplatPrimitive::FragmentBwd v_splat = SplatPrimitive::FragmentBwd::zero(splat);
         [[maybe_unused]] float accum_weight = 0.0f;
+        [[maybe_unused]] float accum_weight_den = 0.0f;
+        float max_weight = 0.0f;
+        // A survivor overlaps the sub-tile but often clears no pixel's alpha
+        // threshold; its gradient is then all zeros and the ~12 atomics that
+        // write it are pure cost.
+        bool touched = false;
 
         // at t=0, thread 0 (back-most survivor) undoes pixel 0; at t=1 it undoes
         // pixel 1 while thread 1 undoes pixel 0; etc. -> each pixel sees survivors
@@ -400,7 +429,7 @@ __global__ void rasterize_to_pixels_bwd_kernel(
             if (alpha <= ALPHA_THRESHOLD || dot(ray_d, ray_d) == 0.0f)
                 continue;
         #else
-            float alpha = splat.evaluate_alpha(px, py);
+            float alpha = splat.evaluate_alpha(px, py, kernel_cut);
             if (alpha <= ALPHA_THRESHOLD)
                 continue;
         #endif
@@ -412,6 +441,7 @@ __global__ void rasterize_to_pixels_bwd_kernel(
         #else
             RenderOutput color = splat.evaluate_color(px, py);
         #endif
+            touched = true;
 
             // printf("t=%d, thread %u, splat %d (%u), pix_id %d, pix %d %d\n", t, thread_id, splat_idx-range_start, splat_gid, pix_id, pix_global_x, pix_global_y);
 
@@ -530,14 +560,22 @@ __global__ void rasterize_to_pixels_bwd_kernel(
                 splat.evaluate_alpha_vjp(ray_o, ray_d, v_alpha, v_splat, v_ray_o_alpha, v_ray_d_alpha);
                 splat.evaluate_color_vjp(ray_o, ray_d, v_color, v_splat, v_ray_o_color, v_ray_d_color);
             #else
-                splat.evaluate_alpha_vjp(px, py, v_alpha, v_splat);
+                splat.evaluate_alpha_vjp(px, py, v_alpha, v_splat, kernel_cut);
                 splat.evaluate_color_vjp(px, py, v_color, v_splat);
             #endif
             }
 
+            if (o_max_weight != nullptr)
+                max_weight = fmaxf(max_weight, alpha * T0);
             if constexpr (output_accum_weight) {
-                // accum_weight += accum_weight_map[pix_id] * alpha * T0;
-                accum_weight = fmaxf(accum_weight, accum_weight_map[pix_id] * alpha * T0);
+                const float w = alpha * T0;  // this splat's contribution here
+                if constexpr (accum_mode == DensifyAccumMode::Max) {
+                    accum_weight = fmaxf(accum_weight, accum_weight_map[pix_id] * w);
+                } else {
+                    accum_weight += accum_weight_map[pix_id] * w;
+                    if constexpr (accum_mode == DensifyAccumMode::Avg)
+                        accum_weight_den += w;
+                }
             }
 
         #if IS_EVAL3D
@@ -554,12 +592,22 @@ __global__ void rasterize_to_pixels_bwd_kernel(
         }
 
         // accumulate gradient (only survivors reach here)
-        if (active) {
+        if (active && touched) {
             v_splat.atomicStore(v_splat_wbuffer, v_splat_sbuffer, splat_wid, splat_sid);
             if constexpr (output_accum_weight) {
-                // atomicAddFVec(o_accum_weight + splat_wid, accum_weight);
-                atomicMax(o_accum_weight + splat_wid, accum_weight);
+                if constexpr (accum_mode == DensifyAccumMode::Max) {
+                    atomicMax(o_accum_weight + splat_wid, accum_weight);
+                } else {
+                    atomicAdd(o_accum_weight + splat_wid, accum_weight);
+                    // Denominator lane: planar, so the numerator stays a
+                    // contiguous [N] score once finalize divides in place.
+                    if constexpr (accum_mode == DensifyAccumMode::Avg)
+                        atomicAdd(o_accum_weight_den + splat_wid,
+                                  accum_weight_den);
+                }
             }
+            if (o_max_weight != nullptr && max_weight > 0.0f)
+                atomicMax(o_max_weight + splat_wid, max_weight * max_weight_scale);
         }
     }  // for splat_b (within segment)
 
@@ -629,7 +677,7 @@ template <
 #if IS_EVAL3D
     bool output_viewmat_grad,
 #endif
-    bool output_accum_weight,
+    DensifyAccumMode accum_mode,
     bool output_median
 >
 #if IS_EVAL3D
@@ -649,12 +697,13 @@ void rasterize_to_pixels_bwd_kernel_wrapper(
     const float *__restrict__ viewmats, // [B, C, 4, 4]
     const float4 *__restrict__ intrins,  // [B, C, 4], fx, fy, cx, cy
     const CameraDistortionCoeffsBuffer dist_coeffs_buffer,
-    const float4 *__restrict__ aabb,  // [..., N] projected 2D AABB (xmin,ymin,xmax,ymax)
+    const uint2 *__restrict__ aabb,   // [..., N] packed, core/AabbQuant.cuh
 #endif
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_width,
     const uint32_t tile_height,
+    const int macro_log2,
     const int32_t *__restrict__ tile_offsets, // [..., tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
     // fwd outputs
@@ -669,10 +718,18 @@ void rasterize_to_pixels_bwd_kernel_wrapper(
     const float *__restrict__ v_render_Ts, // [..., image_height, image_width, 1]
     const float *__restrict__ v_median, // [..., image_height, image_width, 1], optional
     RenderOutput::Buffer v_distortions_output_buffer,
+    // With no RGB distortion gradient buffer, that gradient is this multiple of
+    // the depth channel's (the loss gives both the same mask and normalizer).
+    const float v_dist_rgb_per_depth,
     // grad inputs
     typename SplatPrimitive::WorldBuffer v_splat_wbuffer,
     typename SplatPrimitive::ScreenBuffer v_splat_sbuffer,
-    float *__restrict__ o_accum_weight
+    float *__restrict__ o_accum_weight,
+    float *__restrict__ o_accum_weight_den,  // Avg lane 2, else null
+    // Peak alpha * T per splat, atomic-maxed times max_weight_scale; null = off.
+    float *__restrict__ o_max_weight,
+    const float max_weight_scale,
+    const float kernel_cut  // Primitive3DGS::kernel_vis; the 2D path only
 #if IS_EVAL3D
     ,
     float *__restrict__ v_viewmats // [B, C, 4, 4]
@@ -683,8 +740,8 @@ void rasterize_to_pixels_bwd_kernel_wrapper(
         1, 1};
     dim3 grid = {
         I,
-        tile_height * (TILE_SIZE_Y * MACRO_TILE_SIZE_Y / TILE_SIZE_DY),
-        tile_width * (TILE_SIZE_X * MACRO_TILE_SIZE_X / TILE_SIZE_DX)
+        (tile_height << macro_log2) * (TILE_SIZE_Y / TILE_SIZE_DY),
+        (tile_width << macro_log2) * (TILE_SIZE_X / TILE_SIZE_DX)
     };
 
 #if IS_EVAL3D
@@ -700,7 +757,7 @@ void rasterize_to_pixels_bwd_kernel_wrapper(
     #if IS_EVAL3D
         output_viewmat_grad,
     #endif
-        output_accum_weight,
+        accum_mode,
         output_median
     ><<<grid, threads, 0, stream>>>(
         I, N, n_isects,
@@ -708,15 +765,20 @@ void rasterize_to_pixels_bwd_kernel_wrapper(
     #if IS_EVAL3D
         viewmats, intrins, dist_coeffs_buffer, aabb,
     #endif
-        image_width, image_height, tile_width, tile_height,
+        image_width, image_height, tile_width, tile_height, macro_log2,
         tile_offsets, flatten_ids,
         render_Ts, last_ids,
         render_output_buffer, render_distortion_buffer, loss_map_buffer, accum_weight_map_buffer,
         v_render_output_buffer, v_render_Ts,
         v_median,
         v_distortions_output_buffer,
+        v_dist_rgb_per_depth,
         v_splat_wbuffer, v_splat_sbuffer,
-        o_accum_weight
+        o_accum_weight,
+        o_accum_weight_den,
+        o_max_weight,
+        max_weight_scale,
+        kernel_cut
     #if IS_EVAL3D
         , v_viewmats
     #endif

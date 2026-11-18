@@ -13,8 +13,10 @@
 
 #include "nn/io/Image.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace video {
 
@@ -25,6 +27,30 @@ struct VideoInfo {
     double fps = 0.0;
     std::string codec;        // "h264" | "h265" | "av1"
 };
+
+// Container metadata without a decode session: the header tables the
+// demuxer reads, nothing on the GPU. `tracks` counts the file's video
+// tracks; width/height/fps/frame_count/codec are the first track's.
+struct VideoProbe {
+    int         tracks = 0;
+    int         width = 0;
+    int         height = 0;
+    int64_t     frame_count = 0;   // 0 when the container does not state it
+    double      fps = 0.0;
+    std::string codec;             // "h264" | "h265" | "av1"
+};
+
+// What a file contains, without the decode session open() builds. False
+// with `error` set when the file has no readable video track.
+bool probe_video(const std::string& path, VideoProbe& out, std::string& error);
+
+// A HEIF still (.heic): its primary image's H.265 tiles decoded and composed,
+// then cropped and turned as the container asks. `exif`, when given, gets the
+// JPEG APP1 payload ("Exif\0\0" + TIFF) or nothing. One decode at a time.
+bool decode_heif(const std::string& path, nn::Image& out, std::vector<uint8_t>* exif,
+                 std::string& error);
+// Its displayed size, from the container alone.
+bool probe_heif(const std::string& path, int& width, int& height, std::string& error);
 
 class VideoReader {
 public:

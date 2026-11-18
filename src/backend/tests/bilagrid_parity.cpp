@@ -92,6 +92,15 @@ struct Rng {
         for (auto& x : v) x = uf(lo, hi);
         return v;
     }
+
+    // An upstream gradient with the first half of the pixels at EXACTLY zero,
+    // as a loss mask leaves them -- which is the only thing the backward's
+    // skip path keys on, and random values never are.
+    std::vector<float> vgrad(int64_t n_pix, int c, float lo, float hi) {
+        std::vector<float> v = vec(n_pix * c, lo, hi);
+        for (int64_t i = 0; i < n_pix / 2 * c; i++) v[i] = 0.0f;
+        return v;
+    }
 };
 
 // A grid + optional q16 encoding (built on-device via
@@ -147,7 +156,7 @@ void test_affine(Rng& r) {
                                         backend::kDefaultStream, gi);
         readback_f(g_tight, out, 3 * np);
 
-        float* v_out = upload(r.vec(3 * np, -0.5f, 0.5f));
+        float* v_out = upload(r.vgrad(np, 3, -0.5f, 0.5f));
         float* v_grid = alloc_zero<float>((int64_t)N_img * 12 * L * Hg * Wg);
         float* v_rgb = alloc_zero<float>(3 * np);
         bilagrid_uniform_sample_backward_v1(g.reader(vq != 0), rgb, v_out,
@@ -172,7 +181,7 @@ void test_affine(Rng& r) {
         Grid g = make_grid(r, N_img, 12, Ls, Hs, Ws, -0.6f, 1.0f, false);
         int64_t np = (int64_t)N_img * h * w;
         float* rgb = upload(r.vec(3 * np, 0.0f, 1.0f));
-        float* v_out = upload(r.vec(3 * np, -0.2f, 0.2f));
+        float* v_out = upload(r.vgrad(np, 3, -0.2f, 0.2f));
         float* v_grid = alloc_zero<float>((int64_t)N_img * 12 * Ls * Hs * Ws);
         float* v_rgb = alloc_zero<float>(3 * np);
         bilagrid_uniform_sample_backward_v1(g.reader(false), rgb, v_out,
@@ -202,7 +211,7 @@ void test_affine(Rng& r) {
                                         backend::kDefaultStream);
         readback_f(g_tight, out, 3 * np);
 
-        float* v_out = upload(r.vec(3 * np, -0.5f, 0.5f));
+        float* v_out = upload(r.vgrad(np, 3, -0.5f, 0.5f));
         float* v_grid = alloc_zero<float>((int64_t)N_img * 12 * L * Hg * Wg);
         float* v_rgb = alloc_zero<float>(3 * np);
         bilagrid_patched_sample_backward_v1(
@@ -232,7 +241,7 @@ void test_affine(Rng& r) {
                                 Hg, Wg, m, h, w, backend::kDefaultStream);
         readback_f(g_tight, out, 3 * np);
 
-        float* v_out = upload(r.vec(3 * np, -0.5f, 0.5f));
+        float* v_out = upload(r.vgrad(np, 3, -0.5f, 0.5f));
         for (int with_coords = 0; with_coords < 2; with_coords++) {
             float* v_grid =
                 alloc_zero<float>((int64_t)N_img * 12 * L * Hg * Wg);
@@ -253,11 +262,11 @@ void test_affine(Rng& r) {
  * PPISP family (autodiff-vs-handwritten bwd -> loose gradients)
  * ======================================================================== */
 
-void test_ppisp(Rng& r) {
-    const int L = 5, Hg = 6, Wg = 8;
+void test_ppisp(Rng& r, int L = 5) {
+    const int Hg = 6, Wg = 8;
 
     for (int vq = 0; vq < 2; vq++) {
-        const int N_img = 2, N_grids = 2, h = 30, w = 36;
+        const int N_img = 2, N_grids = 2, h = 96, w = 128;
         Grid g = make_grid(r, N_grids, 9, L, Hg, Wg, -0.7f, 0.7f, vq != 0);
         int64_t np = (int64_t)N_img * h * w;
         float* rgb = upload(r.vec(3 * np, 0.0f, 1.0f));
@@ -268,11 +277,36 @@ void test_ppisp(Rng& r) {
                                               nullptr);
         readback_f(g_tight, out, 3 * np);
 
-        float* v_out = upload(r.vec(3 * np, -0.4f, 0.4f));
+        float* v_out = upload(r.vgrad(np, 3, -0.4f, 0.4f));
         float* v_grid = alloc_zero<float>((int64_t)N_img * 9 * L * Hg * Wg);
         float* v_rgb = alloc_zero<float>(3 * np);
         bilagrid_ppisp_uniform_sample_backward_v1(
             g.reader(vq != 0), rgb, v_out, v_grid, v_rgb, N_img, L, Hg, Wg, h,
+            w, 1, backend::kDefaultStream, nullptr);
+        readback_f(g_loose, v_rgb, 3 * np);
+        readback_f(g_loose, v_grid, (int64_t)N_img * 9 * L * Hg * Wg);
+    }
+
+    // Negative-intensity pixels: ~half push rgi_out.z below the denominator
+    // floor, the one branch where the hand-written CUDA backward and the Slang
+    // autodiff one have to be made to agree.
+    {
+        const int N_img = 2, N_grids = 2, h = 30, w = 36;
+        Grid g = make_grid(r, N_grids, 9, L, Hg, Wg, -0.7f, 0.7f, false);
+        int64_t np = (int64_t)N_img * h * w;
+        float* rgb = upload(r.vec(3 * np, -1.0f, 1.0f));
+        float* out = alloc_zero<float>(3 * np);
+        bilagrid_ppisp_uniform_sample_forward(g.reader(false), rgb, out,
+                                              N_img, L, Hg, Wg, h, w,
+                                              backend::kDefaultStream,
+                                              nullptr);
+        readback_f(g_tight, out, 3 * np);
+
+        float* v_out = upload(r.vgrad(np, 3, -0.4f, 0.4f));
+        float* v_grid = alloc_zero<float>((int64_t)N_img * 9 * L * Hg * Wg);
+        float* v_rgb = alloc_zero<float>(3 * np);
+        bilagrid_ppisp_uniform_sample_backward_v1(
+            g.reader(false), rgb, v_out, v_grid, v_rgb, N_img, L, Hg, Wg, h,
             w, 1, backend::kDefaultStream, nullptr);
         readback_f(g_loose, v_rgb, 3 * np);
         readback_f(g_loose, v_grid, (int64_t)N_img * 9 * L * Hg * Wg);
@@ -297,7 +331,7 @@ void test_ppisp(Rng& r) {
                                               h0, w0, backend::kDefaultStream);
         readback_f(g_tight, out, 3 * np);
 
-        float* v_out = upload(r.vec(3 * np, -0.4f, 0.4f));
+        float* v_out = upload(r.vgrad(np, 3, -0.4f, 0.4f));
         float* v_grid = alloc_zero<float>((int64_t)N_img * 9 * L * Hg * Wg);
         float* v_rgb = alloc_zero<float>(3 * np);
         bilagrid_ppisp_patched_sample_backward_v1(
@@ -320,7 +354,7 @@ void test_ppisp(Rng& r) {
                                       backend::kDefaultStream);
         readback_f(g_tight, out, 3 * np);
 
-        float* v_out = upload(r.vec(3 * np, -0.4f, 0.4f));
+        float* v_out = upload(r.vgrad(np, 3, -0.4f, 0.4f));
         float* v_grid = alloc_zero<float>((int64_t)N_img * 9 * L * Hg * Wg);
         float* v_coords = alloc_zero<float>(2 * np);
         float* v_rgb = alloc_zero<float>(3 * np);
@@ -376,7 +410,7 @@ void test_loglinear(Rng& r) {
             backend::kDefaultStream, nullptr);
         readback_f(g_tight, out, 3 * np);
 
-        float* v_out = upload(r.vec(3 * np, -0.4f, 0.4f));
+        float* v_out = upload(r.vgrad(np, 3, -0.4f, 0.4f));
         float* v_grid = alloc_zero<float>((int64_t)N_img * 9 * L * Hg * Wg);
         float* v_rgb = alloc_zero<float>(3 * np);
         bilagrid_loglinear_uniform_sample_backward_v1(
@@ -404,7 +438,7 @@ void test_loglinear(Rng& r) {
             h0, w0, backend::kDefaultStream);
         readback_f(g_tight, out, 3 * np);
 
-        float* v_out = upload(r.vec(3 * np, -0.4f, 0.4f));
+        float* v_out = upload(r.vgrad(np, 3, -0.4f, 0.4f));
         float* v_grid = alloc_zero<float>((int64_t)N_img * 9 * L * Hg * Wg);
         float* v_rgb = alloc_zero<float>(3 * np);
         bilagrid_loglinear_patched_sample_backward_v1(
@@ -682,17 +716,19 @@ void test_fused_optim(Rng& r) {
             // Two steps (quantized state needs a second step over encoded
             // state to be meaningful).
             for (int step = 7; step <= 8; step++) {
+                // The second step also scales the image gradient.
+                const float scale = step == 8 ? 0.5f : 1.0f;
                 if (variant == 0) {
                     fused_bilagrid_tv_adam(
                         c.vq ? nullptr : g.fp32, g.q16, g.vbounds, g1, g2,
                         packed, qb4, image_grad, cams, N_grids, C_batch, c.C,
-                        L, Hg, Wg, lr, c.tv_w, step, c.qbits != 0, c.qbits,
-                        c.vq, backend::kDefaultStream);
+                        L, Hg, Wg, lr, c.tv_w, scale, step, c.qbits != 0,
+                        c.qbits, c.vq, backend::kDefaultStream);
                 } else {
                     fused_bilagrid_tv_adagrad(
                         c.vq ? nullptr : g.fp32, g.q16, g.vbounds, g1, packed,
                         qb2, image_grad, cams, N_grids, C_batch, c.C, L, Hg,
-                        Wg, lr, c.tv_w, c.qbits != 0, c.qbits, c.vq,
+                        Wg, lr, c.tv_w, scale, c.qbits != 0, c.qbits, c.vq,
                         backend::kDefaultStream);
                 }
             }
@@ -752,13 +788,13 @@ void test_fold_tail(Rng& r) {
         if (variant == 0) {
             fused_bilagrid_tv_adam(grids, nullptr, nullptr, nullptr, nullptr,
                                    packed, qb4, image_grad, nullptr, N_grids,
-                                   C_batch, C, L, Hg, Wg, lr, 0.0f, 7, true,
-                                   8, false, backend::kDefaultStream);
+                                   C_batch, C, L, Hg, Wg, lr, 0.0f, 1.0f, 7,
+                                   true, 8, false, backend::kDefaultStream);
         } else {
             fused_bilagrid_tv_adagrad(grids, nullptr, nullptr, nullptr,
                                       packed, qb2, image_grad, nullptr,
                                       N_grids, C_batch, C, L, Hg, Wg, lr,
-                                      0.0f, true, 8, false,
+                                      0.0f, 1.0f, true, 8, false,
                                       backend::kDefaultStream);
         }
 
@@ -847,7 +883,12 @@ void test_utils(Rng& r) {
         const size_t n = 1000;
         float* src = upload(r.vec(n, -2.0f, 2.0f));
         float* dst = upload(r.vec(n, -2.0f, 2.0f));
-        ppisp_add_into_grad(src, dst, n, backend::kDefaultStream);
+        ppisp_add_into_grad(src, dst, 1.0f, n, backend::kDefaultStream);
+        readback_f(g_tight, dst, n);
+        // Scaled, with and without something to add.
+        ppisp_add_into_grad(src, dst, 0.25f, n, backend::kDefaultStream);
+        readback_f(g_tight, dst, n);
+        ppisp_add_into_grad(nullptr, dst, 3.0f, n, backend::kDefaultStream);
         readback_f(g_tight, dst, n);
     }
 }
@@ -872,6 +913,8 @@ int main(int argc, char** argv) {
     test_fused_optim(r);
     test_fold_tail(r);
     test_utils(r);
+    Rng single_layer(260729u);
+    test_ppisp(single_layer, 1);
 
     auto write_all = [&](const char* path) {
         std::ofstream f(path, std::ios::binary);

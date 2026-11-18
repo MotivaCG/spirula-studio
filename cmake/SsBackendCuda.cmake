@@ -128,12 +128,13 @@ add_library(csrc STATIC ${SPLAT_SOURCES})
 
 target_include_directories(csrc PRIVATE
     ${SS_SRC}
+    ${SS_SRC}/external/apriltag
     ${CMAKE_BINARY_DIR}      # app_generated/viewer_html.h
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 
 find_package(Threads REQUIRED)
-target_link_libraries(csrc CUDA::cudart Threads::Threads ss_i18n)
+target_link_libraries(csrc CUDA::cudart Threads::Threads ss_i18n ${CMAKE_DL_LIBS})   # dlopen: NVML
 if(OpenMP_CXX_FOUND AND NOT APPLE)
     # OpenMP::OpenMP_CXX's flags are language-guarded, so nvcc never sees them.
     target_link_libraries(csrc OpenMP::OpenMP_CXX)
@@ -141,11 +142,21 @@ endif()
 
 target_compile_options(csrc PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:${SPLAT_CXX_FLAGS}>
+    $<$<COMPILE_LANGUAGE:C>:${SPLAT_C_FLAGS}>
     $<$<COMPILE_LANGUAGE:CUDA>:${SPLAT_NVCC_FLAGS}>
 )
 
 set_property(TARGET csrc PROPERTY CXX_STANDARD 17)
 set_property(TARGET csrc PROPERTY CUDA_STANDARD 17)
+
+# backend/cuda/KernelProfilerCuda.cu interposes cudaLaunchKernel here. Without
+# --wrap its object is never pulled out of the archive and the SS_PROFILE
+# per-kernel table is absent; nothing else changes.
+include(CheckLinkerFlag)
+check_linker_flag(CXX "LINKER:--wrap=cudaLaunchKernel" SS_HAS_LINKER_WRAP)
+if(SS_HAS_LINKER_WRAP)
+    target_link_options(csrc INTERFACE "LINKER:--wrap=cudaLaunchKernel")
+endif()
 
 set(SS_APP_LIBS csrc CUDA::cudart)
 
@@ -165,5 +176,7 @@ if(SS_BUILD_BACKEND_TESTS)
             ${SS_SRC}
             ${CUDAToolkit_INCLUDE_DIRS})
         target_link_libraries(${test_name} PRIVATE csrc CUDA::cudart)
+        target_compile_options(${test_name} PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:${SPLAT_CXX_FLAGS}>)
     endforeach()
 endif()

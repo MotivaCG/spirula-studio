@@ -1,6 +1,7 @@
 #pragma once
 
 #include "backend/api/BackendTypes.h"
+#include "core/SourcePath.h"
 #ifdef __CUDACC__
 #include <cuda_fp16.h>
 #endif
@@ -35,12 +36,32 @@ inline constexpr int WARP_SIZE = 32;
 
 inline constexpr int TILE_SIZE_X = 8;
 inline constexpr int TILE_SIZE_Y = 8;
-inline constexpr int MACRO_TILE_SIZE_X = 2;
-inline constexpr int MACRO_TILE_SIZE_Y = 2;
 
-// The per-microtile forward and the backward work for any macro size; only the
-// (retired) macro-block forward required MACRO_NUM_TILES == WARP_SIZE.
-static_assert(MACRO_TILE_SIZE_X >= 1 && MACRO_TILE_SIZE_Y >= 1);
+// Binning granularity: macro tiles of (TILE_SIZE_X << macro_log2) pixels, one
+// splat list per macro tile, walked by every micro tile in it. Runtime, not a
+// constant -- see docs/notes/binning-tile-size.md.
+inline constexpr int kMacroLog2Default = 1;  // 16 px, the historical tile
+inline constexpr int kMacroLog2Min = 0;      // 8 px
+inline constexpr int kMacroLog2Max = 4;      // 128 px
+// Where the automatic search starts. Coarse on purpose: the pool's high-water
+// only ever grows, so starting fine would pin the intersection buffers at the
+// finest size the run ever touches. Descending reaches the optimum from above.
+inline constexpr int kMacroLog2Start = 3;    // 64 px
+
+inline constexpr int bin_tile_x(int macro_log2) {
+    return TILE_SIZE_X << macro_log2;
+}
+inline constexpr int bin_tile_y(int macro_log2) {
+    return TILE_SIZE_Y << macro_log2;
+}
+
+// Binning tile edge in pixels -> macro_log2, or -1 if it is not a supported
+// power of two.
+inline int macro_log2_from_pixels(int px) {
+    for (int m = kMacroLog2Min; m <= kMacroLog2Max; ++m)
+        if (bin_tile_x(m) == px) return m;
+    return -1;
+}
 
 inline constexpr float ALPHA_THRESHOLD = (1.f/255.f);
 
@@ -76,6 +97,14 @@ static __device__ __forceinline__ bool ellipse_box_overlap_test(
     return fminf(mc, fminf(mx, my) - 1.0f) < 0.f;
 }
 
+// The sigma at which opac * Primitive3DGS::kernel_vis falls to ALPHA_THRESHOLD: the
+// raster cull radius, which the forward and the backward must compute identically.
+static __device__ __forceinline__ float kernel_reach(float opac, float kernel_cut) {
+    if (kernel_cut <= 0.f) return __logf(opac / ALPHA_THRESHOLD);
+    const float ec = __expf(-kernel_cut);
+    return -__logf(ec + (1.f - ec) * (ALPHA_THRESHOLD / opac));
+}
+
 #else  // #ifdef __CUDACC__
 
 template<typename T, size_t SIZE>
@@ -96,6 +125,7 @@ enum class CameraModelType {
     FISHEYE = 1,
     EQUISOLID = 2,
     EQUIRECTANGULAR = 3,
+    ORTHOGRAPHIC = 4,
 };
 
 // Lens distortion tier, orthogonal to CameraModelType and a COMPILE-TIME axis
@@ -105,7 +135,6 @@ enum class CameraDistortionType {
     None = 0,
     OpenCV = 1,
     ThinPrism = 2,
-    Rational = 3,
 };
 
 // Storage width of one camera's coefficient row. Each tier reads a prefix.
@@ -174,6 +203,7 @@ inline CameraModelType cmt(const std::string &s) {
     return (s == "PINHOLE") ? CameraModelType::PINHOLE :
         (s == "FISHEYE") ? CameraModelType::FISHEYE :
         (s == "EQUISOLID") ? CameraModelType::EQUISOLID :
+        (s == "ORTHOGRAPHIC") ? CameraModelType::ORTHOGRAPHIC :
         (s == "EQUIRECTANGULAR") ? CameraModelType::EQUIRECTANGULAR :
         (CameraModelType)-1;
 }
@@ -182,7 +212,6 @@ inline CameraDistortionType cdt(const std::string &s) {
     return (s == "NONE") ? CameraDistortionType::None :
         (s == "OPENCV") ? CameraDistortionType::OpenCV :
         (s == "THIN_PRISM") ? CameraDistortionType::ThinPrism :
-        (s == "RATIONAL") ? CameraDistortionType::Rational :
         (CameraDistortionType)-1;
 }
 
@@ -197,7 +226,7 @@ do {                                                                \
     cudaError_t err = call;                                         \
     if (err != cudaSuccess) {                                       \
         fprintf(stderr, "\033[41mCUDA Error at %s:%d: %s\033[m\n",  \
-                __FILE__, __LINE__, cudaGetErrorString(err));       \
+                SS_FILE, __LINE__, cudaGetErrorString(err));        \
         exit(EXIT_FAILURE);                                         \
     }                                                               \
 } while (0)
@@ -214,7 +243,7 @@ do {                                                                \
         if ((x) != cudaSuccess) {                                              \
             printf(                                                            \
                 "Error at %s:%d - %s\n",                                       \
-                __FILE__,                                                      \
+                SS_FILE,                                                       \
                 __LINE__,                                                      \
                 cudaGetErrorString(cudaGetLastError())                         \
             );                                                                 \
@@ -624,6 +653,15 @@ inline __device__ void warpAtomicAdd(float2* addr, float2 &val) {
 // block reduce / atomic
 ///////////////////////////////
 
+// First stride of the cross-warp fold, which must be a power of two: with 18
+// warps, strides 9/4/2/1 never fold lanes 8 and 17 into lane 0 and the
+// fused-SSIM scalar read ~11% low. Lanes past the warp count hold 0.
+constexpr int warpFoldStride(int num_warps) {
+    int s = 1;
+    while (s < num_warps) s <<= 1;
+    return s >> 1;
+}
+
 template<int BLOCK_SIZE>
 inline __device__ void blockAtomicAdd(float* addr, float val) {
     static_assert(BLOCK_SIZE > WARP_SIZE && BLOCK_SIZE <= WARP_SIZE * WARP_SIZE);
@@ -647,7 +685,8 @@ inline __device__ void blockAtomicAdd(float* addr, float val) {
         val = laneId < BLOCK_SIZE / WARP_SIZE ?
             sharedSums[laneId] : 0.0f;
         #pragma unroll
-        for (int stride = (BLOCK_SIZE / WARP_SIZE) >> 1; stride > 0; stride >>= 1)
+        for (int stride = warpFoldStride(BLOCK_SIZE / WARP_SIZE);
+             stride > 0; stride >>= 1)
             val += __shfl_down_sync(0xFFFFFFFF, val, stride);
         if (laneId == 0 && val != 0.0f)
             atomicAdd(addr, val);
@@ -685,7 +724,7 @@ inline __device__ void blockAtomicAdd(float4* addr, float4 val) {
         float val = laneId < NUM_WARPS ?
             sharedSums[laneId + warpId * NUM_WARPS] : 0.0f;
         #pragma unroll
-        for (int stride = NUM_WARPS >> 1; stride > 0; stride >>= 1)
+        for (int stride = warpFoldStride(NUM_WARPS); stride > 0; stride >>= 1)
             val += __shfl_down_sync(0xFFFFFFFF, val, stride);
         if (laneId == 0 && val != 0.0f)
             atomicAdd((float*)addr + warpId, val);
@@ -721,7 +760,7 @@ inline __device__ void blockAtomicAdd(float3* addr, float3 val) {
         float val = laneId < NUM_WARPS ?
             sharedSums[laneId + warpId * NUM_WARPS] : 0.0f;
         #pragma unroll
-        for (int stride = NUM_WARPS >> 1; stride > 0; stride >>= 1)
+        for (int stride = warpFoldStride(NUM_WARPS); stride > 0; stride >>= 1)
             val += __shfl_down_sync(0xFFFFFFFF, val, stride);
         if (laneId == 0 && val != 0.0f)
             atomicAdd((float*)addr + warpId, val);
@@ -755,7 +794,7 @@ inline __device__ void blockAtomicAdd(float2* addr, float2 val) {
         float val = laneId < NUM_WARPS ?
             sharedSums[laneId + warpId * NUM_WARPS] : 0.0f;
         #pragma unroll
-        for (int stride = NUM_WARPS >> 1; stride > 0; stride >>= 1)
+        for (int stride = warpFoldStride(NUM_WARPS); stride > 0; stride >>= 1)
             val += __shfl_down_sync(0xFFFFFFFF, val, stride);
         if (laneId == 0 && val != 0.0f)
             atomicAdd((float*)addr + warpId, val);

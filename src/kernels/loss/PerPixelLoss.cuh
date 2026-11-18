@@ -30,7 +30,8 @@ enum class RawLossIndex {
     RenderNormalMaskTotal,
     DepthNormalMaskTotal,
     NormalRegMaskTotal,
-    AlphaMaskTotal,
+    AlphaOverTotal,
+    AlphaUnderTotal,
     // median-depth mask totals
     MeanMedianDepthMaskTotal,
     MedianDepthNormalMaskTotal,
@@ -95,19 +96,9 @@ struct PerPixelGrads {
     TorchTensorView v_median_depth, v_median_normal;
 };
 
-// What gets accumulated into the densification loss_map. Numeric values are
-// shared with the `densify_loss_map_mode` config flag.
-//   None              -> loss_map_out is left null upstream; no kernel writes.
-//   LossFull          -> per-pixel L1/L2/aux + full SSIM(LCS).
-//   SsimFull          -> full SSIM(LCS) only.
-//   SsimContrastStruct -> SSIM contrast*structure (D_/B), no luminance.
-//   SsimStructure     -> SSIM structure only (D_/(2*sqrt(sig1*sig2)+C2)).
-//   EdgeAware         -> canny edge magnitude of GT rgb (Plenoxels-style
-//                        edge guidance, https://arxiv.org/abs/2603.08661).
-//   RobustEdgeAware   -> RobustNeRF-style Tukey biweight on the luma of
-//                        |render - GT|, followed by canny. Suppresses both
-//                        well-reconstructed regions and distractor pixels
-//                        (residuals above the q-quantile).
+// Numeric values are shared with the `densify_loss_map_mode` config flag, and
+// the per-mode meanings with its help text in i18n/catalog/TrainFields.h.
+// EdgeAware is Plenoxels' edge guidance (https://arxiv.org/abs/2603.08661).
 enum class DensifyLossMapMode : int {
     None = 0,
     LossFull = 1,
@@ -116,7 +107,48 @@ enum class DensifyLossMapMode : int {
     SsimStructure = 4,
     EdgeAware = 5,
     RobustEdgeAware = 6,
+    LossFullNms = 7,
+    SsimFullNms = 8,
+    SsimContrastStructNms = 9,
+    SsimStructureNms = 10,
+    SCielab = 11,
+    SCielabNms = 12,
+    Flip = 13,
+    FlipNms = 14,
+    FlipFeature = 15,
+    FlipFeatureNms = 16,
 };
+
+// A *Nms mode is its base plus canny's non-maximum-suppression step (see
+// loss_map_nms in PerPixelLoss.cu), so everything upstream switches on base.
+constexpr bool densify_loss_map_has_nms(DensifyLossMapMode m) {
+    return (m >= DensifyLossMapMode::LossFullNms &&
+            m <= DensifyLossMapMode::SsimStructureNms) ||
+           m == DensifyLossMapMode::SCielabNms || m == DensifyLossMapMode::FlipNms ||
+           m == DensifyLossMapMode::FlipFeatureNms;
+}
+constexpr DensifyLossMapMode densify_loss_map_base(DensifyLossMapMode m) {
+    if (m >= DensifyLossMapMode::SCielab)
+        return densify_loss_map_has_nms(m) ? (DensifyLossMapMode)((int)m - 1) : m;
+    return densify_loss_map_has_nms(m)
+        ? (DensifyLossMapMode)((int)m - (int)DensifyLossMapMode::LossFullNms + 1)
+        : m;
+}
+
+// What ssim_lambda weights: the `perceptual_loss` flag.
+enum class PerceptualLoss : int {
+    Ssim = 0,
+    SCielab = 1,
+    Flip = 2,
+    SsimBlurTolerant = 3,
+};
+
+// SsimBlurTolerant's blur sigma in full-resolution pixels; each coarser loss
+// scale halves it (docs/notes/ssim-blur-tolerance.md).
+constexpr float kSsimBlurTolerance = 1.5f;
+
+// The S-CIELAB term is mean dE*ab / 100, so L* spans [0, 1] as the image does.
+constexpr float kScielabLossPerDeltaE = 0.01f;
 
 // Mode dispatched to the SSIM kernel (the SSIM kernel doesn't need to know
 // about per-pixel L1/L2 or edge-aware; those are handled outside it).
@@ -132,7 +164,8 @@ enum class SsimLossMapMode : int {
 };
 
 // Per-step loss values returned by compute_multi_scale_per_pixel_losses.
-// Fields mirror LossIndex (raw weighted sums) plus ssim.
+// Fields mirror LossIndex (raw weighted sums) plus the perceptual term: ssim,
+// delta_e (mean S-CIELAB dE*ab) or flip (mean FLIP) -- whichever was trained.
 struct LossValues {
     float rgb_loss;
     float rgb_psnr;
@@ -149,6 +182,8 @@ struct LossValues {
     float median_normal_sup;
     float median_render_normal_reg;
     float ssim;
+    float delta_e;
+    float flip;
 };
 
 
@@ -175,6 +210,12 @@ LossValues compute_multi_scale_per_pixel_losses(
     bool has_mask,
     const std::array<float, (int)LossWeightIndex::length> loss_weights_0,
     const float w_ssim,
+    // PerceptualLoss: what w_ssim weights.
+    const int perceptual_loss,
+    // Positive: a pixel whose render and reference are both above it in every
+    // channel leaves the loss entirely -- value, map and gradient. Both are
+    // clipped there, so no colour error at that pixel is recoverable.
+    const float saturation_threshold,
     TorchTensorView v_losses,
     std::vector<bool> needs_input_grad,
     long num_train_images,
@@ -182,5 +223,6 @@ LossValues compute_multi_scale_per_pixel_losses(
     TorchTensorView loss_map_out,
     int loss_map_mode,
     float robust_edge_aware_quantile,
+    float nms_falloff,
     PerPixelGrads& grads_out
 );

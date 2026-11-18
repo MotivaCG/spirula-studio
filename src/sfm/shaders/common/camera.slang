@@ -24,14 +24,21 @@
 // damping in damp_S would leave singular). D49/D50.
 interface ICameraModel : IDifferentiable {
     static const int kNumIntr;
+    static const bool kPeriodicX;
     [Differentiable] static This fromArray(Real v[kNumIntr]);
     // p is the point in camera frame; returns projected pixel coordinates.
     [Differentiable] RVec2 project(RVec3 p);
 };
 
+// theta^2 below which the rotation is Ceres' first-order p + aa x p: its
+// derivative -[p]x exists at aa = 0, the norm's does not. Host: kSmallAngle2 in CpuCamera.h.
+static const float kSmallAngle2 = 2.220446049250313e-16;
+
 [Differentiable]
 RVec3 angleAxisRotate(RVec3 axis, RVec3 p) {
-    Real theta = length3(axis);
+    Real t2 = dot3(axis, axis);
+    if (t2 <= Real(kSmallAngle2)) return p + cross3(axis, p);
+    Real theta = sqrt(t2);
     RVec3 a = axis * (Real(1.0) / (theta + Real(1e-15)));
     RVec2 sc = rsincos(theta);
     Real st = sc.x, ct = sc.y;
@@ -50,6 +57,7 @@ RVec3 applyPose(Real pose[6], RVec3 p_world) {
 // Projects along -z (BAL convention).
 struct SnavelyModel : ICameraModel {
     static const int kNumIntr = 3;
+    static const bool kPeriodicX = false;
     Real f_log; Real k1; Real k2;
 
     [Differentiable] static SnavelyModel fromArray(Real v[3]) {
@@ -69,6 +77,7 @@ struct SnavelyModel : ICameraModel {
 // examples do) instead of log-focal.
 struct SnavelyFModel : ICameraModel {
     static const int kNumIntr = 3;
+    static const bool kPeriodicX = false;
     Real f; Real k1; Real k2;
 
     [Differentiable] static SnavelyFModel fromArray(Real v[3]) {
@@ -88,6 +97,7 @@ struct SnavelyFModel : ICameraModel {
 // different parameter count drop in without touching the solver.
 struct PinholeRadialModel : ICameraModel {
     static const int kNumIntr = 5;
+    static const bool kPeriodicX = false;
     Real f; Real cx; Real cy; Real k1; Real k2;
 
     [Differentiable] static PinholeRadialModel fromArray(Real v[5]) {
@@ -107,6 +117,7 @@ struct PinholeRadialModel : ICameraModel {
 // COLMAP SIMPLE_PINHOLE: one focal, principal point, no distortion.
 struct SimplePinholeModel : ICameraModel {
     static const int kNumIntr = 3;
+    static const bool kPeriodicX = false;
     Real f; Real cx; Real cy;
     [Differentiable] static SimplePinholeModel fromArray(Real v[3]) {
         SimplePinholeModel m; m.f = v[0]; m.cx = v[1]; m.cy = v[2]; return m;
@@ -119,6 +130,7 @@ struct SimplePinholeModel : ICameraModel {
 // COLMAP PINHOLE: separate focals, principal point, no distortion.
 struct PinholeModel : ICameraModel {
     static const int kNumIntr = 4;
+    static const bool kPeriodicX = false;
     Real fx; Real fy; Real cx; Real cy;
     [Differentiable] static PinholeModel fromArray(Real v[4]) {
         PinholeModel m; m.fx = v[0]; m.fy = v[1]; m.cx = v[2]; m.cy = v[3]; return m;
@@ -133,6 +145,7 @@ struct PinholeModel : ICameraModel {
 // CamModel::OpenCV project(). +z looking, pixel = f*distorted + c.
 struct OpenCVModel : ICameraModel {
     static const int kNumIntr = 8;
+    static const bool kPeriodicX = false;
     Real fx; Real fy; Real cx; Real cy; Real k1; Real k2; Real p1; Real p2;
 
     [Differentiable] static OpenCVModel fromArray(Real v[8]) {
@@ -159,6 +172,7 @@ struct OpenCVModel : ICameraModel {
 // (D31). Host mirror: sfm/core/Camera.h CamModel::OpenCVFisheye.
 struct FisheyeModel : ICameraModel {
     static const int kNumIntr = 8;
+    static const bool kPeriodicX = false;
     Real fx; Real fy; Real cx; Real cy; Real k1; Real k2; Real k3; Real k4;
 
     [Differentiable] static FisheyeModel fromArray(Real v[8]) {
@@ -184,6 +198,7 @@ struct FisheyeModel : ICameraModel {
 // two tangential terms. Host mirror: sfm/core/Camera.h CamModel::FullOpenCV.
 struct FullOpenCVModel : ICameraModel {
     static const int kNumIntr = 12;
+    static const bool kPeriodicX = false;
     Real fx; Real fy; Real cx; Real cy;
     Real k1; Real k2; Real p1; Real p2; Real k3; Real k4; Real k5; Real k6;
 
@@ -212,6 +227,7 @@ struct FullOpenCVModel : ICameraModel {
 // theta*(x,y)/r. Valid past 90 deg. Host mirror: CamModel::ThinPrismFisheye.
 struct ThinPrismFisheyeModel : ICameraModel {
     static const int kNumIntr = 12;
+    static const bool kPeriodicX = false;
     Real fx; Real fy; Real cx; Real cy;
     Real k1; Real k2; Real p1; Real p2; Real k3; Real k4; Real sx1; Real sy1;
 
@@ -243,6 +259,7 @@ struct ThinPrismFisheyeModel : ICameraModel {
 // gives this group a free count of 0). Host mirror: CamModel::Equirect.
 struct EquirectModel : ICameraModel {
     static const int kNumIntr = 2;
+    static const bool kPeriodicX = true;
     Real w; Real h;
 
     [Differentiable] static EquirectModel fromArray(Real v[2]) {
@@ -260,12 +277,31 @@ struct EquirectModel : ICameraModel {
     }
 };
 
+[Differentiable]
+RVec2 projectResidual<M : ICameraModel>(Real intr[M.kNumIntr], RVec3 p, no_diff RVec2 obs) {
+    M cam = M.fromArray(intr);
+    RVec2 r = cam.project(p) - obs;
+    if (M.kPeriodicX) {
+        Real half = Real(0.5) * intr[0];
+        if (r.x > half) r.x = r.x - intr[0];
+        else if (r.x < -half) r.x = r.x + intr[0];
+    }
+    return r;
+}
+
 // Reprojection residual, generic in the camera model.
 [Differentiable]
 RVec2 reproject<M : ICameraModel>(
     Real pose[6], Real intr[M.kNumIntr], RVec3 X, no_diff RVec2 obs
 ) {
-    M cam = M.fromArray(intr);
-    RVec3 p = applyPose(pose, X);
-    return cam.project(p) - obs;
+    return projectResidual<M>(intr, applyPose(pose, X), obs);
+}
+
+// The same through a rig: `pose` is the frame's rig_from_world, `ext` the
+// member's cam_from_rig (sfm/ba/Problem.h).
+[Differentiable]
+RVec2 reprojectRig<M : ICameraModel>(
+    Real pose[6], Real ext[6], Real intr[M.kNumIntr], RVec3 X, no_diff RVec2 obs
+) {
+    return projectResidual<M>(intr, applyPose(ext, applyPose(pose, X)), obs);
 }

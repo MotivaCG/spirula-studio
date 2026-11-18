@@ -49,6 +49,7 @@
 #include "sfm/map/Merge.h"
 #include "sfm/map/ModelOps.h"
 #include "sfm/map/Partition.h"
+#include "sfm/core/Log.h"
 
 namespace sfm {
 
@@ -136,20 +137,21 @@ inline std::vector<Reconstruction> bottomUpReconstruct(Mapper& mapper, const Mat
     st.atoms = atoms.size();
     for (const std::vector<uint32_t>& a : atoms) st.atom_images += a.size();
     if (opt.verbose) {
-        size_t small = SIZE_MAX, big = 0;
+        size_t smallest = SIZE_MAX, biggest = 0;
         for (const std::vector<uint32_t>& a : atoms) {
-            small = std::min(small, a.size());
-            big = std::max(big, a.size());
+            smallest = std::min(smallest, a.size());
+            biggest = std::max(biggest, a.size());
         }
-        fprintf(stderr, "[bup] %zu image(s) -> %zu atom(s) of %zu..%zu images (%.2fx cover)\n",
-                db.images.size(), atoms.size(), atoms.empty() ? 0 : small, big,
-                db.images.empty() ? 0.0 : (double)st.atom_images / (double)db.images.size());
+        slog::diag(slog::Tag::Map,
+                   "[bup] %zu image(s) -> %zu atom(s) of %zu..%zu images (%.2fx cover)",
+                   db.images.size(), atoms.size(), atoms.empty() ? 0 : smallest, biggest,
+                   db.images.empty() ? 0.0 : (double)st.atom_images / (double)db.images.size());
     }
 
     // A capture that does not split into at least two atoms has nothing to
     // merge, and the flat mapper is what a single atom would have run anyway.
     if (atoms.size() < 2) {
-        if (opt.verbose) fprintf(stderr, "[bup] one atom: reconstructing it flat\n");
+        if (opt.verbose) slog::diag(slog::Tag::Map, "[bup] one atom: reconstructing it flat");
         return mapper.run();
     }
 
@@ -159,14 +161,16 @@ inline std::vector<Reconstruction> bottomUpReconstruct(Mapper& mapper, const Mat
     ao.verbose = opt.verbose;
     std::vector<Reconstruction> models =
         reconstructAtoms(db, feats, mapper.options(), mapper.cameraIds(),
-                         mapper.startingCameras(), atoms, ao, as);
+                         mapper.startingCameras(), atoms, ao, as, mapper.rigs(),
+                         mapper.sequences(), mapper.priors());
     st.t_atoms = as.secs;
     st.models_from_atoms = models.size();
     st.atom_threads = as.threads;
     if (opt.verbose)
-        fprintf(stderr, "[bup] %zu atom(s) on %d thread(s) -> %zu model(s), %zu registrations, "
-                "%zu empty: %.1f s\n", as.atoms, as.threads, as.models, as.registered, as.empty,
-                as.secs);
+        slog::diag(slog::Tag::Map,
+                   "[bup] %zu atom(s) on %d thread(s) -> %zu model(s), %zu registrations, "
+                   "%zu empty: %.1f s", as.atoms, as.threads, as.models, as.registered, as.empty,
+                   as.secs);
     mapper.claimAll(models);
     // Every atom failed. The flat mapper will fail the same way and fail fast,
     // and it is what gives the caller a model to report the failure on.
@@ -181,8 +185,8 @@ inline std::vector<Reconstruction> bottomUpReconstruct(Mapper& mapper, const Mat
         st.assemble.joint_ba++;
         st.assemble.t_ba += secs(t0, clk());
         if (opt.verbose)
-            fprintf(stderr, "[bup] joint refinement over %zu atom model(s): %.1f s\n",
-                    models.size(), st.assemble.t_ba);
+            slog::diag(slog::Tag::Map, "[bup] joint refinement over %zu atom model(s): %.1f s",
+                       models.size(), st.assemble.t_ba);
     }
 
     // ---- upwards, then the finishing passes -------------------------------

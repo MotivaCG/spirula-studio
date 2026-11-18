@@ -1,38 +1,17 @@
 #pragma once
 
-// ColmapRunner -- turns raw images or a video into a trainable COLMAP
-// dataset by driving the external `colmap` (>= 4.x; the CLI flags follow
-// reference/scripts/run_colmap.bash) on a worker thread with live log
-// streaming and cancellation.
+// ColmapRunner -- raw images or a video -> a trainable COLMAP dataset, by
+// driving the external `colmap` (>= 4.x; the CLI flags follow
+// reference/scripts/run_colmap.bash) on a worker thread.
 //
-// It is the CUDA build's dataset path and the fallback everywhere else; the
-// Vulkan build defaults to SfmRunner, which needs nothing installed. The two
-// share their first half through DatasetPrep -- frames, sharpest-frame
-// selection, .insv track splitting and masking -- so only what is actually
-// COLMAP-specific lives here.
+// The CUDA build's dataset path and the fallback everywhere else; the Vulkan
+// build defaults to SfmRunner, which needs nothing installed. Both share their
+// first half through DatasetPrep, so only what is COLMAP-specific is here.
 //
-// Pipeline:
-//   DatasetPrep (frames + masks; see DatasetPrep.h)
-//   feature_extractor (SIFT or ALIKED; optional initial camera params) ->
-//           exhaustive / sequential (+ optional vocab-tree loop closure) /
-//           vocab-tree matcher (the tree is auto-found or downloaded;
-//           optional LightGlue matching) -> mapper -> best-effort
-//           model_merger when the scene splits into partial models ->
-//           [optional] bundle_adjuster refinement on the largest model
-//
-// Output layout (what the dataset parsers auto-detect):
-//   <workspace>/database.db
-//   <workspace>/sparse/0/{cameras,images,points3D}.bin
-//   <workspace>/images/            (video input: extracted frames)
-//   <workspace>/masks/             (when masking is enabled)
-//
-// For a folder-of-images input the images are NOT copied; COLMAP indexes
-// them where they are (recursively) and the GUI passes the absolute path as
-// image_dir for the immediate open (the parsers join dataset_dir /
-// image_dir, absolute wins). No marker file is written -- when re-opening
-// such a dataset later, set data.image_dir in the dataparser options (video
-// datasets need nothing: images/ is the default).
+// PhotoImport::InPlace records nothing in the workspace, so re-opening such a
+// dataset means setting data.image_dir in the dataparser options by hand.
 
+#include "app/gui/DatasetPlan.h"
 #include "app/gui/DatasetPrep.h"   // MaskClick
 #include "app/gui/FilmReel.h"
 #include "app/gui/GeometryRunner.h"
@@ -65,8 +44,8 @@ inline std::vector<const spirula::i18n::Msg*> colmap_camera_model_helps() {
     return {&m::lens_opencv_help, &m::lens_pinhole_help,
             &m::lens_simple_pinhole_help, &m::lens_radial_help,
             &m::lens_radial_help, &m::lens_full_opencv_help,
-            &m::lens_fisheye_kb_help, &m::lens_fisheye_thin_prism_help,
-            &m::lens_fisheye_kb_help, &m::lens_fisheye_kb_help};
+            &m::lens_fisheye_opencv_help, &m::lens_fisheye_thin_prism_help,
+            &m::lens_fisheye_opencv_help, &m::lens_fisheye_opencv_help};
 }
 
 inline bool colmap_model_is_fisheye(const std::string& m) {
@@ -81,24 +60,23 @@ struct ColmapJob {
     // honoured by the built-in reconstruction.
     std::vector<PrepInput> inputs;
     std::string workspace;               // output dataset dir (created)
-    bool resume = true;                  // reuse artifacts an interrupted
-                                         // run left in the workspace:
-                                         // extracted frames, masks (mask.py
-                                         // resumes), features + matches
-                                         // (COLMAP skips existing DB rows),
-                                         // and completed sparse models.
+    bool resume = true;                  // reuse what an interrupted run
+                                         // left: frames, masks, features +
+                                         // matches, completed sparse models.
                                          // false = require a clean folder.
     std::string colmap_exe = "colmap";
     std::string ffmpeg_exe = "ffmpeg";
-    std::string python_exe = "python3";  // for the masking script
     bool force_external_decode = false;  // ffmpeg even when we could decode
-    bool force_external_masking = false; // mask.py even when we could segment
 
-    // Steps a re-run redoes rather than reuses; see PrepJob.
-    bool redo_frames = false;
-    bool redo_masks = false;
-    bool redo_model = false;             // reconstruct again over existing
-                                         // frames, masks and features
+    PlanRequest request;                 // see SfmJob
+    bool mask_features = true;           // ... and so is this
+    PhotoImport photo_import = PhotoImport::ConvertJpeg;  // see PrepJob
+
+    // Canonical native selector for frame extraction and masking; external
+    // COLMAP does not read it, so its routing remains a separate compatibility
+    // tail.
+    std::string device;
+    std::string inference_devices;
 
     // Cameras
     std::string camera_model = "OPENCV"; // ImageReader.camera_model
@@ -125,7 +103,17 @@ struct ColmapJob {
 
     // Video extraction
     float video_fps = 2.0f;              // kept frames per second
+    bool adaptive_fps = false;           // see PrepJob
+    float adaptive_range = 4.0f;
     int sharp_window = 3;                // pick sharpest of N candidates (1 = off)
+    bool skip_blurry = false;
+    float blur_px = 8.0f;
+    bool blur_neighbour = true;
+    int similar_bits = 0;
+    bool keep_skipped = true;
+    bool sync_tracks = true;
+    bool auto_rotate = true;
+    app::Pano360Options pano;            // see PrepJob
     int max_frames = 100000;
 
     // Advanced
@@ -164,17 +152,18 @@ struct ColmapJob {
     bool final_bundle_adjust = true;     // bundle_adjuster refinement pass
     std::string vocab_tree_path;         // "" = auto find / download
 
-    // AI masking. The built-in path wants a checkpoint file
-    // (mask_model_path, from ModelCache); the mask.py fallback wants
-    // a model name it understands (mask_model).
+    // AI masking
     bool mask_enable = false;
     std::string mask_prompt;             // "people; cars; ..."
     std::string mask_negative_prompt;
+    std::string mask_feature_prompt;     // what features skip, training keeps
     bool mask_keep_subject = false;      // prompt names what to KEEP
     std::string mask_model_path;
-    std::string mask_model = "sam2.1_hiera_large";
+    std::string mask_detector_path;      // Grounding DINO, when one is paired
+    float mask_detector_threshold = 0.3f;
     int mask_max_image_size = 1600;
-    float mask_threshold = 0.5f;         // all four: see PrepJob in DatasetPrep.h
+    float mask_dilate_ratio = 0.05f;
+    float mask_threshold = 0.5f;         // all five: see PrepJob in DatasetPrep.h
     float mask_nms = 0.1f;
     bool mask_memory = false;            // track objects across a video's frames
     int mask_detect_every = 1;
@@ -184,11 +173,13 @@ struct ColmapJob {
     // The photographs' colour space; masking and geometry convert to sRGB.
     std::string image_gamut;
     std::optional<bool> image_is_linear;
+    std::string image_exposure;
 
     // Depth and normals, written after the reconstruction from the dataset it
     // produced. Shared with the built-in path (SfmJob), which runs the same
     // child over the same folder.
     GeometryJob geometry;
+    DenseJob dense;
 };
 
 class ColmapRunner {
@@ -209,12 +200,17 @@ public:
     std::string dataset_dir();           // valid when Done
     std::string image_dir();             // image_dir to train with ("" = default)
     std::string mask_dir();              // mask_dir to train with ("" = none)
+    bool mask_flipped() const;           // ... and are they white where REMOVED?
+
+    // What preparation is handed, so the panel plans from the same job.
+    static PrepJob prep_job(const ColmapJob& job);
 
 private:
     void run(ColmapJob job);
     void take_reconstruction(ColmapJob& job);
     void take_masking(PrepJob& prep);
     void take_geometry(ColmapJob& job);
+    void take_dense(ColmapJob& job);
     void log(const std::string& line, bool detail = true);
     int  exec(const std::vector<std::string>& argv);
     void set_stage(Stage st, const std::string& s);
@@ -231,6 +227,7 @@ private:
     RunFilms _films;
     std::mutex _mu;                      // guards the strings below
     std::string _error, _dataset_dir, _image_dir, _mask_dir;
+    std::atomic<bool> _mask_flipped{false};
     ColmapJob _live;                     // guarded by _mu; see update()
 };
 

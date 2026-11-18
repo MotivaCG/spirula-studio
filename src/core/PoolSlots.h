@@ -50,7 +50,10 @@
 // other.
 enum class VramCategory : uint8_t {
     Splat = 0,   // per-splat params, gradients, optimizer state, densify aux
-    SplatXImg,   // scratch sized ~ (splats seen per image): projection, tiling
+    // Scratch sized by (camera, gaussian), visible or splat-tile PAIRS, and
+    // the alias arena: the one category that grows during training. Splat is
+    // sized for cap_max (POOL_LIVE_SPLAT_TABLE) -- docs/notes/vram-splat-x-img.md.
+    SplatXImg,
     Image,       // per-image buffers: render outputs, GT, loss maps, img grads
     Appearance,  // bilagrid / background-SH / PPISP / color-space / color-shift
     Viewer,      // interactive viewer + sync visualizer caches and scratch
@@ -122,7 +125,25 @@ enum class SaveClass : uint8_t {
   X(EngRadii                       , "eng.radii",                         Splat    , Resume) \
   X(EngAccumBuffer                 , "eng.accum_buffer",                  Splat    , Resume) \
   X(EngBiasCorrectionSteps         , "eng.bias_correction_steps",         Splat    , Resume) \
+  X(EngVisitCounters               , "eng.visit_counters",                Splat    , Resume) \
+  X(EngProjectiveState, "eng.projective_state", Splat, Resume) \
+  X(EngProjectiveInformation, "eng.projective_information", Splat, Resume) \
+  X(EngProjectiveAngularBound, "eng.projective_angular_bound", Splat, Never) \
+  X(EngProjectiveCenters, "eng.projective_centers", Other, Never) \
+  X(EngMaxWeight                   , "eng.max_weight",                    Splat    , Never) \
   X(EngDensifyWorldGradScore       , "eng.densify.world_grad_score",      Splat    , Never) \
+  X(EngDensifySampleScore          , "eng.densify.sample_score",          Splat    , Never) \
+  X(EngDensifyOversize             , "eng.densify.oversize",              Splat    , Never) \
+  X(EngLearnedScoreStats           , "eng.densify.learned_score_stats",   Other    , Never) \
+  X(EngRegionWeight                , "eng.region.weight",                 Splat    , Never) \
+  X(EngRegionProgram               , "eng.region.program",                Other    , Never) \
+  X(EngRegionFieldBvh              , "eng.region.field_bvh",              Other    , Never) \
+  X(EngRegionFieldSeeds            , "eng.region.field_seeds",            Other    , Never) \
+  X(EngRegionCameraBvh             , "eng.region.camera_bvh",             Other    , Never) \
+  X(EngRegionCameraSeeds           , "eng.region.camera_seeds",           Other    , Never) \
+  X(EngRegionPattern               , "eng.region.pattern",                Other    , Never) \
+  X(EngVisitCamSum                 , "eng.visit.cam_sum",                 Other    , Never) \
+  X(EngVisitCamCnt                 , "eng.visit.cam_cnt",                 Other    , Never) \
   /* ---- sub-batch scratch ---- */ \
   X(EngSubbatchAccumWeightSum      , "eng.subbatch.accum_weight_sum",     Splat    , Never) \
   /* ---- gradients ---- */ \
@@ -159,6 +180,7 @@ enum class SaveClass : uint8_t {
   X(ProjAabb                       , "proj.aabb",                         SplatXImg, Never) \
   X(ProjDepths                     , "proj.depths",                       SplatXImg, Never) \
   X(ProjMask                       , "proj.mask",                         SplatXImg, Never) \
+  X(ProjBlockCount                 , "proj.block_count",                  SplatXImg, Never) \
   X(ProjScan                       , "proj.scan",                         SplatXImg, Never) \
   X(ProjCameraIds                  , "proj.camera_ids",                   SplatXImg, Never) \
   X(ProjGaussianIds                , "proj.gaussian_ids",                 SplatXImg, Never) \
@@ -166,33 +188,40 @@ enum class SaveClass : uint8_t {
   /* ---- tile intersect scratch ---- */ \
   X(IsectTilesPerSplat             , "isect.tiles_per_splat",             SplatXImg, Never) \
   X(IsectCumTiles                  , "isect.cum_tiles",                   SplatXImg, Never) \
+  X(IsectTotal                     , "isect.total",                       SplatXImg, Never) \
   X(IsectOffsets                   , "isect.offsets",                     SplatXImg, Never) \
   X(IsectIdsA                      , "isect.ids_a",                       SplatXImg, Never) \
   X(IsectIdsB                      , "isect.ids_b",                       SplatXImg, Never) \
   X(IsectFlatA                     , "isect.flat_a",                      SplatXImg, Never) \
   X(IsectFlatB                     , "isect.flat_b",                      SplatXImg, Never) \
-  /* ---- tile intersect (post) scratch ---- */ \
-  X(IsectPostIds                   , "isect_post.ids",                    SplatXImg, Never) \
-  X(IsectPostFlat                  , "isect_post.flat",                   SplatXImg, Never) \
-  X(IsectPostNumSel                , "isect_post.num_sel",                SplatXImg, Never) \
-  X(IsectPostOffsets               , "isect_post.offsets",                SplatXImg, Never) \
+  X(IsectTileActive                , "isect.tile_active",                 Image    , Never) \
   /* ---- render outputs ---- */ \
   X(RenderTs                       , "render.Ts",                         Image    , Never) \
   X(RenderLastIds                  , "render.last_ids",                   Image    , Never) \
   X(RenderMedian                   , "render.median",                     Image    , Never) \
+  X(RenderScore                    , "render.score",                      Image    , Never) \
   /* render/distortion channel tuples: sub-buffers ".rgb"/".depth"/".normal" */ \
   X(Renders                        , "renders",                           Image    , Never) \
   X(Distortions                    , "distortions",                       Image    , Never) \
   /* ---- raster backward scratch ---- */ \
-  X(RasterBwdAccumWeight           , "raster_bwd.accum_weight",           SplatXImg, Never) \
-  X(RasterBwdVViewmats             , "raster_bwd.v_viewmats",             SplatXImg, Never) \
+  X(RasterBwdAccumWeight           , "raster_bwd.accum_weight",           Splat    , Never) \
+  X(RasterBwdVViewmats             , "raster_bwd.v_viewmats",             Other    , Never) \
   X(RasterBwdVScreen               , "raster_bwd.v_screen",               SplatXImg, Never) \
-  X(RasterBwdVWorld                , "raster_bwd.v_world",                SplatXImg, Never) \
+  X(RasterBwdVWorld                , "raster_bwd.v_world",                Splat    , Never) \
   /* ---- fused proj-bwd scratch ---- */ \
   X(FusedProjBwdGaussSorted        , "fused_proj_bwd.gauss_sorted",       SplatXImg, Never) \
   X(FusedProjBwdPerm               , "fused_proj_bwd.perm",               SplatXImg, Never) \
   X(FusedProjBwdPermSorted         , "fused_proj_bwd.perm_sorted",        SplatXImg, Never) \
-  X(FusedProjBwdCamBounds          , "fused_proj_bwd.cam_bounds",         SplatXImg, Never) \
+  X(FusedProjBwdCamBounds          , "fused_proj_bwd.cam_bounds",         Splat    , Never) \
+  /* ---- PCA regularizer (kernels/loss/PcaReg.cu) ---- */ \
+  X(PcaRegWork                     , "pca_reg.work",                      Splat    , Never) \
+  X(PcaRegBox                      , "pca_reg.box",                       Splat    , Never) \
+  X(PcaRegNodes                    , "pca_reg.nodes",                     Splat    , Never) \
+  X(PcaRegMeta                     , "pca_reg.meta",                      Splat    , Never) \
+  X(PcaRegRanges                   , "pca_reg.ranges",                    Splat    , Never) \
+  X(PcaRegPermCache                , "pca_reg.perm_cache",                Splat    , Never) \
+  X(PcaRegNbrsCache                , "pca_reg.nbrs_cache",                Splat    , Never) \
+  X(PcaRegLossSums                 , "pca_reg.loss_sums",                 Other    , Never) \
   /* ---- splat-tile intersector scratch ---- */ \
   X(StiBruteCount                  , "sti.brute.count",                   SplatXImg, Never) \
   X(StiBruteCountMap               , "sti.brute.count_map",               SplatXImg, Never) \
@@ -211,10 +240,9 @@ enum class SaveClass : uint8_t {
   X(StiLbvhCountMap                , "sti.lbvh.count_map",                SplatXImg, Never) \
   X(StiLbvhIds                     , "sti.lbvh.ids",                      SplatXImg, Never) \
   /* ---- meshing scratch ---- */ \
-  X(MeshingRenderRadii             , "meshing.render.radii",              SplatXImg, Never) \
+  X(MeshingRenderRadii             , "meshing.render.radii",              Splat    , Never) \
   /* ---- per-pixel-loss scratch ---- */ \
   X(PplLosses                      , "ppl.losses",                        Image    , Never) \
-  X(PplLossMapScale                , "ppl.loss_map_scale",                Image    , Never) \
   X(PplRawLosses                   , "ppl.raw_losses",                    Image    , Never) \
   X(PplTotalLosses                 , "ppl.total_losses",                  Image    , Never) \
   X(PplVRawLosses                  , "ppl.v_raw_losses",                  Image    , Never) \
@@ -253,6 +281,7 @@ enum class SaveClass : uint8_t {
   X(EngBgSkyImage                  , "eng.bg_sky.image",                  Appearance, Never) \
   X(EngBgSkyRgbPost                , "eng.bg_sky.rgb_post",               Appearance, Never) \
   X(EngBgSkyVTsScratch             , "eng.bg_sky.v_Ts_scratch",           Appearance, Never) \
+  X(EngBgExponentByCam             , "eng.bg.exponent_by_cam",            Appearance, Never) \
   X(EngBgSkyVBg                    , "eng.bg_sky.v_bg",                   Appearance, Never) \
   X(EngBgSkyVSh                    , "eng.bg_sky.v_sh",                   Appearance, Never) \
   /* ---- PPISP ---- */ \
@@ -266,6 +295,8 @@ enum class SaveClass : uint8_t {
   X(EngPpispRegRawLosses           , "eng.ppisp.reg_raw_losses",          Appearance, Never) \
   X(EngPpispVRegLosses             , "eng.ppisp.v_reg_losses",            Appearance, Never) \
   X(EngPpispVRegParams             , "eng.ppisp.v_reg_params",            Appearance, Never) \
+  /* ---- calibration warp (engine/EngineCalibWarp.cpp) ---- */ \
+  X(EngCalibWarpParams             , "eng.calib_warp.params",             Appearance, Always) \
   /* ---- color-shift reg ---- */ \
   X(EngColorShiftRegEma            , "eng.color_shift_reg.ema",           Appearance, Always) \
   X(EngColorShiftRegBatchSum       , "eng.color_shift_reg.batch_sum",     Appearance, Never) \
@@ -273,6 +304,9 @@ enum class SaveClass : uint8_t {
   X(ColorSpaceSplatMatrix          , "color_space.splat_matrix",          Appearance, Always) \
   X(ColorSpaceImageMatrix          , "color_space.image_matrix",          Appearance, Always) \
   X(ColorSpaceFwdPost              , "color_space.fwd_post",              Image    , Never) \
+  X(EngAppearancePost              , "eng.appearance.post",               Image    , Never) \
+  X(EngAppearanceLinear            , "eng.appearance.linear",             Image    , Never) \
+  X(EngAppearanceRaw16             , "eng.appearance.raw16",              Image    , Never) \
   X(ColorSpaceBgSrgb               , "color_space.bg_srgb",               Image    , Never) \
   /* ---- ground-truth staging ---- */ \
   X(GtRgb                          , "gt.rgb",                            Image    , Never) \
@@ -290,9 +324,7 @@ enum class SaveClass : uint8_t {
   X(WarpInputDistCoeffs            , "warp.input_dist_coeffs",            Other    , Never) \
   X(WarpSourceModels               , "warp.source_models",                Other    , Never) \
   X(WarpSourceParams               , "warp.source_params",                Other    , Never) \
-  /* ---- data-manager scratch ---- */ \
-  X(DmAxesFisheye5                 , "dm.axes.fisheye5",                  Other    , Never) \
-  X(DmAxesEquirect6                , "dm.axes.equirect6",                 Other    , Never) \
+  X(WarpFaceAxes                   , "warp.face_axes",                    Other    , Never) \
   /* ---- debug ---- */ \
   X(DebugFeaturesDc                , "debug.features_dc",                 Other    , Never) \
   /* ---- bilagrid misc ---- */ \
@@ -302,29 +334,39 @@ enum class SaveClass : uint8_t {
   X(RdtedMaxDepth                  , "rdted_max_depth",                   Other    , Never) \
   X(SemiOffloadedAdamBuf           , "semi_offloaded_adam_buf",           Other    , Never) \
   X(SsimScalar                     , "ssim_scalar",                       Other    , Never) \
+  X(SsimMaskWeight                 , "ssim.mask_weight",                  Image    , Never) \
+  X(SsimBlurred                    , "ssim.blurred",                      Image    , Never) \
+  X(SsimBlurNorm                   , "ssim.blur_norm",                    Image    , Never) \
+  X(SsimBlurGrad                   , "ssim.blur_grad",                    Image    , Never) \
+  X(ScielabMaskWeight              , "scielab.mask_weight",               Image    , Never) \
+  X(FlipMaskWeight                 , "flip.mask_weight",                  Image    , Never) \
   /* ---- densify scratch ---- */ \
   X(DensifyQuantileTemp            , "densify_quantile_temp",             Other    , Never) \
-  X(DensifyInvMedian               , "densify_inv_median",                Other    , Never) \
+  X(DensifyMapNorm                 , "densify_map_norm",                  Other    , Never) \
+  X(DensifyScoreGather             , "densify_score_gather",              Splat    , Never) \
+  X(DensifyScoreClip               , "densify_score_clip",                Other    , Never) \
   X(DensifyClipScale               , "densify_clip_scale",                Other    , Never) \
   X(DensifyUpdateWeight            , "densify_update_weight",             Other    , Never) \
-  X(DensifyWswrSortingValues       , "densify_wswr_sorting_values",       Other    , Never) \
-  X(DensifyWswrOutIdx              , "densify_wswr_out_idx",              Other    , Never) \
-  X(DensifyWswrKeysOut             , "densify_wswr_keys_out",             Other    , Never) \
-  X(DensifyWswrIndicesIn           , "densify_wswr_indices_in",           Other    , Never) \
-  X(DensifyWswrIndicesOut          , "densify_wswr_indices_out",          Other    , Never) \
-  X(DensifyRelocMask               , "densify_reloc_mask",                Other    , Never) \
+  X(DensifyWswrSortingValues       , "densify_wswr_sorting_values",       Splat    , Never) \
+  X(DensifyWswrOutIdx              , "densify_wswr_out_idx",              Splat    , Never) \
+  X(DensifyWswrKeysOut             , "densify_wswr_keys_out",             Splat    , Never) \
+  X(DensifyWswrIndicesIn           , "densify_wswr_indices_in",           Splat    , Never) \
+  X(DensifyWswrIndicesOut          , "densify_wswr_indices_out",          Splat    , Never) \
+  X(DensifyWswrEligible            , "densify_wswr_eligible",             Other    , Never) \
+  X(DensifyRelocMask               , "densify_reloc_mask",                Splat    , Never) \
   X(DensifyRelocCount              , "densify_reloc_count",               Other    , Never) \
-  X(DensifyRelocDstIndices         , "densify_reloc_dst_indices",         Other    , Never) \
-  X(DensifyMcmcSampleProbs         , "densify_mcmc_sample_probs",         Other    , Never) \
-  X(DensifyMcmcSampleProbsCumsum   , "densify_mcmc_sample_probs_cumsum",  Other    , Never) \
-  X(DensifyMcmcIndexMap            , "densify_mcmc_index_map",            Other    , Never) \
-  X(DensifyMcmcNIdxBuffer          , "densify_mcmc_n_idx_buffer",         Other    , Never) \
-  X(DensifyMcmcAddSampleProbs      , "densify_mcmc_add_sample_probs",     Other    , Never) \
-  X(DensifyMcmcAddSampleProbsCumsum, "densify_mcmc_add_sample_probs_cumsum",Other    , Never) \
-  X(DensifyMcmcAddIndexMap         , "densify_mcmc_add_index_map",        Other    , Never) \
-  X(DensifyMcmcAddNIdxBuffer       , "densify_mcmc_add_n_idx_buffer",     Other    , Never) \
+  X(DensifyRelocDstIndices         , "densify_reloc_dst_indices",         Splat    , Never) \
+  X(DensifyMcmcSampleProbs         , "densify_mcmc_sample_probs",         Splat    , Never) \
+  X(DensifyMcmcSampleProbsCumsum   , "densify_mcmc_sample_probs_cumsum",  Splat    , Never) \
+  X(DensifyMcmcIndexMap            , "densify_mcmc_index_map",            Splat    , Never) \
+  X(DensifyMcmcNIdxBuffer          , "densify_mcmc_n_idx_buffer",         Splat    , Never) \
+  X(DensifyMcmcAddSampleProbs      , "densify_mcmc_add_sample_probs",     Splat    , Never) \
+  X(DensifyMcmcAddSampleProbsCumsum, "densify_mcmc_add_sample_probs_cumsum",Splat    , Never) \
+  X(DensifyMcmcAddIndexMap         , "densify_mcmc_add_index_map",        Splat    , Never) \
+  X(DensifyMcmcAddNIdxBuffer       , "densify_mcmc_add_n_idx_buffer",     Splat    , Never) \
   X(DensifyRobustResid             , "densify_robust_resid",              Other    , Never) \
   X(DensifyTukeyC                  , "densify_tukey_c",                   Other    , Never) \
+  X(DensifyQshValueExt             , "densify_qsh_value_ext",             Other    , Never) \
   /* ---- viewer cache/scratch ---- */ \
   X(ViewerThumb                    , "viewer.thumb",                      Viewer   , Never) \
   X(ViewerThumbDone                , "viewer.thumb_done",                 Viewer   , Never) \
@@ -444,6 +486,139 @@ constexpr const char* to_string(SaveClass s) {
         case SaveClass::Resume: return "resume";
         case SaveClass::Always: return "always";
         default:                return "?";
+    }
+}
+
+
+// ---- Aliasing: phases that share one arena --------------------------------
+
+// A slot listed in POOL_ALIAS_TABLE below owns no storage: every phase carves
+// out of ONE arena (booked to SplatXImg), so it costs the largest phase. Adding
+// a row is a lifetime claim -- docs/notes/vram-splat-x-img.md says how to test it.
+enum class PoolPhase : uint8_t {
+    None = 0,   // owns its allocation -- every slot not listed below
+    TileIsect,  // scratch that dies inside do_intersect_tile_generic
+    Loss,       // the loss pyramid and its scratch, dead once the loss returns
+    ImageBwd,   // what the image stages' backward rebuilds after the loss
+    RasterBwd,  // raster backward -> projection backward / fused optim step
+    Densify,    // one densify launcher's scratch, dead when it returns
+    Count
+};
+
+// X(PoolSlot enumerator, PoolPhase enumerator)
+#define POOL_ALIAS_TABLE(X) \
+  /* The sort keys, the tile counts and the sort's alternate index buffer: \
+     none leaves the intersector, which sorts into isect.flat_a. */ \
+  X(IsectIdsA          , TileIsect) \
+  X(IsectIdsB          , TileIsect) \
+  X(IsectFlatB         , TileIsect) \
+  X(IsectTilesPerSplat , TileIsect) \
+  X(IsectCumTiles      , TileIsect) \
+  /* Screen-space gradients: written by the raster backward, consumed by the \
+     projection backward, or stashed for the fused optim step -- all before \
+     the next forward's intersection. forward_3dgs drops the stashed view. */ \
+  X(RasterBwdVScreen   , RasterBwd) \
+  /* Per-splat densification score from raster backward. */ \
+  X(RasterBwdAccumWeight, RasterBwd) \
+  /* Camera ID bounds for packed projection backward / FPBO. */ \
+  X(FusedProjBwdCamBounds, RasterBwd) \
+  /* The PCA regularizer runs between the backward and the optim step, which \
+     reads its gradient out of pca_reg.work: the sort's scratch first, then \
+     the order and the gradients (engine/EnginePcaReg.cpp). */ \
+  X(PcaRegWork         , RasterBwd) \
+  X(PcaRegBox          , RasterBwd) \
+  X(PcaRegNodes        , RasterBwd) \
+  X(PcaRegMeta         , RasterBwd) \
+  X(PcaRegRanges       , RasterBwd) \
+  /* The perceptual losses' per-call scratch, re-acquired per pyramid scale \
+     (acquire_reused): scale 0 sizes it. */ \
+  X(SsimMaskWeight     , Loss) \
+  X(SsimBlurred        , Loss) \
+  X(SsimBlurNorm       , Loss) \
+  X(SsimBlurGrad       , Loss) \
+  X(ScielabMaskWeight  , Loss) \
+  X(FlipMaskWeight     , Loss) \
+  /* Each relocate / add / score-clip launcher opens its own instance: the \
+     draw's sort and the relocation lists never leave the call. */ \
+  X(DensifyScoreGather             , Densify) \
+  X(DensifyWswrSortingValues       , Densify) \
+  X(DensifyWswrKeysOut             , Densify) \
+  X(DensifyWswrIndicesIn           , Densify) \
+  X(DensifyWswrIndicesOut          , Densify) \
+  X(DensifyWswrOutIdx              , Densify) \
+  X(DensifyRelocMask               , Densify) \
+  X(DensifyRelocDstIndices         , Densify) \
+  X(DensifyMcmcSampleProbs         , Densify) \
+  X(DensifyMcmcSampleProbsCumsum   , Densify) \
+  X(DensifyMcmcIndexMap            , Densify) \
+  X(DensifyMcmcNIdxBuffer          , Densify) \
+  X(DensifyMcmcAddSampleProbs      , Densify) \
+  X(DensifyMcmcAddSampleProbsCumsum, Densify) \
+  X(DensifyMcmcAddIndexMap         , Densify) \
+  X(DensifyMcmcAddNIdxBuffer       , Densify)
+
+struct AliasRow { PoolSlot slot; PoolPhase phase; };
+inline constexpr AliasRow kAliasRows[] = {
+#define X(name, ph) AliasRow{ PoolSlot::name, PoolPhase::ph },
+    POOL_ALIAS_TABLE(X)
+#undef X
+};
+
+constexpr PoolPhase slot_phase(PoolSlot s) {
+    for (const AliasRow& r : kAliasRows)
+        if (r.slot == s) return r.phase;
+    return PoolPhase::None;
+}
+
+constexpr bool ce_alias_rows_unique() {
+    const size_t n = sizeof(kAliasRows) / sizeof(kAliasRows[0]);
+    for (size_t i = 0; i < n; ++i)
+        for (size_t j = i + 1; j < n; ++j)
+            if (kAliasRows[i].slot == kAliasRows[j].slot) return false;
+    return true;
+}
+static_assert(ce_alias_rows_unique(),
+              "POOL_ALIAS_TABLE: a slot is listed twice");
+
+// ---- Slots sized by the live splat count ----------------------------------
+
+// Requested at a size proportional to the LIVE count, so the pool allocates
+// them for cap_max on first use: Splat then stops growing as the model
+// densifies, which the training VRAM forecast assumes.
+#define POOL_LIVE_SPLAT_TABLE(X) \
+  X(EngSubbatchAccumWeightSum)       X(RasterBwdVWorld) \
+  X(PcaRegPermCache)                 X(PcaRegNbrsCache)
+
+inline constexpr PoolSlot kLiveSplatSlots[] = {
+#define X(name) PoolSlot::name,
+    POOL_LIVE_SPLAT_TABLE(X)
+#undef X
+};
+
+constexpr bool slot_live_sized(PoolSlot s) {
+    for (PoolSlot r : kLiveSplatSlots)
+        if (r == s) return true;
+    return false;
+}
+
+constexpr bool ce_live_splat_rows_are_splat() {
+    for (PoolSlot r : kLiveSplatSlots)
+        if (slot_category(r) != VramCategory::Splat || slot_phase(r) != PoolPhase::None)
+            return false;
+    return true;
+}
+static_assert(ce_live_splat_rows_are_splat(),
+              "POOL_LIVE_SPLAT_TABLE: rows must be Splat and own their memory");
+
+constexpr const char* to_string(PoolPhase p) {
+    switch (p) {
+        case PoolPhase::None:      return "none";
+        case PoolPhase::TileIsect: return "tile-isect";
+        case PoolPhase::Loss:      return "loss";
+        case PoolPhase::ImageBwd:  return "image-bwd";
+        case PoolPhase::RasterBwd: return "raster-bwd";
+        case PoolPhase::Densify:   return "densify";
+        default:                   return "?";
     }
 }
 

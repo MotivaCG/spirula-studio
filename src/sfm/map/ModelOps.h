@@ -27,6 +27,7 @@
 #include "sfm/core/Model.h"
 #include "sfm/map/Mapper.h"
 #include "sfm/map/Merge.h"
+#include "sfm/core/Log.h"
 
 namespace sfm {
 
@@ -164,6 +165,7 @@ struct ManagerStats {
     double seam_bar_sum = 0, seam_reference_sum = 0;
     size_t seam_refused_pairs = 0, seam_passed = 0;
     size_t splits = 0, duplicate_splits = 0, split_dropped = 0;
+    size_t seams_welded = 0;       // open pairs Mapper::weldSeams fused
     size_t models_before = 0, models_after = 0;
     size_t covered_before = 0, covered_after = 0;
 };
@@ -406,9 +408,9 @@ inline std::vector<Reconstruction> dropRedundantModels(std::vector<Reconstructio
         if (rank && n && (double)shared >= opt.redundant_ratio * (double)n) {
             st.dropped_redundant++;
             if (opt.verbose)
-                fprintf(stderr,
-                        "[mgr] dropped a %u-image model: %zu of its images are already in "
-                        "larger ones\n", n, shared);
+                slog::diag(slog::Tag::Map,
+                           "[mgr] dropped a %u-image model: %zu of its images are already in "
+                           "larger ones", n, shared);
             continue;
         }
         for (const auto& kv : m.images)
@@ -460,11 +462,11 @@ inline std::vector<Reconstruction> splitInconsistentModels(Mapper& mapper,
         st.splits++;
         st.split_dropped += ss.dropped_images;
         if (opt.verbose)
-            fprintf(stderr,
-                    "[mgr] split a %u-image model into %zu (%zu of %zu inner pairs hold; "
-                    "largest group %zu, %zu images dropped)\n",
-                    m.numRegistered(), parts.size(), ss.pairs_agree, ss.pairs_tested, ss.largest,
-                    ss.dropped_images);
+            slog::diag(slog::Tag::Map,
+                       "[mgr] split a %u-image model into %zu (%zu of %zu inner pairs hold; "
+                       "largest group %zu, %zu images dropped)",
+                       m.numRegistered(), parts.size(), ss.pairs_agree, ss.pairs_tested, ss.largest,
+                       ss.dropped_images);
         for (Reconstruction& p : parts) {
             memo.split.insert(ModelMemo::of(p));
             out.push_back(std::move(p));
@@ -504,36 +506,39 @@ inline std::vector<Reconstruction> splitFoldedModels(Mapper& mapper,
         // always runs through structure it really does share.
         if (parts.size() <= 1 || !foldSplitAccepted(dr, cut, opt.duplicate)) {
             if (opt.verbose && parts.size() > 1)
-                fprintf(stderr,
-                        "[mgr] a %u-image model has %zu of %zu co-located pairs with nothing "
-                        "in common, but splitting it would sever %.1f%% of its co-visibility "
-                        "(>%.1f%%): keeping it whole\n",
-                        m.numRegistered(), dr.conflicts, dr.colocated, 100.0 * cut.fraction(),
-                        100.0 * opt.duplicate.max_cut_fraction);
+                slog::diag(slog::Tag::Map,
+                           "[mgr] a %u-image model has %zu of %zu co-located pairs with nothing "
+                           "in common, but splitting it would sever %.1f%% of its co-visibility "
+                           "(>%.1f%%): keeping it whole",
+                           m.numRegistered(), dr.conflicts, dr.colocated, 100.0 * cut.fraction(),
+                           100.0 * opt.duplicate.max_cut_fraction);
             else if (opt.verbose && cut.reattached)
-                fprintf(stderr,
-                        "[mgr] a %u-image model has %zu of %zu co-located pairs with nothing "
-                        "in common, but the %zu piece(s) they would cut off stand where nothing "
-                        "else does (<%.0f%%): keeping it whole\n",
-                        m.numRegistered(), dr.conflicts, dr.colocated, cut.reattached,
-                        100.0 * opt.duplicate.min_fold_overlap);
+                slog::diag(slog::Tag::Map,
+                           "[mgr] a %u-image model has %zu of %zu co-located pairs with nothing "
+                           "in common, but the %zu piece(s) they would cut off stand where nothing "
+                           "else does (<%.0f%%): keeping it whole",
+                           m.numRegistered(), dr.conflicts, dr.colocated, cut.reattached,
+                           100.0 * opt.duplicate.min_fold_overlap);
             out.push_back(std::move(m));
             continue;
         }
         st.duplicate_splits++;
         st.split_dropped += dropped;
         if (opt.verbose) {
-            fprintf(stderr,
-                    "[mgr] a %u-image model has %zu of %zu co-located image pairs with no "
-                    "structure in common and no match either (%zu more share nothing but were "
-                    "matched), a cut that severs %.2f%% of its co-visibility, and every piece "
-                    "standing where another one does (%.0f%% at worst): two places written on "
-                    "top of each other. Splitting into",
-                    m.numRegistered(), dr.conflicts, dr.colocated, dr.unmatched_but_seen,
-                    100.0 * cut.fraction(), 100.0 * cut.min_overlap);
-            for (const Reconstruction& p : parts) fprintf(stderr, " %u", p.numRegistered());
-            if (dropped) fprintf(stderr, " (%zu images dropped)", dropped);
-            fprintf(stderr, "\n");
+            char head[512];
+            snprintf(head, sizeof head,
+                     "[mgr] a %u-image model has %zu of %zu co-located image pairs with no "
+                     "structure in common and no match either (%zu more share nothing but were "
+                     "matched), a cut that severs %.2f%% of its co-visibility, and every piece "
+                     "standing where another one does (%.0f%% at worst): two places written on "
+                     "top of each other. Splitting into",
+                     m.numRegistered(), dr.conflicts, dr.colocated, dr.unmatched_but_seen,
+                     100.0 * cut.fraction(), 100.0 * cut.min_overlap);
+            std::string line = head;
+            for (const Reconstruction& p : parts)
+                line += " " + std::to_string(p.numRegistered());
+            if (dropped) line += " (" + std::to_string(dropped) + " images dropped)";
+            slog::diag(slog::Tag::Map, "%s", line.c_str());
         }
         for (Reconstruction& p : parts) {
             memo.split.insert(ModelMemo::of(p));
@@ -541,6 +546,18 @@ inline std::vector<Reconstruction> splitFoldedModels(Mapper& mapper,
         }
     }
     return out;
+}
+
+// After a fold split: refine unaudited models, then drop duplicates. Refine can re-register
+// a cut piece into the main model, leaving a contained duplicate (4412-image rig).
+template <class Refine>
+std::vector<Reconstruction> refineAfterFoldSplit(std::vector<Reconstruction> models,
+                                                 ModelMemo& memo, const ManagerOptions& opt,
+                                                 ManagerStats& st, Refine&& refine) {
+    for (Reconstruction& m : models)
+        if (m.numRegistered() >= 2 && memo.audited.insert(ModelMemo::of(m)).second)
+            m = refine(m);
+    return dropRedundantModels(std::move(models), opt, st);
 }
 
 // ---- camera consensus ----------------------------------------------------
@@ -622,18 +639,18 @@ inline void refitOutlierCameras(Mapper& mapper, std::vector<Reconstruction>& mod
             }
             if (!donor) continue;
             if (opt.verbose)
-                fprintf(stderr,
-                        "[mgr] camera %u of a %u-image model: focal %.0f vs the %.0f the other "
-                        "models agree on; refitting\n", id, m.numRegistered(),
-                        m.cameras[id].focal(), donor->focal());
+                slog::diag(slog::Tag::Map,
+                           "[mgr] camera %u of a %u-image model: focal %.0f vs the %.0f the other "
+                           "models agree on; refitting", id, m.numRegistered(),
+                           m.cameras[id].focal(), donor->focal());
             m.cameras[id] = *donor;
             st.cameras_refit++;
         }
         const uint32_t before = m.numRegistered();
         m = mapper.refine(m);
         if (opt.verbose)
-            fprintf(stderr, "[mgr] refit model: %u -> %u images, %zu points\n", before,
-                    m.numRegistered(), m.points3D.size());
+            slog::diag(slog::Tag::Map, "[mgr] refit model: %u -> %u images, %zu points", before,
+                       m.numRegistered(), m.points3D.size());
     }
 }
 
@@ -664,11 +681,10 @@ inline std::vector<Reconstruction> auditModels(Mapper& mapper, std::vector<Recon
         st.audited_repaired += as.reregistered;
         memo.audited.insert(ModelMemo::of(m));
         if (opt.verbose && (as.unsupported || m.numRegistered() != imgs))
-            fprintf(stderr,
-                    "[mgr] audited a model: %u -> %u images, %zu -> %zu points "
-                    "(%u unsupported, %u re-registered, %u dropped)\n",
-                    imgs, m.numRegistered(), pts, m.points3D.size(), as.unsupported,
-                    as.reregistered, as.deregistered);
+            slog::diag(slog::Tag::Map, "[mgr] audited a model: %u -> %u images, %zu -> %zu points "
+                       "(%u unsupported, %u re-registered, %u dropped)",
+                       imgs, m.numRegistered(), pts, m.points3D.size(), as.unsupported,
+                       as.reregistered, as.deregistered);
     }
     return models;
 }

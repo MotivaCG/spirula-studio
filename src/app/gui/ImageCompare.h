@@ -1,17 +1,8 @@
 #pragma once
 
-// ImageCompare -- the training preview's second mode: one training frame's
-// ground truth beside the render of the same camera, one row per modality the
-// run actually loaded (photo, and depth / normals where they are supervised).
-//
-// The pair comes out of the engine (engine_preview_forward), so what is on
-// screen is what the loss compares -- the same decode, mask, downscale,
-// fisheye / equirectangular split and per-image colour correction. Zoom and
-// pan are shared by every pane: the question this mode answers is whether the
-// render is soft because the model is, or because the photograph was.
-//
-// GUI thread only, plus the one worker it starts for the engine call.
-// attach() once the engine is ready; detach() BEFORE the session goes away.
+// Training images, renders and supervision maps, shown separately or blended.
+// The engine supplies the images compared by the loss and the map used for densification.
+// GUI thread plus one worker. detach() before the session goes away.
 
 #include "app/gui/GlLoader.h"
 
@@ -31,10 +22,14 @@ namespace i18n { struct Msg; }
 
 namespace gui {
 
-// Where one post-split view goes when the pair is drawn, and how far it has to
-// be turned to sit flush against its neighbours (ImageCompare.cpp's kCross5 /
-// kCross6 build the tables).
-struct FaceCell { int col, row, turns; };   // turns = quarter turns clockwise
+// Where one post-split view goes on the canvas when the pair is drawn, in
+// canvas pixels, and how far it is turned to sit flush against its neighbours
+// (ImageCompare.cpp's face_layout unfolds the cube).
+struct FaceCell { float x, y, w, h; int turns; };   // turns = quarter turns clockwise
+
+// Where one view sits in the packed texture, in texels. Views differ in size
+// when the faces were cropped per lens, so each carries its own rect.
+struct AtlasRect { int x, y, w, h; };
 
 class ImageCompare {
 public:
@@ -43,29 +38,36 @@ public:
     void attach(spirula::TrainerSession& session);
     void detach();
     bool attached() const { return _session != nullptr; }
+    // Blend playback wants every frame drawn while the toolbar is on screen.
+    bool animating() const {
+        return _blend_playing && ImGui::GetFrameCount() - _blend_play_frame <= 1;
+    }
 
     // Draw into the current window. `step` is the training iteration that has
     // just finished (< 0 when unknown); `training` enables the follow-along
     // refresh.
     void draw(bool training, int step);
 
-    // Free the GL textures. Call while the GL context is still current.
+    // Free the GL textures; the next draw() uploads them again from the shot.
+    // Call while the GL context is still current.
     void destroy_gl();
 
 private:
     // What the region the mask excludes looks like.
     enum class MaskShow { Dim = 0, Unmarked = 1, Hide = 2 };
 
-    // What the worker was asked for. Equality decides whether the pair on
-    // screen still answers the current selection.
     struct Job {
         int  index = 0;
         bool color_correct = true;
         // Show the file itself rather than the downscaled copy the loss sees.
         bool source_gt = false;
-        bool operator==(const Job& o) const {
+        bool calib_warp = true;
+        // Also compute the densification error map, which costs a loss pass.
+        bool error_map = false;
+        bool covers(const Job& o) const {
             return index == o.index && color_correct == o.color_correct &&
-                   source_gt == o.source_gt;
+                   source_gt == o.source_gt && calib_warp == o.calib_warp &&
+                   (!o.error_map || error_map);
         }
     };
 
@@ -77,16 +79,20 @@ private:
         uint64_t id = 0;
         Job  job;
         int  views = 1;
-        int  view_w = 0, view_h = 0;       // one view
-        int  pack_cols = 1, pack_rows = 1; // the packed grid, in views
-        int  lay_cols = 1, lay_rows = 1;   // the canvas, in cells
-        std::vector<FaceCell> cells;       // one per view, in view order
-        std::vector<uint8_t> gt, render;   // [pack_rows*view_h, pack_cols*view_w, 3]
+        int  view_w = 0, view_h = 0;       // the largest view
+        int  atlas_w = 0, atlas_h = 0;     // the packed texture, in texels
+        int  canvas_w = 0, canvas_h = 0;   // the unfolded layout, in pixels
+        std::vector<FaceCell>  cells;      // where each view is drawn
+        std::vector<AtlasRect> uv;         // where each view is stored
+        std::vector<uint8_t> gt, render;   // [atlas_h, atlas_w, 3]
         // The supervision modalities on the same grid, already coloured
         // (app/DepthColor.h) so the UI thread only uploads. Empty when the
         // run does not load them.
         std::vector<uint8_t> gt_depth, render_depth;
         std::vector<uint8_t> gt_normal, render_normal;
+        // The densification error map on the same grid, on the depth ramp.
+        std::vector<uint8_t> err_map;
+        float err_mean = 0.0f, err_max = 0.0f;
         std::vector<uint8_t> mask;         // the same grid; empty when there is none
         int  src_w = 0, src_h = 0;
         std::vector<uint8_t> src;          // the file itself, when asked for
@@ -105,10 +111,9 @@ private:
     struct Pane {
         GLuint tex = 0;
         int tex_w = 0, tex_h = 0;
-        int view_w = 0, view_h = 0;
-        int pack_cols = 1;
         int canvas_w = 0, canvas_h = 0;
-        std::vector<FaceCell> cells;
+        std::vector<FaceCell>  cells;
+        std::vector<AtlasRect> uv;
     };
 
     void worker_loop();
@@ -120,16 +125,21 @@ private:
     // costing a render.
     void rebuild_textures();
     void upload(GLuint& tex, const uint8_t* rgb, int w, int h);
-    void draw_toolbar(bool training);
+    void draw_toolbar();
     void draw_image_picker();
     // Put the next control on this row if `w` still fits, else start a row.
     void place(float w);
     void draw_panes(const ImVec2& avail);
+    // One modality's panes: the reference / render pair, or a lone map.
+    struct Block;
+    int  collect(Block* out) const;
+    void draw_view_menu();
     void draw_pane(const Pane& p, const ImVec2& box,
-                   const spirula::i18n::Msg& caption);
+                   const char* id, const char* caption,
+                   const Pane* overlay = nullptr, float opacity = 0.0f);
     void handle_view_input();
     void handle_keys();
-    // The split factor of the selected image (1, 5 or 6).
+    // The split factor of the selected image.
     int  faces() const;
     bool has_masks() const;
     void select(int index);
@@ -141,10 +151,20 @@ private:
     MaskShow _mask_show = MaskShow::Dim;
     bool _color_correct = true;
     bool _source_gt = false;
+    bool _calib_warp = true;
     bool _smooth = false;
-    bool _live = true;
     bool _show_depth = true;
     bool _show_normal = true;
+    bool _show_error = true;
+    bool _blend = false;
+    int _blend_pair = 0;
+    float _blend_amount[5] = {50.0f, 50.0f, 50.0f, 50.0f, 50.0f};
+    bool _blend_playing = false;
+    float _blend_phase = 0.0f;    // [0, 2): rising then falling
+    int _blend_play_frame = -10;  // last frame the playback advanced
+    // Whether this run builds a densification error map at all -- a mode of
+    // `none`, or a score taken entirely from the world gradient, builds none.
+    bool _has_error_map = false;
     std::string _filter;          // the picker's file-name search
     float _row_w = 0.0f, _row_used = 0.0f;   // toolbar packing (see place)
 
@@ -177,16 +197,17 @@ private:
     // coloured outside it: colouring 2 MPx would hold the trainer up for
     // nothing.
     std::vector<float> _wgt_depth, _wr_depth, _wgt_normal, _wr_normal;
+    std::vector<float> _werr;
     std::vector<uint8_t> _wmodrgb;   // one of them coloured, before packing
 
     // ---- what is on screen ----
     Shot _shot;
-    Job  _requested{-1, false, false};   // never equals a real selection
+    Job  _requested{-1, false, false, false};
     uint64_t _in_flight = 0;
     bool _dirty = true;           // the selection changed; re-request
     bool _tex_dirty = true;       // the composite changed; re-upload
     Pane _gt, _render;
-    Pane _gt_depth, _render_depth, _gt_normal, _render_normal;
+    Pane _gt_depth, _render_depth, _gt_normal, _render_normal, _err_map;
     std::string _error;
 
     // ---- refresh pacing while training (see draw) ----

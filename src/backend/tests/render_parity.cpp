@@ -5,13 +5,10 @@
 //   CUDA build:   ./render_parity dump ref.bin
 //   Vulkan build: ./render_parity compare ref.bin   (per device)
 //
-// Sections:
-//   1. Background SH forward: SH degree x (camera model, distortion tier).
-//   2. Full pipeline (projection -> intersect -> rasterize), fused + packed,
-//      per primitive, with dist-loss / median variants. Rendered images,
-//      transmittances, and tile offsets are compared with tolerance; near-tie
-//      depth keys may sort differently across backends (last-ulp projection
-//      divergence), so a small violation fraction is allowed.
+// Covers background SH and projection -> intersect -> rasterize (packed or
+// not, per primitive, with distortion / median / score-map variants). Near-tie
+// depth keys may sort differently across backends, so a small violation
+// fraction is allowed.
 
 #include <backend/tests/DistortionFixture.h>
 #include <kernels/background/BackgroundSphericalHarmonics.cuh>
@@ -27,6 +24,7 @@
 #include <fstream>
 #include <random>
 #include <vector>
+#include "backend/tests/ScreenRows.h"
 
 using backend::MemcpyKind;
 
@@ -71,12 +69,12 @@ int check_error() {
     return 0;
 }
 
-// Local copy of EngineCommon.h vec_to_2d_float4 (the [nnz, 1] AABB view the
-// engine hands the packed 3dgut rasterizer).
-DeviceTensor2D<float4> vec_to_2d_float4(const DeviceVector<float4>& vec) {
-    TorchTensorView tv{(uint64_t)vec.data_ptr(), (uint32_t)sizeof(float),
-                       {vec.size(), 1LL, 4LL}};
-    return DeviceTensor2D<float4>(tv);
+// static: the engine library these tools link defines the same helper
+// inline (engine/EngineCommon.h), and MSVC refuses the duplicate.
+static DeviceTensor2D<uint2> vec_to_2d_aabb(const DeviceVector<uint2>& vec) {
+    TorchTensorView tv{(uint64_t)vec.data_ptr(), (uint32_t)sizeof(unsigned),
+                       {vec.size(), 1LL, 2LL}};
+    return DeviceTensor2D<uint2>(tv);
 }
 
 int main(int argc, char** argv) {
@@ -186,20 +184,34 @@ int main(int argc, char** argv) {
         int dist;      // distortion tier, index into dist_fixture::kTierNames
         DistortionType dt;
         bool median;
+        bool score;    // the learned densification score map
     };
     // Only the 3dgut rasterizer reads the camera, so its rows carry the tier
     // sweep; for 3dgs/mip the tier reaches the projection alone.
     const Cfg cfgs[] = {
-        {0, false, 0, 1, DistortionType::RGB_D, true},
-        {1, false, 0, 0, DistortionType::RGB_D, true},
-        {2, false, 0, 1, DistortionType::RGB_D, true},
-        {2, false, 0, 2, DistortionType::D, false},
-        {0, false, 1, 2, DistortionType::D, false},
-        {2, false, 3, 0, DistortionType::None, true},
-        {0, true, 3, 0, DistortionType::None, false},
-        {1, true, 0, 3, DistortionType::D, false},
-        {2, true, 0, 3, DistortionType::None, false},
+        {0, false, 0, 1, DistortionType::RGB_D, true, true},
+        {1, false, 0, 0, DistortionType::RGB_D, true, false},
+        {2, false, 0, 1, DistortionType::RGB_D, true, true},
+        {2, false, 0, 2, DistortionType::D, false, false},
+        {0, false, 1, 2, DistortionType::D, false, false},
+        {2, false, 3, 0, DistortionType::None, true, false},
+        {0, true, 3, 0, DistortionType::None, false, true},
+        {1, true, 0, 2, DistortionType::D, false, false},
+        {2, true, 0, 2, DistortionType::None, false, true},
     };
+
+    // Scores as the densify state holds them, (s^p, updates); every fifth
+    // splat has no update yet and renders the prior.
+    std::vector<float> score_in(N * 2), score_one(N * 2, 1.0f);
+    for (int64_t i = 0; i < N; i++) {
+        score_in[2 * i] = uf(0.0f, 1.0f);
+        score_in[2 * i + 1] = i % 5 == 0 ? 0.0f : uf(1.0f, 10.0f);
+    }
+    float* d_score_in = upload(score_in);
+    float* d_score_one = upload(score_one);
+    float* d_score_out =
+        (float*)backend::device_malloc((size_t)C * H * W * sizeof(float));
+    bool score_self_ok = true;
 
     for (const Cfg& cfg : cfgs) {
         backend::memset_sync(d_radii, 0, N * sizeof(float));
@@ -207,15 +219,15 @@ int main(int argc, char** argv) {
         // --- projection ---
         std::vector<DeviceTensorFloatND> splats_s;
         DeviceVector<int32_t> cam_ids, gauss_ids;
-        DeviceTensor2D<float4> aabb_2d;       // non-packed (or packed view)
-        DeviceVector<float4> aabb_vec;        // packed
-        DeviceTensorFloatND aabb_nd, depths_nd;
+        DeviceTensor2D<uint2> aabb_2d;       // non-packed (or packed view)
+        DeviceVector<uint2> aabb_vec;        // packed
+        DeviceTensorFloatND depths_nd;
 
         if (cfg.packed) {
             auto fn = cfg.prim == 0   ? projection_3dgs_packed_forward
                       : cfg.prim == 1 ? projection_mip_packed_forward
                                       : projection_3dgut_packed_forward;
-            auto out = fn(N, 3, in_splats, ttv(d_vm, {(int64_t)C, 16}),
+            auto out = fn(N, ColorBasis{3, 0}, in_splats, ttv(d_vm, {(int64_t)C, 16}),
                           ttv(d_intr, {(int64_t)C, 4}), W, H, cams[cfg.cam],
                           dist_fixture::kTierNames[cfg.dist],
                           dist_tv(cfg.dist), radii, std::nullopt,
@@ -225,15 +237,14 @@ int main(int argc, char** argv) {
             aabb_vec = std::get<2>(out);
             auto depths_vec = std::get<3>(out);
             splats_s = std::get<4>(out);
-            aabb_2d = vec_to_2d_float4(aabb_vec);
-            aabb_nd = DeviceTensorFloatND(aabb_vec);
+            aabb_2d = vec_to_2d_aabb(aabb_vec);
             depths_nd = DeviceTensorFloatND(depths_vec);
             acc.push_back((float)cam_ids.size());  // nnz
         } else {
             auto fn = cfg.prim == 0   ? projection_3dgs_forward
                       : cfg.prim == 1 ? projection_mip_forward
                                       : projection_3dgut_forward;
-            auto out = fn(N, 3, in_splats, ttv(d_vm, {(int64_t)C, 16}),
+            auto out = fn(N, ColorBasis{3, 0}, in_splats, ttv(d_vm, {(int64_t)C, 16}),
                           ttv(d_intr, {(int64_t)C, 4}), W, H, cams[cfg.cam],
                           dist_fixture::kTierNames[cfg.dist],
                           dist_tv(cfg.dist), radii, std::nullopt,
@@ -241,30 +252,23 @@ int main(int argc, char** argv) {
             aabb_2d = std::get<0>(out);
             auto depths_2d = std::get<1>(out);
             splats_s = std::get<2>(out);
-            aabb_nd = DeviceTensorFloatND(aabb_2d);
             depths_nd = DeviceTensorFloatND(depths_2d);
         }
         backend::device_synchronize();
         if (check_error()) return 1;
 
-        // --- tile intersection (ellipse mode; screen layout per primitive,
-        //     see EngineForward.cpp) ---
-        DeviceTensorFloatND *proj_xy = nullptr, *proj_conic = nullptr,
-                            *proj_opac = nullptr;
-        if (cfg.prim == 2) {
-            proj_conic = &splats_s[0];
-            proj_opac = &splats_s[1];
-        } else {
-            proj_xy = &splats_s[0];
-            proj_conic = &splats_s[2];
-            proj_opac = &splats_s[3];
-        }
+        // --- tile intersection (ellipse mode) ---
         DeviceVector<int32_t>* image_ids_ptr =
             cfg.packed && cam_ids.data_ptr() ? &cam_ids : nullptr;
 
-        auto [isect_ids, flatten_ids, tile_offsets] = do_intersect_tile_generic(
-            aabb_nd, depths_nd, proj_xy, proj_conic, proj_opac, C,
-            ttv(d_intr, {(int64_t)C, 4}), W, H, image_ids_ptr);
+        int macro_log2 = kMacroLog2Default;
+
+        auto intersections = do_intersect_tile_generic(
+            aabb_2d, depths_nd, ellipse_view(splats_s, cfg.prim == 2), C,
+            ttv(d_intr, {(int64_t)C, 4}), W, H, image_ids_ptr, /*tile_active=*/nullptr,
+        macro_log2);
+        auto& flatten_ids = std::get<1>(intersections);
+        auto& tile_offsets = std::get<2>(intersections);
         backend::device_synchronize();
         if (check_error()) return 1;
 
@@ -278,20 +282,51 @@ int main(int argc, char** argv) {
                    DeviceTensor3D<int32_t>, RenderOutput::TensorTuple,
                    DeviceTensor3D<float>>
             rout;
-        if (cfg.prim == 2) {
-            rout = rasterize_to_pixels_3dgut_fwd(
-                N, in_splats, splats_s, gauss_ids,
-                ttv(d_vm, {(int64_t)C, 16}), ttv(d_intr, {(int64_t)C, 4}),
-                cams[cfg.cam], dist_fixture::kTierNames[cfg.dist],
-                dist_tv(cfg.dist), aabb_2d, W, H,
-                tile_offsets, flatten_ids, cfg.dt, cfg.median);
-        } else {
-            auto fn = cfg.prim == 0 ? rasterize_to_pixels_3dgs_fwd
-                                    : rasterize_to_pixels_mip_fwd;
-            rout = fn(N, in_splats, splats_s, gauss_ids, W, H, tile_offsets,
-                      flatten_ids, cfg.dt, cfg.median);
+        auto raster = [&](const float* score) {
+            SplatScoreRender sr;
+            if (score) {
+                sr.score = (const float2*)score;
+                sr.out = d_score_out;
+                sr.exponent = 2.5f;
+                sr.prior = 0.3f;
+            }
+            if (cfg.prim == 2) {
+                rout = rasterize_to_pixels_3dgut_fwd(
+                    N, in_splats, splats_s, gauss_ids,
+                    ttv(d_vm, {(int64_t)C, 16}), ttv(d_intr, {(int64_t)C, 4}),
+                    cams[cfg.cam], dist_fixture::kTierNames[cfg.dist],
+                    dist_tv(cfg.dist), aabb_2d, W, H,
+                    tile_offsets, flatten_ids, macro_log2, cfg.dt,
+                    cfg.median, true, sr);
+            } else {
+                auto fn = cfg.prim == 0 ? rasterize_to_pixels_3dgs_fwd
+                                        : rasterize_to_pixels_mip_fwd;
+                rout = fn(N, in_splats, splats_s, gauss_ids, W, H, tile_offsets,
+                          flatten_ids, macro_log2, cfg.dt, cfg.median, true, sr, 0.0f);
+            }
+            backend::device_synchronize();
+        };
+        const int64_t n_pix = (int64_t)C * H * W;
+        if (cfg.score) {
+            // With every s = 1 the coverage-normalized map is 1 wherever
+            // anything is drawn: holds on either backend, whatever the order.
+            raster(d_score_one);
+            if (check_error()) return 1;
+            std::vector<float> m(n_pix), t(n_pix);
+            backend::memcpy_sync(m.data(), d_score_out, n_pix * 4,
+                                 MemcpyKind::DeviceToHost);
+            backend::memcpy_sync(t.data(), std::get<1>(rout).data_ptr(),
+                                 n_pix * 4, MemcpyKind::DeviceToHost);
+            for (int64_t i = 0; i < n_pix; i++)
+                if (1.0f - t[i] > 1e-3f ? std::fabs(m[i] - 1.0f) > 1e-3f
+                                        : !(m[i] >= 0.0f && m[i] <= 1.001f)) {
+                    std::fprintf(stderr, "score map at pixel %lld: %g, coverage %g\n",
+                                 (long long)i, m[i], 1.0f - t[i]);
+                    score_self_ok = false;
+                    break;
+                }
         }
-        backend::device_synchronize();
+        raster(cfg.score ? d_score_in : nullptr);
         if (check_error()) return 1;
 
         auto& renders = std::get<0>(rout);
@@ -299,7 +334,8 @@ int main(int argc, char** argv) {
         auto& distortions = std::get<3>(rout);
         auto& render_median = std::get<4>(rout);
 
-        const int64_t n_pix = (int64_t)C * H * W;
+        if (cfg.score)
+            readback(acc, d_score_out, n_pix);
         readback(acc, (const float*)std::get<0>(renders).data_ptr(),
                  n_pix * 3);
         readback(acc, std::get<1>(renders).data_ptr(), n_pix);
@@ -312,6 +348,11 @@ int main(int argc, char** argv) {
         if (dist_has_depth(cfg.dt))
             readback(acc, std::get<1>(distortions).data_ptr(), n_pix);
         readback(acc, d_radii, N);
+    }
+
+    if (!score_self_ok) {
+        std::printf("render_parity: FAILED (score map)\n");
+        return 1;
     }
 
     if (dumping) {

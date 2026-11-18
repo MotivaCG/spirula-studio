@@ -1,17 +1,51 @@
 // Tile-geometry constants and the ellipse/box culling test shared by the
 // rasterization forward (rasterize_fwd.slang) and backward
-// (rasterize_bwd.slang). Values mirror Common.cuh (TILE_SIZE_* /
-// MACRO_TILE_SIZE_*) — binning happens at macro-tile granularity, kernels
-// work on micro tiles.
+// (rasterize_bwd.slang). Values mirror Common.cuh — binning happens at
+// macro-tile granularity, kernels work on micro tiles.
 
 static const uint TILE_SIZE_X = 8;
 static const uint TILE_SIZE_Y = 8;
-static const uint MACRO_TILE_SIZE_X = 2;
-static const uint MACRO_TILE_SIZE_Y = 2;
 static const uint TILE_AREA = TILE_SIZE_X * TILE_SIZE_Y;
+
+// Which macro tile's splat list this micro tile walks. macro_log2 rides in
+// the params buffer rather than being a constant, so the binning tile is
+// retunable without respecializing any pipeline (core/Common.cuh).
+[ForceInline] uint macro_tile_id(uint mt_y, uint mt_x, uint tile_width,
+                                 uint macro_log2) {
+    return ((mt_y >> macro_log2) * tile_width) + (mt_x >> macro_log2);
+}
 
 // ALPHA_THRESHOLD comes from projection_utils.slang.
 static const float DEPTH_DIST_EPS = 1e-6f;
+
+// Primitive3DGS::kernel_vis (cut > 0: cut at sigma = cut, the tail renormalized to
+// zero there); dvis = -d vis / d sigma where vis > 0. cut stays a push constant: a
+// folded exp(-cut) may round unlike the device's, and both passes must agree on alpha.
+[ForceInline]
+float kernel_vis(float sigma, float cut, out float dvis) {
+    float vis = exp(-sigma);
+    dvis = vis;
+    if (cut > 0.0f) {
+        float inv = 1.0f / (1.0f - exp(-cut));
+        dvis = vis * inv;
+        vis = max(vis - exp(-cut), 0.0f) * inv;
+    }
+    return vis;
+}
+[ForceInline]
+float kernel_vis(float sigma, float cut) {
+    float dvis;
+    return kernel_vis(sigma, cut, dvis);
+}
+
+// The sigma at which opac * kernel_vis(sigma, cut) falls to ALPHA_THRESHOLD: the cull
+// radius, which the forward and the backward must compute identically.
+[ForceInline]
+float kernel_reach(float opac, float cut) {
+    if (cut <= 0.0f) return log(opac / ALPHA_THRESHOLD);
+    float ec = exp(-cut);
+    return -log(ec + (1.0f - ec) * (ALPHA_THRESHOLD / opac));
+}
 
 // Test whether the unit ellipse (x^T inv_cov x = 1, centered at origin)
 // overlaps an axis-aligned box [x0,x1]x[y0,y1]. Port of Common.cuh
@@ -34,3 +68,4 @@ bool ellipse_box_overlap_test(float3 inv_cov, float x0, float x1, float y0,
     float mc = max(max(x0, -x1), max(y0, -y1));
     return min(mc, min(mx, my) - 1.0f) < 0.f;
 }
+

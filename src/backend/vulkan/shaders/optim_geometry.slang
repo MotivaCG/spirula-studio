@@ -1,27 +1,23 @@
-// Fused 3DGS geometry optimizer (Vulkan backend), mirroring
-// fused_optim_3dgs_geometry_kernel in kernels/optim/FusedGeometryOptim.cu: one thread per
-// splat (256/block), per-splat regularizer gradients, then in-place Adam on
-// scales / quats (Riemannian) / opacities / means (optionally
-// scale-agnostic), plus features_dc when non-SH Adam-state quantization is
-// on (the fp32 path drives DC via a separate fused_adam_step launch). This
-// is the non-FPBO geometry step: data gradients come from the fp32 v_*
-// buffers or the block-wise 16-bit grad-quant codec, not from a camera loop.
+// Fused 3DGS geometry optimizer (Vulkan backend): one thread per splat
+// (256/block), per-splat regularizer gradients, then in-place Adam on scales /
+// quats (Riemannian) / opacities / means, plus features_dc under kNonShQuant
+// (the fp32 path drives DC from a separate fused_adam_step launch).
 //
-// Spec constants:
-//   kScaleAgnostic = use_scale_agnostic_mean
-//   kZeroGrad      = zero fp32 grad buffers after consuming them
-//   kNonShQuant    = non_sh.enabled (16-bit qadam for the five attributes)
-//   kGqMask        = which grad-quant buffers exist (1 means, 2 quats,
-//                    4 scales, 8 opac, 16 dc) — folded decode-vs-fp32 reads
+// Spec: kScaleAgnostic, kZeroGrad, kNonShQuant, kGqMask (bit per grad-quant
+// buffer: 1 means, 2 quats, 4 scales, 8 opac, 16 dc), kColorTrust (linear
+// splat colour space; features_dc only).
 //
 // Barriers only exist in the kNonShQuant reduces, which every thread
 // reaches (`inside` masks work, never control flow around a reduce).
-
+#include "shaders/projective_depth.slang"
 #define CudaDeviceExport ForceInline
 #include "shaders/per_splat_losses.slang"
+#include "shaders/pixel_wise.slang"
 #include "shaders/projection_utils.slang"
 #undef CudaDeviceExport
 #include "optim_quant.slang"
+#include "screen_size_hinge.slang"
+#include "visit.slang"
 
 [SpecializationConstant]
 const int kScaleAgnostic = 0;
@@ -31,6 +27,8 @@ const int kZeroGrad = 0;
 const int kNonShQuant = 0;
 [SpecializationConstant]
 const int kGqMask = 0;
+[SpecializationConstant]
+const int kColorTrust = 0;
 
 static const float kGeoBeta1 = 0.9f;
 static const float kGeoBeta2 = 0.999f;
@@ -63,6 +61,8 @@ struct OptimGeoParams {
     float* radii;          // (kScaleAgnostic)
     float* densify_score;  // optional output (has_densify_score)
     int* steps;            // per-splat steps (has_steps)
+    uint* visit_counters;  // per-splat render counters (has_visit)
+    float* auxiliary_opacities;
     // block-wise 16-bit quantized gradients (kGqMask; bound per 256 splats)
     uint* gq_means_packed;
     float2* gq_means_bounds;
@@ -86,6 +86,13 @@ struct OptimGeoParams {
     float4* nq_opacities_bounds;
     float4* nq_dc_bounds;
     // learning rates + regularizer weights (already divided by N host-side)
+    float4* depth_states;
+    float* depth_information;
+    float4* depth_centers;
+    int* depth_cameras;
+    float* depth_angular_bound;
+    float depth_lr, depth_angular_lr;
+    uint has_depth, depth_photo, depth_relative, depth_has_bound;
     float lr_means;
     float lr_quats;
     float lr_scales;
@@ -98,14 +105,20 @@ struct OptimGeoParams {
     float erank_reg_weight;
     float erank_reg_weight_s3;
     float quat_norm_reg_weight;
+    float dc_reg_weight;
     float sh_reg_weight;
     float grad_scale;
+    float max_screen_size;
+    float max_screen_size_penalty;
+    float eps_tr;              // colour trust region (kColorTrust != 0)
     int32_t scalar_step;
     uint32_t has_steps;
     uint32_t has_densify_score;
     uint32_t numel;
     uint32_t wgs_per_row;
-    uint32_t _pad0;
+    uint32_t has_visit;
+    uint32_t skip_unrendered_reg;
+    uint32_t has_auxiliary_opacities;
 };
 
 // Data gradient for a PRIMS-wide attribute: decode from the 16-bit
@@ -157,6 +170,7 @@ void fused_optim_3dgs_geometry(uint3 wg: SV_GroupID,
     float4 nq_mm_mean = float4(1e30f, -1e30f, 1e30f, -1e30f);
     float4 nq_mm_dc = float4(1e30f, -1e30f, 1e30f, -1e30f);
 
+    bool regularize = true;
     if (inside) {
         float step = float(p.has_steps != 0 ? p.steps[gid] : p.scalar_step);
         float ibc1 = 1.0f / (1.0f - pow(kGeoBeta1, step));
@@ -198,11 +212,22 @@ void fused_optim_3dgs_geometry(uint3 wg: SV_GroupID,
         _geo_grad_read<1>((kGqMask & 8) != 0, p.gq_opac_packed,
                           p.gq_opac_bounds, p.v_opacities, block_id, gid,
                           gd_opac);
+        bool rendered = gd_opac[0] != 0.0f;
+        if (p.has_visit != 0)
+            p.visit_counters[gid] = visit_step(p.visit_counters[gid], rendered);
+        regularize = !(p.skip_unrendered_reg != 0 && !rendered);
+        if (!regularize) {
+            v_scale = float3(0.0f);
+            v_quat = float4(0.0f);
+            v_opac = 0.0f;
+        }
         v_scale += p.grad_scale * float3(gd_scale[0], gd_scale[1],
                                          gd_scale[2]);
         v_quat += p.grad_scale * float4(gd_quat[0], gd_quat[1], gd_quat[2],
                                         gd_quat[3]);
         v_opac += p.grad_scale * gd_opac[0];
+        if (p.has_auxiliary_opacities != 0)
+            v_opac += p.grad_scale * p.auxiliary_opacities[gid];
         if (kZeroGrad != 0) {
             if ((kGqMask & 4) == 0) {
                 p.v_scales[3 * gid] = 0.0f;
@@ -224,6 +249,11 @@ void fused_optim_3dgs_geometry(uint3 wg: SV_GroupID,
             oq_state_read<3>(kNonShQuant != 0, p.nq_scales_packed,
                              p.nq_scales_bounds, p.g1_scales, p.g2_scales,
                              block_id, gid, g1, g2);
+            if (regularize) v_scale += screen_size_hinge_grad(
+                p.radii[gid], p.max_screen_size, p.max_screen_size_penalty,
+                scale,
+                oq_sqrt3(float3(g2[0], g2[1], g2[2]) * ibc2) +
+                    float3(kAdamEps));
             [ForceUnroll]
             for (int i = 0; i < 3; i++) {
                 g1[i] = kGeoBeta1 * g1[i] + (1.0f - kGeoBeta1) * v_scale[i];
@@ -329,6 +359,22 @@ void fused_optim_3dgs_geometry(uint3 wg: SV_GroupID,
                 p.v_means[3 * gid + 1] = 0.0f;
                 p.v_means[3 * gid + 2] = 0.0f;
             }
+            float4 projective_state = float4(0);
+            float3 projective_anchor = float3(0), projective_camera = float3(0);
+            float projective_gradient = 0;
+            float3 data_scale_gradient = p.grad_scale*float3(gd_scale[0],gd_scale[1],gd_scale[2]);
+            bool projective_active = p.has_depth != 0 && p.radii[gid] > 0
+                && dot(v_mean,v_mean)+dot(data_scale_gradient,data_scale_gradient) > 0;
+            if (projective_active) {
+                projective_state = p.depth_states[gid];
+                projective_active = projective_state.x > 0;
+                if (projective_active) {
+                    projective_anchor = p.depth_centers[max(int(projective_state.x),1)-1].xyz;
+                    projective_camera = p.depth_centers[p.depth_cameras[0]].xyz;
+                    projective_gradient = projective_depth_gradient(projective_anchor,projective_camera,
+                        mean,v_mean,data_scale_gradient,p.depth_photo != 0);
+                }
+            }
             // densification score: ||dL/dmean_world|| * max post-exp world
             // scale (pre-update log scales).
             if (p.has_densify_score != 0) {
@@ -387,6 +433,17 @@ void fused_optim_3dgs_geometry(uint3 wg: SV_GroupID,
                     p.g2_means[3 * gid + i] = g2[i];
                 }
             }
+            if (projective_active) {
+                float3 updated_mean = new_mean;
+                float3 updated_scale = float3(p.scales[3*gid],p.scales[3*gid+1],p.scales[3*gid+2]);
+                projective_depth_update(projective_anchor,projective_camera,p.depth_lr,p.depth_angular_lr,
+                    p.depth_photo != 0,p.depth_relative != 0,projective_gradient,p.depth_information[gid],
+                    projective_state,updated_mean,updated_scale,p.depth_has_bound != 0 ? p.depth_angular_bound[gid] : -1.f);
+                p.means[3*gid] = updated_mean.x; p.means[3*gid+1] = updated_mean.y; p.means[3*gid+2] = updated_mean.z;
+                p.scales[3*gid] = updated_scale.x; p.scales[3*gid+1] = updated_scale.y; p.scales[3*gid+2] = updated_scale.z;
+                p.depth_states[gid] = projective_state;
+            }
+
         }
 
         // update features_dc (only under kNonShQuant; the fp32 path keeps
@@ -409,12 +466,20 @@ void fused_optim_3dgs_geometry(uint3 wg: SV_GroupID,
             // L1-shrinkage DC color regularization (mirrors the fp32 path's
             // fused_adam_step l2_reg + offset = 0.5/kSh0).
             const float dc_off = 0.5f / kGeoSh0;
-            v_dc.x += p.sh_reg_weight *
-                      (max(fdc.x - dc_off, 0.0f) + min(fdc.x + dc_off, 0.0f));
-            v_dc.y += p.sh_reg_weight *
-                      (max(fdc.y - dc_off, 0.0f) + min(fdc.y + dc_off, 0.0f));
-            v_dc.z += p.sh_reg_weight *
-                      (max(fdc.z - dc_off, 0.0f) + min(fdc.z + dc_off, 0.0f));
+            float under_reg_weight = p.dc_reg_weight + p.sh_reg_weight;
+            v_dc.x += p.dc_reg_weight * max(fdc.x - dc_off, 0.0f) +
+                under_reg_weight * min(fdc.x + dc_off, 0.0f);
+            v_dc.y += p.dc_reg_weight * max(fdc.y - dc_off, 0.0f) +
+                under_reg_weight * min(fdc.y + dc_off, 0.0f);
+            v_dc.z += p.dc_reg_weight * max(fdc.z - dc_off, 0.0f) +
+                under_reg_weight * min(fdc.z + dc_off, 0.0f);
+
+            // Adam runs on x = splat_dc_encode(dc); carry the gradient there.
+            if (kColorTrust != 0) {
+                v_dc.x /= linear_rgb_to_srgb_grad(kGeoSh0 * fdc.x + 0.5f);
+                v_dc.y /= linear_rgb_to_srgb_grad(kGeoSh0 * fdc.y + 0.5f);
+                v_dc.z /= linear_rgb_to_srgb_grad(kGeoSh0 * fdc.z + 0.5f);
+            }
 
             float g1[3], g2[3];
             oq_state_read<3>(kNonShQuant != 0, p.nq_dc_packed, p.nq_dc_bounds,
@@ -427,9 +492,24 @@ void fused_optim_3dgs_geometry(uint3 wg: SV_GroupID,
             }
             float3 g1v = float3(g1[0], g1[1], g1[2]);
             float3 g2v = float3(g2[0], g2[1], g2[2]);
-            float3 new_dc = fdc - lr_features_dc * g1v /
-                                      (oq_sqrt3(g2v * ibc2) +
-                                       float3(kAdamEps));
+            float3 delta_dc = -lr_features_dc * g1v /
+                                  (oq_sqrt3(g2v * ibc2) + float3(kAdamEps));
+            float3 new_dc = fdc + delta_dc;
+            if (kColorTrust != 0) {
+                // The encode supplies the brightness scaling, so the rail is a
+                // bare radius; the 2 matches the colour-proportional clip.
+                float clip = kGeoSh0 * sqrt(max(2.0f * p.eps_tr /
+                                                max(_geo_sigmoid(opac), 1e-12f),
+                                                0.0f));
+                delta_dc = clamp(delta_dc, -float3(clip), float3(clip));
+                delta_dc.x = isfinite(delta_dc.x) ? delta_dc.x : 0.0f;
+                delta_dc.y = isfinite(delta_dc.y) ? delta_dc.y : 0.0f;
+                delta_dc.z = isfinite(delta_dc.z) ? delta_dc.z : 0.0f;
+                new_dc = float3(
+                    splat_dc_decode(splat_dc_encode(fdc.x) + delta_dc.x),
+                    splat_dc_decode(splat_dc_encode(fdc.y) + delta_dc.y),
+                    splat_dc_decode(splat_dc_encode(fdc.z) + delta_dc.z));
+            }
             p.features_dc[3 * gid] = new_dc.x;
             p.features_dc[3 * gid + 1] = new_dc.y;
             p.features_dc[3 * gid + 2] = new_dc.z;

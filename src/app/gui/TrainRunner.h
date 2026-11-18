@@ -17,7 +17,7 @@
 #include "app/webviewer/Viewer.h"
 
 #include <atomic>
-#include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -36,6 +36,7 @@ public:
         LoadError,  // preview parse failed
         Preparing,  // start_training: re-parse + engine setup
         Training,   // step loop running
+        Evaluating, // held-out render and metrics pass running
         Done,       // finished or stopped (checkpoint saved); engine viewable
         TrainError, // training pipeline failed
     };
@@ -63,6 +64,10 @@ public:
     // shutdown() asks to stop too, and must not undo the user's answer.
     void request_stop(bool save = true);
     void shutdown();              // stop + join (app exit / new session)
+    // ... and give the engine's VRAM back with it. The session goes too, so
+    // the trainer screen has nothing left to render: call it only when
+    // something else needs the device -- a reconstruction, a meshing child.
+    void release_engine();
 
     Phase phase() const { return _phase.load(); }
     // Did the finished run write a final checkpoint? False only after a stop
@@ -84,15 +89,40 @@ public:
 
     // Latest per-step progress (copy).
     spirula::TrainerProgress latest_progress();
-    double eta_seconds();         // < 0 when unknown
-    // Since the step loop began
-    double elapsed_seconds();       //< 0 before training, and frozen once the loop ends.
+    spirula::EvalProgress latest_eval_progress();
+    // Mean over the last 100 steps. A single step's latency swings
+    // several-fold with whether a viewer render landed on it, so it is not a
+    // number to put on screen.
+    double avg_step_latency();
+    double eta_seconds();         // TrainerSession::eta_seconds; < 0 when unknown
+    // Time spent in the step loop, pauses excluded: < 0 before a session
+    // exists, 0 until the loop starts, frozen once it ends.
+    double elapsed_seconds();
     void get_metrics(std::vector<MetricPoint>& out);
     std::vector<std::string> drain_log();
 
+    // While start_training() downloads an LPIPS checkpoint: the line to show
+    // and 0..1 (-1 unknown). Empty otherwise.
+    std::string fetch_line();
+    float fetch_progress();
+
+    // ---- Unreadable dataset file ------------------------------------------
+
+    // Non-empty while the training thread is blocked on a file it could not
+    // read. The GUI shows it and answers with resolve_data_error().
+    std::string data_error();
+    // true retries the decode and the run picks up where it stopped; false
+    // stops the run, which still saves a checkpoint.
+    void resolve_data_error(bool retry);
+
 private:
     void push_log(const std::string& s);
+    double avg_latency_locked() const;   // caller holds _mu
     void join_worker();
+    bool await_data_decision(const std::string& what);
+    // What setup_engine() would download, fetched with a progress readout
+    // instead; throws when a file does not arrive.
+    void fetch_eval_models(const TrainConfig& cfg);
 
     std::unique_ptr<spirula::TrainerSession> _session;
     std::unique_ptr<ViewerServer> _web_viewer;
@@ -100,14 +130,20 @@ private:
     std::atomic<Phase> _phase{Phase::Idle};
     std::atomic<bool> _engine_ready{false};
 
+    std::mutex              _data_mu;
+    std::condition_variable _data_cv;
+    std::string             _data_err;     // non-empty while awaiting an answer
+    int                     _data_answer = 0;   // 0 pending, 1 retry, 2 stop
+
     mutable std::mutex _mu;       // guards everything below
     std::string _error;
-    std::chrono::steady_clock::time_point _train_start{};  // {} = not started
-    std::chrono::steady_clock::time_point _train_end{};    // {} = still running
     spirula::TrainerProgress _latest;
+    spirula::EvalProgress _eval;
     std::deque<double> _latencies;
     std::vector<MetricPoint> _metrics;
     std::vector<std::string> _log;
+    std::string _fetch_line;
+    float _fetch_progress = -1.0f;
 };
 
 }  // namespace gui

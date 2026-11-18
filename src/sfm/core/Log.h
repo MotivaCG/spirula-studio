@@ -23,8 +23,15 @@
 
 #include "i18n/Message.h"
 
+#include <functional>
 #include <initializer_list>
 #include <string>
+
+#if defined(__GNUC__) || defined(__clang__)
+#define SFM_LOG_PRINTF(a, b) __attribute__((format(printf, a, b)))
+#else
+#define SFM_LOG_PRINTF(a, b)
+#endif
 
 namespace sfm {
 namespace slog {
@@ -39,6 +46,18 @@ enum class Tag {
     Orient,    // the final gauge fix (map/Orient.h)
     Device,    // which GPU, and what it can do
 };
+
+// Which stream the default sink writes a line to, and how a front end should
+// style it. `Diag` is a developer diagnostic: English, carrying its own
+// bracketed tag inside the text, never translated and never padded.
+enum class Level { Info, Note, Warning, Error, Diag };
+
+// Where lines go; the default prints them exactly as the CLI always has.
+// Process-global: one SfM job per process. The text carries no tag prefix and
+// no WARNING/ERROR word (Diag is verbatim). A sink may call prefix(); it must
+// not log, which would deadlock on the lock ordering lines.
+using Sink = std::function<void(Tag, Level, const std::string&)>;
+void set_sink(Sink s);   // {} restores the printing default
 
 // "[extract] " -- localized, bracketed, and padded so every tag in the current
 // language occupies the same number of terminal columns. By value because the
@@ -75,6 +94,11 @@ std::string num(double v, int decimals);
 // does in the GUI.
 void out_raw(Tag t, const std::string& text);
 void err_raw(Tag t, const std::string& text);
+
+// A developer diagnostic: printf-formatted, verbatim to stderr, no newline of
+// its own. Write the bracketed tag into `fmt` -- these stay English and are
+// not padded into the localized tag column.
+void diag(Tag t, const char* fmt, ...) SFM_LOG_PRINTF(2, 3);
 
 }  // namespace slog
 }  // namespace sfm

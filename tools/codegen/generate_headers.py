@@ -97,6 +97,7 @@ HEADER_SOURCES = dict([
     _fam("kernels/loss", "PerSplatLoss", "PerSplatLoss.cu"),
     _fam("kernels/loss", "PerPixelLoss", "PerPixelLoss.cu"),
     _fam("kernels/loss", "FusedSSIM", "FusedSSIM.cu"),
+    _fam("kernels/loss", "PcaReg", "PcaReg.cu"),
     _fam("kernels/visualize", "Visualizer", "Visualizer.cu"),
     _fam("kernels/bilagrid", "BilagridUtils", "BilagridUtils.cu"),
 
@@ -111,6 +112,8 @@ HEADER_SOURCES = dict([
     _fam("kernels/raster", "RasterizationBwd", "RasterizationBwd.cu"),
     _fam("kernels/raster", "RasterizationEval3DFwd", "RasterizationEval3DFwd.cu"),
     _fam("kernels/raster", "RasterizationEval3DBwd", "RasterizationEval3DBwd.cu"),
+
+    _fam("kernels/optim", "ProjectiveDepth", "ProjectiveDepth.cu"),
 
     # Optimizer variants, split by function.
     _fam("kernels/optim", "Optimizer",
@@ -130,7 +133,8 @@ HEADER_SOURCES = dict([
          "DensifyScoring.cu",      # covariance scale init, param update
          "Relocation.cu",
          "McmcRelocation.cu",      # MCMC relocation + noise
-         "DensifySplitFilter.cu"), # long-axis split, image edge filters
+         "DensifySplitFilter.cu",  # long-axis split, image edge filters
+         "RegionWeight.cu"),       # the region test that gates the draw
 ])
 
 # Image-space per-pixel operations, split by function. PixelWise.cuh is the one
@@ -139,6 +143,7 @@ HEADER_SOURCES = dict([
 HEADER_SOURCES["kernels/pixelwise/PixelWise"] = [
     "kernels/pixelwise/ImageConvert.cu",      # uint8/uint16 -> float; rendered -> expected depth
     "kernels/pixelwise/ImageColorOps.cu",     # background blending, log map, overexposure reg
+    "kernels/pixelwise/AppearanceChain.cu",   # blend + PPISP + display encode, fused
     "kernels/pixelwise/DepthGeometry.cu",     # depth -> points/normal, depth-normal loss,
                                               #   ray <-> linear depth
     "kernels/pixelwise/ImageDistort.cu",      # distort / undistort
@@ -147,6 +152,7 @@ HEADER_SOURCES["kernels/pixelwise/PixelWise"] = [
     "kernels/pixelwise/GtDepthNormalWarp.cu", # GT depth/normal wide -> pinhole warps
     "kernels/ppisp/Ppisp.cu",                 # per-pixel image signal processing
 ]
+HEADER_SOURCES["kernels/pixelwise/CalibWarp"] = ["kernels/pixelwise/CalibWarp.cu"]
 
 
 def generate_headers():

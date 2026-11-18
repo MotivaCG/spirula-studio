@@ -7,8 +7,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include "core/Env.h"
+#include "sfm/core/Log.h"
 
 namespace sfm {
 
@@ -53,6 +55,11 @@ struct MapProf {
     std::atomic<long> n_ba{0}, n_ba_iters{0}, n_choose{0}, n_reg_try{0}, n_reg_ok{0};
     std::atomic<long> n_seed_geom{0};  // two-view RANSACs run (cache misses)
     std::atomic<long> n_merged{0};  // observations absorbed by track merging
+    std::atomic<uint64_t> track_completed{0}, track_created{0}, track_removed{0};
+    std::atomic<uint64_t> fusion_cap{0}, fusion_clash{0}, fusion_error{0}, fusion_angle{0};
+    std::atomic<uint64_t> association_features{0}, association_ambiguous{0};
+    std::atomic<uint64_t> association_changed{0}, association_deferred{0};
+    std::atomic<uint64_t> association_duplicates{0};
 
     static bool enabled() {
         static bool e = spirula::env("SFM_MAP_PROF") != nullptr;
@@ -78,24 +85,39 @@ struct MapProf {
         const long n_merged = this->n_merged;
         double ba = ba_build + ba_init + ba_solve + ba_write;
         double accounted = init_seed + choose + reg + tri + retri + filter + snapshot + ba;
-        fprintf(stderr,
-                "[prof] %s total %.2f s, accounted %.2f s (%.0f%%)\n"
-                "[prof]   seed search   %8.2f s  (two-view %.2f s over %ld pair(s), "
-                "focal bootstrap %.2f s)\n"
-                "[prof]   choose-next   %8.2f s  (%ld calls)\n"
-                "[prof]   register      %8.2f s  (%ld tries, %ld ok)\n"
-                "[prof]   triangulate   %8.2f s\n"
-                "[prof]   retriangulate %8.2f s  (of which merge %.2f s, %ld obs absorbed)\n"
-                "[prof]   filter        %8.2f s\n"
-                "[prof]   snapshot      %8.2f s\n"
-                "[prof]   audit         %8.2f s  (check %.2f + repair and refine %.2f)\n"
-                "[prof]   BA            %8.2f s  (%ld calls, %ld LM iters): "
-                "build %.2f + init %.2f + solve %.2f + write %.2f\n",
-                what, total_s, accounted, total_s > 0 ? 100.0 * accounted / total_s : 0.0,
-                init_seed, seed_geom, n_seed_geom, bootstrap, choose, n_choose, reg, n_reg_try,
-                n_reg_ok, tri, retri, merge,
-                n_merged, filter, snapshot, audit_check + audit_fix, audit_check, audit_fix,
-                ba, n_ba, n_ba_iters, ba_build, ba_init, ba_solve, ba_write);
+        slog::diag(slog::Tag::Map, "[prof] %s total %.2f s, accounted %.2f s (%.0f%%)\n"
+                   "[prof]   seed search   %8.2f s  (two-view %.2f s over %ld pair(s), "
+                   "focal bootstrap %.2f s)\n"
+                   "[prof]   choose-next   %8.2f s  (%ld calls)\n"
+                   "[prof]   register      %8.2f s  (%ld tries, %ld ok)\n"
+                   "[prof]   triangulate   %8.2f s\n"
+                   "[prof]   retriangulate %8.2f s  (of which merge %.2f s, %ld obs absorbed)\n"
+                   "[prof]   filter        %8.2f s\n"
+                   "[prof]   snapshot      %8.2f s\n"
+                   "[prof]   audit         %8.2f s  (check %.2f + repair and refine %.2f)\n"
+                   "[prof]   BA            %8.2f s  (%ld calls, %ld LM iters): "
+                   "build %.2f + init %.2f + solve %.2f + write %.2f",
+                   what, total_s, accounted, total_s > 0 ? 100.0 * accounted / total_s : 0.0,
+                   init_seed, seed_geom, n_seed_geom, bootstrap, choose, n_choose, reg, n_reg_try,
+                   n_reg_ok, tri, retri, merge,
+                   n_merged, filter, snapshot, audit_check + audit_fix, audit_check, audit_fix,
+                   ba, n_ba, n_ba_iters, ba_build, ba_init, ba_solve, ba_write);
+        slog::diag(slog::Tag::Map,
+                   "[tracks] completed %llu created %llu removed %llu | fusion refusals "
+                   "cap %llu clash %llu reprojection %llu angle %llu | associations "
+                   "features %llu ambiguous %llu changed %llu deferred %llu duplicates %llu",
+                   (unsigned long long)track_completed.load(),
+                   (unsigned long long)track_created.load(),
+                   (unsigned long long)track_removed.load(),
+                   (unsigned long long)fusion_cap.load(),
+                   (unsigned long long)fusion_clash.load(),
+                   (unsigned long long)fusion_error.load(),
+                   (unsigned long long)fusion_angle.load(),
+                   (unsigned long long)association_features.load(),
+                   (unsigned long long)association_ambiguous.load(),
+                   (unsigned long long)association_changed.load(),
+                   (unsigned long long)association_deferred.load(),
+                   (unsigned long long)association_duplicates.load());
     }
 };
 

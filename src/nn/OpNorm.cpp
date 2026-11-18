@@ -2,6 +2,8 @@
 #include "nn/Ops.h"
 #include "nn/vk/Stream.h"
 
+#include <algorithm>
+
 namespace nn {
 
 namespace {
@@ -11,6 +13,13 @@ struct LayerNormParams {
     uint32_t rows, cols;
     float    eps;
     uint32_t x_row_stride, out_row_stride, has_affine, groups_per_row, _pad0;
+};
+
+struct RmsNormHeadsParams {
+    uint64_t x, weight;
+    uint32_t heads, n_heads, head_dim, row_stride;
+    float    eps;
+    uint32_t groups_per_row;
 };
 
 struct GroupNormStatsParams {
@@ -37,28 +46,55 @@ void layer_norm(const Tensor& out, const Tensor& x, const Tensor& w, const Tenso
         NN_CHECK(w.numel() >= cols && b.numel() >= cols,
                    "layer_norm: affine parameters are shorter than %lld", (long long)cols);
 
-    LayerNormParams p{};
-    p.out = out.ptr;
-    p.x = x.ptr;
-    p.weight = vk::or_fallback(w.ptr);
-    p.bias = vk::or_fallback(b.ptr);
-    p.residual = vk::or_fallback(residual.ptr);
-    p.rows = (uint32_t)rows;
-    p.cols = (uint32_t)cols;
-    p.eps = eps;
-    p.x_row_stride = (uint32_t)cols;
-    p.out_row_stride = (uint32_t)cols;
-    p.has_affine = w.valid() ? 1u : 0u;
-
-    // One workgroup per row; rows can exceed the 65535 grid cap (a 288x288 map
-    // has 82944), so fold across y.
-    vk::Stream::Fold f = vk::Stream::fold1D(rows, 1);
-    p.groups_per_row = f.per_row;
+    check_span("layer_norm", {w, b});
 
     vk::SpecList spec{(uint32_t)(residual.valid() ? 1 : 0),
                       (uint32_t)(x.dtype == DType::F16)};
-    vk::Stream::get().dispatch("norm.layer_norm", spec, f.per_row, f.rows, 1, &p,
-                               sizeof(p));
+    const int64_t xe = dtype_size(x.dtype);
+    const int64_t per = span_rows_even("layer_norm", cols * std::max<int64_t>(4, xe));
+    for (int64_t r0 = 0; r0 < rows; r0 += per) {
+        LayerNormParams p{};
+        p.out = out.ptr + (uint64_t)(r0 * cols) * 4;
+        p.x = x.ptr + (uint64_t)(r0 * cols) * xe;
+        p.weight = vk::or_fallback(w.ptr);
+        p.bias = vk::or_fallback(b.ptr);
+        p.residual = vk::or_fallback(
+            residual.valid() ? residual.ptr + (uint64_t)(r0 * cols) * 4 : 0);
+        p.rows = (uint32_t)std::min(per, rows - r0);
+        p.cols = (uint32_t)cols;
+        p.eps = eps;
+        p.x_row_stride = (uint32_t)cols;
+        p.out_row_stride = (uint32_t)cols;
+        p.has_affine = w.valid() ? 1u : 0u;
+
+        // One workgroup per row; rows can exceed the 65535 grid cap (a 288x288
+        // map has 82944), so fold across y.
+        vk::Stream::Fold f = vk::Stream::fold1D(p.rows, 1);
+        p.groups_per_row = f.per_row;
+        vk::Stream::get().dispatch("norm.layer_norm", spec, f.per_row, f.rows, 1, &p,
+                                   sizeof(p), (double)p.rows * cols * vk::Stream::kElemWork);
+    }
+}
+
+void rms_norm_heads(const Tensor& x, const Tensor& w, int64_t n, int n_heads, int head_dim,
+                    int64_t row_stride, float eps) {
+    NN_CHECK(x.dtype == DType::F32, "rms_norm_heads works in place on f32");
+    NN_CHECK(head_dim > 0 && head_dim <= 256, "rms_norm_heads: head_dim %d is past 256",
+             head_dim);
+    NN_CHECK(w.numel() >= head_dim, "rms_norm_heads: the weight is shorter than a head");
+    const KernelName entry = span_entry("norm.rms_norm_heads", {x, w});
+    RmsNormHeadsParams p{};
+    p.x = x.ptr;
+    p.weight = w.ptr;
+    p.heads = (uint32_t)(n * n_heads);
+    p.n_heads = (uint32_t)n_heads;
+    p.head_dim = (uint32_t)head_dim;
+    p.row_stride = (uint32_t)row_stride;
+    p.eps = eps;
+    vk::Stream::Fold f = vk::Stream::fold1D(p.heads, 1);
+    p.groups_per_row = f.per_row;
+    vk::Stream::get().dispatch(entry, {0u, 0u}, f.per_row, f.rows, 1, &p, sizeof(p),
+                               (double)p.heads * head_dim * vk::Stream::kElemWork);
 }
 
 void group_norm(vk::Arena& arena, const Tensor& out, const Tensor& x, const Tensor& w,
@@ -69,6 +105,10 @@ void group_norm(vk::Arena& arena, const Tensor& out, const Tensor& x, const Tens
                (long long)channels, groups);
 
     Tensor stats = arena_tensor(arena, DType::F32, groups, 2);
+    // Both passes index the whole map from its base, so it cannot be split.
+    const KernelName stats_entry = span_entry("norm.group_norm_stats", {x});
+    const KernelName apply_entry = span_entry("norm.group_norm_apply", {out, x});
+    check_span("group_norm", {w, b});
 
     GroupNormStatsParams sp{};
     sp.stats = stats.ptr;
@@ -78,8 +118,8 @@ void group_norm(vk::Arena& arena, const Tensor& out, const Tensor& x, const Tens
     sp.groups = (uint32_t)groups;
     sp.eps = eps;
     vk::SpecList spec{0u, (uint32_t)(x.dtype == DType::F16)};
-    vk::Stream::get().dispatch("norm.group_norm_stats", spec, (uint32_t)groups, 1, 1, &sp,
-                               sizeof(sp));
+    vk::Stream::get().dispatch(stats_entry, spec, (uint32_t)groups, 1, 1, &sp,
+                               sizeof(sp), (double)n * channels * vk::Stream::kElemWork);
 
     GroupNormApplyParams ap{};
     ap.out = out.ptr;
@@ -91,8 +131,8 @@ void group_norm(vk::Arena& arena, const Tensor& out, const Tensor& x, const Tens
     ap.channels = (uint32_t)channels;
     ap.groups = (uint32_t)groups;
     ap.act = (uint32_t)act;
-    vk::Stream::get().dispatchFlat("norm.group_norm_apply", spec, n * channels, 256, &ap,
-                                   sizeof(ap), &ap.groups_per_row);
+    vk::Stream::get().dispatchFlat(apply_entry, spec, n * channels, 256, &ap, sizeof(ap),
+                                   &ap.groups_per_row);
 }
 
 }  // namespace nn

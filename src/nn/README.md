@@ -7,12 +7,32 @@ detector, a matcher or a depth model is added later it builds on this
 unchanged. Do not put model-specific constants here.
 
 Vulkan-only, like `src/sfm/`: built by default for `SS_BACKEND=vulkan`
-(`SS_BUILD_SAM`) and absent from a CUDA build. It carries its own device;
-converging the repository's three Vulkan contexts onto one is
-`docs/notes/sfm-port-plan.md` phase 6.
+(`SS_BUILD_SAM`) and absent from a CUDA build. It keeps its own Vulkan context
+and resolves the same native selector identity as the other built-in Vulkan
+workflows; physical or logical device handles are never shared.
 
-Runtime knobs: `SS_NN_LOG=0..3`, `SS_VK_DEVICE`, `SS_PROFILE=1`,
-`SS_VK_VALIDATION=1`, `SS_NN_DEBUG_SYNC=1`, `SS_NN_COOPMAT=0`.
+Runtime knobs: `SS_NN_LOG=0..3`, `SS_VK_DEVICE=<index|name|auto|uuid:hex>`,
+`SS_PROFILE=1`, `SS_VK_VALIDATION=1`, `SS_NN_DEBUG_SYNC=1`, `SS_NN_COOPMAT=0`,
+`SS_SUBMIT_BUDGET_MS`, `SS_VK_SUBMIT_LOG` (docs/notes/gpu-submit-budget.md),
+`SS_NN_METAL=0|1` (macOS, below).
+
+Host loops in `core/Parallel.h` accept a process-local thread cap through
+`nn::set_parallel_threads(unsigned)`, including the calling thread.
+`nn::parallel_threads()` returns the effective cap, limited to hardware concurrency
+with a minimum of one. Zero restores the default automatic hardware sizing.
+The setting is atomic; each `parallel_for` snapshots it once, so changes do not
+resize an in-flight loop. It is a per-loop cap, not a shared pool across concurrent
+or nested calls. Worker processes set it before starting their host work.
+`nn::configured_parallel_threads()` returns the configured value, retaining zero
+for automatic sizing. `nn::load_image` forwards an explicit cap to EXR/TIFF
+decoders, but preserves their all-core default when no cap is configured.
+
+The context probes optional `VK_EXT_memory_budget`. `Context::memoryBudget`
+queries the selected device's current local-heap budgets and usage, or returns
+an empty report when unsupported. The query in `core/VulkanMemoryBudget.h`
+is shared with the trainer's memory reporting. `Allocator` exposes live bytes
+and allocation count so model-owned caches can adapt to device headroom and
+`maxMemoryAllocationCount` without a fixed cache size or device-name rule.
 
 ## The op layer
 
@@ -20,6 +40,9 @@ An op runs when you call it, writing into a caller-provided output — usually a
 `Arena` tensor inside an `ArenaScope`. There is no computation graph, and that
 is deliberate: a module's forward pass reads as straight-line C++ next to its
 PyTorch reference, and the arena's scoping is the whole memory strategy.
+
+`Blocks.h` holds the few composites more than one model is built from (the
+LightGlue-family message FFN). They take their weights as arguments, like an op.
 
 ### Layout conventions
 
@@ -63,6 +86,13 @@ more than the arithmetic.
   matters for frame time. It keeps its weight tile in shared in the fp16 the
   checkpoint already holds, which is why it needs an fp16 weight and why an
   fp32 second operand (a matmul against another activation) falls back.
+
+  `sparse_conv` is the same four kernels with `x` read through a neighbour
+  table (`kGatherCi`, `load_x` in both GEMM modules): row m, column t·Ci + c is
+  `x[nbr[m, t], c]`. It is a sparse convolution with no column matrix, which
+  for MoGe-3's refiner would be 3.2 GB a convolution. Row splits move the
+  table, not `x`. The gathered loads, not the multiply, bound it at narrow
+  widths: at 32 output channels the tensor-core kernel is only 10% faster.
 
 - **Attention** has a cooperative-matrix variant too (`flash_attn_coop`),
   selected whenever the device offers tensor cores and `head_dim` is a multiple
@@ -177,12 +207,80 @@ Tiny track, 38 in 17 M for a SAM 3 image, all on boundaries. Both kernels take
 fp16 operands with an fp32 accumulator, which is the arithmetic PyTorch runs
 these models in; `nn_ops_test` checks each path against a reference rounded the
 same way, so the tolerances stay tight rather than being widened to absorb it.
+- **Quantized weights** are a storage format, not a GEMM. `dequant_nf4`
+  expands bitsandbytes' NF4 (blocksize 64, bf16 scales, `dequantize_4bit`'s
+  bf16 rounding) into the fp16 matrix the GEMMs above already take, optionally
+  adding a merged LoRA product and scaling rows by a gate. It needs no device
+  feature past the baseline, so a model that streams 4-bit weights runs
+  wherever fp16 weights do; `src/marigold/` expands one projection at a time
+  into a reused scratch. `LinearOpts::x_scale` is its companion: activations
+  past fp16's range (Qwen-Image's reach 5e4) are prescaled by a power of two
+  before the tensor-core kernel rounds them, which changes nothing else.
 - **Convolution** is chunked im2col + GEMM, not a bespoke kernel. A full im2col
   of the seg head's 288×288×256 3×3 conv would be 764 MiB, so the output
   positions are chunked to keep the column buffer near 32 MiB. Depthwise is
   direct; transposed 2×2/stride-2 is a GEMM plus a scatter (the four kernel taps
   are four output-channel groups). One well-tuned matmul therefore carries ~95%
   of the model's FLOPs.
+
+## The Metal path (macOS)
+
+On Apple GPUs the SPIR-V kernels, translated by MoltenVK, use a fraction of the
+ALUs. `OpMetal.mm` therefore runs attention and the large GEMMs on MPSGraph.
+It is built on macOS (`-DSS_NN_METAL=ON`, the default there) and runs unless
+`SS_NN_METAL=0`, on any device that passes `nn/vk/MetalInterop.mm`'s probe.
+Every other op, and every other platform, runs the Vulkan kernels unchanged.
+
+- **Which ops.** `attention` with no bias, packed rows and a head dim of 16,
+  32, 64 or 128, at any batch. `linear` and `matmul_nt` with fp32 activations,
+  an fp32 or fp16 weight, an output of at least 128 x 128, and no neighbour
+  gather. GEMM executables leave M dynamic, so a row count that follows the
+  input (keypoints, chunk tails) does not compile a graph per call. The
+  executables live in an LRU of 128.
+- **Memory.** Every allocation is made exportable
+  (`VkExportMetalObjectCreateInfoEXT`). A tensor becomes a 1-D `MPSNDArray` over
+  its allocation's `MTLBuffer`, at its byte offset. Each wrap checks that the
+  range lies inside the allocation and the buffer. It also checks that the
+  buffer's GPU address equals the Vulkan device address, which is what proves
+  the two objects alias.
+- **Ordering, with no host stall.** Consecutive Metal ops share one command
+  buffer on a queue of our own (a section). Opening one flushes the stream and
+  waits on its timeline's `MTLSharedEvent`. Closing it signals the next value,
+  and the next Vulkan submission waits on that. `Stream` closes an open section
+  before it records again or syncs. A failed command buffer aborts the process,
+  because it never signals and Vulkan would wait forever. So does a section
+  that MPSGraph moves to a second command buffer, which nothing would order.
+- **In place.** MPSGraph does not say whether a result may alias an input. An
+  in-place op (`x = W h + b + x`) writes a graph-owned result and copies it out.
+- **fp16 tier.** `nn::Fp16Scope` makes the Metal path cast operands to fp16,
+  which the M5's GPU neural accelerators run, and honours `LinearOpts::x_scale`
+  as the tensor-core kernels do. It fails fp32 parity bars by design, so a model
+  opts in with its own flag and its own bars. Nothing in `nn` sets it.
+- **MPS bugs it avoids** (macOS 26.6). SDPA aborts the process at head dim 96,
+  is wrong at head dim 256, and aborts when the whole problem is one score
+  (batch x heads x queries x keys = 1). Those shapes stay on Vulkan.
+  `nn_ops_test --probe-attn B,nq,nk,H,D` runs one shape in its own process, to
+  check a new OS.
+- **Not covered.** `SS_PROFILE` times Vulkan dispatches only. Metal work shows
+  up as the gap between them.
+
+Measured on an Apple M5 Pro, macOS 26.6, MoltenVK 1.4.2:
+
+| workload | Vulkan | Metal fp32 | Metal fp16 |
+|---|---|---|---|
+| attention 4096 x 4096, 8 heads, d64 (`nn_ops_test --bench`) | 18.6 ms | 5.75 ms | 1.65 ms |
+| attention 5184 x 5184, 16 heads, d64 (SAM 3 ViT global) | 57.7 ms | 16.2 ms | 4.8 ms |
+| GEMM 4096 x 1024 x 1024, fp32 weight | 2.86 ms | 1.47 ms | 0.58 ms |
+| GEMM 5184 x 4736 x 1024 (SAM 3 ViT MLP) | 15.6 ms | 8.1 ms | 2.7 ms |
+| MoGe-2 ViT-L, 1800 tokens (`moge_test --repeat 5`) | 810-813 ms (a second run: 1296-1318) | 662-670 ms | |
+
+MoGe's stages agree with the Vulkan path to 3.2e-6 relative L2 or better.
+LoMa's descriptors agree to 2.0e-6, with identical keypoints and match counts.
+
+`nn_ops_test` reruns its suite with the Metal path on. It adds cases for
+hand-off ordering in both directions, aliasing, unaligned offsets, the range
+check, the smallest shapes and the fp16 tier. `nn_ops_test --bench` prints both
+paths side by side.
 
 ## Portability rules for new kernels
 
@@ -200,9 +298,55 @@ These are load-bearing; see `src/nn/vk/README.md` for the device baseline.
 5. Grids cap at 65535 per dimension. Long flat ranges fold across `y`
    (`Stream::fold1D` + `fold_index`); a kernel that keeps out-of-range threads
    alive for a groupshared reduction must gate its block-indexed writes,
-   because the last folded row is padding.
+   because the last folded row is padding. GEMM's row tiles hit the same cap at
+   4.2 M rows — a full-resolution 1x1 conv over a 2048x2048 map — and split
+   into several dispatches on shifted pointers rather than folding.
 6. Reductions use a deterministic groupshared tree, not wave intrinsics, so
    wave32 and wave64 devices agree bit for bit.
+7. A kernel indexes from its params pointers with a 32-bit element index and
+   the driver folds the byte offset to 32 bits, so an access 4 GiB past a
+   pointer wraps back to it — silently, and widening the shader's index to 64
+   bits does not change it. Only 64-bit pointer arithmetic does. A launcher
+   handles this one of three ways:
+
+   - **split**, onto shifted pointers (`span_rows()`): the elementwise and
+     row-wise ops, `strided_copy`, and GEMM's row tiles. Costs nothing.
+   - **widen**, via `span_entry()`, which swaps `misc.foo` for
+     `misc_wide.foo` past the narrow reach. `misc`/`resample`/`conv`/`norm`
+     are each compiled twice, and `NN_WIDE` switches `_common.slang`'s
+     addressing shim. The wide copy is the only thing in this tree that
+     declares `OpCapability Int64`, which is why it is a separate module and
+     why `Context::hasInt64()` gates it — the same containment the
+     cooperative-matrix module uses. The narrow module is byte-for-byte what
+     it was, so nothing below 4 GiB pays for this.
+   - **refuse**, `check_span()`: GEMM's weights and attention's operands,
+     neither of which is a full-resolution map.
+
+   The wide kernel's own `uint` index is the next wall, at 2^32 elements.
+
+### Where each model sits
+
+Measured by instrumenting `check_span` (bytes in the widest tensor a kernel
+cannot split) and scaling. "narrow" is the 4 GiB reach; "wide" is 2^32 f32
+elements, where the `_wide` kernels run:
+
+| module | widest such tensor | narrow | wide |
+|---|---|---|---|
+| ALIKED | 512 B/px — the 128-channel aggregate | 2880² | 5792² |
+| LoMa | 384 B/px — DaD's finest refiner input | 3344² | 6688² |
+| Metric3D | 256 B/px, at the caller's resolution | 4096² | 8192² |
+| MoGe | ~66 KB/token, independent of the image | ~64 650 tokens | ~258 000 |
+| SAM | everything is sized by `img_size`, not the input | not reachable | — |
+
+Past the narrow figure VRAM is the binding constraint, not addressing: ALIKED
+at 5792² wants ~30 GB of arena.
+
+A model whose map is `C` channels at full resolution hits the narrow reach at
+`2^30 / C` pixels — 2880² at C=128, 2048² at C=256, 1448² at C=512 — so the
+ceiling drops as a model gets wider. A dense full-resolution frontend (a
+RoMa-class matcher, a higher-capacity MoGe) belongs on the wide path from the
+start: give its new kernels `load_at`/`store_at` and its launchers
+`span_entry`, and they inherit both.
 
 ## Testing
 

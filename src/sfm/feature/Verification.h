@@ -1,26 +1,11 @@
-// Geometric verification of a whole pair list (src/sfm/README.md).
-//
-// `estimateTwoView` verifies one pair; this drives it over every pair produced
-// by `sfm/feature/Pairing.h` and is where the parallelism lives: host RANSAC on
-// every putative pair is the largest single cost in the `match` stage (it was
-// 83-85% of it, and ~70% of end-to-end wall clock, when this pool was written;
-// it is a third to two thirds of the stage now that the other stages have been
-// worked on, and still the reason the stage is CPU-bound).
-//
-// Shape: the GPU matcher owns one VkContext and one queue, so descriptor matching
-// stays on the calling thread; it acts as the producer and a pool of worker
-// threads consumes the putative matches. That overlaps host RANSAC with GPU
-// matching *and* spreads it across cores, which the serial loop did neither of.
-//
-// Results are collected by pair index and returned in the pair list's order, so
-// the output does not depend on thread count or scheduling. `estimateTwoView`
-// is reentrant (no globals; its RNG is seeded per call from RansacOptions), so
-// each pair's geometry is likewise thread-count-independent.
+// Parallel host geometric verification fed by a serial GPU matcher.
+// Results retain pair-list order regardless of worker scheduling.
 #pragma once
 
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -30,11 +15,18 @@
 #include <utility>
 #include <vector>
 
+#include "core/Env.h"
+#include "core/HardwareThreads.h"
 #include "sfm/core/Progress.h"
 #include "sfm/core/Camera.h"
 #include "sfm/core/Features.h"
 #include "sfm/core/Matches.h"
+#include "sfm/core/Cancel.h"
+#include "sfm/core/Events.h"
 #include "sfm/core/Log.h"
+#include "sfm/core/Resume.h"
+#include "sfm/core/PriorSource.h"
+#include "sfm/geometry/KnownRotation.h"
 #include "sfm/geometry/TwoView.h"
 #include "i18n/catalog/Sfm.h"
 
@@ -73,7 +65,7 @@ inline BearingCache precomputeBearings(const std::vector<FeatureSet>& feats,
     const size_t n = std::min(feats.size(), cams.size());
     // Millions of independent Newton inversions, one per keypoint; images are
     // written to disjoint slots, so this is a straight fan-out.
-    const unsigned hc = std::thread::hardware_concurrency();
+    const unsigned hc = spirula::hardware_threads();
     int nt = threads > 0 ? threads : (hc > 0 ? (int)hc : 1);
     nt = std::max(1, std::min<int>(nt, (int)std::max<size_t>(n, 1)));
     std::atomic<size_t> next{0};
@@ -170,7 +162,7 @@ inline FocalScore focalInliers(const std::vector<FeatureSet>& feats,
             periph += w;
         }
     };
-    int nt = threads > 0 ? threads : (int)std::max(1u, std::thread::hardware_concurrency());
+    int nt = threads > 0 ? threads : (int)std::max(1u, spirula::hardware_threads());
     std::vector<std::thread> pool;
     for (int t = 0; t < nt; t++) pool.emplace_back(worker);
     for (std::thread& t : pool) t.join();
@@ -227,10 +219,14 @@ inline double bootstrapFocal(const std::vector<FeatureSet>& feats,
                   (long long)((0.5 * diag / best_f) * 180.0 / M_PI)});
         // The search curve itself is a debug histogram -- whoever reads it is
         // calibrating the focal search, not waiting on a reconstruction.
-        fprintf(stderr, "[focal] curve (f:peripheral/total):");
-        for (size_t i = 0; i < curve.size(); i++)
-            fprintf(stderr, " %.0f:%d/%d", curve[i].first, curve[i].second, totals[i]);
-        fprintf(stderr, "\n");
+        std::string line = "[focal] curve (f:peripheral/total):";
+        for (size_t i = 0; i < curve.size(); i++) {
+            char buf[64];
+            snprintf(buf, sizeof buf, " %.0f:%d/%d", curve[i].first,
+                     curve[i].second, totals[i]);
+            line += buf;
+        }
+        slog::diag(slog::Tag::Match, "%s", line.c_str());
     }
     return best_f;
 }
@@ -275,10 +271,10 @@ inline void bootstrapGroupFocals(const std::vector<FeatureSet>& feats,
         auto g = by_group.find(id);
         if (g == by_group.end() || g->second.size() < 8) {
             if (verbose)
-                fprintf(stderr,
-                        "[focal] camera %u: %zu in-group pair(s), too few to search; "
-                        "keeping f=%.1f\n",
-                        id, g == by_group.end() ? 0 : g->second.size(), kv.second.focal());
+                slog::diag(slog::Tag::Match,
+                           "[focal] camera %u: %zu in-group pair(s), too few to search; "
+                           "keeping f=%.1f",
+                           id, g == by_group.end() ? 0 : g->second.size(), kv.second.focal());
             continue;
         }
         // Spread the sample over the group's pairs; a prefix would sample one
@@ -290,7 +286,7 @@ inline void bootstrapGroupFocals(const std::vector<FeatureSet>& feats,
             sp.push_back(pairs[g->second[k]]);
             sm.push_back(matches[g->second[k]]);
         }
-        if (verbose) fprintf(stderr, "[focal] camera %u:\n", id);
+        if (verbose) slog::diag(slog::Tag::Match, "[focal] camera %u:", id);
         double f = bootstrapFocal(feats, sp, sm, percam, tvopt, threads, verbose);
         if (f > 0) {
             kv.second.setFocal(f);
@@ -442,7 +438,7 @@ inline FocalVoteReport focalFromEpipolar(const std::vector<FeatureSet>& feats,
         std::lock_guard<std::mutex> lk(mtx);
         votes.insert(votes.end(), local.begin(), local.end());
     };
-    const int nt = threads > 0 ? threads : (int)std::max(1u, std::thread::hardware_concurrency());
+    const int nt = threads > 0 ? threads : (int)std::max(1u, spirula::hardware_threads());
     std::vector<std::thread> pool;
     for (int t = 0; t < std::max(1, nt); t++) pool.emplace_back(worker);
     for (std::thread& t : pool) t.join();
@@ -501,17 +497,17 @@ inline void bootstrapRectilinearFocals(const std::vector<FeatureSet>& feats,
             focalFromEpipolar(feats, sp, sm, kv.second, tvopt, fo, threads);
         if (r.focal > 0) {
             if (verbose)
-                fprintf(stderr,
-                        "[focal] camera %u: %.0f -> %.0f px from %d/%d epipolar vote(s), "
-                        "spread %.0f%%\n",
-                        id, kv.second.focal(), r.focal, r.votes, r.pairs, 100.0 * r.spread);
+                slog::diag(slog::Tag::Match,
+                           "[focal] camera %u: %.0f -> %.0f px from %d/%d epipolar vote(s), "
+                           "spread %.0f%%",
+                           id, kv.second.focal(), r.focal, r.votes, r.pairs, 100.0 * r.spread);
             kv.second.setFocal(r.focal);
             measured.insert(id);
         } else if (verbose) {
-            fprintf(stderr,
-                    "[focal] camera %u: %d/%d epipolar vote(s)%s; keeping the f=%.0f guess\n",
-                    id, r.votes, r.pairs,
-                    r.votes >= fo.min_votes ? " disagree" : " -- too few", kv.second.focal());
+            slog::diag(slog::Tag::Match,
+                       "[focal] camera %u: %d/%d epipolar vote(s)%s; keeping the f=%.0f guess",
+                       id, r.votes, r.pairs,
+                       r.votes >= fo.min_votes ? " disagree" : " -- too few", kv.second.focal());
         }
     }
 }
@@ -522,7 +518,8 @@ struct VerificationOptions {
     // sphere; `two_view.ransac.max_error` stays in pixels and is converted per
     // pair with the two cameras' focal lengths.
     const BearingCache* bearings = nullptr;
-    // Worker threads for the RANSAC. 0 = hardware_concurrency, 1 = verify
+    const std::vector<char>* essential_images = nullptr;
+    // Worker threads for the RANSAC. 0 = hardware_threads(), 1 = verify
     // inline on the calling thread (no pool, no queue).
     int num_threads = 0;
     // Producer backpressure: the queue holds at most num_threads * this many
@@ -532,36 +529,57 @@ struct VerificationOptions {
     // Pairs requested from the matcher per call. Must match the matcher's own
     // batch size to get the benefit; see MatchOptions::batch_pairs.
     int match_batch_pairs = 64;
+    // Where every finished pair is recorded so an interrupted run need not
+    // verify it again (sfm/core/Resume.h). Null writes nothing.
+    resume::MatchJournal* journal = nullptr;
+    // Where this call sits in a larger list: a resumed run is handed only the
+    // pairs its journal has not got, and the bar still counts the whole stage.
+    size_t progress_done_base = 0;
+    size_t progress_total = 0;   // 0 = pairs.size()
+    // A pair whose rotation a sensor knows is also verified with it fixed and
+    // keeps that inlier set when it explains `prior_agree` of the free
+    // estimate's. Needs `cameras`, one per image, for the bearings.
+    const PriorSource* priors = nullptr;
+    const std::vector<Camera>* cameras = nullptr;
+    double prior_agree = 0.7;
+};
+
+// What the rotation prior did over one verifyPairs call.
+struct VerifyPriorStats {
+    std::atomic<uint64_t> pairs{0};      // pairs a prior covered
+    std::atomic<uint64_t> kept{0};       // ... verified on the prior's inlier set
+    std::atomic<uint64_t> disagreed{0};  // ... where the prior explained too little
+    std::atomic<uint64_t> dropped{0};    // matches the free estimate kept and the prior rejected
+    std::atomic<uint64_t> rescued{0};    // pairs only the prior could verify
+    std::atomic<uint64_t> contradicted{0};  // pairs dropped: turned far from the gyro, nothing held
 };
 
 inline int verificationThreadCount(const VerificationOptions& opt) {
     if (opt.num_threads > 0) return opt.num_threads;
-    unsigned hc = std::thread::hardware_concurrency();
+    unsigned hc = spirula::hardware_threads();
     return hc > 0 ? (int)hc : 1;
 }
 
-// Match and verify every pair. `matchFn(begin, end, out)` fills `out` with the
-// putative matches for pairs[begin..end) in order, and is only ever called on
-// the calling thread (GPU matchers are not thread-safe). Batching is the
-// matcher's business, not ours -- it lets a GPU matcher amortize uploads and
-// fence round trips over many pairs (D22) -- so we hand it a run and push the
-// results into the queue one at a time, keeping the backpressure per pair.
-// `progress(done, total)` is optional and also called only on the calling
-// thread.
-//
-// Returned entries keep the pair list's order and only cover pairs that
-// survived: fewer putatives than `min_num_inliers`, or a degenerate/undefined
-// two-view config, drops the pair entirely. `putative_out` accumulates the
-// pre-verification match count.
+// matchFn runs on the calling thread; workers verify its bounded batches.
+// Results retain input order and contain only pairs passing the inlier floor.
 inline std::vector<TwoViewMatches> verifyPairs(
     const std::vector<FeatureSet>& feats,
     const std::vector<std::pair<uint32_t, uint32_t>>& pairs,
     const std::function<void(size_t, size_t, std::vector<std::vector<FeatureMatch>>&)>& matchFn,
     const VerificationOptions& opt, uint64_t* putative_out = nullptr,
-    const std::function<void(size_t, size_t)>& progress = nullptr) {
+    const std::function<void(size_t, size_t)>& progress = nullptr,
+    VerifyPriorStats* prior_stats = nullptr) {
 
     const int nthreads = verificationThreadCount(opt);
     const TwoViewOptions& tv = opt.two_view;
+    const bool priors = opt.priors && opt.cameras && opt.cameras->size() >= feats.size();
+    // SS_SFM_PRIOR_DUMP=1: one line per pair the prior covered, with the free
+    // estimate's own rotation for comparison.
+    const bool prior_dump = priors && spirula::env("SFM_PRIOR_DUMP") != nullptr;
+    auto bearingOf = [&](uint32_t img, uint32_t k) {
+        if (opt.bearings && opt.bearings->has(img)) return opt.bearings->bearings[img][k];
+        return (*opt.cameras)[img].bearing({feats[img].keypoints[k].x, feats[img].keypoints[k].y});
+    };
 
     // Per-pair slot, filled by whichever worker takes the job.
     std::vector<TwoViewMatches> results(pairs.size());
@@ -578,7 +596,72 @@ inline std::vector<TwoViewMatches> verifyPairs(
         // more than the other, which a mixed-resolution capture does routinely.
         const double sc = 0.5 * (feats[i].pixelScale() + feats[j].pixelScale());
         TwoViewGeometry g;
-        if (opt.bearings && opt.bearings->has(i) && opt.bearings->has(j)) {
+        Mat3 R_prior;
+        double prior_sigma = 0;
+        if (priors && opt.priors->relativeRotation(i, j, R_prior, prior_sigma)) {
+            // Both estimates: the free one is the fallback and the yardstick,
+            // the fixed-rotation one is what a wrong copy or the camera's own
+            // equipment cannot pass.
+            std::vector<Vec3> b1(m.size()), b2(m.size());
+            for (size_t k = 0; k < m.size(); k++) {
+                b1[k] = bearingOf(i, m[k].idx1);
+                b2[k] = bearingOf(j, m[k].idx2);
+            }
+            TwoViewOptions tvb = tv;
+            tvb.calibrated_essential = opt.essential_images &&
+                (*opt.essential_images)[i] && (*opt.essential_images)[j];
+            const double f = 0.5 * ((*opt.cameras)[i].focal() + (*opt.cameras)[j].focal());
+            tvb.ransac.max_error = tv.ransac.max_error * sc / std::max(1.0, f);
+            tvb.recover_pose = true;
+            g = estimateTwoViewBearing(b1, b2, tvb);
+            KnownRotationOptions ko;
+            ko.ransac = tvb.ransac;
+            ko.min_num_inliers = tv.min_num_inliers;
+            ko.max_rotation_only_ratio = tv.max_H_inlier_ratio;
+            ko.rot_sigma = prior_sigma;
+            ko.start = g.has_pose ? &g.pose : nullptr;
+            const KnownRotationGeometry k = estimateTwoViewKnownRotation(b1, b2, R_prior, ko);
+            const int free_inl = g.config == TwoViewConfig::Degenerate ||
+                                         g.config == TwoViewConfig::Undefined
+                                     ? 0
+                                     : g.num_inliers;
+            // A free geometry turned far from the gyro's rotation that the
+            // held estimate cannot reproduce is a match to a place the camera
+            // did not turn towards: the pair is dropped.
+            double free_deg = -1;
+            if (g.has_pose) {
+                const Mat3 D = mul(g.pose.R, transpose(R_prior));
+                const double tr = std::max(-1.0, std::min(1.0, (D[0] + D[4] + D[8] - 1.0) * 0.5));
+                free_deg = std::acos(tr) * 180.0 / M_PI;
+            }
+            const double contradict_deg = std::max(10.0, 5.0 * prior_sigma * 180.0 / M_PI);
+            const bool contradicted = free_inl && free_deg > contradict_deg &&
+                                      (!k.ok || k.num_inliers < opt.prior_agree * (double)free_inl);
+            if (prior_stats) prior_stats->pairs++;
+            if (prior_dump)
+                slog::diag(slog::Tag::Match,
+                           "[prior] pair %u-%u: %zu matches, free %s %d inliers (rotation %.2f deg "
+                           "from the prior), held: loose %d, strict %d, moved %.2f deg, sigma %.2f",
+                           i, j, m.size(), twoViewConfigName(g.config), free_inl, free_deg,
+                           k.loose_inliers, k.num_inliers, k.moved_deg,
+                           prior_sigma * 180.0 / M_PI);
+            if (contradicted) {
+                if (prior_stats) prior_stats->contradicted++;
+                return 0;
+            }
+            if (k.ok && k.num_inliers >= opt.prior_agree * (double)free_inl) {
+                if (prior_stats) {
+                    prior_stats->kept++;
+                    if (free_inl > k.num_inliers) prior_stats->dropped += (uint64_t)(free_inl - k.num_inliers);
+                    if (!free_inl) prior_stats->rescued++;
+                }
+                g.config = k.panoramic ? TwoViewConfig::PlanarOrPanoramic : TwoViewConfig::Uncalibrated;
+                g.inlier_mask = k.inlier_mask;
+                g.num_inliers = k.num_inliers;
+            } else if (prior_stats && free_inl) {
+                prior_stats->disagreed++;
+            }
+        } else if (opt.bearings && opt.bearings->has(i) && opt.bearings->has(j)) {
             const BearingCache& bc = *opt.bearings;
             std::vector<Vec3> b1(m.size()), b2(m.size());
             for (size_t k = 0; k < m.size(); k++) {
@@ -586,6 +669,8 @@ inline std::vector<TwoViewMatches> verifyPairs(
                 b2[k] = bc.bearings[j][m[k].idx2];
             }
             TwoViewOptions tvb = tv;
+            tvb.calibrated_essential = opt.essential_images &&
+                (*opt.essential_images)[i] && (*opt.essential_images)[j];
             double f = 0.5 * (bc.cameras[i].focal() + bc.cameras[j].focal());
             tvb.ransac.max_error = tv.ransac.max_error * sc / std::max(1.0, f);  // px -> rad
             g = estimateTwoViewBearing(b1, b2, tvb);
@@ -615,17 +700,48 @@ inline std::vector<TwoViewMatches> verifyPairs(
 
     auto verifyOne = [&](size_t p, std::vector<FeatureMatch>& m) {
         const uint32_t i = pairs[p].first, j = pairs[p].second;
-        // Every pair, kept or not: a screen watching the matrix cannot tell a
-        // pair that failed from one nothing has reached yet unless both are
-        // reported. A no-op without --progress-dir, and called from the
-        // workers, which is what the lock inside it is for.
-        progress::pair(i, j, verifyBody(p, m, i, j));
+        // Failed attempts must remain distinguishable from untested pairs in the viewer.
+        const uint32_t inl = verifyBody(p, m, i, j);
+        progress::pair(i, j, inl);
+        if (inl) {
+            const MatchList& kept = results[p].matches;
+            progress::live_pair(i, j, results[p].config,
+                                &kept[0].idx1, &kept[0].idx2,
+                                sizeof(FeatureMatch), (uint32_t)kept.size());
+            if (opt.journal)
+                opt.journal->record(i, j, results[p].config, (uint32_t)m.size(),
+                                    &kept[0].idx1, &kept[0].idx2,
+                                    sizeof(FeatureMatch), (uint32_t)kept.size());
+        } else if (opt.journal) {
+            // A pair that failed is recorded too: without it a resumed run
+            // cannot tell one nothing reached from one already answered, and
+            // the pairs that fail are the expensive half.
+            opt.journal->record(i, j, 0, (uint32_t)m.size(), nullptr, nullptr, 4, 0);
+        }
+        Event e;
+        e.kind = Event::Kind::PairVerified;
+        e.stage = Stage::Match;
+        e.image_a = i;
+        e.image_b = j;
+        e.inliers = inl;
+        events::emit(e);
     };
 
     // How many pairs to ask the matcher for at once. Independent of the worker
     // count: it only bounds how far the GPU may run ahead of the verifiers.
     const size_t batch = std::max<size_t>(1, (size_t)opt.match_batch_pairs);
     std::vector<std::vector<FeatureMatch>> batch_out;
+
+    // The stage's fraction, at most a few hundred steps over the whole of it.
+    // Per pair it is a global lock the workers are already contending for, and
+    // a screen cannot show 700k of anything.
+    const size_t step = std::max<size_t>(1, pairs.size() / 400);
+    const size_t ptotal = opt.progress_total ? opt.progress_total : pairs.size();
+    auto tick = [&](size_t p) {
+        if ((p + 1) % step == 0 || p + 1 == pairs.size())
+            events::progress(Stage::Match, (int64_t)(opt.progress_done_base + p + 1),
+                             (int64_t)ptotal);
+    };
 
     if (nthreads <= 1) {
         for (size_t b = 0; b < pairs.size(); b += batch) {
@@ -636,6 +752,8 @@ inline std::vector<TwoViewMatches> verifyPairs(
                 putative += m.size();
                 verifyOne(p, m);
                 if (progress) progress(p + 1, pairs.size());
+                tick(p);
+                cancel::check();
             }
         }
     } else {
@@ -648,6 +766,17 @@ inline std::vector<TwoViewMatches> verifyPairs(
         std::condition_variable cv_job, cv_space;
         bool done_producing = false;
         const size_t max_queued = (size_t)nthreads * std::max(1, opt.queue_depth_per_thread);
+
+        // Any throw -- a worker's, or the matcher's on a lost device -- must reach
+        // the caller only after every worker is joined: unwinding past a
+        // joinable std::thread terminates the process.
+        std::exception_ptr error;
+        std::atomic<bool> failed{false};
+        auto fail = [&](std::exception_ptr e) {
+            std::lock_guard<std::mutex> lk(mtx);
+            if (!error) error = e;
+            failed = true;
+        };
 
         std::vector<std::thread> workers;
         workers.reserve(nthreads);
@@ -663,25 +792,37 @@ inline std::vector<TwoViewMatches> verifyPairs(
                         queue.pop();
                     }
                     cv_space.notify_one();
-                    verifyOne(job.index, job.matches);
+                    if (failed) continue;  // keep draining so the producer never blocks
+                    try {
+                        verifyOne(job.index, job.matches);
+                    } catch (...) {
+                        fail(std::current_exception());
+                    }
                 }
             });
         }
 
-        for (size_t b = 0; b < pairs.size(); b += batch) {
-            size_t e = std::min(b + batch, pairs.size());
-            matchFn(b, e, batch_out);
-            for (size_t p = b; p < e; p++) {
-                std::vector<FeatureMatch>& m = batch_out[p - b];
-                putative += m.size();
-                {
-                    std::unique_lock<std::mutex> lk(mtx);
-                    cv_space.wait(lk, [&] { return queue.size() < max_queued; });
-                    queue.push({p, std::move(m)});
+        try {
+            for (size_t b = 0; b < pairs.size() && !failed; b += batch) {
+                size_t e = std::min(b + batch, pairs.size());
+                matchFn(b, e, batch_out);
+                for (size_t p = b; p < e; p++) {
+                    std::vector<FeatureMatch>& m = batch_out[p - b];
+                    putative += m.size();
+                    {
+                        std::unique_lock<std::mutex> lk(mtx);
+                        cv_space.wait(lk, [&] { return queue.size() < max_queued; });
+                        queue.push({p, std::move(m)});
+                    }
+                    cv_job.notify_one();
+                    if (progress) progress(p + 1, pairs.size());
+                    tick(p);
+                    if (cancel::requested() || failed) break;
                 }
-                cv_job.notify_one();
-                if (progress) progress(p + 1, pairs.size());
+                if (cancel::requested()) break;
             }
+        } catch (...) {
+            fail(std::current_exception());
         }
         {
             std::lock_guard<std::mutex> lk(mtx);
@@ -689,7 +830,9 @@ inline std::vector<TwoViewMatches> verifyPairs(
         }
         cv_job.notify_all();
         for (std::thread& w : workers) w.join();
+        if (error) std::rethrow_exception(error);
     }
+    cancel::check();   // safe now: every worker has been joined
 
     if (putative_out) *putative_out = putative;
 

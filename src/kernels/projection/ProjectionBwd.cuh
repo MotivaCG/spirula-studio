@@ -6,6 +6,7 @@
 #include <core/Tensor.h>
 
 #include <core/Common.cuh>
+#include <core/ColorBasis.h>
 
 #include "primitives/Primitive3DGS.cuh"
 #include "primitives/Primitive3DGUT.cuh"
@@ -18,7 +19,7 @@
 void projection_3dgs_backward(
     // fwd inputs
     const int64_t num_splats,
-    const int max_sh_degree,
+    const ColorBasis color,
     const std::vector<DeviceTensorFloatND> &splats_world,
     TorchTensorView viewmats,  // [C, 4, 4]
     TorchTensorView intrins,   // [C, 4], fx, fy, cx, cy
@@ -30,7 +31,7 @@ void projection_3dgs_backward(
     // fwd outputs
     const DeviceVector<int32_t> camera_ids,  // [nnz] or null
     const DeviceVector<int32_t> gaussian_ids,  // [nnz] or null
-    const DeviceTensor2D<float4> aabb,  // [C, N]
+    const DeviceTensor2D<uint2> aabb,  // [C, N]
     // grad outputs
     const std::vector<DeviceTensorFloatND> &v_splats_screen,
     // returns
@@ -49,7 +50,7 @@ void projection_3dgs_backward(
 void projection_mip_backward(
     // fwd inputs
     const int64_t num_splats,
-    const int max_sh_degree,
+    const ColorBasis color,
     const std::vector<DeviceTensorFloatND> &splats_world,
     TorchTensorView viewmats,  // [C, 4, 4]
     TorchTensorView intrins,   // [C, 4], fx, fy, cx, cy
@@ -61,7 +62,7 @@ void projection_mip_backward(
     // fwd outputs
     const DeviceVector<int32_t> camera_ids,  // [nnz] or null
     const DeviceVector<int32_t> gaussian_ids,  // [nnz] or null
-    const DeviceTensor2D<float4> aabb,  // [C, N]
+    const DeviceTensor2D<uint2> aabb,  // [C, N]
     // grad outputs
     const std::vector<DeviceTensorFloatND> &v_splats_screen,
     // returns
@@ -80,7 +81,7 @@ void projection_mip_backward(
 void projection_3dgut_backward(
     // fwd inputs
     const int64_t num_splats,
-    const int max_sh_degree,
+    const ColorBasis color,
     const std::vector<DeviceTensorFloatND> &splats_world,
     TorchTensorView viewmats,  // [C, 4, 4]
     TorchTensorView intrins,   // [C, 4], fx, fy, cx, cy
@@ -92,7 +93,7 @@ void projection_3dgut_backward(
     // fwd outputs
     const DeviceVector<int32_t> camera_ids,  // [nnz] or null
     const DeviceVector<int32_t> gaussian_ids,  // [nnz] or null
-    const DeviceTensor2D<float4> aabb,  // [C, N]
+    const DeviceTensor2D<uint2> aabb,  // [C, N]
     // grad outputs
     const std::vector<DeviceTensorFloatND> &v_splats_screen,
     // returns

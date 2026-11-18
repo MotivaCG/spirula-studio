@@ -1,29 +1,18 @@
-// Tile rasterization forward (Vulkan backend), closely following
-// kernels/raster/RasterizationEval3DFwd_kernel.cuh (which also generates the 2D
-// forward via IS_EVAL3D=0; here the two are separate entries because their
-// groupshared fragment types differ). One workgroup per micro-tile
-// (TILE_SIZE_X x TILE_SIZE_Y pixels, one thread per pixel); binning is at
-// macro-tile granularity, so a workgroup reads its macro tile's gaussian
-// range and culls the ones that miss its micro-tile.
+// Tile rasterization forward (Vulkan backend), following
+// kernels/raster/RasterizationEval3DFwd_kernel.cuh; its 2D and eval3d forms
+// are separate entries here because their groupshared fragments differ. One
+// 64-thread workgroup per micro-tile, binned per macro tile; the CUDA template
+// axes are the specialization constants below. Every primitive is RGB_D, so
+// the outputs are hard-wired to rgb + depth.
 //
-// Variants (specialization constants, matching the CUDA template axes):
-//   kCameraModel  = CameraModelType 0..3 (eval3d entry only)
-//   kDistType     = 0 None | 1 D | 2 RGB_D (the instantiated subset)
-//   kOutputMedian = 0 | 1
-//   kDistortion   = CameraDistortionType 0..3 (eval3d entry only), last
-// The primitive pixel type is RGB_D for all current primitives, so the
-// render output channels are hard-wired to rgb + depth.
-//
-// CUDA's __syncthreads_count(done) early-out becomes a monotonic groupshared
-// counter: each thread adds 1 exactly when it transitions to done, and the
-// loop-top barrier (which CUDA also needs, to protect the shared batch)
-// makes the count visible.
-//
-// The 64-thread workgroup is a multiple of every pinned subgroup size on
-// known hardware (8..64; see README subgroup rules).
+// CUDA's __syncthreads_count(done) early-out is a monotonic groupshared
+// counter each thread bumps once on turning done; the loop-top barrier, which
+// also guards the shared batch, publishes it.
 
 #define CudaDeviceExport ForceInline
+#include "aabb16.slang"
 #include "int64_compat.slang"
+#include "screen.slang"
 #include "shaders/projection_utils.slang"
 #undef CudaDeviceExport
 
@@ -40,9 +29,33 @@ const int kOutputMedian = 0;
 // never sits behind a runtime branch (see backend README).
 [SpecializationConstant]
 const int kRasterPacked = 0;
+[SpecializationConstant]
+const int kOutputScore = 0;
 
 groupshared uint _hit[TILE_AREA];
 groupshared uint _done_count;
+
+// SplatScoreRender (primitives/Primitive.cuh) plus the world-id lookup the 2D
+// entry otherwise never needs. Behind a pointer: the 2D params are pushed,
+// and these would take them past the 128-byte floor.
+struct RasterScoreIO {
+    float2* score;      // [N] (s^p, update count)
+    int* gaussian_ids;  // kRasterPacked
+    float* out;         // [I,H,W]
+    uint32_t N;
+    float exponent;
+    float prior;
+    uint32_t _pad0;
+};
+
+static const int RF_SCORE_N = kOutputScore != 0 ? (int)TILE_AREA : 1;
+groupshared float _score[RF_SCORE_N];
+
+[ForceInline]
+float _rf_splat_score(RasterScoreIO* io, uint wi) {
+    float2 a = io.score[wi];
+    return a.y > 0.0f ? pow(a.x, io.exponent) : io.prior;
+}
 
 // ---------------------------------------------------------------------------
 // 2D splatting (Vanilla3DGS / MipSplatting share the fragment; the
@@ -61,13 +74,9 @@ struct Frag2d {
 groupshared Frag2d _batch_2d[TILE_AREA];
 
 struct RasterFwd2dParams {
-    // ScreenBuffer (TensorArray<5>) flattened; indexed by the flatten id
-    // (the 2D fragment never touches the world buffer).
-    float* s_xy;      // [.., 2]
-    float* s_depth;   // [.., 1]
-    float* s_conic;   // [.., 3]
-    float* s_opac;    // [.., 1]
-    float* s_rgb;     // [.., 3]
+    // Packed ScreenBuffer rows, indexed by the flatten id (the 2D fragment
+    // never touches the world buffer).
+    float* s_screen;
     int* tile_offsets;  // [I, tile_height, tile_width]
     int* flatten_ids;   // [n_isects]
     // outputs (RGB_D pixel type)
@@ -78,25 +87,28 @@ struct RasterFwd2dParams {
     float* dist_rgb;     // [I,H,W,3], kDistType == 2 only
     float* dist_depth;   // [I,H,W],   kDistType != 0 only
     float* out_median;   // [I,H,W],   kOutputMedian only
+    RasterScoreIO* score_io;  // kOutputScore only
     uint32_t I;
     uint32_t n_isects;
     uint32_t width;
     uint32_t height;
     uint32_t tile_width;
     uint32_t tile_height;
+    uint32_t macro_log2;
+    uint32_t out_depth_on;  // 0: nothing reads the depth, out_depth unbound
+    float kernel_cut;  // Primitive3DGS::kernel_vis: > 0 cut and renormalized, 0 gaussian
+    uint32_t _pad0;
 };
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void rasterize_fwd_2d(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
-                      uniform RasterFwd2dParams* pp) {
-    RasterFwd2dParams p = *pp;
+                      uniform RasterFwd2dParams p) {
     uint image_id = wg.x;
     // one workgroup per micro-tile; recover its macro tile for binning
     uint mt_y = wg.y;
     uint mt_x = wg.z;
-    int tile_id = int((mt_y / MACRO_TILE_SIZE_Y) * p.tile_width +
-                      (mt_x / MACRO_TILE_SIZE_X));
+    int tile_id = int(macro_tile_id(mt_y, mt_x, p.tile_width, p.macro_log2));
 
     int* tile_offsets =
         p.tile_offsets + image_id * p.tile_height * p.tile_width;
@@ -123,6 +135,7 @@ void rasterize_fwd_2d(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
     float pix_depth = 0.0f;
     float3 pix2_rgb = float3(0.0f);
     float pix2_depth = 0.0f;
+    float pix_score = 0.0f;
 
     // gaussians overlapping this micro-tile's macro tile
     int range_start = tile_offsets[tile_id];
@@ -163,21 +176,26 @@ void rasterize_fwd_2d(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
             // 2D splatting: the fragment is just the screen data, so load it
             // (cheap) and cull from its own conic / opacity.
             Frag2d f;
-            f.xy = float2(p.s_xy[2 * g], p.s_xy[2 * g + 1]);
-            f.depth = p.s_depth[g];
-            f.conic = float3(p.s_conic[3 * g], p.s_conic[3 * g + 1],
-                             p.s_conic[3 * g + 2]);
-            f.opac = p.s_opac[g];
-            f.rgb = float3(p.s_rgb[3 * g], p.s_rgb[3 * g + 1],
-                           p.s_rgb[3 * g + 2]);
+            float* r = scr2_row(p.s_screen, g);
+            f.xy = scr2_xy(r);
+            f.depth = scr2_depth(r);
+            f.conic = scr2_conic(r);
+            f.opac = scr2_opac(r);
+            f.rgb = scr2_rgb(r);
             _batch_2d[tid] = f;
             if (f.opac > ALPHA_THRESHOLD) {
-                float kk = 0.5f / log(f.opac / ALPHA_THRESHOLD);
+                float kk = 0.5f / kernel_reach(f.opac, p.kernel_cut);
                 float3 inv_cov = f.conic * kk;
                 hit = ellipse_box_overlap_test(
                     inv_cov, mt_bx0 - f.xy.x,
                     mt_bx0 + float(TILE_SIZE_X) - f.xy.x, mt_by0 - f.xy.y,
                     mt_by0 + float(TILE_SIZE_Y) - f.xy.y);
+            }
+            if (kOutputScore != 0 && hit) {
+                uint wi = kRasterPacked != 0
+                              ? uint(p.score_io.gaussian_ids[g])
+                              : uint(g) % p.score_io.N;
+                _score[tid] = _rf_splat_score(p.score_io, wi);
             }
         }
         _hit[tid] = hit ? 1u : 0u;
@@ -199,7 +217,7 @@ void rasterize_fwd_2d(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
             float sigma = 0.5f * (f.conic.x * delta.x * delta.x +
                                   f.conic.z * delta.y * delta.y) +
                           f.conic.y * delta.x * delta.y;
-            float vis0 = exp(-sigma);
+            float vis0 = kernel_vis(sigma, p.kernel_cut);
             float alpha = min(0.999f, f.opac * vis0);
             if (sigma < 0.f)
                 alpha = 0.f;
@@ -242,6 +260,7 @@ void rasterize_fwd_2d(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
                 }
                 pix_rgb += color_rgb * vis;
                 pix_depth += acc_depth * vis;
+                if (kOutputScore != 0) pix_score += vis * _score[t];
                 cur_idx = uint(batch_start) + t;
                 T = next_T;
             } else {
@@ -255,6 +274,8 @@ void rasterize_fwd_2d(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
         p.out_T[pix_id_global] = T;
         if (kOutputMedian != 0)
             p.out_median[pix_id_global] = median_depth;
+        if (kOutputScore != 0)
+            p.score_io.out[pix_id_global] = pix_score / max(1.0f - T, 1e-10f);
         // distortion: closed form D = W*S - C^2, evaluated before the depth
         // channel of C is normalized below
         if (kDistType != 0) {
@@ -274,7 +295,7 @@ void rasterize_fwd_2d(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
         p.out_rgb[3 * pix_id_global + 0] = pix_rgb.x;
         p.out_rgb[3 * pix_id_global + 1] = pix_rgb.y;
         p.out_rgb[3 * pix_id_global + 2] = pix_rgb.z;
-        p.out_depth[pix_id_global] = out_depth;
+        if (p.out_depth_on != 0) p.out_depth[pix_id_global] = out_depth;
         // index in bin of last gaussian in this pixel
         p.out_last_ids[pix_id_global] = int(cur_idx);
     }
@@ -301,15 +322,12 @@ struct RasterFwd3dgutParams {
     float* quats;   // [N, 4]
     float* scales;  // [N, 3]
     int* gaussian_ids;  // [nnz] packed mode or null (world idx = g % N)
-    // ScreenBuffer (TensorArray<3>) flattened
-    float* s_scale;  // [.., 3] projected 2D conic (culling)
-    float* s_opac;   // [.., 1]
-    float* s_rgb;    // [.., 3]
+    float* s_screen;  // packed ScreenBuffer rows; "scale" slot = 2D conic
     // cameras
     float* viewmats;     // [I, 16] row-major
     float4* intrins;     // [I]
     float* dist_coeffs;  // [I, 8] or null
-    float4* aabb;        // [..] projected 2D AABB (xmin,ymin,xmax,ymax)
+    uint2* aabb;         // [..] packed 2D AABB, aabb16.slang
     int* tile_offsets;   // [I, tile_height, tile_width]
     int* flatten_ids;    // [n_isects]
     // outputs (RGB_D pixel type)
@@ -320,6 +338,7 @@ struct RasterFwd3dgutParams {
     float* dist_rgb;
     float* dist_depth;
     float* out_median;
+    RasterScoreIO* score_io;  // kOutputScore only
     uint32_t I;
     uint32_t N;  // zero if packed
     uint32_t n_isects;
@@ -327,6 +346,9 @@ struct RasterFwd3dgutParams {
     uint32_t height;
     uint32_t tile_width;
     uint32_t tile_height;
+    uint32_t macro_log2;
+    uint32_t out_depth_on;  // 0: nothing reads the depth, out_depth unbound
+    uint32_t _pad0;
 };
 
 #define _rf_ray(D)                                                    \
@@ -342,8 +364,7 @@ void rasterize_fwd_3dgut(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
     uint image_id = wg.x;
     uint mt_y = wg.y;
     uint mt_x = wg.z;
-    int tile_id = int((mt_y / MACRO_TILE_SIZE_Y) * p.tile_width +
-                      (mt_x / MACRO_TILE_SIZE_X));
+    int tile_id = int(macro_tile_id(mt_y, mt_x, p.tile_width, p.macro_log2));
 
     int* tile_offsets =
         p.tile_offsets + image_id * p.tile_height * p.tile_width;
@@ -372,6 +393,8 @@ void rasterize_fwd_3dgut(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
     bool ray_ok = false;
     SS_DISPATCH_DIST(_rf_ray)
     inside = inside && ray_ok;
+    if (kCameraModel == 4)
+        ray_o += transform_ray_d(R, float3((px-intrin.z)/intrin.x, (py-intrin.w)/intrin.y, 0));
     float3 ray_d = transform_ray_d(R, raydir);
 
     bool done = !inside;
@@ -388,6 +411,7 @@ void rasterize_fwd_3dgut(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
     float pix_depth = 0.0f;
     float3 pix2_rgb = float3(0.0f);
     float pix2_depth = 0.0f;
+    float pix_score = 0.0f;
 
     int range_start = tile_offsets[tile_id];
     int range_end =
@@ -424,13 +448,12 @@ void rasterize_fwd_3dgut(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
             // channel and the ellipse center is the AABB center. Cull here,
             // before the (expensive) 3D fragment load, matching the tile
             // intersector.
-            float opac = p.s_opac[g];
+            float* r = scrg_row(p.s_screen, g);
+            float opac = scrg_opac(r);
             if (opac > ALPHA_THRESHOLD) {
-                float3 conic = float3(p.s_scale[3 * g], p.s_scale[3 * g + 1],
-                                      p.s_scale[3 * g + 2]);
-                float4 bb = p.aabb[g];
-                float ecx = 0.5f * (bb.x + bb.z);
-                float ecy = 0.5f * (bb.y + bb.w);
+                float3 conic = scrg_scale(r);
+                float2 ec = aabb16_center(p.aabb[g], p.width, p.height);
+                float ecx = ec.x, ecy = ec.y;
                 float kk = 0.5f / log(opac / ALPHA_THRESHOLD);
                 float3 inv_cov = conic * kk;
                 hit = ellipse_box_overlap_test(
@@ -449,9 +472,10 @@ void rasterize_fwd_3dgut(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
                     float3(p.scales[3 * wi], p.scales[3 * wi + 1],
                            p.scales[3 * wi + 2]));
                 f.opacity = opac;
-                f.rgb = float3(p.s_rgb[3 * g], p.s_rgb[3 * g + 1],
-                               p.s_rgb[3 * g + 2]);
+                f.rgb = scrg_rgb(r);
                 _batch_ut[tid] = f;
+                if (kOutputScore != 0)
+                    _score[tid] = _rf_splat_score(p.score_io, wi);
             }
         }
         _hit[tid] = hit ? 1u : 0u;
@@ -505,6 +529,7 @@ void rasterize_fwd_3dgut(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
                 }
                 pix_rgb += color_rgb * vis;
                 pix_depth += acc_depth * vis;
+                if (kOutputScore != 0) pix_score += vis * _score[t];
                 cur_idx = uint(batch_start) + t;
                 T = next_T;
             } else {
@@ -518,6 +543,8 @@ void rasterize_fwd_3dgut(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
         p.out_T[pix_id_global] = T;
         if (kOutputMedian != 0)
             p.out_median[pix_id_global] = median_depth;
+        if (kOutputScore != 0)
+            p.score_io.out[pix_id_global] = pix_score / max(1.0f - T, 1e-10f);
         if (kDistType != 0) {
             float W = 1.0f - T;
             if (kDistType == 2) {
@@ -535,7 +562,7 @@ void rasterize_fwd_3dgut(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
         p.out_rgb[3 * pix_id_global + 0] = pix_rgb.x;
         p.out_rgb[3 * pix_id_global + 1] = pix_rgb.y;
         p.out_rgb[3 * pix_id_global + 2] = pix_rgb.z;
-        p.out_depth[pix_id_global] = out_depth;
+        if (p.out_depth_on != 0) p.out_depth[pix_id_global] = out_depth;
         p.out_last_ids[pix_id_global] = int(cur_idx);
     }
 }

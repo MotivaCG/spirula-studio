@@ -6,7 +6,9 @@
 // host assumed (as the rest of this repo does).
 #pragma once
 
+#include "core/BufferedFile.h"
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -15,10 +17,13 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "sfm/core/Camera.h"
 #include "sfm/core/Pose.h"
+#include "sfm/core/Rig.h"
 #include "sfm/geometry/LinAlg.h"
 
 namespace sfm {
@@ -33,7 +38,7 @@ struct TrackElement {
 struct Point3D {
     Vec3 xyz;
     uint8_t rgb[3] = {128, 128, 128};
-    double error = 0;
+    double error = -1;
     std::vector<TrackElement> track;
 };
 
@@ -43,6 +48,10 @@ struct Image {
     std::string name;
     Pose pose;                 // world -> camera
     bool registered = false;
+    // The file's EXIF Orientation (sfm/core/Exif.h), 1 when it has none or the
+    // pixels already carry it. Only the gauge fix reads it, and only a model
+    // built from features has it -- one read back from disk does not.
+    uint8_t exif_orientation = 1;
     std::vector<Vec2> points2D;              // keypoint coords (all features)
     std::vector<uint64_t> point3D_ids;       // parallel; kInvalidPoint3D if none
 
@@ -51,6 +60,20 @@ struct Image {
         for (uint64_t id : point3D_ids)
             if (id != kInvalidPoint3D) n++;
         return n;
+    }
+
+    // Every member but points2D, for an undo record of a model that never
+    // rewrites its keypoints. Names every member.
+    Image withoutPoints2D() const {
+        Image c;
+        c.id = id;
+        c.camera_id = camera_id;
+        c.name = name;
+        c.pose = pose;
+        c.registered = registered;
+        c.exif_orientation = exif_orientation;
+        c.point3D_ids = point3D_ids;
+        return c;
     }
 };
 
@@ -62,12 +85,32 @@ struct Reconstruction {
     std::map<uint32_t, Image> images;
     std::map<uint64_t, Point3D> points3D;
     uint64_t next_point3D_id = 1;
+    // Per rig of the run's RigTable, the extrinsics this model has settled on;
+    // empty until a rig's frames register. In this model's units (sfm/core/Rig.h).
+    std::vector<RigCalib> rigs;
+    // Images left outside their frame, with a pose of their own. The mapper
+    // keeps frames whole and never fills it; the solvers and the merge honour it.
+    std::set<uint32_t> rig_detached;
 
     uint32_t numRegistered() const {
         uint32_t n = 0;
         for (const auto& kv : images)
             if (kv.second.registered) n++;
         return n;
+    }
+
+    // A copy without the unregistered images, which never copies them: the
+    // mapper's model holds every image of the capture. Names every member.
+    Reconstruction registeredCopy() const {
+        Reconstruction m;
+        m.cameras = cameras;
+        for (const auto& kv : images)
+            if (kv.second.registered) m.images.emplace_hint(m.images.end(), kv);
+        m.points3D = points3D;
+        m.next_point3D_id = next_point3D_id;
+        m.rigs = rigs;
+        m.rig_detached = rig_detached;
+        return m;
     }
 
     uint64_t addPoint3D(const Vec3& xyz, const std::vector<TrackElement>& track) {
@@ -80,9 +123,48 @@ struct Reconstruction {
         return id;
     }
 
+    void updatePointErrors();
     void writeBinary(const std::string& dir) const;
     static Reconstruction readBinary(const std::string& dir);
 };
+
+inline void Reconstruction::updatePointErrors() {
+    using ImageCamera = std::pair<const Image*, const Camera*>;
+    std::unordered_map<uint32_t, ImageCamera> image_cameras;
+    image_cameras.reserve(images.size());
+    for (const auto& kv : images) {
+        if (!kv.second.registered) continue;
+        auto camera = cameras.find(kv.second.camera_id);
+        if (camera != cameras.end()) image_cameras.emplace(kv.first, ImageCamera{&kv.second, &camera->second});
+    }
+    for (auto& kv : points3D) {
+        Point3D& point = kv.second;
+        double sum = 0;
+        size_t count = 0;
+        for (const TrackElement& observation : point.track) {
+            auto found = image_cameras.find(observation.image_id);
+            if (found == image_cameras.end()) continue;
+            const Image& image = *found->second.first;
+            const Camera& camera = *found->second.second;
+            if (observation.point2D_idx >= image.points2D.size()) continue;
+            const Vec2& keypoint = image.points2D[observation.point2D_idx];
+            if (!std::isfinite(keypoint.x) || !std::isfinite(keypoint.y)) continue;
+            Vec3 p = mul(image.pose.R, point.xyz) + image.pose.t;
+            if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+            if (camera.wideFov()) {
+                if (!(p.dot(camera.bearing(keypoint)) > 0)) continue;
+            } else if (!(p.z >= 1e-8)) {
+                continue;
+            }
+            Vec2 pixel = camera.project(p);
+            double error = std::hypot(pixel.x - keypoint.x, pixel.y - keypoint.y);
+            if (!std::isfinite(error)) continue;
+            sum += error;
+            count++;
+        }
+        point.error = count ? sum / count : -1;
+    }
+}
 
 // A copy holding only `keep`, with the tracks trimmed to match: the operation
 // every "this model is really two models" decision ends in (D45). Images not
@@ -158,7 +240,7 @@ T rd(std::istream& f) {
 inline void Reconstruction::writeBinary(const std::string& dir) const {
     using namespace detail;
     {
-        std::ofstream f(dir + "/cameras.bin", std::ios::binary);
+        spirula::BufferedOutputFile f(dir + "/cameras.bin", std::ios::binary);
         if (!f) throw std::runtime_error("cannot write cameras.bin in " + dir);
         wr<uint64_t>(f, cameras.size());
         for (const auto& kv : cameras) {
@@ -171,9 +253,11 @@ inline void Reconstruction::writeBinary(const std::string& dir) const {
             packColmap(c, ps);
             for (int i = 0; i < camColmapParams(c.model); i++) wr<double>(f, ps[i]);
         }
+        f.close();
+        if (!f) throw std::runtime_error("cannot finish COLMAP model in " + dir);
     }
     {
-        std::ofstream f(dir + "/images.bin", std::ios::binary);
+        spirula::BufferedOutputFile f(dir + "/images.bin", std::ios::binary);
         if (!f) throw std::runtime_error("cannot write images.bin in " + dir);
         uint64_t nreg = numRegistered();
         wr<uint64_t>(f, nreg);
@@ -193,9 +277,11 @@ inline void Reconstruction::writeBinary(const std::string& dir) const {
                 wr<uint64_t>(f, im.point3D_ids[i]);
             }
         }
+        f.close();
+        if (!f) throw std::runtime_error("cannot finish COLMAP model in " + dir);
     }
     {
-        std::ofstream f(dir + "/points3D.bin", std::ios::binary);
+        spirula::BufferedOutputFile f(dir + "/points3D.bin", std::ios::binary);
         if (!f) throw std::runtime_error("cannot write points3D.bin in " + dir);
         wr<uint64_t>(f, points3D.size());
         for (const auto& kv : points3D) {
@@ -210,6 +296,8 @@ inline void Reconstruction::writeBinary(const std::string& dir) const {
                 wr<uint32_t>(f, e.point2D_idx);
             }
         }
+        f.close();
+        if (!f) throw std::runtime_error("cannot finish COLMAP model in " + dir);
     }
 }
 
@@ -217,7 +305,7 @@ inline Reconstruction Reconstruction::readBinary(const std::string& dir) {
     using namespace detail;
     Reconstruction r;
     {
-        std::ifstream f(dir + "/cameras.bin", std::ios::binary);
+        spirula::BufferedInputFile f(dir + "/cameras.bin", std::ios::binary);
         if (!f) throw std::runtime_error("cannot read cameras.bin");
         uint64_t n = rd<uint64_t>(f);
         for (uint64_t i = 0; i < n; i++) {
@@ -234,7 +322,7 @@ inline Reconstruction Reconstruction::readBinary(const std::string& dir) {
         }
     }
     {
-        std::ifstream f(dir + "/images.bin", std::ios::binary);
+        spirula::BufferedInputFile f(dir + "/images.bin", std::ios::binary);
         if (!f) throw std::runtime_error("cannot read images.bin");
         uint64_t n = rd<uint64_t>(f);
         for (uint64_t i = 0; i < n; i++) {
@@ -260,7 +348,7 @@ inline Reconstruction Reconstruction::readBinary(const std::string& dir) {
         }
     }
     {
-        std::ifstream f(dir + "/points3D.bin", std::ios::binary);
+        spirula::BufferedInputFile f(dir + "/points3D.bin", std::ios::binary);
         if (!f) throw std::runtime_error("cannot read points3D.bin");
         uint64_t n = rd<uint64_t>(f);
         for (uint64_t i = 0; i < n; i++) {
@@ -278,6 +366,30 @@ inline Reconstruction Reconstruction::readBinary(const std::string& dir) {
             r.points3D[id] = p;
             r.next_point3D_id = std::max(r.next_point3D_id, id + 1);
         }
+    }
+    // Some exporters drop untriangulated keypoints from images.bin and leave
+    // the tracks indexing the old lists (Hierarchical 3DGS "campus": 26.6 M of
+    // 29.7 M entries out of range), so a disagreeing model is re-tracked from images.
+    auto agrees = [&](uint64_t id, const TrackElement& e) {
+        auto it = r.images.find(e.image_id);
+        return it != r.images.end() && e.point2D_idx < it->second.point3D_ids.size() &&
+               it->second.point3D_ids[e.point2D_idx] == id;
+    };
+    bool consistent = true;
+    for (const auto& kv : r.points3D)
+        for (const TrackElement& e : kv.second.track) consistent = consistent && agrees(kv.first, e);
+    if (!consistent) {
+        std::fprintf(stderr, "[model] %s: tracks disagree with images.bin; rebuilt from the images\n",
+                     dir.c_str());
+        for (auto& kv : r.points3D) kv.second.track.clear();
+        for (auto& kv : r.images)
+            for (uint32_t k = 0; k < kv.second.point3D_ids.size(); k++) {
+                uint64_t& id = kv.second.point3D_ids[k];
+                if (id == kInvalidPoint3D) continue;
+                auto it = r.points3D.find(id);
+                if (it == r.points3D.end()) id = kInvalidPoint3D;
+                else it->second.track.push_back({kv.first, k});
+            }
     }
     return r;
 }

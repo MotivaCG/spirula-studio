@@ -75,7 +75,6 @@ __device__ __forceinline__ RayToPixel<D, kFromSource> make_ray_to_pixel(
         _SS_DISPATCH_SOURCE_CASE(BODY, None, _ss_has)                          \
         _SS_DISPATCH_SOURCE_CASE(BODY, OpenCV, _ss_has)                        \
         _SS_DISPATCH_SOURCE_CASE(BODY, ThinPrism, _ss_has)                     \
-        _SS_DISPATCH_SOURCE_CASE(BODY, Rational, _ss_has)                      \
         default: throw std::runtime_error(                                     \
             "Unknown camera distortion: " + std::string(name));                \
     } } while (0)

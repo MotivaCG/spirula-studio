@@ -1,60 +1,33 @@
 #pragma once
 
-// SegmentPanel -- try a mask prompt on one real frame before committing to a
-// run over the whole capture.
-//
-// Masking is the one dataset setting a beginner cannot reason about in the
-// abstract: "people; cars" either catches the thing walking through the shot
-// or it does not, and finding out after a twenty-minute reconstruction is the
-// wrong time. This shows the actual mask, from the actual model, on a frame of
-// the actual input, in about a second per attempt once the checkpoint is
-// loaded -- and it is the same sam::Masker the dataset run uses, so what is on
-// screen is what will be written.
-//
-// Clicks are supported too, which is the only way to prompt a SAM 2 checkpoint
-// (it has no text tower): left-click marks the subject, right-click marks
-// something to exclude. They belong to an object and to the frame they were
-// drawn on -- see MaskClick -- and they are kept in the settings rather than
-// in the panel, because they are prompts for the run and not a preview toy.
-//
-// The model lives on the GPU for as long as the panel is open and is dropped
-// when it closes -- a reconstruction that follows should not be sharing VRAM
-// with a 2 GB backbone that nobody is looking at.
-//
-// The same panel edits the input's static stencil (app::FrameStencil): the
-// fisheye border it finds by itself, plus circles and boxes dragged over the
-// picture. That half needs no model at all, and the panel stays usable -- and
-// says so -- when there is none.
+// Mask prompts and static frame stencils on the pixels preparation writes.
+// Clicks belong to an object and a frame; drawn areas can belong to a camera.
 
 #include "app/FrameMask.h"
-#include "app/gui/DatasetPrep.h"   // MaskClick
 #include "app/gui/GlLoader.h"
+#include "app/gui/MaskSettings.h"
+#include "app/gui/ModelCache.h"
 #include "app/gui/PreviewFrames.h"
+#include "app/gui/StencilEdit.h"
+#include "app/gui/StencilPreset.h"
+#include "app/gui/StencilSetMenu.h"
+#include "app/gui/edit/EditTool.h"
+#include "app/gui/mask/Livewire.h"
+#include "app/gui/mask/MaskWindow.h"
+#include "app/gui/mask/PathTool.h"
+#include "app/gui/mask/PenTool.h"
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace gui {
-
-// The mask settings the panel edits, owned by the dataset screen so what is
-// tried here is what runs.
-struct MaskSettings {
-    std::string prompt;              // "people; cars"
-    std::string negative_prompt;
-    bool keep_subject = false;       // prompt names what to KEEP
-    int  max_image_size = 1600;
-    float threshold = 0.5f;
-    float nms = 0.1f;
-    // Clicked objects, across every frame and every input the user visited;
-    // each carries the input it was drawn on (MaskClick::source).
-    std::vector<MaskClick> clicks;
-    int object_count = 1;            // how many the user has opened
-    int current_object = 0;          // which one a new click joins
-};
 
 class SegmentPanel {
 public:
@@ -62,18 +35,18 @@ public:
     SegmentPanel();
     ~SegmentPanel();
 
-    // `input` is a folder of images or a video file. Cheap: the frame list is
-    // gathered here, nothing is decoded or loaded until the panel draws (a
-    // video is asked how long it is, which is one probe either way).
-    //
-    // `ffmpeg_exe` and `force_ffmpeg` are the same two settings the dataset run
-    // takes: a machine whose driver cannot decode video reads the preview frame
-    // with an external ffmpeg, exactly as preparation would.
-    void open(const std::string& input, bool is_video,
-              const std::string& model_path, const std::string& ffmpeg_exe,
-              bool force_ffmpeg);
+    // `src` carries the decoder and the FrameLook the run will use, so the
+    // picture here is the file it writes. Video listing and probing run on the
+    // panel worker; frame decoding follows there after the list is ready.
+    void open(const PreviewSource& src, const MaskModelFiles& model,
+              std::optional<PreviewFrame> initial = std::nullopt);
     bool is_open() const { return _open; }
     void close();
+    // The source preview's frame: a video's frame number, or a photo's path. A
+    // frame outside the clip lands on its nearer end.
+    void show_frame(const PreviewFrame& frame);
+    // A table row's camera, selected and given its own areas after listing.
+    void edit_camera(std::string camera) { _camera_request = std::move(camera); }
 
     // Draws the modal window. Call once per frame from the dataset screen,
     // inside its ImGui frame. Both arguments are edited in place.
@@ -82,18 +55,74 @@ public:
     // Frees the GL textures; call while the GL context is current.
     void destroy_gl();
 
+    // Whether the drawn shapes changed since the last call.
+    bool take_shapes_edited() { return std::exchange(_shapes_edited, false); }
+    // The output folder, whose kDatasetStencilDir the Load menu offers.
+    void set_workspace(const std::string& w) { _workspace = w; }
+    // Load menu's "Other file...": the caller owns the file picker.
+    bool take_browse_request() { return std::exchange(_browse_requested, false); }
+    // Shown where a click or prompt finds no model: draws a picker and returns
+    // the model once the user takes one, empty until then.
+    void set_model_picker(std::function<MaskModelFiles()> pick) {
+        _pick_model = std::move(pick);
+    }
+    bool load_file(app::FrameStencil& stencil, const std::string& path);
+    // A saved set to change here, on `camera` where there are several. Call
+    // after open(); draw() loads it once the frames are listed, because where
+    // it goes depends on the cameras.
+    struct EditRequest {
+        StencilPreset set;
+        std::string camera;
+    };
+    void edit_saved(EditRequest request) {
+        edit_camera(request.camera);
+        _edit_request = std::move(request);
+    }
+
 private:
     struct Rgb;
     struct Job;
 
     void start_job(const MaskSettings& s, const app::FrameMask& stencil);
     void start_detect();
+    void start_livewire();
+    // The key the worker's Job uses for the shown frame, so the panel can
+    // tell whether the edge map it holds is this frame's.
+    std::string shown_frame_key() const;
+    // Where show_frame()'s frame sits in _frames; -1 for a photo not in it.
+    int frame_position(const PreviewFrame& frame) const;
     void upload_preview();
-    void upload_stencil(const app::FrameMask& stencil);
+    // `win` is the part of the frame on screen, normalized (u0, v0, u1, v1).
+    void upload_stencil(const app::FrameMask& stencil, const float win[4], int w, int h);
     void draw_image(MaskSettings& settings, app::FrameStencil& stencil,
                     bool& edited);
     void draw_objects(MaskSettings& settings, bool& edited);
     void draw_stencil(app::FrameStencil& stencil, bool& edited);
+    void draw_tools(app::FrameStencil& stencil, bool& edited);
+    void draw_saved_areas(app::FrameStencil& stencil);
+    void start_editing(app::FrameStencil& stencil, const StencilPreset& set);
+    bool show_camera(const std::string& camera);
+    // A pen shape's anchors and handles under Points, or the pen with Ctrl:
+    // hover, grab, drag, and the history step on release. True: the pointer
+    // is on one of them, so the click is not the canvas's.
+    bool edit_points(app::FrameStencil& stencil, app::MaskShape& shape, float mu, float mv,
+                     float cw, float ch, bool hovered, bool& edited);
+    // The pen over the selected pen shape: add, delete or convert an anchor.
+    bool pen_on_shape(app::FrameStencil& stencil, app::MaskShape& shape, float mu, float mv,
+                      float cw, float ch, bool hovered, bool& edited);
+    // Every change to the stencil goes through here, for undo.
+    void change_shapes(app::FrameStencil& stencil, bool& edited);
+    void undo_shapes(app::FrameStencil& stencil, bool redo, bool& edited);
+    // A plain stroke removes; Subtract, the eraser and Ctrl each flip it.
+    bool stroke_removes(bool ctrl) const;
+
+    // What the tools edit: the input's stencil, or with separate areas on,
+    // the shown camera's (a copy of the input's until it is drawn on).
+    app::CameraStencil& scope(app::FrameStencil& stencil);
+    void set_per_camera(app::FrameStencil& stencil, bool on);
+    // The camera folders this input writes, keyed as shown_camera() keys them;
+    // worked out when the listing lands, into _cameras.
+    std::vector<std::string> camera_names() const;
 
     // The stencil as it will be written: the shapes plus, when asked for, the
     // border this panel found, shrunk by the current amount.
@@ -102,22 +131,46 @@ private:
     // The settings hold every input's clicks; these are the ones on this picture.
     bool mine(const MaskClick& c) const { return c.source == _src.input; }
 
+    // A photo input's file's subfolder under the input. "" for a video.
+    std::string camera_of(const std::string& file) const;
+    // Where the run puts that file's frames (DatasetPrep's StencilRaster
+    // keys): its subfolder, under the shown lens's cam<k>/ for packed photos.
+    std::string file_camera(const std::string& file) const;
+
+    // The folder the shown frame lands in under the input's images: a 360
+    // view, one lens of a multi-lens file, or the photo's own subfolder.
+    std::string shown_camera() const;
+
     bool _open = false;
-    std::string _model_path;
+    MaskModelFiles _model;
     PreviewSource _src;
+    // What the run splits this input into; one empty name for one camera.
+    std::vector<std::string> _folders;
+    std::vector<std::string> _cameras;
+    int  _folder_idx = 0;
     std::vector<PreviewFrame> _frames;
-    // Every image of a photo input, which is what the border fit reads. The
-    // slider offers a dozen of them; a fit wants a spread of two dozen.
+    // Every image of a photo input; the border fit reads the ones sharing the
+    // shown frame's camera folder. The slider offers all of them, a fit two dozen.
     std::vector<std::string> _all_files;
+    bool _frames_ready = false;         // guarded by _mu
+    PreviewSource _listed_src;          // guarded by _mu
+    std::vector<PreviewFrame> _frames_pending;
+    std::vector<std::string> _all_files_pending;
+    std::vector<std::string> _folders_pending;
     int  _frame_idx = 0;
+    std::optional<PreviewFrame> _target_frame;   // until the listing lands
+    std::optional<std::string> _camera_request;
     bool _frame_dirty = true;           // the chosen frame changed
     bool _needs_run = false;            // prompt edited; rerun on release
+    std::atomic<bool> _listing{false};
 
     // ---- the stencil ----
-    // The border found for the frames this panel is showing, with no shrink
-    // applied -- the slider re-applies it without another fit. The dataset run
-    // fits one per camera; this is the one the preview can show.
+
+    // The border of the camera the shown frame belongs to -- the run fits one
+    // per camera and so does this -- carrying no shrink, so the slider
+    // re-applies it without another fit.
     app::BorderDetect _border;          // UI thread
+    std::string _border_camera;         // which camera _border was fitted on
     app::BorderDetect _border_pending;  // guarded by _mu
     bool _border_ready = false;         // guarded by _mu
     std::atomic<bool> _detecting{false};
@@ -129,8 +182,55 @@ private:
     static constexpr int kDragBody = -2;
     int   _drag_handle = -1;
     float _drag_from_u = 0.0f, _drag_from_v = 0.0f;
+    // A pen shape's point being dragged (Points, or the pen with Ctrl or
+    // Alt), relative like the body: where it and the pointer were at the grab.
+    PenPart _pt_part = PenPart::None;
+    int   _pt_anchor = -1;              // also the picked anchor Delete removes
+    float _pt_from[2] = {0.0f, 0.0f};
+    float _pt_press[2] = {0.0f, 0.0f};
+    bool  _pt_moved = false;
+    bool  _pt_pull = false;             // Alt on an anchor under the pen: new handles
     GLuint _stencil_tex = 0;
     std::string _stencil_key;           // what _stencil_tex was built from
+    float _stencil_win[4] = {0.0f, 0.0f, 1.0f, 1.0f};   // and the part of the frame it covers
+
+    // The canvas: the mask editor's view over the preview's pixels, reset
+    // when their size changes.
+    mask::View _view;
+    int _view_w = 0, _view_h = 0;
+    bool _panning = false;
+
+    // ---- the drawing tools ----
+    enum class DrawTool { Select, Points, Shape, Eraser, Path, Pen };
+    DrawTool _draw = DrawTool::Select;
+    EditTool _tool;                     // Box to Brush, for Shape and Eraser
+    bool _subtract = false;
+    float _brush_pct = 2.0f;            // radius, % of the picture's shorter side
+    StencilHistory _history;
+    app::FrameStencil _drag_before;     // the stencil as a drag found it
+    std::string _drag_before_key;       // and its edited shapes, spelled
+    bool _shapes_edited = false;
+    std::vector<StencilPreset> _saved;  // refreshed when the load popup opens
+    std::vector<StencilPreset> _in_dataset;
+    StencilSetMenu _set_menu;
+    std::optional<EditRequest> _edit_request;
+    std::optional<StencilPreset> _editing;  // what Save changes writes over
+    std::string _workspace;
+    bool _browse_requested = false;
+    std::function<MaskModelFiles()> _pick_model;
+    bool _model_missing = false;        // under _mu: a prompt wants one
+    std::string _save_name;
+    std::string _saved_msg;
+    bool _saved_msg_err = false;
+    mask::PathTool _path;
+    mask::PenTool _pen;
+    std::unique_ptr<mask::Livewire> _livewire;          // UI thread
+    std::string _livewire_key;                          // frame it was built for
+    std::unique_ptr<mask::Livewire> _livewire_pending;  // guarded by _mu
+    std::string _livewire_pending_key;                  // guarded by _mu
+    bool _livewire_ready = false;                       // guarded by _mu
+    double _livewire_ms = 0.0;                          // guarded by _mu
+    std::atomic<bool> _livewiring{false};
 
     // The composited RGB preview handed to GL, guarded by _mu.
     std::mutex _mu;
@@ -138,7 +238,9 @@ private:
     int _preview_w = 0, _preview_h = 0;
     bool _preview_dirty = false;
     std::string _status, _error;
-    float _kept_fraction = -1.0f;
+    float _kept_fraction = -1.0f; // guarded by _mu
+    // What is left for feature points; -1 without a feature prompt. Ditto.
+    float _feature_fraction = -1.0f;
 
     GLuint _tex = 0;
     int _tex_w = 0, _tex_h = 0;

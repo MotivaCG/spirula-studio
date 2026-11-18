@@ -1,24 +1,17 @@
-// Engine ↔ DataManager glue.
-//
-// engine_setup_data_manager:
-//   Build / replace the engine-owned DataManager from a parsed-out dataset.
-//   Idempotent; an existing DataManager is destroyed first (and its disk
-//   prefetch threads cleanly joined) before swap-in.
-//
-// engine_train_step_managed:
-//   Pull the next training batch from engine().dm and dispatch the same
-//   fused step as engine_train_step. The DataManager owns the per-step
-//   host buffers; we hand pointers into those buffers to the engine as
-//   TorchTensorViews. They stay alive until the *next* call to
-//   next_train_batch().
-
 #include "core/Camera.h"         // camera_model_to_string
+#include "core/ColorSpace.h"
 #include "data/DataManager.h"
 #include "engine/Engine.h"
+#include "engine/EngineInternal.h"
 #include "engine/EngineState.h"
 #include "i18n/catalog/Log.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <vector>
 
@@ -38,6 +31,9 @@ void engine_setup_data_manager(
     std::vector<float>        viewmats,
     std::vector<float>        intrins,
     std::vector<float>        dist_coeffs,
+    std::vector<int32_t>      post_widths,
+    std::vector<int32_t>      post_heights,
+    std::vector<float>        face_axes,
     std::vector<float>        input_intrins,
     std::vector<float>        input_dist_coeffs,
     std::vector<int32_t>      redistort_models,
@@ -48,6 +44,30 @@ void engine_setup_data_manager(
     // Drop the existing manager first so its scheduler / worker threads are
     // joined before we begin spinning up new ones.
     engine().dm.reset();
+    engine().gt_mean_luma.clear();
+    engine().visit.num_post = (int32_t)(viewmats.size() / 16);
+    engine().visit.cam_sum = DeviceVector<float>();
+    engine().visit.cam_cnt = DeviceVector<uint32_t>();
+
+    std::vector<float4> centers(viewmats.size()/16);
+    for (size_t i = 0; i < centers.size(); ++i) {
+        const float* m = viewmats.data()+16*i;
+        centers[i] = {-m[0]*m[3]-m[4]*m[7]-m[8]*m[11],
+                      -m[1]*m[3]-m[5]*m[7]-m[9]*m[11],
+                      -m[2]*m[3]-m[6]*m[7]-m[10]*m[11],1};
+    }
+    // Virtual faces share a physical center; separate R^T t evaluations can differ by an ulp.
+    if (K_per_camera.size() == post_offsets.size())
+        for (size_t i = 0; i < K_per_camera.size(); ++i) {
+            int offset = post_offsets[i], count = K_per_camera[i];
+            if (count > 1 && offset >= 0 && int64_t(offset)+count <= int64_t(centers.size()))
+                std::fill(centers.begin()+offset+1,centers.begin()+offset+count,centers[offset]);
+        }
+    engine_clear_projective_depth();
+    engine().optim.projective_one_center = false;
+    engine().optim.projective_center_id = engine().optim.projective_step_center_id = -1;
+    engine().optim.projective_step_one_center = engine().optim.projective_step_photometric = false;
+    engine().projective_centers_host = std::move(centers);
 
     engine().dm = std::make_unique<DataManager>(
         std::move(cfg), std::move(camera_models), std::move(camera_distortions),
@@ -57,11 +77,40 @@ void engine_setup_data_manager(
         std::move(K_per_camera),     std::move(post_offsets),
         std::move(viewmats),         std::move(intrins),
         std::move(dist_coeffs),
+        std::move(post_widths),      std::move(post_heights),
+        std::move(face_axes),
         std::move(input_intrins),    std::move(input_dist_coeffs),
         std::move(redistort_models), std::move(redistort_params),
         std::move(train_indices),    std::move(val_indices));
 }
 
+
+void engine_set_view_stats(bool enabled) {
+    auto& v = engine().visit;
+    v.enabled = enabled && v.num_post > 0;
+    if (!v.enabled) return;
+    if (v.cam_sum.data_ptr() == nullptr) {
+        v.cam_sum.resize(PoolSlot::EngVisitCamSum, v.num_post);
+        v.cam_cnt.resize(PoolSlot::EngVisitCamCnt, v.num_post);
+        v.cam_sum.zero();
+        v.cam_cnt.zero();
+    }
+}
+
+void engine_read_view_stats(std::vector<float>& cam_sum, std::vector<uint32_t>& cam_cnt) {
+    auto& v = engine().visit;
+    cam_sum.clear(); cam_cnt.clear();
+    if (!v.enabled || v.cam_sum.data_ptr() == nullptr) return;
+    cam_sum.resize((size_t)v.num_post);
+    cam_cnt.resize((size_t)v.num_post);
+    backend::memcpy_sync(cam_sum.data(), v.cam_sum.data_ptr(),
+                         (size_t)v.num_post * sizeof(float), backend::MemcpyKind::DeviceToHost);
+    backend::memcpy_sync(cam_cnt.data(), v.cam_cnt.data_ptr(),
+                         (size_t)v.num_post * sizeof(uint32_t), backend::MemcpyKind::DeviceToHost);
+}
+
+// The stats a DataManager epoch draws on are at most this many steps old.
+static constexpr int kViewStatsPushEvery = 100;
 
 // Resolve the `split_batch` + `use_fused_proj_bwd_optim` conflict. Both
 // turned on at once is an inconsistency: split_batch loops over single
@@ -72,7 +121,15 @@ void engine_setup_data_manager(
 // choice. Otherwise the user wants the memory win of split_batch and we
 // must turn FPBO off. Prints a one-shot warning describing the choice.
 static EngineStepConfig _resolve_split_vs_fpbo(const EngineStepConfig& cfg,
-                                               int64_t max_batch_known) {
+                                               int64_t max_batch_known,
+                                               int max_face_passes) {
+    // Faces of unequal size are rendered one pass per size, which accumulates
+    // grad across passes -- the very thing FPBO cannot do.
+    if (max_face_passes > 1) {
+        EngineStepConfig out = cfg;
+        out.optim.use_fused_proj_bwd_optim = false;
+        return out;
+    }
     if (!cfg.optim.split_batch || !cfg.optim.use_fused_proj_bwd_optim)
         return cfg;
     EngineStepConfig out = cfg;
@@ -105,6 +162,160 @@ static EngineStepConfig _resolve_split_vs_fpbo(const EngineStepConfig& cfg,
 }
 
 
+// Mean Rec.709 luma of one reference image, in display code values.
+static float _sampled_mean_luma(uint64_t base, int64_t n_px, int64_t width,
+                                uint32_t elem) {
+    int64_t stride = std::max<int64_t>(1, n_px / 256);
+    // Coprime with the row length, or the walk samples one column of pixels.
+    while (std::gcd(stride, width) != 1) stride++;
+
+    const auto& cs = engine().color_space;
+    const auto transfer = (colorspace::Transfer)cs.image_transfer;
+    const uint64_t pitch = 3 * (uint64_t)elem;
+
+    double sum = 0.0;
+    int64_t n = 0;
+    for (int64_t i = 0; i < n_px; i += stride, n++) {
+        const void* p = (const void*)(base + (uint64_t)i * pitch);
+        float c[3];
+        if (elem == 1) {
+            const uint8_t* q = (const uint8_t*)p;
+            for (int k = 0; k < 3; k++) c[k] = q[k] * (1.0f / 255.0f);
+        } else if (elem == 2) {
+            const uint16_t* q = (const uint16_t*)p;
+            for (int k = 0; k < 3; k++) c[k] = q[k] * (1.0f / 65535.0f);
+        } else {
+            const float* q = (const float*)p;
+            for (int k = 0; k < 3; k++) c[k] = q[k];
+        }
+        // What _engine_color_space_apply_to_gt does to the same pixels on the
+        // GPU (working_to_display in shaders/pixel_wise.slang).
+        if (cs.image_enabled) {
+            if (!cs.image_is_linear)
+                for (int k = 0; k < 3; k++) c[k] = colorspace::srgb_to_linear(c[k]);
+            colorspace::apply3x3(cs.image_color_matrix_host, c);
+            for (int k = 0; k < 3; k++) c[k] = colorspace::tone_encode(c[k], transfer);
+        }
+        sum += 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    }
+    return (float)(sum / (double)n);
+}
+
+
+static bool _sub_has_gt_rgb(const DecodedBatch& sub) {
+    const auto& shape = std::get<2>(sub.rgb_view);
+    return std::get<0>(sub.rgb_view) != 0 && shape.size() == 4 &&
+           shape[3] == 3 && shape[1] * shape[2] > 0;
+}
+
+// Mean display luma of row `j` of a sub-batch's reference images, through the
+// per-camera cache when the rows are whole input images (indices per row).
+static float _gt_row_luma(const DecodedBatch& sub, int64_t j) {
+    const TorchTensorView& rgb = sub.rgb_view;
+    const auto& shape = std::get<2>(rgb);
+    const int64_t px = shape[1] * shape[2];
+    const uint32_t elem = std::get<1>(rgb);
+    auto compute = [&] {
+        return _sampled_mean_luma(std::get<0>(rgb) + (uint64_t)(j * px) * 3 * elem,
+                                  px, shape[2], elem);
+    };
+    if ((int64_t)sub.indices.size() != shape[0]) return compute();
+    const int32_t id = sub.indices[(size_t)j];
+    if (id < 0) return compute();
+    std::vector<float>& cache = engine().gt_mean_luma;
+    if ((size_t)id >= cache.size())
+        cache.resize((size_t)id + 1, std::numeric_limits<float>::quiet_NaN());
+    if (std::isnan(cache[(size_t)id])) cache[(size_t)id] = compute();
+    return cache[(size_t)id];
+}
+
+// LossConfig::luminance_normalization: the photometric weights times
+// 1 - factor (1 - (0.5 / max(mean sRGB luma, 1/255))). Leaves them alone when the step
+// carries no reference image to measure.
+static void _normalize_weights_by_luminance(LossConfig& loss, const TrainStep& stp,
+                                            float factor) {
+    double sum = 0.0, total_px = 0.0;
+    for (const auto& sub : stp.subs) {
+        if (!_sub_has_gt_rgb(*sub)) continue;
+        const auto& shape = std::get<2>(sub->rgb_view);
+        const int64_t B = shape[0], px = shape[1] * shape[2];
+        if ((int64_t)sub->indices.size() != B) continue;
+        for (int64_t j = 0; j < B; j++) {
+            if (sub->indices[(size_t)j] < 0) continue;
+            sum += (double)_gt_row_luma(*sub, j) * (double)px;
+            total_px += (double)px;
+        }
+    }
+    if (total_px <= 0.0) return;
+
+    const float scale =
+        1.0f - factor * (1.0f - 0.5f / std::max((float)(sum / total_px), 1.0f / 255.0f));
+    constexpr LossWeightIndex photometric[] = {
+        LossWeightIndex::RgbSupL1, LossWeightIndex::RgbSupL2,
+        LossWeightIndex::YSupL1,   LossWeightIndex::YSupL2,
+        LossWeightIndex::USupL2,   LossWeightIndex::VSupL2,
+    };
+    for (LossWeightIndex i : photometric) loss.weights[(int)i] *= scale;
+    loss.w_ssim *= scale;
+}
+
+
+// 0.5^p = luma / gain: the draw's median lands on the image's mean luma ahead
+// of PPISP, whose 2^e scales display values, or linear light (2^(e/2.2) in
+// display) when it runs before the encode. Clamped to [1/255, 1]: p in [0, 8].
+static float _bg_luma_exponent(float luma, float exposure_log2,
+                               bool ppisp_before_color_space) {
+    const double e = ppisp_before_color_space ? exposure_log2 / 2.2 : exposure_log2;
+    const double target = std::min(std::max((double)luma * std::exp2(-e), 1.0 / 255.0), 1.0);
+    return (float)-std::log2(target);
+}
+
+// BackgroundStepConfig::match_luminance: the per-slot power table the blend
+// kernels read, recomputed for this step's slots from the cached luma and the
+// current PPISP exposure, and re-uploaded whole (it is tiny).
+static void _update_background_exponents(const TrainStep& stp,
+                                         bool ppisp_before_color_space) {
+    auto& bg = engine().background;
+    std::vector<float>& luma = bg.luma_by_cam_host;
+    std::vector<float>& expo = bg.exponent_by_cam_host;
+
+    const auto& pp = engine().ppisp;
+    const int P = pp.num_params;
+    std::vector<float> ppisp_host;
+    if (pp.enabled && pp.params.data_ptr() && P > 0) {
+        ppisp_host.resize((size_t)pp.params.size<0>() * P);
+        backend::memcpy_sync(ppisp_host.data(), pp.params.data_ptr(),
+                             ppisp_host.size() * sizeof(float),
+                             backend::MemcpyKind::DeviceToHost);
+    }
+
+    bool any = false;
+    for (const auto& sub : stp.subs) {
+        if (!_sub_has_gt_rgb(*sub)) continue;
+        const int64_t B = std::get<2>(sub->rgb_view)[0];
+        const int K = std::max(sub->K, 1);
+        if ((int64_t)sub->post_offsets.size() * K < B) continue;
+        for (int64_t j = 0; j < B; j++) {
+            const size_t slot = (size_t)sub->post_offsets[(size_t)(j / K)] + (size_t)(j % K);
+            if (slot >= luma.size()) {
+                luma.resize(slot + 1, std::numeric_limits<float>::quiet_NaN());
+                expo.resize(slot + 1, 1.0f);   // the plain draw for slots never seen
+            }
+            luma[slot] = _gt_row_luma(*sub, j);
+            const float e = (slot + 1) * (size_t)P <= ppisp_host.size()
+                                ? ppisp_host[slot * (size_t)P] : 0.0f;
+            expo[slot] = _bg_luma_exponent(luma[slot], e, ppisp_before_color_space);
+            any = true;
+        }
+    }
+    if (!any) return;
+    if (bg.exponent_by_cam.size() != (int64_t)expo.size())
+        bg.exponent_by_cam.resize(PoolSlot::EngBgExponentByCam, (int64_t)expo.size());
+    backend::memcpy_sync(bg.exponent_by_cam.data_ptr(), expo.data(),
+                         expo.size() * sizeof(float), backend::MemcpyKind::HostToDevice);
+}
+
+
 std::map<std::string, float> engine_train_step_managed(
     int step, int max_steps,
     std::string primitive,
@@ -114,19 +325,35 @@ std::map<std::string, float> engine_train_step_managed(
 {
     if (!engine().dm) {
         throw std::runtime_error(
-            "engine_train_step_managed: DataManager not configured — "
+            "engine_train_step_managed: DataManager not configured -- "
             "call engine_setup_data_manager(...) first.");
     }
 
     // Resolve split_batch vs FPBO using the DataManager's view of the
     // dataset (max train batch size × max K). Done once per session via
     // the static warned flag inside the helper.
-    const EngineStepConfig cfg = _resolve_split_vs_fpbo(
-        cfg_in, engine().dm->max_input_batch_size());
+    EngineStepConfig cfg = _resolve_split_vs_fpbo(
+        cfg_in, engine().dm->max_input_batch_size(),
+        engine().dm->max_face_passes());
 
+    if (engine().visit.enabled && step % kViewStatsPushEvery == 0 && step > 0) {
+        std::vector<float> sum; std::vector<uint32_t> cnt;
+        engine_read_view_stats(sum, cnt);
+        engine().dm->set_view_stats(std::move(sum), std::move(cnt));
+    }
+
+    const auto wait_start = std::chrono::steady_clock::now();
     const TrainStep& stp = engine().dm->next_train_step();
+    engine().data_wait_seconds +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - wait_start).count();
     if (stp.subs.empty())
         throw std::runtime_error("engine_train_step_managed: empty training step");
+
+    if (cfg.loss.luminance_normalization > 0.0f)
+        _normalize_weights_by_luminance(cfg.loss, stp, cfg.loss.luminance_normalization);
+    if (cfg.background.match_luminance && engine().background.enabled)
+        _update_background_exponents(
+            stp, cfg.ppisp.run_before_color_space && engine().color_space.splat_enabled);
 
     // Build a POST-split bilagrid cam-index buffer for one sub-batch.
     // bilagrid_cam_indices must be the POST-split camera id, not the input
@@ -183,7 +410,7 @@ std::map<std::string, float> engine_train_step_managed(
             b.mask_height, b.mask_width,
             b.depth_view, b.depth_height, b.depth_width,
             b.normal_view, b.normal_height, b.normal_width,
-            (uint64_t)b.axes_dev,
+            b.face_axes_view, b.face_passes,
             bilagrid_cam_indices,
             cfg);
     }
@@ -201,7 +428,7 @@ std::map<std::string, float> engine_train_step_managed(
         if (b.K > 1 || !b.input_source_models.empty()) {
             throw std::runtime_error(
                 "engine_train_step_managed: warp sub-batch (K>1 or re-distort) "
-                "inside a multi-sub-batch step — the scheduler must never pack "
+                "inside a multi-sub-batch step -- the scheduler must never pack "
                 "these.");
         }
         build_bg_idx(b, bg_bufs[i]);
@@ -211,6 +438,7 @@ std::map<std::string, float> engine_train_step_managed(
         hs.height       = (int)b.height;
         hs.num          = (int)b.num;
         hs.camera_model = camera_model_to_string(b.model);
+        hs.distortion   = camera_distortion_to_string(b.distortion);
         hs.viewmats     = b.viewmats_view;
         hs.intrins      = b.intrins_view;
         hs.dist_coeffs  = b.dist_coeffs_view;
@@ -230,17 +458,55 @@ std::map<std::string, float> engine_train_step_managed(
 }
 
 
+double engine_take_data_wait_seconds() {
+    const double s = engine().data_wait_seconds;
+    engine().data_wait_seconds = 0.0;
+    return s;
+}
+
+int engine_train_resolution_divisor() {
+    return engine().dm ? engine().dm->last_train_divisor() : 1;
+}
+
+void engine_resolve_data_error(bool retry) {
+    if (engine().dm) engine().dm->resolve_data_error(retry);
+}
+
+
 // ---------------------------------------------------------------------------
 // Forward-only paths: take a batch, install it, render it. See Engine.h.
 // ---------------------------------------------------------------------------
 static TorchTensorView _tv_null() { return {0, 0, {}}; }
 
-// Install a decoded batch as GT + camera params and run the forward pass;
-// neither caller wants loss, backward or optim. `with_geometry` installs the
-// depth and normal GT too, which costs the linear->ray conversion.
-static void _install_and_forward(const DecodedBatch& b, std::string primitive,
-                                 int sh_degree, bool packed,
-                                 bool with_geometry = false) {
+// Slice [k_start, k_start + k_count) off the leading dim; null passes through.
+static TorchTensorView _slice_rows(const TorchTensorView& tv, int64_t k_start,
+                                   int64_t k_count) {
+    uint64_t base = std::get<0>(tv);
+    if (base == 0) return tv;
+    const auto& shape = std::get<2>(tv);
+    if (shape.empty()) return tv;
+    int64_t inner = 1;
+    for (size_t i = 1; i < shape.size(); ++i) inner *= shape[i];
+    std::vector<int64_t> out = shape;
+    out[0] = k_count;
+    return TorchTensorView(base + (uint64_t)k_start * (uint64_t)inner *
+                                      (uint64_t)std::get<1>(tv),
+                           std::get<1>(tv), std::move(out));
+}
+
+// How many post-split views one pass of a batch renders.
+static int _batch_views(const DecodedBatch& b, int pass) {
+    if (b.K <= 1 && b.input_source_models.empty()) return (int)b.num;
+    const int C = b.face_passes.empty() ? 1 : (int)b.face_passes.size();
+    const int p = std::min(std::max(pass, 0), C - 1);
+    const int k0 = C == 1 ? 0 : b.face_passes[(size_t)p].k0;
+    return (C == 1 ? (int)b.K : b.face_passes[(size_t)p].k1) - k0;
+}
+
+// Install one pass of a decoded batch as GT + camera params. `with_geometry`
+// installs the depth and normal GT too, which costs the linear->ray conversion.
+static void _install_batch(const DecodedBatch& b, bool with_geometry,
+                           bool input_depth_is_ray_depth, int pass) {
     const bool geom = with_geometry;
     if (b.K <= 1 && b.input_source_models.empty()) {
         set_camera_params((int)b.width, (int)b.height,
@@ -250,86 +516,114 @@ static void _install_and_forward(const DecodedBatch& b, std::string primitive,
         set_training_data(b.rgb_view,
                           geom ? b.depth_view : _tv_null(),
                           geom ? b.normal_view : _tv_null(),
-                          b.mask_view, true);
+                          b.mask_view, input_depth_is_ray_depth);
     } else {
+        // Faces of unequal size render one pass at a time; the rows of a pass
+        // are contiguous, and a fetched batch is one input image.
+        const int C = b.face_passes.empty() ? 1 : (int)b.face_passes.size();
+        const int p = std::min(std::max(pass, 0), C - 1);
+        const int k0 = C == 1 ? 0 : b.face_passes[(size_t)p].k0;
+        const int Kc = (C == 1 ? b.K : b.face_passes[(size_t)p].k1) - k0;
+        const int Wc = C == 1 ? (int)b.width  : b.face_passes[(size_t)p].width;
+        const int Hc = C == 1 ? (int)b.height : b.face_passes[(size_t)p].height;
+        if (C > 1 && b.input_num != 1)
+            throw std::runtime_error(
+                "engine forward: a multi-pass batch must hold one input image");
         // b.model / b.distortion are already PINHOLE / NONE when K > 1; at
         // K == 1 (re-distort) they are the camera the parser fitted.
-        set_camera_params((int)b.width, (int)b.height,
+        set_camera_params(Wc, Hc,
                           camera_model_to_string(b.model),
                           camera_distortion_to_string(b.distortion),
-                          b.viewmats_view, b.intrins_view, b.dist_coeffs_view);
+                          _slice_rows(b.viewmats_view, k0, Kc),
+                          _slice_rows(b.intrins_view, k0, Kc),
+                          _slice_rows(b.dist_coeffs_view, k0, Kc));
         set_training_data_warped(
             camera_model_to_string(b.input_model),
             camera_distortion_to_string(b.input_distortion),
             b.input_num, (int)b.input_height, (int)b.input_width,
-            b.K, (int)b.height, (int)b.width,
+            Kc, Hc, Wc,
             b.rgb_view, b.mask_view, (int)b.mask_height, (int)b.mask_width,
             geom ? b.depth_view : _tv_null(),
             geom ? (int)b.depth_height : 0, geom ? (int)b.depth_width : 0,
             geom ? b.normal_view : _tv_null(),
             geom ? (int)b.normal_height : 0, geom ? (int)b.normal_width : 0,
-            true,
+            input_depth_is_ray_depth,
             b.input_intrins_view, b.input_dist_coeffs_view,
             b.input_source_models_view, b.input_source_params_view,
-            (uint64_t)b.axes_dev);
+            _slice_rows(b.face_axes_view, k0, Kc));
     }
-
-    forward_3dgs(std::move(primitive), sh_degree, packed);
 }
 
-int engine_eval_forward(std::string primitive, int sh_degree, bool packed) {
+// Install a decoded batch and run the forward pass alone, for eval.
+static int _install_and_forward(const DecodedBatch& b, std::string primitive,
+                                int sh_degree, bool packed) {
+    _install_batch(b, /*with_geometry=*/false, true, 0);
+    forward_3dgs(std::move(primitive), sh_degree, packed,
+                 /*output_median=*/false, 0);
+    return _batch_views(b, 0);
+}
+
+int engine_eval_forward(int index, std::string primitive, int sh_degree, bool packed) {
     if (!engine().dm)
         throw std::runtime_error(
-            "engine_eval_forward: DataManager not configured — call "
+            "engine_eval_forward: DataManager not configured -- call "
             "engine_setup_data_manager(...) with the eval split first.");
 
-    const TrainStep& stp = engine().dm->next_train_step();
-    if (stp.subs.empty()) return 0;
-    if (stp.subs.size() != 1)
+    static DecodedBatch b;
+    engine().dm->fetch_one(index, b);
+    if (b.face_passes.size() > 1)
         throw std::runtime_error(
-            "engine_eval_forward: expected one sub-batch per eval step "
-            "(set train_batch_size = 1)");
-
-    const DecodedBatch& b = *stp.subs[0];
-    _install_and_forward(b, std::move(primitive), sh_degree, packed);
-    return (int)b.num;
+            "engine_eval_forward: the eval split must be baked with uniform "
+            "faces, which is what TrainerCore does");
+    return _install_and_forward(b, std::move(primitive), sh_degree, packed);
 }
 
 int engine_preview_forward(int index, std::string primitive, int sh_degree,
-                           bool packed, bool apply_color_correction) {
+                           bool packed, bool apply_color_correction,
+                           bool apply_calib_warp, const EngineStepConfig& cfg,
+                           int pass, int* out_passes) {
     if (!engine().dm)
         throw std::runtime_error(
-            "engine_preview_forward: DataManager not configured — call "
+            "engine_preview_forward: DataManager not configured -- call "
             "engine_setup_data_manager(...) first.");
 
     // Static: the buffers the views point into must outlive the forward, and
-    // a preview is one call at a time under the engine mutex.
+    // a preview is one call at a time under the engine mutex. Later passes of
+    // one image re-render what pass 0 fetched.
     static DecodedBatch b;
-    engine().dm->fetch_one((int32_t)index, b);
-    // With the geometry GT: this is the panel that shows what the loss
-    // compares, and the depth and normal rows are half of that.
-    _install_and_forward(b, std::move(primitive), sh_degree, packed,
-                         /*with_geometry=*/true);
-
-    if (apply_color_correction) {
-        // POST-split camera ids, the same ones the training step hands the
-        // per-image tables (see build_bg_idx above).
-        std::vector<int32_t> cam_idx((size_t)b.num);
-        for (int j = 0; j < b.input_num; ++j)
-            for (int k = 0; k < b.K; ++k)
-                cam_idx[(size_t)j * b.K + k] = b.post_offsets[j] + k;
-        TorchTensorView cam_view((uint64_t)cam_idx.data(), 4,
-                                 {(int64_t)b.num, 1LL});
-        const bool bg_enabled = engine().bilagrid_rgb.enabled ||
-                                engine().bilagrid_depth.enabled ||
-                                engine().bilagrid_normal.enabled;
-        if (engine().ppisp.cur_run_before_bilagrid) {
-            if (engine().ppisp.enabled) engine_ppisp_forward(cam_view);
-            if (bg_enabled)             engine_bilagrid_forward(cam_view);
-        } else {
-            if (bg_enabled)             engine_bilagrid_forward(cam_view);
-            if (engine().ppisp.enabled) engine_ppisp_forward(cam_view);
-        }
+    static int fetched = -1;
+    if (pass <= 0 || fetched != index) {
+        engine().dm->fetch_one((int32_t)index, b);
+        fetched = index;
     }
-    return (int)b.num;
+    const int passes = std::max<int>(1, (int)b.face_passes.size());
+    if (out_passes) *out_passes = passes;
+    pass = std::min(std::max(pass, 0), passes - 1);
+    const int k0 = b.face_passes.empty() ? 0 : b.face_passes[(size_t)pass].k0;
+    // With the geometry GT and the training step's distortion channels: this
+    // renders what the loss compares, so a loss map read off this forward
+    // carries the same terms the trainer's does.
+    const LossConfig& loss = cfg.loss;
+    const DistortionType dist_type = engine_distortion_type(
+        engine_primitive_pixel_type(primitive),
+        loss.weights[(int)LossWeightIndex::RgbDistReg],
+        loss.weights[(int)LossWeightIndex::DepthDistReg],
+        loss.weights[(int)LossWeightIndex::NormalDistReg]);
+    // POST-split camera ids for this pass's faces, the same ones the training
+    // step hands the per-image tables; the forward's fused stages read them.
+    const int views = _batch_views(b, pass);
+    std::vector<int32_t> cam_idx((size_t)views);
+    for (int v = 0; v < views; ++v)
+        cam_idx[(size_t)v] = b.post_offsets[0] + k0 + v;
+    TorchTensorView cam_view((uint64_t)cam_idx.data(), 4,
+                             {(int64_t)views, 1LL});
+    _set_cur_cam_indices(cam_view);
+
+    _install_batch(b, /*with_geometry=*/true, loss.input_depth_is_ray_depth, pass);
+    _engine_arm_step_forward(cfg, dist_type, apply_color_correction);
+    forward_3dgs(std::move(primitive), sh_degree, packed,
+                 /*output_median=*/false, (int)dist_type);
+    if (apply_color_correction) _engine_step_image_stages(cam_view);
+    if (apply_calib_warp) _engine_calib_warp_preview();
+    return views;
 }

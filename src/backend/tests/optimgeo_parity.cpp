@@ -55,6 +55,13 @@ void readback_f(std::vector<float>& acc, const float* d, int64_t n) {
 }
 
 // 16-bit qadam cells -> two codes per cell.
+void readback_i(std::vector<int32_t>& acc, const int32_t* d, int64_t n) {
+    size_t off = acc.size();
+    acc.resize(off + n);
+    backend::memcpy_sync(acc.data() + off, d, n * sizeof(int32_t),
+                         MemcpyKind::DeviceToHost);
+}
+
 void readback_qadam16(std::vector<int32_t>& codes, const uint8_t* d,
                       int64_t n_cells) {
     std::vector<uint16_t> h(n_cells * 2);
@@ -82,15 +89,17 @@ int main(int argc, char** argv) {
     std::vector<int32_t> codes;
 
     // ---- fused_optim_3dgs_geometry ----
-    // (sam, zero_grad, non_sh_quant, grad_quant, per_splat_steps, densify)
+    // (sam, zero_grad, non_sh_quant, grad_quant, per_splat_steps, densify,
+    //  linear colour trust region -- only the nq config updates DC)
     struct GeoCfg {
-        bool sam, zero_grad, nq, gq, steps, densify;
+        bool sam, zero_grad, nq, gq, steps, densify, ct;
     };
-    const GeoCfg geo_cfgs[4] = {
-        {false, true, false, false, false, true},
-        {true, false, false, false, true, false},
-        {false, true, true, false, false, true},
-        {true, true, false, true, true, true},
+    const GeoCfg geo_cfgs[5] = {
+        {false, true, false, false, false, true, false},
+        {true, false, false, false, true, false, false},
+        {false, true, true, false, false, true, false},
+        {true, true, false, true, true, true, false},
+        {false, false, true, false, false, false, true},
     };
 
     for (const GeoCfg& c : geo_cfgs) {
@@ -187,6 +196,23 @@ int main(int argc, char** argv) {
             steps = dv<int32_t>(upload(st), N);
         }
 
+        ColorTrustState ct{};
+        if (c.ct) {
+            ct.enabled = true;
+            ct.eps_tr = 1e-4f;
+            ct.features_dc = d_dc;
+            ct.opacities = d_opacs;
+        }
+
+        // Render counters; the unrendered-splat gate follows zero_grad so
+        // both settings are covered.
+        std::vector<int32_t> vis(N);
+        for (auto& v : vis) v = (int32_t)((rng() % 50u) | ((rng() % 30u) << 16));
+        uint32_t* d_visit = (uint32_t*)upload(vis);
+        SplatVisitState visit;
+        visit.counters = d_visit;
+        visit.skip_unrendered_reg = c.zero_grad;
+
         // Two steps so the quantized configs decode self-written state.
         for (int step_i = 0; step_i < (c.nq ? 2 : 1); step_i++) {
             fused_optim_3dgs_geometry(
@@ -205,9 +231,11 @@ int main(int argc, char** argv) {
                 /*max_gauss_ratio=*/4.f, /*scale_reg=*/0.1f,
                 /*mcmc_op=*/0.05f, /*mcmc_scale=*/0.02f,
                 /*erank=*/0.1f, /*erank_s3=*/0.05f, /*quat_norm=*/0.1f,
-                /*sh_reg=*/0.01f, c.sam, nq, gq,
+                /*dc_reg=*/0.01f, /*sh_reg=*/0.01f,
+                /*max_screen_size=*/0.3f, /*max_screen_size_penalty=*/1.5f,
+                c.sam, ct, nq, visit, gq, {},
                 /*step=*/7 + step_i, steps, /*grad_scale=*/0.5f,
-                c.zero_grad);
+                c.zero_grad, {});
             backend::device_synchronize();
         }
 
@@ -229,6 +257,7 @@ int main(int argc, char** argv) {
             }
         }
         if (c.zero_grad && !c.gq) readback_f(acc, d_v_means, 3 * N);
+        readback_i(codes, (const int32_t*)d_visit, N);
     }
 
     // ---- fused_adamtr_(linear_)rgb_(sh_)optim ----
@@ -254,7 +283,8 @@ int main(int argc, char** argv) {
                                 : fused_adamtr_rgb_optim;
             fn(ttv(d_p, {N, 3}), ttv(d_g, {N, 3}), ttv(d_g1, {N, 3}),
                ttv(d_g2, {N, 3}), ttv(d_o, {N, 1}), 2.5e-3f, 0.9f, 0.999f,
-               1e-15f, /*eps_tr=*/1e-4f, /*step=*/7, /*grad_scale=*/0.5f,
+               1e-15f, /*eps_tr=*/1e-4f, /*dc_reg=*/0.01f, /*sh_reg=*/0.01f,
+               /*step=*/7, /*grad_scale=*/0.5f,
                /*zero_grad=*/is_linear == 1);
             backend::device_synchronize();
             readback_f(acc, d_p, 3 * N);
@@ -277,7 +307,8 @@ int main(int argc, char** argv) {
             sfn(ttv(d_sp, {N, K, 3}), ttv(d_sg, {N, K, 3}),
                 ttv(d_sg1, {N, K, 3}), ttv(d_sg2, {N, K, 3}),
                 ttv(d_p, {N, 3}), ttv(d_o, {N, 1}), 1.25e-4f, 0.9f, 0.999f,
-                1e-15f, 1e-4f, 7, 0.5f, is_linear == 1);
+                1e-15f, 1e-4f, /*sh_reg=*/0.01f, 7, SbOptimCells{}, 0.5f,
+                is_linear == 1);
             backend::device_synchronize();
             readback_f(acc, d_sp, 3 * K * N);
             readback_f(acc, d_sg, 3 * K * N);

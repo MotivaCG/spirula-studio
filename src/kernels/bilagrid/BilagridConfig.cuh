@@ -9,10 +9,13 @@
 #define kC2G_g 0.587f
 #define kC2G_b 0.114f
 
+#include "core/PixelFormat.h"
+
 #ifdef __CUDACC__
 
 #include <stdio.h>
 #include <cuda_runtime.h>
+#include "core/SourcePath.h"
 
 // Function-call-style macro (different from the original statement-style),
 // matching the form used by the rest of core/Common.cuh.
@@ -22,13 +25,24 @@ do {                                                                \
     cudaError_t err = call;                                         \
     if (err != cudaSuccess) {                                       \
         fprintf(stderr, "\033[41mCUDA Error at %s:%d: %s\033[m\n",  \
-                __FILE__, __LINE__, cudaGetErrorString(err));       \
+                SS_FILE, __LINE__, cudaGetErrorString(err));        \
         exit(EXIT_FAILURE);                                         \
     }                                                               \
 } while (0)
 #endif
 
 #include "kernels/bilagrid/BilagridReader.cuh"
+
+#include <type_traits>
+
+// Calls fn with the image's format as the kernels' compile-time kF: a format
+// switch on every load costs the v1 grid kernel ~13%.
+template <typename Fn>
+inline void bilagrid_with_format(PixelFormat f, Fn&& fn) {
+    if (f == PixelFormat::F16) fn(std::integral_constant<int, (int)PixelFormat::F16>{});
+    else if (f == PixelFormat::F32) fn(std::integral_constant<int, (int)PixelFormat::F32>{});
+    else fn(std::integral_constant<int, -1>{});
+}
 
 // Block dimensions baked into every bilagrid *_sample_backward_v1 kernel
 // (affine RGB, PPISP, log-linear, depth, normal). Threaded as compile-time

@@ -1,38 +1,20 @@
-// Backend parity tool for the densification launch APIs: densify_clip_scale,
-// the MCMC/revised noise kernels, the long-axis-split relocate/add family
-// and the MCMC relocate/add family. The SAME source builds under both
-// backends:
-//
-//   CUDA build:   ./densify_parity dump ref.bin
-//   Vulkan build: ./densify_parity compare ref.bin   (per device)
-//
-// Ref format: [nf tight floats] [nl loose floats] [nc int32 codes].
-//
-// Channels: deterministic outputs (clip_scale) compare in the tight float
-// channel. Everything downstream of float-hash randomness sits in the LOOSE
-// float channel with a violation-fraction cap: randn3 noise and the
-// sampling draws (efraimidis keys, MCMC cumsum binary searches) hash
-// integers bit-exactly on both backends, but their float post-processing
-// (fract/log/cumsum association) can flip rare boundary cases
-// cross-backend, and one flipped sample rewrites one splat's row. Quantized
-// packed cells compare as integer codes with a +-1 allowance and the same
-// rationale for its violation cap.
-//
-// The long-axis-split RELOCATE path pairs sampled srcs with atomically
-// compacted dst slots, so the pairing is scheduling-dependent even on CUDA
-// alone. The relocate configs are therefore constructed with EXACTLY ONE
-// relocating splat (one low-opacity config, one non-finite config), making
-// the pairing trivial and the comparison elementwise; the ADD path (same
-// kernel, dst = cur + i deterministic) covers many concurrent dst splats,
-// including neighbor-word masked atomic stores in the quantized layouts.
+// Densification parity: dump a CUDA reference, compare it on Vulkan.
+// Ref format: tight floats, loose floats, integer codes.
+// Integer noise keys match exactly; transcendental functions and cumulative
+// sampling sums allow small numerical differences in the loose channel.
+// Relocation uses one destination per fixture because atomic compaction makes
+// source/destination pairing schedule-dependent. Addition tests concurrent
+// destinations, including masked stores to shared quantization words.
 
 #include <kernels/densify/Densify.cuh>
 
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <random>
 #include <vector>
 
@@ -148,7 +130,7 @@ int main(int argc, char** argv) {
         float* d_opacs = upload(opacs);
         mcmc_add_noise_tensor(N, 2e-2f, dv<float3>(d_means, N),
                               dv<float3>(d_scales, N), dv<float4>(d_quats, N),
-                              dv<float>(d_opacs, N));
+                              dv<float>(d_opacs, N), 27);
         backend::device_synchronize();
         readback_f(lacc, d_means, 3 * N);
 
@@ -158,9 +140,24 @@ int main(int argc, char** argv) {
                                  dv<float3>(d_means2, N),
                                  dv<float3>(d_scales, N),
                                  dv<float4>(d_quats, N),
-                                 dv<float>(d_opacs, N));
+                                 dv<float>(d_opacs, N),
+                                 DeviceVector<float>(), 1.0f, 27);
         backend::device_synchronize();
         readback_f(lacc, d_means2, 3 * N);
+
+        // gated on the peak weight: half the splats look hidden (peak far under opacity)
+        std::vector<float> peak(N);
+        for (int64_t i = 0; i < N; ++i) peak[i] = (i % 2) ? 0.5f : 2e-3f;
+        float* d_means3 = upload(means);
+        float* d_peak = upload(peak);
+        revised_add_noise_tensor(N, 5e-2f, dv<float>(d_radii, N),
+                                 dv<float3>(d_means3, N),
+                                 dv<float3>(d_scales, N),
+                                 dv<float4>(d_quats, N),
+                                 dv<float>(d_opacs, N),
+                                 dv<float>(d_peak, N), 0.5f, 27);
+        backend::device_synchronize();
+        readback_f(lacc, d_means3, 3 * N);
     }
 
     // ---- long-axis-split relocate/add + MCMC relocate/add ----
@@ -180,8 +177,11 @@ int main(int argc, char** argv) {
         float* sh_value_bounds;         // float2 blocks
         uint8_t* nq_packed[5];
         float* nq_bounds[5];
+        float* projective_state;
+        float* projective_information;
         float* accum;                   // float2 [CAP]
         int32_t* bias_steps;
+        uint32_t* visit;                // core/SplatVisitState.h counters
         int64_t sh_state_bytes, sh_value_bytes;
         int64_t sh_state_bound_f, sh_value_bound_f;
         NonShQuantState nq{};
@@ -192,7 +192,8 @@ int main(int argc, char** argv) {
                            bool bounds_per_splat, bool non_sh,
                            int64_t num_sh, int64_t num_sh_buffer,
                            int64_t special_lowopac,
-                           int64_t special_nan) -> Model {
+                           int64_t special_nan,
+                           int64_t special_dead_scale) -> Model {
         Model m{};
         m.num_sh = num_sh;
         m.num_sh_buffer = num_sh_buffer;
@@ -213,18 +214,36 @@ int main(int argc, char** argv) {
         if (special_lowopac >= 0) opacs[special_lowopac] = -8.f;
         if (special_nan >= 0)
             means[3 * special_nan] = std::numeric_limits<float>::quiet_NaN();
+        // exp() of this is not a positive normal float: the splat is gone
+        // for good, and relocation has to recycle it.
+        if (special_dead_scale >= 0)
+            for (int k = 0; k < 3; k++)
+                scales[3 * special_dead_scale + k] = -90.f;
         m.means = upload(means);
         m.quats = upload(quats);
         m.scales = upload(scales);
         m.opacs = upload(opacs);
         m.dc = upload(dc);
+        std::vector<float> depth_state(4*CAP);
+        for (int64_t i = 0; i < CAP; ++i) {
+            for (int k = 0; k < 3; ++k) depth_state[4*i+k] = dc[3*i+k];
+            depth_state[4*i+3] = 42;
+        }
+        m.projective_state = upload(depth_state);
+        std::vector<float> information(CAP);
+        for (int64_t i = 0; i < CAP; ++i) information[i] = dc[3*i]*dc[3*i]+1;
+        m.projective_information = upload(information);
 
         if (sh_value_bits == 32) {
             std::vector<float> sh(3 * num_sh * CAP);
             for (auto& v : sh) v = uf(-0.5f, 0.5f);
             m.sh = upload(sh);
         } else {
-            int64_t cells = 3 * num_sh_buffer * CAP;
+            // The FPBO layout (bounds_per_splat) addresses whole 256-splat
+            // blocks of whole words -- see docs/notes/sh-quant-layout.md.
+            int64_t cells = bounds_per_splat
+                ? sh_fpbo_cells(CAP, (uint32_t)num_sh_buffer)
+                : 3 * num_sh_buffer * CAP;
             m.sh_value_bytes = cells * (sh_value_bits == 16 ? 2 : 1);
             std::vector<uint8_t> pk(m.sh_value_bytes);
             for (auto& v : pk) v = (uint8_t)(rng() & 0xff);
@@ -248,7 +267,9 @@ int main(int argc, char** argv) {
             m.g2_sh = upload(g);
         } else {
             // state stride is 3 * num_sh cells per splat (see FusedAppearanceOptim.cu)
-            int64_t cells = 3 * num_sh * CAP;
+            int64_t cells = bounds_per_splat
+                ? sh_fpbo_cells(CAP, (uint32_t)num_sh)
+                : 3 * num_sh * CAP;
             m.sh_state_bytes = cells * (sh_optim_bits == 8 ? 2 : 1);
             std::vector<uint8_t> pk(m.sh_state_bytes);
             for (auto& v : pk) v = (uint8_t)(rng() & 0xff);
@@ -314,7 +335,16 @@ int main(int argc, char** argv) {
         std::vector<int32_t> steps(CAP);
         for (auto& v : steps) v = 1 + (int32_t)(rng() % 40);
         m.bias_steps = upload(steps);
+        // renders 0..99 | unrendered 0..59, all under the stale threshold
+        std::vector<int32_t> visit(CAP);
+        for (auto& v : visit)
+            v = (int32_t)((rng() % 100u) | ((rng() % 60u) << 16));
+        m.visit = (uint32_t*)upload(visit);
         return m;
+    };
+    auto set_visit = [&](Model& m, int64_t idx, uint32_t renders, uint32_t streak) {
+        uint32_t v = renders | (streak << 16);
+        backend::memcpy_sync(m.visit + idx, &v, sizeof v, MemcpyKind::HostToDevice);
     };
 
     auto readback_model = [&](const Model& m) {
@@ -325,6 +355,7 @@ int main(int argc, char** argv) {
         readback_f(lacc, m.dc, 3 * CAP);
         readback_f(lacc, (const float*)m.accum, 2 * CAP);
         readback_i(codes, m.bias_steps, CAP);
+        readback_i(codes, (const int32_t*)m.visit, CAP);
         if (m.sh_value_bits == 32)
             readback_f(lacc, m.sh, 3 * m.num_sh * CAP);
         else
@@ -351,43 +382,29 @@ int main(int argc, char** argv) {
     };
 
     // Argument pack shared by the four API calls.
-    auto call_relocate_las = [&](Model& m, float min_opacity, uint32_t seed) {
-        relocate_splats_with_long_axis_split_tensor(
-            N, min_opacity, /*split_opacity_k=*/0.6f,
-            dv<float3>(m.means, CAP), dv<float4>(m.quats, CAP),
-            dv<float3>(m.scales, CAP), dv<float>(m.opacs, CAP),
-            dv<float3>(m.dc, CAP),
-            dv<float3>(m.sh, m.sh ? m.num_sh * CAP : 0),
-            dv<float3>(m.g1[0], m.g1[0] ? CAP : 0),
-            dv<float4>(m.g1[1], m.g1[1] ? CAP : 0),
-            dv<float3>(m.g1[2], m.g1[2] ? CAP : 0),
-            dv<float>(m.g1[3], m.g1[3] ? CAP : 0),
-            dv<float3>(m.g1[4], m.g1[4] ? CAP : 0),
-            dv<float3>(m.sh_optim_bits == 32 ? (void*)m.g1_sh
-                                             : (void*)m.sh_state_packed,
-                       0),
-            dv<float3>(m.g2[0], m.g2[0] ? CAP : 0),
-            dv<float4>(m.g2[1], m.g2[1] ? CAP : 0),
-            dv<float3>(m.g2[2], m.g2[2] ? CAP : 0),
-            dv<float>(m.g2[3], m.g2[3] ? CAP : 0),
-            dv<float3>(m.g2[4], m.g2[4] ? CAP : 0),
-            dv<float3>(m.sh_optim_bits == 32 ? (void*)m.g2_sh
-                                             : (void*)m.sh_state_packed,
-                       0),
-            dv<float2>(m.accum, CAP), dv<int32_t>(m.bias_steps, CAP),
-            m.sh_optim_bits, (int)m.num_sh,
-            dv<float4>(m.sh_state_bounds, m.sh_state_bound_f / 4),
-            m.bounds_per_splat, dv<uint8_t>(m.sh_value_packed,
-                                            m.sh_value_bytes),
-            dv<float2>(m.sh_value_bounds, m.sh_value_bound_f / 2),
-            m.sh_value_bits, m.bounds_per_splat, (int)m.num_sh_buffer, m.nq,
-            seed);
-        backend::device_synchronize();
+    auto check_projective_state = [&](const Model& m) {
+        std::vector<float> colors(3*CAP), state(4*CAP), information(CAP);
+        backend::memcpy_sync(colors.data(),m.dc,colors.size()*4,MemcpyKind::DeviceToHost);
+        backend::memcpy_sync(state.data(),m.projective_state,state.size()*4,MemcpyKind::DeviceToHost);
+        backend::memcpy_sync(information.data(),m.projective_information,information.size()*4,MemcpyKind::DeviceToHost);
+        for (int64_t i = 0; i < CAP; ++i) {
+            if (information[i] != colors[3*i]*colors[3*i]+1)
+                throw std::runtime_error("split child lost its bearing information");
+            for (int k = 0; k < 3; ++k)
+                if (colors[3*i+k] != state[4*i+k])
+                    throw std::runtime_error("split child lost its parent's projective state");
+            if (state[4*i+3] != 42) throw std::runtime_error("split child lost its optimizer age");
+        }
     };
 
-    auto call_add_las = [&](Model& m, int64_t num_add, uint32_t seed) {
-        add_splats_with_long_axis_split_tensor(
-            N, num_add, /*split_opacity_k=*/0.6f,
+    auto call_relocate_las = [&](Model& m, float min_opacity, uint32_t seed,
+                                 float* max_weight = nullptr,
+                                 bool dead_by_opacity = true,
+                                 int64_t* num_dead = nullptr,
+                                 float min_split_opacity = 0.0f,
+                                 float min_weight = 0.0f) {
+        relocate_splats_with_long_axis_split_tensor(
+            N, min_opacity, /*split_opacity_k=*/0.6f, min_split_opacity,
             dv<float3>(m.means, CAP), dv<float4>(m.quats, CAP),
             dv<float3>(m.scales, CAP), dv<float>(m.opacs, CAP),
             dv<float3>(m.dc, CAP),
@@ -408,15 +425,60 @@ int main(int argc, char** argv) {
             dv<float3>(m.sh_optim_bits == 32 ? (void*)m.g2_sh
                                              : (void*)m.sh_state_packed,
                        0),
-            dv<float2>(m.accum, CAP), dv<int32_t>(m.bias_steps, CAP),
+            dv<float2>(m.accum, CAP), DeviceVector<float2>{},
+            dv<int32_t>(m.bias_steps, CAP), dv<uint32_t>(m.visit, CAP), /*dead_after_steps=*/100u,
+            dv<float>(max_weight, max_weight ? CAP : 0), min_weight, dead_by_opacity,
             m.sh_optim_bits, (int)m.num_sh,
             dv<float4>(m.sh_state_bounds, m.sh_state_bound_f / 4),
             m.bounds_per_splat, dv<uint8_t>(m.sh_value_packed,
                                             m.sh_value_bytes),
             dv<float2>(m.sh_value_bounds, m.sh_value_bound_f / 2),
-            m.sh_value_bits, m.bounds_per_splat, (int)m.num_sh_buffer, m.nq,
+            m.sh_value_bits, m.bounds_per_splat, (int)m.num_sh_buffer, m.nq, dv<float4>(m.projective_state, CAP), dv<float>(m.projective_information, CAP),
+            seed, /*max_relocate=*/0, num_dead);
+        backend::device_synchronize();
+        check_projective_state(m);
+    };
+
+    auto call_add_las = [&](Model& m, int64_t num_add, uint32_t seed,
+                            float* max_weight = nullptr,
+                            float min_split_opacity = 0.0f,
+                            float* oversize = nullptr, float oversize_blend = 0.0f) {
+        const int64_t added = add_splats_with_long_axis_split_tensor(
+            N, num_add, /*split_opacity_k=*/0.6f, min_split_opacity,
+            dv<float3>(m.means, CAP), dv<float4>(m.quats, CAP),
+            dv<float3>(m.scales, CAP), dv<float>(m.opacs, CAP),
+            dv<float3>(m.dc, CAP),
+            dv<float3>(m.sh, m.sh ? m.num_sh * CAP : 0),
+            dv<float3>(m.g1[0], m.g1[0] ? CAP : 0),
+            dv<float4>(m.g1[1], m.g1[1] ? CAP : 0),
+            dv<float3>(m.g1[2], m.g1[2] ? CAP : 0),
+            dv<float>(m.g1[3], m.g1[3] ? CAP : 0),
+            dv<float3>(m.g1[4], m.g1[4] ? CAP : 0),
+            dv<float3>(m.sh_optim_bits == 32 ? (void*)m.g1_sh
+                                             : (void*)m.sh_state_packed,
+                       0),
+            dv<float3>(m.g2[0], m.g2[0] ? CAP : 0),
+            dv<float4>(m.g2[1], m.g2[1] ? CAP : 0),
+            dv<float3>(m.g2[2], m.g2[2] ? CAP : 0),
+            dv<float>(m.g2[3], m.g2[3] ? CAP : 0),
+            dv<float3>(m.g2[4], m.g2[4] ? CAP : 0),
+            dv<float3>(m.sh_optim_bits == 32 ? (void*)m.g2_sh
+                                             : (void*)m.sh_state_packed,
+                       0),
+            dv<float2>(m.accum, CAP), DeviceVector<float2>{},
+            dv<float>(oversize, oversize ? CAP : 0), oversize_blend,
+            dv<int32_t>(m.bias_steps, CAP), dv<uint32_t>(m.visit, CAP),
+            dv<float>(max_weight, max_weight ? CAP : 0),
+            m.sh_optim_bits, (int)m.num_sh,
+            dv<float4>(m.sh_state_bounds, m.sh_state_bound_f / 4),
+            m.bounds_per_splat, dv<uint8_t>(m.sh_value_packed,
+                                            m.sh_value_bytes),
+            dv<float2>(m.sh_value_bounds, m.sh_value_bound_f / 2),
+            m.sh_value_bits, m.bounds_per_splat, (int)m.num_sh_buffer, m.nq, dv<float4>(m.projective_state, CAP), dv<float>(m.projective_information, CAP),
             seed);
         backend::device_synchronize();
+        check_projective_state(m);
+        return added;
     };
 
     auto call_relocate_mcmc = [&](Model& m, float min_opacity,
@@ -448,9 +510,10 @@ int main(int argc, char** argv) {
             m.bounds_per_splat, dv<uint8_t>(m.sh_value_packed,
                                             m.sh_value_bytes),
             dv<float2>(m.sh_value_bounds, m.sh_value_bound_f / 2),
-            m.sh_value_bits, m.bounds_per_splat, (int)m.num_sh_buffer, m.nq,
-            seed);
+            m.sh_value_bits, m.bounds_per_splat, (int)m.num_sh_buffer, m.nq, dv<float4>(m.projective_state, CAP), dv<float>(m.projective_information, CAP),
+            seed, DeviceVector<float>());
         backend::device_synchronize();
+        check_projective_state(m);
     };
 
     auto call_add_mcmc = [&](Model& m, int64_t num_add, float min_opacity,
@@ -482,23 +545,94 @@ int main(int argc, char** argv) {
             m.bounds_per_splat, dv<uint8_t>(m.sh_value_packed,
                                             m.sh_value_bytes),
             dv<float2>(m.sh_value_bounds, m.sh_value_bound_f / 2),
-            m.sh_value_bits, m.bounds_per_splat, (int)m.num_sh_buffer, m.nq,
-            seed);
+            m.sh_value_bits, m.bounds_per_splat, (int)m.num_sh_buffer, m.nq, dv<float4>(m.projective_state, CAP), dv<float>(m.projective_information, CAP),
+            seed, DeviceVector<float>());
         backend::device_synchronize();
+        check_projective_state(m);
+    };
+
+    // A recycled splat must come back alive. Parity cannot see this on its
+    // own: both backends leaving the dead splat where it is compares equal.
+    bool revived_ok = true;
+    auto check_revived = [&](const Model& m, int64_t idx, const char* what) {
+        float sc[3];
+        backend::memcpy_sync(sc, m.scales + 3 * idx, sizeof sc,
+                             MemcpyKind::DeviceToHost);
+        float hi = std::max(std::max(sc[0], sc[1]), sc[2]);
+        if (!(hi > -87.336548f)) {
+            std::printf("densify_parity: %s left splat %lld dead "
+                        "(max log scale %g)\n", what, (long long)idx, hi);
+            revived_ok = false;
+        }
+    };
+
+    // A splat MCMC copies sits on its source's mean, so splats sharing a mean
+    // must decode the same value-codec row. Parity cannot see a clipped copy
+    // on its own: both backends clipping alike compares equal.
+    bool inherit_ok = true;
+    auto check_inherited = [&](const Model& m, int64_t n, const char* what) {
+        std::vector<float> means(3 * n), bd(m.sh_value_bound_f);
+        std::vector<uint8_t> pk(m.sh_value_bytes);
+        backend::memcpy_sync(means.data(), m.means, means.size() * 4,
+                             MemcpyKind::DeviceToHost);
+        backend::memcpy_sync(bd.data(), m.sh_value_bounds, bd.size() * 4,
+                             MemcpyKind::DeviceToHost);
+        backend::memcpy_sync(pk.data(), m.sh_value_packed, pk.size(),
+                             MemcpyKind::DeviceToHost);
+        const int64_t R = 3 * m.num_sh_buffer;
+        const double qmax = m.sh_value_bits == 16 ? 65535.0 : 255.0;
+        auto cell_value = [&](int64_t g, int64_t c, double* quantum) {
+            int64_t cell = m.bounds_per_splat
+                               ? (g >> 8) * ((R + 1) >> 1) * 512 +
+                                     (g & 255) * 2 + (c >> 1) * 512 + (c & 1)
+                               : g * R + c;
+            int64_t b = m.bounds_per_splat ? g / 256 : cell / 256;
+            double q = m.sh_value_bits == 16
+                           ? (double)(pk[2 * cell] | (pk[2 * cell + 1] << 8))
+                           : (double)pk[cell];
+            double lo = bd[2 * b], hi = bd[2 * b + 1];
+            *quantum = (hi - lo) / qmax;
+            return lo + (hi - lo) * q / qmax;
+        };
+        std::map<std::array<float, 3>, int64_t> first;
+        int64_t pairs = 0, bad = 0;
+        double worst = 0;
+        for (int64_t g = 0; g < n; g++) {
+            std::array<float, 3> key{means[3 * g], means[3 * g + 1],
+                                     means[3 * g + 2]};
+            auto [it, fresh] = first.emplace(key, g);
+            if (fresh) continue;
+            pairs++;
+            bool row_ok = true;
+            for (int64_t c = 0; c < 3 * m.num_sh; c++) {
+                double qa = 0, qb = 0;
+                double d = std::fabs(cell_value(it->second, c, &qa) -
+                                     cell_value(g, c, &qb));
+                worst = std::max(worst, d / (qa + qb));
+                row_ok = row_ok && d <= qa + qb;
+            }
+            bad += row_ok ? 0 : 1;
+        }
+        if (pairs == 0 || bad != 0) {
+            std::printf("densify_parity: %s: %lld of %lld copied rows differ "
+                        "from their source (worst %.3g quanta)\n", what,
+                        (long long)bad, (long long)pairs, worst);
+            inherit_ok = false;
+        }
     };
 
     // relocate (long-axis split): exactly one relocating splat per config
     {
         // fp32, low-opacity trigger
         Model m = build_model(32, 32, false, false, 15, 15, /*lowopac=*/517,
-                              /*nan=*/-1);
+                              /*nan=*/-1, -1);
         call_relocate_las(m, 0.005f, 11u);
         readback_model(m);
     }
     {
         // 8-bit SH state + 16-bit value codec (FPBO layouts) + non-SH
         // quant, non-finite trigger
-        Model m = build_model(8, 16, true, true, 15, 15, -1, /*nan=*/1234);
+        Model m = build_model(8, 16, true, true, 15, 15, -1, /*nan=*/1234, -1);
         call_relocate_las(m, 0.005f, 22u);
         readback_model(m);
     }
@@ -506,25 +640,132 @@ int main(int argc, char** argv) {
         // 4-bit SH state + 8-bit value codec (per-cell layouts), degree
         // warmup (num_sh < num_sh_buffer)
         Model m = build_model(4, 8, false, false, 8, 15, /*lowopac=*/2718,
-                              -1);
+                              -1, -1);
         call_relocate_las(m, 0.005f, 33u);
         readback_model(m);
     }
 
+    {
+        // dead-scale trigger: too small for exp() to stay normal
+        Model m = build_model(32, 32, false, false, 15, 15, -1, -1,
+                              /*dead_scale=*/1729);
+        call_relocate_las(m, 0.005f, 121u);
+        check_revived(m, 1729, "relocate_las");
+        readback_model(m);
+    }
+    {
+        // stale trigger: unrendered past dead_after_steps; the counters of
+        // the revived splat and of its source both come back zero
+        Model m = build_model(32, 32, false, false, 15, 15, -1, -1, -1);
+        set_visit(m, 2424, /*renders=*/7u, /*streak=*/300u);
+        call_relocate_las(m, 0.005f, 141u);
+        std::vector<int32_t> vis(N);
+        backend::memcpy_sync(vis.data(), m.visit, N * sizeof(int32_t),
+                             MemcpyKind::DeviceToHost);
+        int zeros = 0;
+        for (int64_t i = 0; i < N; i++) zeros += vis[i] == 0;
+        if (vis[2424] != 0 || zeros != 2) {
+            std::printf("densify_parity: stale relocate reset %d counters "
+                        "(splat 2424 = %d), expected 2\n", zeros, vis[2424]);
+            revived_ok = false;
+        }
+        readback_model(m);
+    }
+
+    // Three dead splats to every live one: each live splat revives exactly one,
+    // and a splat left dead is left alone. Drawing past the live ones splits
+    // dead sources, which are also destinations. Self-checked, not dumped.
+    {
+        Model m = build_model(32, 32, false, false, 15, 15, -1, -1, -1);
+        std::vector<float> op(N), before(3 * N), after(3 * N);
+        backend::memcpy_sync(op.data(), m.opacs, N * sizeof(float),
+                             MemcpyKind::DeviceToHost);
+        backend::memcpy_sync(before.data(), m.means, 3 * N * sizeof(float),
+                             MemcpyKind::DeviceToHost);
+        const float dead_logit = std::log(0.005f / 0.995f);
+        int64_t live = 0;
+        for (int64_t i = 0; i < N; i++) {
+            if (i % 4 != 0) op[i] = -8.f;
+            else live++;
+        }
+        backend::memcpy_sync(m.opacs, op.data(), N * sizeof(float),
+                             MemcpyKind::HostToDevice);
+        call_relocate_las(m, 0.005f, 131u);
+        backend::memcpy_sync(op.data(), m.opacs, N * sizeof(float),
+                             MemcpyKind::DeviceToHost);
+        backend::memcpy_sync(after.data(), m.means, 3 * N * sizeof(float),
+                             MemcpyKind::DeviceToHost);
+        int64_t dead_after = 0, dead_moved = 0;
+        for (int64_t i = 0; i < N; i++) {
+            if (!(op[i] <= dead_logit)) continue;
+            dead_after++;
+            dead_moved += std::memcmp(&before[3 * i], &after[3 * i],
+                                      3 * sizeof(float)) != 0;
+        }
+        if (dead_after != N - 2 * live || dead_moved != 0) {
+            std::printf("densify_parity: relocate_las with dead splats in the "
+                        "majority left %lld dead (want %lld), %lld of them "
+                        "moved\n", (long long)dead_after,
+                        (long long)(N - 2 * live), (long long)dead_moved);
+            revived_ok = false;
+        }
+    }
+
     // add (long-axis split): many deterministic dst splats
     {
-        Model m = build_model(32, 32, false, false, 15, 15, -1, -1);
+        Model m = build_model(32, 32, false, false, 15, 15, -1, -1, -1);
         call_add_las(m, 555, 44u);
         readback_model(m);
     }
     {
-        Model m = build_model(8, 16, true, true, 15, 15, -1, -1);
+        Model m = build_model(8, 16, true, true, 15, 15, -1, -1, -1);
         call_add_las(m, 600, 55u);
         readback_model(m);
     }
     {
-        Model m = build_model(4, 8, false, false, 8, 15, -1, -1);
+        Model m = build_model(4, 8, false, false, 8, 15, -1, -1, -1);
         call_add_las(m, 333, 66u);
+        readback_model(m);
+    }
+    // The oversize channel: the draw's weight is (accum + floor) * score^blend,
+    // computed inside the key kernel.
+    for (float blend : {0.0f, 0.5f, 1.0f}) {
+        Model m = build_model(32, 32, false, false, 15, 15, -1, -1, -1);
+        std::vector<float> over(CAP);
+        for (int64_t i = 0; i < CAP; i++) over[i] = i % 3 == 0 ? 0.f : uf(0.f, 4.f);
+        float* d_over = upload(over);
+        call_add_las(m, 444, 77u, nullptr, 0.0f, d_over, blend);
+        readback_model(m);
+        backend::device_free(d_over);
+    }
+    // Split floor: only splats at or over it are sources, and an add asking
+    // for more than there are stops at their count.
+    {
+        Model m = build_model(32, 32, false, false, 15, 15, -1, -1, -1);
+        const float floor = 0.97f, floor_logit = std::log(floor / (1.0f - floor));
+        std::vector<float> before(N), after(N);
+        backend::memcpy_sync(before.data(), m.opacs, N * sizeof(float),
+                             MemcpyKind::DeviceToHost);
+        int64_t over = 0;
+        for (int64_t i = 0; i < N; i++) over += before[i] >= floor_logit;
+        const int64_t added = call_add_las(m, 600, 171u, nullptr, floor);
+        backend::memcpy_sync(after.data(), m.opacs, N * sizeof(float),
+                             MemcpyKind::DeviceToHost);
+        int64_t under_split = 0;
+        for (int64_t i = 0; i < N; i++)
+            under_split += before[i] < floor_logit && after[i] != before[i];
+        if (over == 0 || over >= 600 || added != over || under_split != 0) {
+            std::printf("densify_parity: add_las under a split floor added "
+                        "%lld (want %lld of 600), split %lld under it\n",
+                        (long long)added, (long long)over, (long long)under_split);
+            revived_ok = false;
+        }
+        readback_model(m);
+    }
+    {
+        Model m = build_model(32, 32, false, false, 15, 15, /*lowopac=*/517,
+                              -1, -1);
+        call_relocate_las(m, 0.005f, 181u, nullptr, true, nullptr, 0.9f);
         readback_model(m);
     }
 
@@ -539,28 +780,131 @@ int main(int argc, char** argv) {
                              MemcpyKind::HostToDevice);
     };
     {
-        Model m = build_model(32, 32, false, false, 15, 15, -1, -1);
+        Model m = build_model(32, 32, false, false, 15, 15, -1, -1, -1);
         lower_some_opacs(m);
         call_relocate_mcmc(m, 0.005f, 77u);
         readback_model(m);
     }
     {
-        Model m = build_model(8, 16, true, true, 15, 15, -1, -1);
+        Model m = build_model(8, 16, true, true, 15, 15, -1, -1, -1);
         lower_some_opacs(m);
         call_relocate_mcmc(m, 0.005f, 88u);
+        check_inherited(m, N, "relocate_mcmc q16");
+        readback_model(m);
+    }
+
+    {
+        // dead-scale trigger on the MCMC path
+        Model m = build_model(32, 32, false, false, 15, 15, -1, -1,
+                              /*dead_scale=*/1729);
+        call_relocate_mcmc(m, 0.005f, 131u);
+        check_revived(m, 1729, "relocate_mcmc");
         readback_model(m);
     }
 
     // MCMC add
     {
-        Model m = build_model(32, 32, false, false, 15, 15, -1, -1);
+        Model m = build_model(32, 32, false, false, 15, 15, -1, -1, -1);
         call_add_mcmc(m, 444, 0.005f, 99u);
         readback_model(m);
     }
     {
-        Model m = build_model(4, 8, false, false, 8, 15, -1, -1);
+        Model m = build_model(4, 8, false, false, 8, 15, -1, -1, -1);
         call_add_mcmc(m, 512, 0.005f, 111u);
+        check_inherited(m, N + 512, "add_mcmc q8");
         readback_model(m);
+    }
+    {
+        Model m = build_model(8, 16, true, true, 15, 15, -1, -1, -1);
+        call_add_mcmc(m, 600, 0.005f, 112u);
+        check_inherited(m, N + 600, "add_mcmc q16");
+        readback_model(m);
+    }
+
+    // Peak-weight dead test: a transparent splat seen in front stays unless
+    // opacity is tested too; an unseen opaque one dies. Rows start at half
+    // their opacity, and a split scales both. Self-checked, not dumped.
+    auto sig = [](float x) { return 1.0f / (1.0f + std::exp(-x)); };
+    auto mw_ratio_ok = [&](const std::vector<float>& op,
+                           const std::vector<float>& mw, int64_t n,
+                           auto&& skip) {
+        for (int64_t i = 0; i < n; i++) {
+            if (skip(i)) continue;
+            const float want = 0.5f * sig(op[i]);
+            if (std::fabs(mw[i] - want) > 1e-5f * want) return false;
+        }
+        return true;
+    };
+    for (int either = 0; either < 2; either++) {
+        Model m = build_model(32, 32, false, false, 15, 15, -1, -1, -1);
+        std::vector<float> op(CAP), mw(CAP), accum(2 * CAP);
+        backend::memcpy_sync(op.data(), m.opacs, CAP * 4, MemcpyKind::DeviceToHost);
+        backend::memcpy_sync(accum.data(), m.accum, 2 * CAP * 4,
+                             MemcpyKind::DeviceToHost);
+        auto transparent = [](int64_t i) { return i % 97 == 5; };
+        auto unseen = [&](int64_t i) { return i % 89 == 7 && !transparent(i); };
+        int64_t n_transparent = 0, n_unseen = 0;
+        for (int64_t i = 0; i < CAP; i++) {
+            if (i < N && transparent(i)) {
+                op[i] = -12.f;
+                accum[2 * i] = 0.f;  // never drawn as a source
+            }
+            mw[i] = 0.5f * sig(op[i]);
+            if (i < N && transparent(i)) { mw[i] = 0.5f; n_transparent++; }
+            if (i < N && unseen(i)) { mw[i] = 1e-3f; n_unseen++; }
+        }
+        backend::memcpy_sync(m.opacs, op.data(), CAP * 4, MemcpyKind::HostToDevice);
+        backend::memcpy_sync(m.accum, accum.data(), 2 * CAP * 4,
+                             MemcpyKind::HostToDevice);
+        float* d_mw = upload(mw);
+        int64_t num_dead = 0;
+        // Thresholds apart, so a weight tested against min_opacity miscounts.
+        call_relocate_las(m, 1e-4f, 151u + either, d_mw, either != 0, &num_dead,
+                          0.0f, 0.005f);
+        backend::memcpy_sync(op.data(), m.opacs, CAP * 4, MemcpyKind::DeviceToHost);
+        backend::memcpy_sync(mw.data(), d_mw, CAP * 4, MemcpyKind::DeviceToHost);
+        int64_t kept = 0;
+        for (int64_t i = 0; i < N; i++)
+            kept += transparent(i) && op[i] == -12.f && mw[i] == 0.5f;
+        const int64_t want_dead = n_unseen + (either ? n_transparent : 0);
+        const int64_t want_kept = either ? 0 : n_transparent;
+        const bool ratio = mw_ratio_ok(op, mw, N, [&](int64_t i) {
+            return !either && transparent(i);
+        });
+        if (num_dead != want_dead || kept != want_kept || !ratio) {
+            std::printf("densify_parity: max-weight relocate (%s) found %lld "
+                        "dead (want %lld), kept %lld transparent (want %lld), "
+                        "weights %s\n", either ? "either" : "max_weight",
+                        (long long)num_dead, (long long)want_dead,
+                        (long long)kept, (long long)want_kept,
+                        ratio ? "ok" : "off");
+            revived_ok = false;
+        }
+        backend::device_free(d_mw);
+    }
+    {
+        Model m = build_model(32, 32, false, false, 15, 15, -1, -1, -1);
+        std::vector<float> op(CAP), mw(CAP), want(CAP);
+        backend::memcpy_sync(op.data(), m.opacs, CAP * 4, MemcpyKind::DeviceToHost);
+        float* d_mw = upload(mw);
+        densify_max_weight_init_tensor(N, dv<float>(m.opacs, CAP), dv<float>(d_mw, CAP));
+        densify_max_weight_scale_tensor(N, 0.5f, dv<float>(d_mw, CAP));
+        backend::device_synchronize();
+        check_projective_state(m);
+        backend::memcpy_sync(mw.data(), d_mw, CAP * 4, MemcpyKind::DeviceToHost);
+        const bool init_ok = mw_ratio_ok(op, mw, N, [](int64_t) { return false; });
+        const int64_t num_add = 555;
+        call_add_las(m, num_add, 161u, d_mw);
+        backend::memcpy_sync(op.data(), m.opacs, CAP * 4, MemcpyKind::DeviceToHost);
+        backend::memcpy_sync(mw.data(), d_mw, CAP * 4, MemcpyKind::DeviceToHost);
+        const bool add_ok =
+            mw_ratio_ok(op, mw, N + num_add, [](int64_t) { return false; });
+        if (!init_ok || !add_ok) {
+            std::printf("densify_parity: max-weight %s off\n",
+                        init_ok ? "after add" : "init/scale");
+            revived_ok = false;
+        }
+        backend::device_free(d_mw);
     }
 
     if (dumping) {
@@ -576,7 +920,7 @@ int main(int argc, char** argv) {
         std::printf("densify_parity: dumped %lld + %lld floats + %lld codes "
                     "to %s\n",
                     (long long)nf, (long long)nl, (long long)nc, argv[2]);
-        return 0;
+        return revived_ok && inherit_ok ? 0 : 1;
     }
 
     // Diagnostics: DENSIFY_DUMP_GOT=<path> writes this run's outputs in the
@@ -661,7 +1005,8 @@ int main(int argc, char** argv) {
         (long long)nf, fmax, (long long)fviol, 100.0 * ffrac, (long long)nl,
         lmax, (long long)lviol, 100.0 * lfrac, (long long)nc,
         (long long)max_c, (long long)cviol, 100.0 * cfrac);
-    bool pass = ffrac <= 1e-3 && lfrac <= 2e-2 && cfrac <= 2e-2;
+    bool pass = ffrac <= 1e-3 && lfrac <= 2e-2 && cfrac <= 2e-2 && revived_ok &&
+                inherit_ok;
     std::printf(pass ? "densify_parity: PASSED\n"
                      : "densify_parity: FAILED\n");
     return pass ? 0 : 1;

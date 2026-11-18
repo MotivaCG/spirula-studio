@@ -2,9 +2,15 @@
 // loss/bwd + bilagrid forward/optim + ppisp forward/optim + splat optim + densify.
 
 #include "engine/Engine.h"
-#include "engine/EngineInternal.h"
-#include "engine/EngineState.h"
 
+#include <chrono>
+#include "engine/EngineInternal.h"
+#include "core/Env.h"
+#include "engine/EngineCommon.h"
+#include "engine/EngineState.h"
+#include "shaders/screen_layout.h"
+
+#include <cstdio>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -48,26 +54,116 @@ static TorchTensorView _slice_tv_range_first_dim(const TorchTensorView& tv,
 }
 
 
+// Folds this batch's screen gradients into the per-camera visit stats. Runs
+// right after the backward, before the optimizer sorts the packed ids.
+static void _visit_accumulate_camera_stats(const std::string& primitive) {
+    auto& v = engine().visit;
+    if (!v.enabled || v.cam_sum.data_ptr() == nullptr) return;
+    const auto& cam_map = engine().bilagrid_cur_cam_indices;
+    const int C = (int)engine().camera.num;
+    if (cam_map.data_ptr() == nullptr || (int64_t)cam_map.size() < C) return;
+    if (engine().fwd.v_splats_s.empty() || engine().fwd.v_splats_s[0].data_ptr() == nullptr)
+        return;
+    const int64_t N = engine().cur_num_splats;
+    const bool packed = engine().packed;
+    const int64_t n_isect = packed ? (int64_t)engine().fwd.camera_ids.size() : (int64_t)C * N;
+    const bool gut = primitive == "3dgut";
+    visit_camera_stats_zero_tensor(C, cam_map, v.cam_sum, v.cam_cnt);
+    visit_camera_stats_tensor(
+        n_isect, N, C, packed, engine().fwd.camera_ids, engine().fwd.gaussian_ids,
+        engine().fwd.v_splats_s[0], gut ? SCRG_STRIDE : SCR2_STRIDE,
+        gut ? SCRG_OPAC : SCR2_OPAC, engine().optim.visit_counters, cam_map,
+        v.cam_sum, v.cam_cnt);
+}
+
+
+void _engine_arm_step_forward(const EngineStepConfig& cfg,
+                              DistortionType dist_type, bool image_stages) {
+    // The rendered depth and its gradient are two full-resolution floats a
+    // pixel; a step none of whose terms reads them leaves both out.
+    {
+        const auto& w = cfg.loss.weights;
+        engine().fwd.skip_depth_pending =
+            !dist_any(dist_type) && engine().gt.depth.data_ptr() == nullptr &&
+            engine().gt.normal.data_ptr() == nullptr &&
+            w[(int)LossWeightIndex::MeanMedianDepthSup] == 0.0f &&
+            w[(int)LossWeightIndex::MedianDepthNormalReg] == 0.0f &&
+            w[(int)LossWeightIndex::MedianNormalSup] == 0.0f &&
+            w[(int)LossWeightIndex::MedianRenderNormalReg] == 0.0f &&
+            !engine_calib_warp_wants_depth();
+    }
+    auto& pp = engine().ppisp;
+    pp.cur_run_before_bilagrid = cfg.ppisp.run_before_bilagrid;
+    pp.cur_run_before_color_space =
+        cfg.ppisp.run_before_color_space && engine().color_space.splat_enabled;
+    pp.forward_pending = image_stages && pp.enabled && pp.cur_run_before_color_space;
+    // The fused appearance chain can also take PPISP after the encode, when
+    // nothing stands between it and the encode.
+    pp.forward_pending_after_encode =
+        image_stages && pp.enabled && !pp.cur_run_before_color_space &&
+        (pp.cur_run_before_bilagrid || !engine().bilagrid_rgb.enabled);
+    engine().appearance.allow = cfg.loss.color_shift_reg_weight <= 0.0f;
+    // The color-shift term reads the stages' images as float.
+    engine().fwd.image_fmt_pending =
+        cfg.optim.image_bits == 16 && engine().appearance.allow
+            ? PixelFormat::F16 : PixelFormat::F32;
+    engine().appearance.transient_pending =
+        image_stages && engine().fwd.image_fmt_pending == PixelFormat::F16 &&
+        engine().bilagrid_rgb.enabled;
+    engine().background.match_luma_pending = cfg.background.match_luminance;
+}
+
+void _engine_step_image_stages(TorchTensorView cam_indices) {
+    // PPISP already ran inside the forward in the before-color-space order,
+    // and in the fused chain's after-encode one.
+    const bool ppisp_fused = engine().appearance.fused &&
+                             engine().appearance.params.ppisp != AppearancePpisp::Off;
+    const bool ppisp_after = engine().ppisp.enabled &&
+                             !engine().ppisp.cur_run_before_color_space &&
+                             !ppisp_fused;
+    const bool bg_enabled = engine().bilagrid_rgb.enabled ||
+                            engine().bilagrid_depth.enabled ||
+                            engine().bilagrid_normal.enabled;
+    if (engine().ppisp.cur_run_before_bilagrid) {
+        if (ppisp_after) engine_ppisp_forward(cam_indices);
+        if (bg_enabled)  engine_bilagrid_forward(cam_indices);
+    } else {
+        // The per-stage PPISP reads the grid's output as float.
+        if (ppisp_after) engine().fwd.image_fmt = PixelFormat::F32;
+        if (bg_enabled)  engine_bilagrid_forward(cam_indices);
+        if (ppisp_after) engine_ppisp_forward(cam_indices);
+    }
+}
+
+
 // Forward + bilagrid/PPISP forward + loss + raster/proj backward only.
 // No optimizer / densify. Used both as a per-sub-batch step in split mode
 // and as the inner of the single-batch path. Returns the loss_dict from
 // engine_compute_loss_backward; callers aggregate across sub-batches.
 static std::map<std::string, float> _engine_step_fwd_bwd_only(
-    int step,
+    int step, int max_steps,
     std::string primitive,
     int sh_degree,
     bool packed,
     TorchTensorView bilagrid_cam_indices,
     const EngineStepConfig& cfg
 ) {
+    // Times the whole fwd+bwd for the binning search. Free: the loss values
+    // this returns are read back from the device, so the call already ends on
+    // a sync and the wall time here is the step's device time.
+    const auto step_t0 = std::chrono::steady_clock::now();
+    const double alloc_t0 = DevicePool::global().alloc_seconds();
+    engine_bin_tile_claim();
     engine().optim.use_fused_proj_bwd_optim = cfg.optim.use_fused_proj_bwd_optim;
     // Block-wise quantized gradient accumulation: only on the non-FPBO path
     // (FPBO already avoids fp32 grad buffers) and only when quantization is on.
     // Preserves split_batch via the projection-bwd kernel's requantize-accumulate.
-    engine().grad.quantize_grad =
-        !cfg.optim.use_fused_proj_bwd_optim && (cfg.optim.quantization_level != 0);
+    engine().grad.quantize_grad = !cfg.optim.use_fused_proj_bwd_optim &&
+                                  (cfg.optim.quantization_level != 0);
+    engine().grad.fp32_geometry = cfg.optim.keep_fp32_geometry_grad;
 
     _set_cur_cam_indices(bilagrid_cam_indices);
+    engine_max_weight_begin_step(step, max_steps, cfg.densify);
 
     // Pick the distortion channel set from the per-channel weights, restricted
     // to the channels this primitive renders (normal is honored only once a
@@ -78,29 +174,89 @@ static std::map<std::string, float> _engine_step_fwd_bwd_only(
         cfg.loss.weights[(int)LossWeightIndex::RgbDistReg],
         cfg.loss.weights[(int)LossWeightIndex::DepthDistReg],
         cfg.loss.weights[(int)LossWeightIndex::NormalDistReg]);
-    forward_3dgs(primitive, sh_degree, packed, /*output_median=*/false, (int)dist_type);
+    // A tile the mask excludes entirely is read by no term of the loss, so it
+    // is left out of the intersections; alpha supervision is the one term that
+    // reads a masked pixel (docs/datasets.md, "Skipping masked tiles").
 
-    engine().ppisp.cur_run_before_bilagrid = cfg.ppisp.run_before_bilagrid;
-    const bool bg_enabled = engine().bilagrid_rgb.enabled ||
-                            engine().bilagrid_depth.enabled ||
-                            engine().bilagrid_normal.enabled;
-    if (engine().ppisp.cur_run_before_bilagrid) {
-        if (engine().ppisp.enabled) engine_ppisp_forward(bilagrid_cam_indices);
-        if (bg_enabled)             engine_bilagrid_forward(bilagrid_cam_indices);
+    // SS_NO_TILE_SKIP=1 renders every tile, to measure what the skip buys.
+    static const bool no_tile_skip = [] {
+        const char* v = spirula::env("NO_TILE_SKIP");
+        return v && *v && v[0] != '0';
+    }();
+    const bool alpha_reads_masked = no_tile_skip ||
+        cfg.loss.weights[(int)LossWeightIndex::AlphaSup] != 0.0f ||
+        cfg.loss.weights[(int)LossWeightIndex::AlphaSupUnder] != 0.0f;
+    const bool skip_tiles = engine().gt.has_mask && engine().gt.alpha.data_ptr() != nullptr &&
+        !alpha_reads_masked;
+    if (skip_tiles) {
+        const int macro_log2 = engine_bin_macro_log2();
+        const int64_t per_image = intersect_tile_count(
+            engine().camera.width, engine().camera.height, macro_log2);
+        engine().fwd.tile_active.resize(PoolSlot::IsectTileActive,
+                                        per_image * engine().camera.num);
+        compute_tile_active(_dt3d_tv(engine().gt.alpha), (int)engine().camera.num,
+                            engine().camera.width, engine().camera.height,
+                            macro_log2,
+                            engine().fwd.tile_active.data_ptr());
+        // SS_TILE_SKIP_LOG=1: what the mask actually saves, in English like
+        // the other deep diagnostics.
+        static const bool log_skip = [] {
+            const char* v = spirula::env("TILE_SKIP_LOG");
+            return v && *v;
+        }();
+        if (log_skip) {
+            const int64_t n = per_image * engine().camera.num;
+            std::vector<int32_t> h((size_t)n);
+            backend::memcpy_sync(h.data(), engine().fwd.tile_active.data_ptr(),
+                                 (size_t)n * sizeof(int32_t),
+                                 backend::MemcpyKind::DeviceToHost);
+            int64_t live = 0;
+            for (int64_t i = 0; i < n; ++i) live += h[(size_t)i] ? 1 : 0;
+            const int64_t total = n;
+            std::fprintf(stderr, "[tile-skip] %lld / %lld tiles live (%.1f%% skipped)\n",
+                         (long long)live, (long long)total,
+                         100.0 * (double)(total - live) / (double)std::max<int64_t>(total, 1));
+        }
     } else {
-        if (bg_enabled)             engine_bilagrid_forward(bilagrid_cam_indices);
-        if (engine().ppisp.enabled) engine_ppisp_forward(bilagrid_cam_indices);
+        engine().fwd.tile_active = DeviceVector<int32_t>();
     }
+    _engine_arm_step_forward(cfg, dist_type, /*image_stages=*/true);
+    engine().fwd.score_pending = cfg.loss.learned_score;
+    engine().learned_score.power = cfg.loss.loss_map_power * cfg.densify.score_power;
 
-    return engine_compute_loss_backward(
-        step, cfg.loss.weights, cfg.loss.w_ssim,
+    engine().fwd.kernel_cut = cfg.loss.raster_kernel_cut;
+    {
+        SplatStageTimer stage_timer;
+        forward_3dgs(primitive, sh_degree, packed, /*output_median=*/false, (int)dist_type);
+    }
+    _engine_step_image_stages(bilagrid_cam_indices);
+    _engine_calib_warp_before_loss(step, skip_tiles);
+
+    engine_prepare_projective_depth(cfg.optim);
+    auto losses = engine_compute_loss_backward(
+        step, cfg.loss.weights, cfg.loss.w_ssim, cfg.loss.perceptual_loss,
         cfg.loss.num_loss_scales, cfg.loss.loss_scale_min_pixels,
         cfg.loss.compute_loss_map,
         cfg.loss.loss_map_mode,
         cfg.loss.robust_edge_aware_quantile,
+        cfg.loss.nms_falloff,
+        cfg.loss.loss_map_normalize,
+        cfg.loss.loss_map_clip_quantile,
+        cfg.loss.loss_map_power,
+        cfg.loss.loss_map_accum_mode,
+        cfg.loss.saturation_threshold,
         cfg.loss.overexposure_reg_weight,
         cfg.loss.color_shift_reg_weight,
         cfg.loss.color_shift_reg_beta);
+    _engine_calib_warp_restore_gt();
+    engine().fwd.kernel_cut = 0.0f;
+    // Less the allocator's time: a buffer growing under a finer trial is not
+    // what that bin size costs, and counted against it the search flips.
+    engine_bin_tile_observe(
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - step_t0).count() -
+        (DevicePool::global().alloc_seconds() - alloc_t0));
+    _visit_accumulate_camera_stats(primitive);
+    return losses;
 }
 
 
@@ -114,7 +270,15 @@ static void _engine_step_optim_and_densify(
     const EngineStepConfig& cfg,
     std::map<std::string, float>& loss_dict
 ) {
-    engine_optim_step(step, cfg.optim);
+    engine_pca_reg_step(step, cfg.pca_reg, loss_dict);
+    {
+        SplatStageTimer stage_timer;
+        engine_optim_step(step, cfg.optim);
+    }
+    engine().pca_reg.v_means = DeviceVector<float3>();
+    engine().pca_reg.v_quats = DeviceVector<float4>();
+    engine().pca_reg.v_scales = DeviceVector<float3>();
+    engine().pca_reg.v_opacities = DeviceVector<float>();
 
     if (engine().background.enabled) {
         engine_background_optim_step(step, cfg.background);
@@ -154,9 +318,19 @@ static void _engine_step_optim_and_densify(
         ppisp_reg_readout.issue(losses_buf);
     }
 
-    int num_added = engine_densify_step(step, max_steps, cfg.densify);
+    int num_added = 0;
+    {
+        SplatStageTimer stage_timer;
+        num_added = engine_densify_step(step, max_steps, cfg.densify);
+    }
+    engine().fwd.accum_weight = DeviceVector<float>();
+    engine().fwd.accum_mode = DensifyAccumMode::None;
 
     loss_dict["num_added"] = (float)num_added;
+    if (densify_grows_at(cfg.densify, step, max_steps)) {
+        loss_dict["num_dead"]      = (float)engine().optim.last_num_dead;
+        loss_dict["num_relocated"] = (float)engine().optim.last_num_relocated;
+    }
     loss_dict["cur_num_splats"] = (float)engine().cur_num_splats;
     loss_dict["max_num_splats"] = (float)engine().max_num_splats;
 }
@@ -186,17 +360,50 @@ std::map<std::string, float> _engine_train_step_after_setup(
     _set_cur_cam_indices(bilagrid_cam_indices);
     engine_viewer_capture_thumbnails(bilagrid_cam_indices);
 
+    engine().fwd.accum_weight = DeviceVector<float>();
+    engine().fwd.accum_mode = DensifyAccumMode::None;
+
     if (engine().background.enabled) {
         engine_set_background_step_params(cfg.background.seed,
-                                          cfg.background.randomize_weight);
+                                          cfg.background.randomize_weight,
+                                          cfg.loss.num_loss_scales,
+                                          cfg.loss.loss_scale_min_pixels);
     }
 
     auto loss_dict = _engine_step_fwd_bwd_only(
-        step, std::move(primitive), sh_degree, packed,
+        step, max_steps, std::move(primitive), sh_degree, packed,
         bilagrid_cam_indices, cfg);
 
     _engine_step_optim_and_densify(step, max_steps, cfg, loss_dict);
     return loss_dict;
+}
+
+
+// Keeps every pass's bilagrid gradient for the step's one optimizer step.
+struct BilagridRowsScope {
+    explicit BilagridRowsScope(int64_t total) { _engine_bilagrid_step_rows(total); }
+    ~BilagridRowsScope() { _engine_bilagrid_step_rows(0); }
+};
+
+// The mode this step's raster backward will use -- None when nothing asked
+// for a loss map, so the accumulator stays one lane wide.
+static DensifyAccumMode _step_accum_mode(const EngineStepConfig& cfg) {
+    return cfg.loss.compute_loss_map ? (DensifyAccumMode)cfg.loss.loss_map_accum_mode
+                                     : DensifyAccumMode::None;
+}
+
+// Fold one sub-batch's raster-bwd accum_weight into `dst` exactly as the
+// unsplit kernel folds a batch's cameras: Max reduces with atomicMax, Sum and
+// Avg with atomicAdd (Avg over both planar lanes, divided later).
+static void _fold_accum_weight(DeviceVector<float>& dst, int64_t num_splats) {
+    if (engine().fwd.accum_weight.data_ptr() == nullptr) return;
+    StepTimingScope timing(StepPart::Densify, StepScale::Splats);
+    const DensifyAccumMode mode = engine().fwd.accum_mode;
+    const int64_t n = num_splats * accum_lanes(mode);
+    if (mode == DensifyAccumMode::Max)
+        float_max_into(dst, engine().fwd.accum_weight, n);
+    else
+        float_add_into(dst, engine().fwd.accum_weight, n);
 }
 
 
@@ -211,6 +418,7 @@ std::map<std::string, float> _engine_train_step_after_setup(
 // at the end. The splat Adam kernel reads grad_scale = 1/B from engine
 // state so per-image grad magnitude vs regularization weight stays
 // batch-size invariant.
+
 static std::map<std::string, float> _engine_train_step_split_one_per_camera(
     int step, int max_steps,
     std::string primitive,
@@ -257,7 +465,9 @@ static std::map<std::string, float> _engine_train_step_split_one_per_camera(
     // background blend reads them per-camera inside the forward kernel).
     if (engine().background.enabled) {
         engine_set_background_step_params(cfg.background.seed,
-                                          cfg.background.randomize_weight);
+                                          cfg.background.randomize_weight,
+                                          cfg.loss.num_loss_scales,
+                                          cfg.loss.loss_scale_min_pixels);
     }
 
     // color_shift_reg EMA: the per-call decay is beta. In single-batch mode
@@ -273,23 +483,23 @@ static std::map<std::string, float> _engine_train_step_split_one_per_camera(
         cfg_sub.loss.color_shift_reg_beta = powf(beta_orig, 1.0f / (float)B);
     }
 
-    // Persistent accumulator for per-sub-batch raster-bwd accum_weight
-    // outputs. The raster_bwd pool buffer ("raster_bwd.accum_weight") is
-    // zeroed + overwritten on every call, so engine().fwd.accum_weight
-    // points at only the LAST sub-batch's contribution by default; we
-    // float_add_into() each sub-batch's value here and then re-point
-    // engine().fwd.accum_weight at this buffer for the densify pass.
+    // The raster_bwd pool buffer ("raster_bwd.accum_weight") is zeroed and
+    // overwritten on every call, so engine().fwd.accum_weight would otherwise
+    // carry only the LAST sub-batch. Folded here, then re-pointed for densify.
     int64_t N_splats = engine().cur_num_splats;
     DeviceVector<float> accum_weight_sum;
-    accum_weight_sum.resize(PoolSlot::EngSubbatchAccumWeightSum, N_splats);
+    accum_weight_sum.resize(PoolSlot::EngSubbatchAccumWeightSum,
+                            N_splats * accum_lanes(_step_accum_mode(cfg)));
     accum_weight_sum.zero();
     // Drop the previous step's re-pointed view (set below for densify): when
     // this step's raster bwd doesn't produce accum_weight (e.g. score_blend_
     // world_grad == 1), the stale view would otherwise pass the null check in
     // the loop and dangle once the pool moves (densify growth, viewer render).
     engine().fwd.accum_weight = DeviceVector<float>();
+    engine().fwd.accum_mode = DensifyAccumMode::None;
 
     std::map<std::string, float> agg;
+    BilagridRowsScope bilagrid_rows(B);
 
     for (int64_t k = 0; k < B; ++k) {
         // First sub-batch: zero grad. Subsequent: skip the zero so atomic
@@ -314,17 +524,18 @@ static std::map<std::string, float> _engine_train_step_split_one_per_camera(
         // B times per step is safe (and matches the unsplit behavior of
         // capturing once over all cams in the batch).
         _set_cur_cam_indices(bgi_k);
+        _engine_bilagrid_pass_rows(k, bgi_k);
         engine_viewer_capture_thumbnails(bgi_k);
 
         auto ld = _engine_step_fwd_bwd_only(
-            step, primitive, sh_degree, packed, bgi_k, cfg_sub);
+            step, max_steps, primitive, sh_degree, packed, bgi_k, cfg_sub);
 
         // Accumulate per-sub-batch accum_weight (per-splat densification
         // score from raster_bwd). engine().fwd.accum_weight points at the
         // raster_bwd pool buffer for this sub-batch; we sum it into our
         // persistent buffer before raster_bwd overwrites it next iter.
         if (engine().fwd.accum_weight.data_ptr() != nullptr) {
-            float_add_into(accum_weight_sum, engine().fwd.accum_weight, N_splats);
+            _fold_accum_weight(accum_weight_sum, N_splats);
         }
 
         // Aggregate loss values across sub-batches as a mean.
@@ -340,10 +551,8 @@ static std::map<std::string, float> _engine_train_step_split_one_per_camera(
     }
     for (auto& [key, val] : agg) val /= (float)B;
 
-    // Re-point engine().fwd.accum_weight at the accumulator so densify sees
-    // the per-splat score summed across all sub-batches (matching the
-    // unsplit raster_bwd output which would have aggregated cameras in a
-    // single kernel launch via atomicAdd).
+    // Reduced across sub-batches the way the unsplit raster_bwd reduces the
+    // cameras of one launch: atomicMax, not a sum.
     engine().fwd.accum_weight = accum_weight_sum;
 
     // Single end-of-step optim + densify pass. The splat Adam kernels read
@@ -404,7 +613,9 @@ std::map<std::string, float> engine_train_step_hetero(
 
     if (engine().background.enabled) {
         engine_set_background_step_params(cfg.background.seed,
-                                          cfg.background.randomize_weight);
+                                          cfg.background.randomize_weight,
+                                          cfg.loss.num_loss_scales,
+                                          cfg.loss.loss_scale_min_pixels);
     }
 
     // color_shift_reg EMA: the hook runs once per fwd/bwd, i.e. total_cams
@@ -418,13 +629,16 @@ std::map<std::string, float> engine_train_step_hetero(
 
     int64_t N_splats = engine().cur_num_splats;
     DeviceVector<float> accum_weight_sum;
-    accum_weight_sum.resize(PoolSlot::EngSubbatchAccumWeightSum, N_splats);
+    accum_weight_sum.resize(PoolSlot::EngSubbatchAccumWeightSum,
+                            N_splats * accum_lanes(_step_accum_mode(cfg)));
     accum_weight_sum.zero();
     // Drop the previous step's re-pointed view (see per-sub-batch path).
     engine().fwd.accum_weight = DeviceVector<float>();
+    engine().fwd.accum_mode = DensifyAccumMode::None;
 
     std::map<std::string, float> agg;
     int64_t kcam = 0;   // global camera index across the whole step
+    BilagridRowsScope bilagrid_rows(total_cams);
 
     for (const auto& s : subs) {
         const auto& vs = std::get<2>(s.viewmats);
@@ -449,13 +663,14 @@ std::map<std::string, float> engine_train_step_hetero(
                               cfg.loss.input_depth_is_ray_depth);
 
             _set_cur_cam_indices(bgi_c);
+            _engine_bilagrid_pass_rows(kcam, bgi_c);
             engine_viewer_capture_thumbnails(bgi_c);
 
             auto ld = _engine_step_fwd_bwd_only(
-                step, primitive, sh_degree, packed, bgi_c, cfg_sub);
+                step, max_steps, primitive, sh_degree, packed, bgi_c, cfg_sub);
 
             if (engine().fwd.accum_weight.data_ptr() != nullptr) {
-                float_add_into(accum_weight_sum, engine().fwd.accum_weight, N_splats);
+                _fold_accum_weight(accum_weight_sum, N_splats);
             }
 
             if (kcam == 0) {
@@ -472,7 +687,7 @@ std::map<std::string, float> engine_train_step_hetero(
     }
     for (auto& [key, val] : agg) val /= (float)total_cams;
 
-    // Densify sees the per-splat score summed across every camera of the step.
+    // Densify sees the per-splat score maxed across every camera of the step.
     engine().fwd.accum_weight = accum_weight_sum;
 
     engine().optim.skip_grad_zero      = false;
@@ -523,14 +738,9 @@ std::map<std::string, float> engine_train_step(
 }
 
 
-// Warped variant of the split-batch dispatcher. Splits per INPUT image
-// (B_in chunks of K post-split cameras each). Numerically: each sub-batch's
-// per-pixel loss kernel sees K cameras, normalizes by 1/(K*H*W). Accumulated
-// across B_in sub-batches the per-splat grad ends up B_in x what an unsplit
-// run on B_in*K post-cams would produce; grad_scale = 1/B_in in the optim
-// step's splat Adam kernels brings it back to the unsplit-equivalent
-// magnitude (mod atomicAdd reordering + the radii zero-on-first-sub-batch
-// fix in EngineForward.cpp).
+// Warped split dispatcher: one pass per (input image, run of equal-size
+// faces). A pass normalizes by 1/(cameras*H*W) and grad_scale = 1/passes puts
+// that back, so passes weigh equally -- pixels, not faces, for unequal faces.
 static std::map<std::string, float> _engine_train_step_split_warped(
     int step, int max_steps,
     std::string primitive, int sh_degree, bool packed,
@@ -553,7 +763,8 @@ static std::map<std::string, float> _engine_train_step_split_warped(
     int depth_in_H, int depth_in_W,
     TorchTensorView gt_normal_byte,
     int normal_in_H, int normal_in_W,
-    uint64_t axes_dev,
+    TorchTensorView face_axes,
+    const std::vector<WarpFacePass>& face_passes,
     TorchTensorView bilagrid_cam_indices,
     const EngineStepConfig& cfg
 ) {
@@ -567,15 +778,18 @@ static std::map<std::string, float> _engine_train_step_split_warped(
     if (K <= 0)
         throw std::runtime_error("split_batch (warped): K must be positive");
 
-    // Cubemap faces are canonical pinhole. K == 1 is the re-distort path,
-    // whose destination is the camera the parser fitted -- the input one.
+    // Faces are canonical pinhole. K == 1 is the re-distort path, whose
+    // destination is the camera the parser fitted -- the input one.
     const std::string post_model = K > 1 ? "PINHOLE" : input_camera_model;
     const std::string post_dist  = K > 1 ? "NONE"    : input_distortion;
 
-    // Single input image (B_in == 1) -> nothing to split; route through the
+    const int C = face_passes.empty() ? 1 : (int)face_passes.size();
+    const int64_t P = B_in * C;
+
+    // One input image and one face size -> nothing to split; route through the
     // standard warped path so K cams are processed in one shot. grad_scale
     // stays at 1.0 (the normal post-batch normalization is correct).
-    if (B_in == 1) {
+    if (P == 1) {
         set_camera_params(out_W, out_H, post_model, post_dist,
                           post_viewmats, post_intrins, post_dist_coeffs);
         set_training_data_warped(input_camera_model, input_distortion,
@@ -587,7 +801,7 @@ static std::map<std::string, float> _engine_train_step_split_warped(
                                  cfg.loss.input_depth_is_ray_depth,
                                  input_intrins, input_dist_coeffs,
                                  input_source_models, input_source_params,
-                                 axes_dev);
+                                 face_axes);
         return _engine_train_step_after_setup(
             step, max_steps, std::move(primitive), sh_degree, packed,
             bilagrid_cam_indices, cfg);
@@ -595,88 +809,113 @@ static std::map<std::string, float> _engine_train_step_split_warped(
 
     if (engine().background.enabled) {
         engine_set_background_step_params(cfg.background.seed,
-                                          cfg.background.randomize_weight);
+                                          cfg.background.randomize_weight,
+                                          cfg.loss.num_loss_scales,
+                                          cfg.loss.loss_scale_min_pixels);
     }
 
     EngineStepConfig cfg_sub = cfg;
     const float beta_orig = cfg.loss.color_shift_reg_beta;
     if (beta_orig > 0.0f && beta_orig < 1.0f) {
-        cfg_sub.loss.color_shift_reg_beta = powf(beta_orig, 1.0f / (float)B_in);
+        cfg_sub.loss.color_shift_reg_beta = powf(beta_orig, 1.0f / (float)P);
     }
 
     int64_t N_splats = engine().cur_num_splats;
     DeviceVector<float> accum_weight_sum;
-    accum_weight_sum.resize(PoolSlot::EngSubbatchAccumWeightSum, N_splats);
+    accum_weight_sum.resize(PoolSlot::EngSubbatchAccumWeightSum,
+                            N_splats * accum_lanes(_step_accum_mode(cfg)));
     accum_weight_sum.zero();
     // Drop the previous step's re-pointed view (see per-sub-batch path).
     engine().fwd.accum_weight = DeviceVector<float>();
+    engine().fwd.accum_mode = DensifyAccumMode::None;
 
     std::map<std::string, float> agg;
+    BilagridRowsScope bilagrid_rows((int64_t)B_in * K);
 
-    for (int64_t k = 0; k < B_in; ++k) {
-        engine().optim.skip_grad_zero = (k > 0);
-
+    for (int64_t j = 0; j < B_in; ++j) {
         // Per-input-image slices (B_in axis).
-        TorchTensorView rgb_k   = _slice_tv_first_dim(gt_rgb_byte,        k);
-        TorchTensorView mask_k  = _slice_tv_first_dim(gt_alpha_byte,      k);
-        TorchTensorView dep_k   = _slice_tv_first_dim(gt_depth_byte,      k);
-        TorchTensorView nrm_k   = _slice_tv_first_dim(gt_normal_byte,     k);
-        TorchTensorView i_itr_k = _slice_tv_first_dim(input_intrins,      k);
-        TorchTensorView i_dst_k = _slice_tv_first_dim(input_dist_coeffs,  k);
+        TorchTensorView rgb_k   = _slice_tv_first_dim(gt_rgb_byte,        j);
+        TorchTensorView mask_k  = _slice_tv_first_dim(gt_alpha_byte,      j);
+        TorchTensorView dep_k   = _slice_tv_first_dim(gt_depth_byte,      j);
+        TorchTensorView nrm_k   = _slice_tv_first_dim(gt_normal_byte,     j);
+        TorchTensorView i_itr_k = _slice_tv_first_dim(input_intrins,      j);
+        TorchTensorView i_dst_k = _slice_tv_first_dim(input_dist_coeffs,  j);
         TorchTensorView i_src_m_k = std::get<0>(input_source_models) == 0
-            ? input_source_models : _slice_tv_first_dim(input_source_models, k);
+            ? input_source_models : _slice_tv_first_dim(input_source_models, j);
         TorchTensorView i_src_p_k = std::get<0>(input_source_params) == 0
-            ? input_source_params : _slice_tv_first_dim(input_source_params, k);
+            ? input_source_params : _slice_tv_first_dim(input_source_params, j);
 
-        // Per-input-image POST-split slices (B_post axis, K consecutive rows
-        // per input).
-        TorchTensorView p_vmt_k = _slice_tv_range_first_dim(post_viewmats,     k * K, K);
-        TorchTensorView p_itr_k = _slice_tv_range_first_dim(post_intrins,      k * K, K);
-        TorchTensorView p_dst_k = _slice_tv_range_first_dim(post_dist_coeffs,  k * K, K);
-        TorchTensorView bgi_k   = _slice_tv_range_first_dim(bilagrid_cam_indices, k * K, K);
+        for (int c = 0; c < C; ++c) {
+            // The faces of this pass, a run of the K axis at one size. Their
+            // POST rows are contiguous because the run is.
+            const int k0 = C == 1 ? 0 : face_passes[(size_t)c].k0;
+            const int Kc = (C == 1 ? K : face_passes[(size_t)c].k1) - k0;
+            const int Wc = C == 1 ? out_W : face_passes[(size_t)c].width;
+            const int Hc = C == 1 ? out_H : face_passes[(size_t)c].height;
+            const int64_t row = j * K + k0;
+            engine().optim.skip_grad_zero = (j * C + c > 0);
+            // A pass normalizes by its own camera count, so weighting it by
+            // that count leaves every FACE weighted alike -- the same loss,
+            // grad and densification score an unsplit batch would produce.
+            EngineStepConfig cfg_pass = cfg_sub;
+            const float w = (float)C * (float)Kc / (float)K;
+            if (C > 1) {
+                for (float& x : cfg_pass.loss.weights) x *= w;
+                cfg_pass.loss.w_ssim *= w;
+            }
 
-        set_camera_params(out_W, out_H, post_model, post_dist,
-                          p_vmt_k, p_itr_k, p_dst_k);
-        set_training_data_warped(input_camera_model, input_distortion,
-                                 /*B_in=*/1, in_H, in_W, K, out_H, out_W,
-                                 rgb_k, mask_k,
-                                 mask_in_H, mask_in_W,
-                                 dep_k, depth_in_H, depth_in_W,
-                                 nrm_k, normal_in_H, normal_in_W,
-                                 cfg.loss.input_depth_is_ray_depth,
-                                 i_itr_k, i_dst_k, i_src_m_k, i_src_p_k,
-                                 axes_dev);
+            TorchTensorView p_vmt_k = _slice_tv_range_first_dim(post_viewmats,    row, Kc);
+            TorchTensorView p_itr_k = _slice_tv_range_first_dim(post_intrins,     row, Kc);
+            TorchTensorView p_dst_k = _slice_tv_range_first_dim(post_dist_coeffs, row, Kc);
+            TorchTensorView bgi_k   = _slice_tv_range_first_dim(bilagrid_cam_indices, row, Kc);
+            TorchTensorView axes_k  = std::get<0>(face_axes) == 0
+                ? face_axes : _slice_tv_range_first_dim(face_axes, row, Kc);
 
-        _set_cur_cam_indices(bgi_k);
-        engine_viewer_capture_thumbnails(bgi_k);
+            set_camera_params(Wc, Hc, post_model, post_dist,
+                              p_vmt_k, p_itr_k, p_dst_k);
+            set_training_data_warped(input_camera_model, input_distortion,
+                                     /*B_in=*/1, in_H, in_W, Kc, Hc, Wc,
+                                     rgb_k, mask_k,
+                                     mask_in_H, mask_in_W,
+                                     dep_k, depth_in_H, depth_in_W,
+                                     nrm_k, normal_in_H, normal_in_W,
+                                     cfg.loss.input_depth_is_ray_depth,
+                                     i_itr_k, i_dst_k, i_src_m_k, i_src_p_k,
+                                     axes_k);
 
-        auto ld = _engine_step_fwd_bwd_only(
-            step, primitive, sh_degree, packed, bgi_k, cfg_sub);
+            _set_cur_cam_indices(bgi_k);
+            _engine_bilagrid_pass_rows(row, bgi_k);
+            engine_viewer_capture_thumbnails(bgi_k);
 
-        if (engine().fwd.accum_weight.data_ptr() != nullptr) {
-            float_add_into(accum_weight_sum, engine().fwd.accum_weight, N_splats);
-        }
+            // Reported as they come: the pass weights average to 1, so the
+            // mean below is the weighted total the loss actually is.
+            auto ld = _engine_step_fwd_bwd_only(
+                step, max_steps, primitive, sh_degree, packed, bgi_k, cfg_pass);
 
-        if (k == 0) {
-            agg = std::move(ld);
-        } else {
-            for (auto& [key, val] : ld) {
-                auto it = agg.find(key);
-                if (it == agg.end()) agg.emplace(key, val);
-                else                 it->second += val;
+            if (engine().fwd.accum_weight.data_ptr() != nullptr) {
+                _fold_accum_weight(accum_weight_sum, N_splats);
+            }
+
+            if (j == 0 && c == 0) {
+                agg = std::move(ld);
+            } else {
+                for (auto& [key, val] : ld) {
+                    auto it = agg.find(key);
+                    if (it == agg.end()) agg.emplace(key, val);
+                    else                 it->second += val;
+                }
             }
         }
     }
-    for (auto& [key, val] : agg) val /= (float)B_in;
+    for (auto& [key, val] : agg) val /= (float)P;
 
     engine().fwd.accum_weight = accum_weight_sum;
 
-    // grad_scale = 1/B_in (number of sub-batches), NOT 1/B_post: each
-    // sub-batch's loss kernel already normalizes by 1/(K*H*W), so summing
-    // B_in sub-batches over-counts by exactly B_in relative to the unsplit
-    // B_post-camera batch (whose per-pixel grad is 1/(B_post*H*W)).
+    // grad_scale = 1/passes, NOT 1/B_post: each pass's loss kernel already
+    // normalizes by 1/(cameras*H*W), so summing them over-counts by exactly
+    // the pass count relative to the unsplit batch.
     engine().optim.skip_grad_zero      = false;
-    engine().optim.grad_scale          = 1.0f / (float)B_in;
+    engine().optim.grad_scale          = 1.0f / (float)P;
     engine().optim.zero_grad_in_optim  = true;
 
     _engine_step_optim_and_densify(step, max_steps, cfg, agg);
@@ -714,12 +953,14 @@ std::map<std::string, float> engine_train_step_warped(
     int depth_in_H, int depth_in_W,
     TorchTensorView gt_normal_byte,       // [B_in, normal_in_H, normal_in_W, 3] u8/f32 (nullable)
     int normal_in_H, int normal_in_W,
-    uint64_t axes_dev,                    // device float ptr [K, 3, 3]
+    TorchTensorView face_axes,            // [B_in*K, 3, 3]
+    // Runs of equal-size faces; empty or one entry = one pass at out_W x out_H.
+    const std::vector<WarpFacePass>& face_passes,
     // Bilagrid cam indices in the POST-split index space.
     TorchTensorView bilagrid_cam_indices,
     const EngineStepConfig& cfg
 ) {
-    if (cfg.optim.split_batch) {
+    if (cfg.optim.split_batch || face_passes.size() > 1) {
         return _engine_train_step_split_warped(
             step, max_steps, std::move(primitive), sh_degree, packed,
             out_W, out_H, post_viewmats, post_intrins, post_dist_coeffs,
@@ -729,10 +970,10 @@ std::map<std::string, float> engine_train_step_warped(
             gt_rgb_byte, gt_alpha_byte, mask_in_H, mask_in_W,
             gt_depth_byte, depth_in_H, depth_in_W,
             gt_normal_byte, normal_in_H, normal_in_W,
-            axes_dev, bilagrid_cam_indices, cfg);
+            face_axes, face_passes, bilagrid_cam_indices, cfg);
     }
-    // Cubemap faces are canonical pinhole; K == 1 (re-distort) keeps the
-    // camera the parser fitted, which is the input one.
+    // Faces are canonical pinhole; K == 1 (re-distort) keeps the camera the
+    // parser fitted, which is the input one.
     set_camera_params(out_W, out_H,
                       K > 1 ? "PINHOLE" : input_camera_model,
                       K > 1 ? "NONE"    : input_distortion,
@@ -746,8 +987,8 @@ std::map<std::string, float> engine_train_step_warped(
                              gt_normal_byte, normal_in_H, normal_in_W,
                              cfg.loss.input_depth_is_ray_depth,
                              input_intrins, input_dist_coeffs,
-                                 input_source_models, input_source_params,
-                                 axes_dev);
+                             input_source_models, input_source_params,
+                             face_axes);
     return _engine_train_step_after_setup(
         step, max_steps, std::move(primitive), sh_degree, packed,
         bilagrid_cam_indices, cfg);

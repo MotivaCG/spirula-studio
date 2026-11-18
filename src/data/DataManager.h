@@ -24,15 +24,27 @@
 #include "core/Common.cuh"
 #include "core/Tensor.h"
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
+
+
+// Thrown by next_train_step() / next_val_batch() when a decode worker is
+// parked on a file it could not read. Answer with resolve_data_error().
+class DataDecodeError : public std::runtime_error {
+public:
+    explicit DataDecodeError(const std::string& what)
+        : std::runtime_error(what) {}
+};
 
 
 // ===========================================================================
@@ -72,27 +84,63 @@ struct DataManagerConfig {
     // Hard upper bound on RAM consumed by ready / partially-ready batches.
     int prefetch_batches = 4;
 
-    // Signed boundary offset applied to binarized masks at decode time,
-    // expressed as a fraction of sqrt(W*H) of the decoded mask. Positive ->
-    // dilate (grow) foreground; negative -> erode (shrink) foreground; zero
-    // disables. Implemented via separable Felzenszwalb-Huttenlocher squared
-    // Euclidean distance transform on CPU (O(N) per row+col, exact).
+    // Swap keep and ignore in every mask file, before mask_boundary_offset.
+    // For masks that mark what to EXCLUDE, the other convention in the wild.
+    bool flip_mask = false;
+
+    // One flag per input image whose alpha channel is a cut-out
+    // (data/ImageProbe.h). Its mask is the alpha, opaque from 128 up, ANDed
+    // with its mask file if it has one; flip_mask turns only the file.
+    std::vector<uint8_t> alpha_masks;
+
+    // One flag per input image whose alpha is composited onto composite_color
+    // (display-referred, 0..1) as its colour is decoded -- the constant
+    // background it is rendered against, so a transparent pixel's GT is that.
+    std::vector<uint8_t> composite_alpha;
+    std::array<float, 3> composite_color{0.0f, 0.0f, 0.0f};
+
+    // Quarter turns clockwise to load each image with, one per input camera
+    // (ParsedDataset::exif_quarter_turns). Mask, depth and normal come from the
+    // same frame and turn with it. Empty when no image asks for one.
+    std::vector<uint8_t> exif_quarter_turns;
+
+    // Integer train_resolution_divisor whose downscaled RGB is cached on disk
+    // (data/DownscaleCache.h), 0 for none; `image_dir` is the dataset's
+    // absolute image folder, `downscale_rounding_mode` how the cache sizes them.
+    int         downscale_cache_divisor = 0;
+    std::string image_dir;
+    std::string downscale_rounding_mode = "floor";
+
+    // Dilate (+) or erode (-) the final mask by this fraction of sqrt(W*H) of
+    // the decoded mask, by an exact squared distance transform; 0 disables.
     float mask_boundary_offset = 0.0f;
 
-    // When true: cameras with model FISHEYE or EQUISOLID get split into 5
-    // cubemap-face pinhole sub-cameras at training time. PINHOLE cameras
-    // pass through unchanged. EQUIRECTANGULAR cameras are ALWAYS split into
-    // 6 sub-cameras regardless of this flag. The byte->float conversion of
-    // the GT image is fused with the warp on GPU, so no full-res
-    // intermediate float buffer is allocated. Depth, normal, and PPISP are
-    // not supported when any image in the dataset is split.
-    bool warp_to_pinhole = false;
+    // Deficit view sampling: an image is drawn per pass in proportion to
+    // ((median + 1) / (mean render count of the splats it showed + 1))^power,
+    // clamped to [1/max_ratio, max_ratio]. Off, every image is drawn once.
+    bool  deficit_sampling  = false;
+    float deficit_power     = 0.5f;
+    float deficit_max_ratio = 8.0f;
+
+    // (first step, divisor) stages for training batches (data/ResolutionSchedule.h);
+    // empty trains at the loaded size. `first_step` is the step a resumed run
+    // continues from. Validation and fetch_one always use divisor 1.
+    std::vector<std::pair<int64_t, int>> resolution_stages;
+    int64_t first_step = 0;
 };
 
 
 // ===========================================================================
 // Decoded batch
 // ===========================================================================
+
+// One run of the face axis at one size: faces [k0, k1) of every input image in
+// a batch, rendered at width x height. A camera whose faces differ in size
+// takes one render pass per entry (data/CameraMath.h, FaceFit).
+struct WarpFacePass {
+    int32_t k0 = 0, k1 = 0, width = 0, height = 0;
+};
+
 
 // Element-type tag, matching the engine's set_training_data inputs.
 //   RGB:    UINT8 (sRGB 0..255), UINT16 (0..65535), or FLOAT32 (0..1).
@@ -115,15 +163,15 @@ inline uint32_t pixel_dtype_size(PixelDType t) { return (uint32_t)t; }
 // corresponding view at all-zero (data_ptr == 0), which the engine interprets
 // as "not provided".
 struct DecodedBatch {
-    // Per-batch metadata. When warp_to_pinhole splits a batch's images, these
-    // fields describe the POST-split state -- so `width`, `height`, `num`,
-    // `model`, `viewmats`, `intrins`, `dist_coeffs` are what the engine's
-    // set_camera_params consumes directly. The INPUT (unwarped) shape is
-    // tracked separately below so the GT warp kernel can read the byte
-    // staging buffer.
+    // Per-batch metadata, POST-split: `width`, `height`, `num`, `model`,
+    // `viewmats`, `intrins`, `dist_coeffs` are what set_camera_params
+    // consumes. The INPUT (unwarped) shape the GT warp reads is tracked below.
     int32_t                width  = 0;     // post-split W (= input W when K=1)
     int32_t                height = 0;     // post-split H
     int32_t                num    = 0;     // post-split B (= input B * K)
+    // Progressive-resolution divisor this batch was scaled by (1 = loaded size).
+    // Its RGB is the group's input image area-filtered to input_width x input_height.
+    int32_t                resolution_divisor = 1;
     CameraModelType        model  = (CameraModelType)-1;   // PINHOLE when K>1
     CameraDistortionType   distortion = CameraDistortionType::None;  // None when K>1
 
@@ -167,21 +215,22 @@ struct DecodedBatch {
     int32_t                normal_width  = 0;
 
     // ---- Warp metadata (only meaningful when K > 1) -----------------------
-    // `input_*` describe the unwarped GT image shape and the input batch;
-    // the engine's warp kernel reads `rgb_buffer` / `mask_buffer` at those
-    // sizes and writes the warped result at post-split resolution
-    // (width / height / num). `K` is the split factor (1 = pass-through,
-    // 5 = fisheye, 6 = equirectangular). `input_model` selects the warp
-    // kernel (fisheye / equisolid / equirectangular). `axes_dev` is a
-    // device pointer to a [K, 3, 3] cubemap axis table -- lifetime is
-    // managed by the DataManager.
+    // `input_*` is the unwarped GT shape the warp reads the buffers at; `K`
+    // the split factor (1 = pass-through); `input_model` picks the kernel.
     int32_t                input_width   = 0;
     int32_t                input_height  = 0;
     int32_t                input_num     = 0;   // = num / K
     int32_t                K             = 1;
     CameraModelType        input_model   = (CameraModelType)-1;
     CameraDistortionType   input_distortion = CameraDistortionType::None;
-    const float*           axes_dev      = nullptr;
+
+    // Each post camera's frame in its input camera's coordinates, rows (ax,
+    // ay, az): the face the warp samples for. Length 9 * num; empty at K == 1.
+    std::vector<float>     face_axes;
+
+    // The face axis in runs of equal size, in order; one entry unless the
+    // camera was split per face. `width` / `height` above are the first run's.
+    std::vector<WarpFacePass> face_passes;
 
     // Per-INPUT intrins / dist_coeffs (length input_num). Populated when
     // K > 1 and the wide warp kernel (fisheye/equisolid) needs them. The
@@ -198,6 +247,7 @@ struct DecodedBatch {
     TorchTensorView        input_dist_coeffs_view{0, 0, {}};
     TorchTensorView        input_source_models_view{0, 0, {}};
     TorchTensorView        input_source_params_view{0, 0, {}};
+    TorchTensorView        face_axes_view{0, 0, {}};
 
     // Engine-facing TorchTensorViews. Lazily filled by `build_views()` once
     // the buffers are populated. The Engine consumes these directly via
@@ -267,23 +317,22 @@ public:
         std::vector<std::string>   normal_filenames,
         std::vector<int32_t>       widths,
         std::vector<int32_t>       heights,
-        // Per-INPUT split factor and post-split offset. K[i] = 1 / 5 / 6
-        // depending on the camera model + warp config. Pre-computed on the
-        // caller side (typically the Python trainer) so the C++ side only
-        // needs to read it. offsets[i] is the starting index in the
-        // POST-split camera arrays for input camera i, computed as
-        // exclusive-prefix-sum of K. Pass empty vectors (or all-ones K +
-        // identity offsets) to disable the warp path.
+        // Per-INPUT split factor (the faces bake_post_split gave camera i)
+        // and its exclusive-prefix-sum offset into the POST-split arrays.
+        // Pass empty vectors to disable the warp path.
         std::vector<int32_t>       K_per_camera,        // length N
         std::vector<int32_t>       post_offsets,        // length N
         // Per-POST-split-camera (length N_post = sum(K_per_camera)) -----------
-        // When the warp path is inactive, N_post == N and these are just
-        // the per-input camera params. When the warp path is active, the
-        // caller pre-expands these per cubemap face / equirectangular face
-        // (bake_post_split in DatasetCommon.cpp).
+        // N_post == N and the per-input params when the warp path is off;
+        // otherwise bake_post_split (PostSplit.cpp) expanded them per face.
         std::vector<float>         viewmats,            // [N_post, 4, 4]
         std::vector<float>         intrins,             // [N_post, 4]
         std::vector<float>         dist_coeffs,         // [N_post, 8]
+        // Face size and frame per POST camera; the K faces of one input share
+        // a size. Empty when the warp path is inactive.
+        std::vector<int32_t>       post_widths,         // [N_post]
+        std::vector<int32_t>       post_heights,        // [N_post]
+        std::vector<float>         face_axes,           // [N_post, 3, 3]
         // Per-INPUT intrins/dist_coeffs (length N). Needed by the wide warp
         // kernel (fisheye/equisolid projection). Pass empty vectors when
         // no fisheye-warp camera is in the dataset -- the kernel only reads
@@ -327,6 +376,25 @@ public:
     // mask only -- its caller is the GUI's ground-truth-vs-render view.
     void fetch_one(int32_t index, DecodedBatch& out);
 
+    // ---- Decode faults ----------------------------------------------------
+
+    // Non-empty while a decode worker is parked on a file it could not read
+    // (moved, renamed, deleted, permissions). The pipeline stays paused, and
+    // the batch in flight is untouched, until this is answered.
+    std::string data_error() const;
+
+    // true re-runs the parked decode -- the run continues where it stopped
+    // once the file is back. false abandons the pipeline: the ready queues
+    // close, so the next fetch throws instead of blocking forever.
+    void resolve_data_error(bool retry);
+
+    // ---- View stats -------------------------------------------------------
+
+    // Per POST-split camera: the sum and count of the render counters of the
+    // splats it contributed to at its last render (engine_read_view_stats).
+    // The next epoch's schedule draws on it under deficit_sampling.
+    void set_view_stats(std::vector<float> cam_sum, std::vector<uint32_t> cam_cnt);
+
     // ---- Stats ------------------------------------------------------------
 
     int64_t num_train()     const;
@@ -346,6 +414,12 @@ public:
     // would be a no-op). Used by the engine to resolve the case where the
     // user has both `split_batch` and `use_fused_proj_bwd_optim` enabled.
     int64_t max_input_batch_size() const;
+
+    // Most render passes one input image costs: 1 unless faces differ in size.
+    int max_face_passes() const;
+
+    // The progressive-resolution divisor of the last training step handed out.
+    int last_train_divisor() const;
 
 private:
     std::unique_ptr<DataManagerImpl> _impl;

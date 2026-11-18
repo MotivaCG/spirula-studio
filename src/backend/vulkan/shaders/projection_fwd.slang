@@ -1,24 +1,21 @@
-// Fused projection forward (Vulkan backend), mirroring
-// kernels/projection/ProjectionFwd_kernel.cuh: one thread per (camera, gaussian), all math
-// via the shared slang modules (primitive_3dgs.slang / harmonics.slang).
-//
-// Variants (specialization constants, matching the CUDA template axes):
-//   kCameraModel  = CameraModelType (0..3)
-//   kShDegree     = 0..4
-//   kAntialiased  = 0 (Vanilla3DGS) | 1 (MipSplatting)
-//   kShValueBits  = 0 (fp32) | 8 | 16 (the CUDA VALUE_BITS template axis;
-//                   decode via sh_quant.slang's word-based q8/q16 loads)
-//   kDistortion   = CameraDistortionType (0..3), declared last (dist_spec.slang)
-//
-// Params exceed the 128-byte push floor -> delivered via the params ring
-// (push constant = one device address).
+// Projection forward (Vulkan backend), mirroring
+// kernels/projection/ProjectionFwd_kernel.cuh: one thread per (camera,
+// gaussian), the math from the shared slang modules. The CUDA template axes
+// are specialization constants (kShValueBits = VALUE_BITS, 0 for fp32), plus
+// kSbLobes, which CUDA lacks; kDistortion is declared last (dist_spec.slang).
+// Params exceed the 128-byte push floor and go through the params ring.
 
 #define CudaDeviceExport ForceInline
 #include "int64_compat.slang"
+#include "aabb16.slang"
+#include "shaders/packed_mask.h"
+#include "screen.slang"
 #include "shaders/primitive_3dgs.slang"
 #include "shaders/harmonics.slang"
 #undef CudaDeviceExport
 #include "sh_quant.slang"
+#include "sh_vjp.slang"
+#include "view_color.slang"
 #include "dist_spec.slang"
 
 [SpecializationConstant]
@@ -29,33 +26,34 @@ const int kShDegree = 0;
 const int kAntialiased = 0;
 [SpecializationConstant]
 const int kShValueBits = 0;
+[SpecializationConstant]
+const int kSbLobes = 0;
 
-// SH -> rgb for one splat, gated exactly like _Base3DGS::project /
-// Primitive3DGUT::project: fp32 features_sh when kShValueBits == 0, else the
-// q8/q16 codec path (base = gid * 3 * num_sh_buffer, matching the encode
-// side; bounds_stride is resolved by the host launcher).
+// The colour row -> rgb for one splat, gated exactly like _Base3DGS::project:
+// fp32 features_sh when kShValueBits == 0, else the q8/q16 codec path
+// (docs/notes/sh-quant-layout.md).
 [ForceInline]
 float3 eval_splat_color(float3 mean, float3x3 R, float3 t, float3 dc,
                         float* features_sh, uint sh_stride, uint gid,
                         uint* sh_packed, float2* sh_bounds,
-                        uint num_sh_buffer, gindex_t sh_bounds_stride) {
-    if (kShValueBits == 8 || kShValueBits == 16) {
-        gindex_t base = (gindex_t)3 * (gindex_t)num_sh_buffer * (gindex_t)gid;
-        if (kShValueBits == 8)
-            return sh_to_color_qw<8>(kShDegree, mean, R, t, dc, sh_packed,
-                                     sh_bounds, base, sh_bounds_stride);
-        return sh_to_color_qw<16>(kShDegree, mean, R, t, dc, sh_packed,
-                                  sh_bounds, base, sh_bounds_stride);
-    }
-    float* sh = features_sh + gid * sh_stride;
-    switch (kShDegree) {
-    case 0: return sh0_to_color(mean, R, t, dc, sh);
-    case 1: return sh1_to_color(mean, R, t, dc, sh);
-    case 2: return sh2_to_color(mean, R, t, dc, sh);
-    case 3: return sh3_to_color(mean, R, t, dc, sh);
-    case 4: return sh4_to_color(mean, R, t, dc, sh);
-    }
-    return float3(0.0f);
+                        uint num_sh_buffer, gindex_t sh_bounds_stride,
+                        uint sb_base) {
+    ShAddrW a = sh_quant_addr_w(num_sh_buffer, sh_bounds_stride);
+    ColorRow row;
+    row.fp32 = elem_at(features_sh, (gindex_t)gid * (gindex_t)sh_stride);
+    row.packed = sh_packed;
+    row.bounds = sh_bounds;
+    row.base = sh_addr_base(a, gid);
+    row.bounds_stride = a.bounds_stride;
+    row.pair_pitch = a.pair_pitch;
+    if (kShValueBits == 8)
+        return color_eval<8>(kShDegree, kSbLobes, int(sb_base), mean, R, t,
+                             dc, row);
+    if (kShValueBits == 16)
+        return color_eval<16>(kShDegree, kSbLobes, int(sb_base), mean, R, t,
+                              dc, row);
+    return color_eval<0>(kShDegree, kSbLobes, int(sb_base), mean, R, t, dc,
+                         row);
 }
 
 struct ProjectionFwdParams {
@@ -72,15 +70,10 @@ struct ProjectionFwdParams {
     float4* intrins;      // [C]
     float* dist_coeffs;   // [C,8] or null
     // outputs
-    float4* out_aabb;     // [C,N]
+    uint2* out_aabb;      // [C,N] packed, aabb16.slang
     float* out_depths;    // [C,N]
     uint32_t* out_radii;  // [N] float bits; atomic max (radius >= 0)
-    // ScreenBuffer (TensorArray<5>) flattened; null members are skipped.
-    float* s_xy;
-    float* s_depth;
-    float* s_conic;
-    float* s_opac;
-    float* s_rgb;
+    float* s_screen;      // packed ScreenBuffer rows [.., SCR2_STRIDE]
     // SH value-quant (kShValueBits 8/16); null / 0 in the fp32 path.
     uint* sh_packed;
     float2* sh_bounds;
@@ -92,7 +85,7 @@ struct ProjectionFwdParams {
     uint32_t height;
     uint32_t wgs_per_row; // grid fold (flat id = wg.y * wgs_per_row*128 + x)
     uint32_t num_sh_buffer;
-    uint32_t _pad0;
+    uint32_t sb_base;     // float3 coefficient of the first lobe in a row
 };
 
 void run_projection<let cam: CameraModelType, D : ICameraDistortion>(
@@ -142,7 +135,8 @@ void run_projection<let cam: CameraModelType, D : ICameraDistortion>(
     if (aabb.z > aabb.x && aabb.w > aabb.y)
         rgb = eval_splat_color(mean, R, t, dc, p.features_sh, p.sh_stride,
                                gid, p.sh_packed, p.sh_bounds,
-                               p.num_sh_buffer, i64mem_get(p.sh_bounds_stride));
+                               p.num_sh_buffer, i64mem_get(p.sh_bounds_stride),
+                               p.sb_base);
 
     // store (mirrors the kernel epilogue: clamp, degenerate cull, atomics)
     aabb.x = clamp(aabb.x, 0.0f, float(p.width) - 1.0f);
@@ -150,28 +144,15 @@ void run_projection<let cam: CameraModelType, D : ICameraDistortion>(
     aabb.z = clamp(aabb.z, 0.0f, float(p.width) - 1.0f);
     aabb.w = clamp(aabb.w, 0.0f, float(p.height) - 1.0f);
     if (aabb.z - aabb.x > 1e-3f && aabb.w - aabb.y > 1e-3f) {
-        if (!is_null(p.s_xy)) {
-            p.s_xy[2 * idx] = s_xy.x;
-            p.s_xy[2 * idx + 1] = s_xy.y;
-        }
-        if (!is_null(p.s_depth)) p.s_depth[idx] = s_depth;
-        if (!is_null(p.s_conic)) {
-            p.s_conic[3 * idx] = s_conic.x;
-            p.s_conic[3 * idx + 1] = s_conic.y;
-            p.s_conic[3 * idx + 2] = s_conic.z;
-        }
-        if (!is_null(p.s_opac)) p.s_opac[idx] = s_opac;
-        if (!is_null(p.s_rgb)) {
-            p.s_rgb[3 * idx] = rgb.x;
-            p.s_rgb[3 * idx + 1] = rgb.y;
-            p.s_rgb[3 * idx + 2] = rgb.z;
-        }
-        p.out_aabb[idx] = aabb;
+        if (!is_null(p.s_screen))
+            scr2_store(scr2_row(p.s_screen, idx), s_xy, s_depth, s_conic,
+                       s_opac, rgb);
+        p.out_aabb[idx] = aabb16_encode(aabb, p.width, p.height);
         p.out_depths[idx] = sorting_depth;
         // float atomicMax on non-negative floats == uint max on bits.
         InterlockedMax(p.out_radii[gid], asuint(radius));
     } else {
-        p.out_aabb[idx] = float4(0.0f);
+        p.out_aabb[idx] = uint2(0u, 0u);
         p.out_depths[idx] = 0.0f;
     }
 }
@@ -185,15 +166,14 @@ void projection_fwd_3dgs(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
     ProjectionFwdParams p = *pp;
     uint idx = (wg.y * p.wgs_per_row + wg.x) * 128 + tid;
     if (idx >= p.C * p.N) return;
-    SS_DISPATCH_CAM_DIST(_pf_call)
+    SS_DISPATCH_CAM_DIST_FWD(_pf_call)
 }
 #undef _pf_call
 
 // ---------------------------------------------------------------------------
 // 3DGUT (eval3d): projection_3dgs<cam, D, false, true>, antialiased always
-// false; the ScreenBuffer is TensorArray<3> {scale, opacity, rgb} where the
-// "conic" output lands in the scale slot (the eval3d rasterizer culls with
-// the projected 2D conic). Mirrors Primitive3DGUT.cuh project().
+// false; the projected 2D conic lands in the screen row's "scale" slot, which
+// is what the eval3d rasterizer culls with. Mirrors Primitive3DGUT::project().
 // ---------------------------------------------------------------------------
 
 struct Projection3dgutParams {
@@ -206,12 +186,10 @@ struct Projection3dgutParams {
     float* viewmats;
     float4* intrins;
     float* dist_coeffs;
-    float4* out_aabb;
+    uint2* out_aabb;      // packed, aabb16.slang
     float* out_depths;
     uint32_t* out_radii;
-    float* s_scale;  // [C*N,3]
-    float* s_opac;   // [C*N,1]
-    float* s_rgb;    // [C*N,3]
+    float* s_screen;  // [C*N, SCRG_STRIDE]
     uint* sh_packed;
     float2* sh_bounds;
     i64mem_t sh_bounds_stride;
@@ -222,7 +200,7 @@ struct Projection3dgutParams {
     uint32_t height;
     uint32_t wgs_per_row;
     uint32_t num_sh_buffer;
-    uint32_t _pad0;
+    uint32_t sb_base;     // float3 coefficient of the first lobe in a row
 };
 
 void run_projection_3dgut<let cam: CameraModelType, D : ICameraDistortion>(
@@ -269,29 +247,21 @@ void run_projection_3dgut<let cam: CameraModelType, D : ICameraDistortion>(
     if (aabb.z > aabb.x && aabb.w > aabb.y)
         rgb = eval_splat_color(mean, R, t, dc, p.features_sh, p.sh_stride,
                                gid, p.sh_packed, p.sh_bounds,
-                               p.num_sh_buffer, i64mem_get(p.sh_bounds_stride));
+                               p.num_sh_buffer, i64mem_get(p.sh_bounds_stride),
+                               p.sb_base);
 
     aabb.x = clamp(aabb.x, 0.0f, float(p.width) - 1.0f);
     aabb.y = clamp(aabb.y, 0.0f, float(p.height) - 1.0f);
     aabb.z = clamp(aabb.z, 0.0f, float(p.width) - 1.0f);
     aabb.w = clamp(aabb.w, 0.0f, float(p.height) - 1.0f);
     if (aabb.z - aabb.x > 1e-3f && aabb.w - aabb.y > 1e-3f) {
-        if (!is_null(p.s_scale)) {
-            p.s_scale[3 * idx] = s_scale.x;
-            p.s_scale[3 * idx + 1] = s_scale.y;
-            p.s_scale[3 * idx + 2] = s_scale.z;
-        }
-        if (!is_null(p.s_opac)) p.s_opac[idx] = s_opac;
-        if (!is_null(p.s_rgb)) {
-            p.s_rgb[3 * idx] = rgb.x;
-            p.s_rgb[3 * idx + 1] = rgb.y;
-            p.s_rgb[3 * idx + 2] = rgb.z;
-        }
-        p.out_aabb[idx] = aabb;
+        if (!is_null(p.s_screen))
+            scrg_store(scrg_row(p.s_screen, idx), s_scale, s_opac, rgb);
+        p.out_aabb[idx] = aabb16_encode(aabb, p.width, p.height);
         p.out_depths[idx] = sorting_depth;
         InterlockedMax(p.out_radii[gid], asuint(radius));
     } else {
-        p.out_aabb[idx] = float4(0.0f);
+        p.out_aabb[idx] = uint2(0u, 0u);
         p.out_depths[idx] = 0.0f;
     }
 }
@@ -305,7 +275,7 @@ void projection_fwd_3dgut(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
     Projection3dgutParams p = *pp;
     uint idx = (wg.y * p.wgs_per_row + wg.x) * 128 + tid;
     if (idx >= p.C * p.N) return;
-    SS_DISPATCH_CAM_DIST(_pg_call)
+    SS_DISPATCH_CAM_DIST_FWD(_pg_call)
 }
 #undef _pg_call
 
@@ -328,7 +298,8 @@ struct PackedMaskParams {  // fits in the 128-byte push floor: pushed direct
     float* viewmats;
     float4* intrins;
     float* dist_coeffs;
-    int* out_mask;  // [C*N] 0/1
+    uint* out_bits;      // [wgs * SS_PMASK_WORDS] visibility bitmask
+    int* out_counts;     // [wgs] popcount of this workgroup's bits
     uint32_t C;
     uint32_t N;
     uint32_t width;
@@ -336,10 +307,12 @@ struct PackedMaskParams {  // fits in the 128-byte push floor: pushed direct
     uint32_t wgs_per_row;
 };
 
-void run_packed_mask<let cam: CameraModelType, D : ICameraDistortion,
+// GAUSSIAN-major, so the nnz list the prefix scan compacts comes out sorted
+// by gaussian id and the backward passes need no sort of their own.
+bool run_packed_mask<let cam: CameraModelType, D : ICameraDistortion,
                      let eval3d: bool>(PackedMaskParams p, uint idx) {
-    uint cid = (idx / p.N) % p.C;
-    uint gid = idx % p.N;
+    uint gid = idx / p.C;
+    uint cid = idx % p.C;
 
     float* vm = p.viewmats + cid * 16;
     float3x3 R;
@@ -380,23 +353,45 @@ void run_packed_mask<let cam: CameraModelType, D : ICameraDistortion,
     aabb.y = clamp(aabb.y, 0.0f, float(p.height) - 1.0f);
     aabb.z = clamp(aabb.z, 0.0f, float(p.width) - 1.0f);
     aabb.w = clamp(aabb.w, 0.0f, float(p.height) - 1.0f);
-    p.out_mask[idx] =
-        (aabb.z - aabb.x > 1e-3f && aabb.w - aabb.y > 1e-3f) ? 1 : 0;
+    return aabb.z - aabb.x > 1e-3f && aabb.w - aabb.y > 1e-3f;
 }
 
-#define _pm_call_3d(M, D) run_packed_mask<M, D, true>(p, idx)
-#define _pm_call_2d(M, D) run_packed_mask<M, D, false>(p, idx)
+#define _pm_call_3d(M, D) keep = run_packed_mask<M, D, true>(p, idx)
+#define _pm_call_2d(M, D) keep = run_packed_mask<M, D, false>(p, idx)
+
+groupshared uint g_mask_bits[SS_PMASK_WORDS];
 
 [shader("compute")]
-[numthreads(128, 1, 1)]
+[numthreads(SS_PMASK_BLOCK, 1, 1)]
 void projection_packed_mask(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
                             uniform PackedMaskParams p) {
-    uint idx = (wg.y * p.wgs_per_row + wg.x) * 128 + tid;
-    if (idx >= p.C * p.N) return;
-    if (kEval3d != 0) {
-        SS_DISPATCH_CAM_DIST(_pm_call_3d)
-    } else {
-        SS_DISPATCH_CAM_DIST(_pm_call_2d)
+    uint blk = wg.y * p.wgs_per_row + wg.x;
+    // gridDim 65535 fold: the last row overshoots the ceil-div block count,
+    // while out_bits / out_counts hold exactly that many slots.
+    if (blk * SS_PMASK_BLOCK >= p.C * p.N) return;
+
+    if (tid < SS_PMASK_WORDS) g_mask_bits[tid] = 0u;
+    GroupMemoryBarrierWithGroupSync();
+
+    uint idx = blk * SS_PMASK_BLOCK + tid;
+    if (idx < p.C * p.N) {
+        bool keep = false;
+        if (kEval3d != 0) {
+            SS_DISPATCH_CAM_DIST_FWD(_pm_call_3d)
+        } else {
+            SS_DISPATCH_CAM_DIST_FWD(_pm_call_2d)
+        }
+        if (keep) InterlockedOr(g_mask_bits[tid >> 5], 1u << (tid & 31));
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (tid < SS_PMASK_WORDS)
+        p.out_bits[blk * SS_PMASK_WORDS + tid] = g_mask_bits[tid];
+    if (tid == 0) {
+        int n = 0;
+        for (uint k = 0; k < SS_PMASK_WORDS; ++k)
+            n += int(countbits(g_mask_bits[k]));
+        p.out_counts[blk] = n;
     }
 }
 #undef _pm_call_3d
@@ -412,17 +407,14 @@ struct PackedFwdParams {
     float* viewmats;
     float4* intrins;
     float* dist_coeffs;
-    int* mask_scan;         // [C*N] inclusive scan of the mask
+    uint* mask_bits;        // [wgs * SS_PMASK_WORDS] visibility bitmask
+    int* block_scan;        // [wgs] inclusive scan of the workgroup counts
     int* out_camera_ids;    // [nnz]
     int* out_gaussian_ids;  // [nnz]
-    float4* out_aabb;       // [nnz]
+    uint2* out_aabb;        // [nnz] packed, aabb16.slang
     float* out_depths;      // [nnz]
     uint32_t* out_radii;    // [N] float bits, atomic max
-    float* s0;              // screen tensors: 3DGS xy/depth/conic/opac/rgb,
-    float* s1;              // 3DGUT scale/opac/rgb (s3, s4 null)
-    float* s2;
-    float* s3;
-    float* s4;
+    float* s_screen;        // packed rows: SCR2_* for 2D, SCRG_* for 3DGUT
     uint* sh_packed;
     float2* sh_bounds;
     i64mem_t sh_bounds_stride;
@@ -433,16 +425,13 @@ struct PackedFwdParams {
     uint32_t height;
     uint32_t wgs_per_row;
     uint32_t num_sh_buffer;
-    uint32_t _pad0;
+    uint32_t sb_base;     // float3 coefficient of the first lobe in a row
 };
 
 void run_packed_fwd<let cam: CameraModelType, D : ICameraDistortion,
-                    let eval3d: bool>(PackedFwdParams p, uint idx) {
-    int out_idx = idx == 0 ? 0 : p.mask_scan[idx - 1];
-    if (p.mask_scan[idx] == out_idx) return;
-
-    uint cid = (idx / p.N) % p.C;
-    uint gid = idx % p.N;
+                    let eval3d: bool>(PackedFwdParams p, uint idx, int out_idx) {
+    uint gid = idx / p.C;  // see run_packed_mask
+    uint cid = idx % p.C;
 
     float* vm = p.viewmats + cid * 16;
     float3x3 R;
@@ -483,63 +472,55 @@ void run_packed_fwd<let cam: CameraModelType, D : ICameraDistortion,
     if (aabb.z > aabb.x && aabb.w > aabb.y)
         rgb = eval_splat_color(mean, R, t, dc, p.features_sh, p.sh_stride,
                                gid, p.sh_packed, p.sh_bounds,
-                               p.num_sh_buffer, i64mem_get(p.sh_bounds_stride));
+                               p.num_sh_buffer, i64mem_get(p.sh_bounds_stride),
+                               p.sb_base);
 
     p.out_camera_ids[out_idx] = int(cid);
     p.out_gaussian_ids[out_idx] = int(gid);
-    aabb.x = clamp(aabb.x, 0.0f, float(p.width) - 1.0f);
-    aabb.y = clamp(aabb.y, 0.0f, float(p.height) - 1.0f);
-    aabb.z = clamp(aabb.z, 0.0f, float(p.width) - 1.0f);
-    aabb.w = clamp(aabb.w, 0.0f, float(p.height) - 1.0f);
-    p.out_aabb[out_idx] = aabb;
+    p.out_aabb[out_idx] = aabb16_encode(aabb, p.width, p.height);
     p.out_depths[out_idx] = sorting_depth;
-    if (eval3d) {  // Screen = {scale, opacity, rgb}
-        if (!is_null(p.s0)) {
-            p.s0[3 * out_idx] = conic.x;
-            p.s0[3 * out_idx + 1] = conic.y;
-            p.s0[3 * out_idx + 2] = conic.z;
-        }
-        if (!is_null(p.s1)) p.s1[out_idx] = opac;
-        if (!is_null(p.s2)) {
-            p.s2[3 * out_idx] = rgb.x;
-            p.s2[3 * out_idx + 1] = rgb.y;
-            p.s2[3 * out_idx + 2] = rgb.z;
-        }
-    } else {  // Screen = {xy, depth, conic, opac, rgb}
-        if (!is_null(p.s0)) {
-            p.s0[2 * out_idx] = xy.x;
-            p.s0[2 * out_idx + 1] = xy.y;
-        }
-        if (!is_null(p.s1)) p.s1[out_idx] = depth;
-        if (!is_null(p.s2)) {
-            p.s2[3 * out_idx] = conic.x;
-            p.s2[3 * out_idx + 1] = conic.y;
-            p.s2[3 * out_idx + 2] = conic.z;
-        }
-        if (!is_null(p.s3)) p.s3[out_idx] = opac;
-        if (!is_null(p.s4)) {
-            p.s4[3 * out_idx] = rgb.x;
-            p.s4[3 * out_idx + 1] = rgb.y;
-            p.s4[3 * out_idx + 2] = rgb.z;
-        }
+    if (!is_null(p.s_screen)) {
+        if (eval3d)  // Screen = {scale, opacity, rgb}
+            scrg_store(scrg_row(p.s_screen, out_idx), conic, opac, rgb);
+        else         // Screen = {xy, conic, opac, depth, rgb}
+            scr2_store(scr2_row(p.s_screen, out_idx), xy, depth, conic, opac,
+                       rgb);
     }
     InterlockedMax(p.out_radii[gid], asuint(radius));
 }
 
-#define _pk_call_3d(M, D) run_packed_fwd<M, D, true>(p, idx)
-#define _pk_call_2d(M, D) run_packed_fwd<M, D, false>(p, idx)
+#define _pk_call_3d(M, D) run_packed_fwd<M, D, true>(p, idx, out_idx)
+#define _pk_call_2d(M, D) run_packed_fwd<M, D, false>(p, idx, out_idx)
+
+groupshared uint g_fwd_bits[SS_PMASK_WORDS];
 
 [shader("compute")]
-[numthreads(128, 1, 1)]
+[numthreads(SS_PMASK_BLOCK, 1, 1)]
 void projection_packed_fwd(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
                            uniform PackedFwdParams* pp) {
     PackedFwdParams p = *pp;
-    uint idx = (wg.y * p.wgs_per_row + wg.x) * 128 + tid;
-    if (idx >= p.C * p.N) return;
+    uint blk = wg.y * p.wgs_per_row + wg.x;
+    if (blk * SS_PMASK_BLOCK >= p.C * p.N) return;  // fold tail, see the mask
+    if (tid < SS_PMASK_WORDS)
+        g_fwd_bits[tid] = p.mask_bits[blk * SS_PMASK_WORDS + tid];
+    GroupMemoryBarrierWithGroupSync();
+
+    uint word = g_fwd_bits[tid >> 5];
+    if (((word >> (tid & 31)) & 1u) == 0u) return;
+
+    // Output slot = scanned count of the workgroups before this one + the bits
+    // set below this thread inside it. Out-of-range lanes never set a bit, so
+    // the range test is implicit.
+    int out_idx = blk == 0 ? 0 : p.block_scan[blk - 1];
+    for (uint k = 0; k < (tid >> 5); ++k)
+        out_idx += int(countbits(g_fwd_bits[k]));
+    out_idx += int(countbits(word & ((1u << (tid & 31)) - 1u)));
+
+    uint idx = blk * SS_PMASK_BLOCK + tid;
     if (kEval3d != 0) {
-        SS_DISPATCH_CAM_DIST(_pk_call_3d)
+        SS_DISPATCH_CAM_DIST_FWD(_pk_call_3d)
     } else {
-        SS_DISPATCH_CAM_DIST(_pk_call_2d)
+        SS_DISPATCH_CAM_DIST_FWD(_pk_call_2d)
     }
 }
 #undef _pk_call_3d

@@ -4,13 +4,16 @@
 // resampled into pinhole faces on the way in and the prediction gathered into
 // the source camera's own frame on the way out, planned once per camera.
 //
-// The faces OVERLAP and `gather` cross-fades them, because each is a separate
-// call into a network that re-guesses its depth scale and its horizon every
-// time. src/metric3d/README.md, "The camera side", is the rest of it.
+// The faces are laid out from what the lens actually holds -- a front face
+// plus a ring of upright square faces reaching the visible boundary -- and
+// OVERLAP so `gather` can cross-fade them, because each is a separate call
+// into a network that re-guesses its depth scale and its horizon every time.
+// src/metric3d/README.md, "The camera side", is the rest of it.
 
 #include "core/CameraModel.h"
 
 #include <cstdint>
+#include <array>
 #include <string>
 #include <vector>
 
@@ -35,18 +38,28 @@ struct GeometryCamera {
     float source_params[16] = {};
 };
 
+// Where a split face takes its pixel density: the written map's, or the frame's
+// own -- several times the work on a capture much larger than the map, for no
+// measured gain (src/metric3d/README.md, "Face size").
+enum class FaceRes { Output, Source };
+
+// Ring: the overlapping faces a monocular network needs to cross-fade. Cube: upright
+// front, side and back faces, each cropped to what the lens holds -- fewer views to match.
+enum class FaceLayout { Ring, Cube };
+
 class GeometryWarp {
 public:
-    // A split face is sized off cam.width x cam.height, NOT out_w x out_h, and
-    // only then capped at `max_face`; sides land on a multiple of `patch`.
-    // Throws std::runtime_error when the camera leaves no usable face.
+    // Split faces: `res`'s density, raised toward `min_face_px` pixels (never
+    // past the frame's own), capped at `max_face`; sides land on a multiple of
+    // `patch`. Throws std::runtime_error when nothing is visible.
     void plan(const GeometryCamera& cam, int out_w, int out_h, bool split, int patch,
-              int max_face);
+              int max_face, FaceRes res = FaceRes::Output, int64_t min_face_px = 0,
+              bool source_indices = false, FaceLayout layout = FaceLayout::Ring);
 
-    bool split() const { return faces_ > 1; }
-    int  faces() const { return faces_; }
-    int  faceWidth() const { return fw_; }
-    int  faceHeight() const { return fh_; }
+    bool split() const { return faces_.size() > 1; }
+    int  faces() const { return (int)faces_.size(); }
+    int  faceWidth(int k) const { return faces_[(size_t)k].w; }
+    int  faceHeight(int k) const { return faces_[(size_t)k].h; }
     int  outWidth() const { return out_w_; }
     int  outHeight() const { return out_h_; }
     // A split keeps the wide capture's ray semantics; one face keeps z.
@@ -54,34 +67,55 @@ public:
 
     // [faces(), 3, 3], or null for one face. Rows 0 and 1 span the face and
     // carry its half-extent in their LENGTH; row 2 is the unit optical axis.
-    const double* faceAxes() const { return axes_; }
+    const double* faceAxes() const { return axes_.empty() ? nullptr : axes_.data(); }
 
-    // The pinhole a face IS, in its own pixels. Metric3D's depth is canonical
-    // to a focal of 1000, so metres are the prediction times faceFocal() over
+    // The pinhole face k IS, in its own pixels. Metric3D's depth is canonical
+    // to a focal of 1000, so metres are the prediction times faceFocal(k) over
     // 1000; MoGe needs all four to resolve its point map's z shift.
-    double faceFocal() const { return face_focal_; }
-    double faceFocalY() const { return face_focal_y_; }
-    double faceCx() const { return face_cx_; }
-    double faceCy() const { return face_cy_; }
+    double faceFocal(int k) const { return faces_[(size_t)k].fx; }
+    double faceFocalY(int k) const { return faces_[(size_t)k].fy; }
+    double faceCx(int k) const { return faces_[(size_t)k].cx; }
+    double faceCy(int k) const { return faces_[(size_t)k].cy; }
 
-    // The resolution to hand `sampleFace`: full unless `max_face` capped the
-    // faces, and NOT the output resolution, which is capped independently.
+    // The resolution to hand `sampleFace`: the source's, downscaled only as
+    // far as the densest face is, and NOT the output resolution.
     int sampleWidth() const { return sw_; }
     int sampleHeight() const { return sh_; }
 
-    // [sampleHeight(), sampleWidth(), 3] in 0..1 -> [faceHeight(),
-    // faceWidth(), 3]. What the camera cannot see is filled mid-grey; a black
+    // [sampleHeight(), sampleWidth(), 3] in 0..1 -> [faceHeight(k),
+    // faceWidth(k), 3]. What the camera cannot see is filled mid-grey; a black
     // border reads as an edge to the network.
     void sampleFace(int k, const float* src, std::vector<float>& dst) const;
 
-    // `depth[k]` is [fh*fw] canonical depth and `normal[k]` is [fh*fw*3] unit
-    // normals in face k's frame; either list may be empty to skip it. Pixels
-    // no face covers come back 0, the trainer's "no ground truth here".
+    // Borrowed [H,W,2] sample-grid coordinates and [H,W] validity until the next plan().
+    const std::vector<float>& faceSourcePixels(int k) const { return faces_.at((size_t)k).to_src; }
+    const std::vector<float>& faceValidity(int k) const { return faces_.at((size_t)k).valid; }
+    const std::vector<int64_t>& faceSourceIndices(int k) const { return faces_.at((size_t)k).source_indices; }
+    uint64_t bytes() const;
+    // Face pixel centers use 0.5; rays are in the original CV camera frame.
+    std::array<double, 3> faceRay(int k, double px, double py) const;
+    // Exact projection to original-resolution source pixels, including panorama seams.
+    bool faceToSource(int k, double px, double py, double source[2]) const;
+
+    // Per face: [fh*fw] depth in ONE unit across faces, [fh*fw*3] normals in its
+    // own frame, [fh*fw] the chance the model answered; any list may be empty.
+    // 0 where no face reaches or ANY face masked: "no ground truth here".
     void gather(const std::vector<std::vector<float>>& depth,
-                const std::vector<std::vector<float>>& normal, bool ray_depth,
+                const std::vector<std::vector<float>>& normal,
+                const std::vector<std::vector<float>>& mask, bool ray_depth,
                 std::vector<float>* out_depth, std::vector<float>* out_normal) const;
 
 private:
+    struct Face {
+        int    w = 0, h = 0;
+        double fx = 0, fy = 0, cx = 0, cy = 0;
+        // [fh*fw*2] coordinates in the sampleWidth() grid, NaN where the
+        // camera has no ray at all, and [fh*fw] of how much is in frame.
+        std::vector<float> to_src;
+        std::vector<float> valid;
+        std::vector<int64_t> source_indices;
+    };
+
     // One face's claim on one output pixel.
     struct Contrib {
         int32_t face;
@@ -92,17 +126,14 @@ private:
 
     std::vector<double> alignFaces(const std::vector<std::vector<float>>& depth) const;
 
-    const double* axes_ = nullptr;
-    int faces_ = 1, fw_ = 0, fh_ = 0, out_w_ = 0, out_h_ = 0, sw_ = 0, sh_ = 0;
-    // [fh*fw*2] coordinates in the sampleWidth() grid, NaN where the camera
-    // has no ray at all, and [fh*fw] of how much of the sample is in frame.
-    std::vector<std::vector<float>> to_src_;
-    std::vector<std::vector<float>> face_valid_;
+    std::vector<Face>   faces_;
+    GeometryCamera camera_;
+    std::vector<double> axes_;   // [faces, 3, 3], empty for one face
+    int out_w_ = 0, out_h_ = 0, sw_ = 0, sh_ = 0;
     // Which faces reach each output pixel. Row offsets rather than a fixed
     // slot per face: only the overlap names more than one.
     std::vector<int64_t> contrib_off_;
     std::vector<Contrib> contrib_;
-    double face_focal_ = 0.0, face_focal_y_ = 0.0, face_cx_ = 0.0, face_cy_ = 0.0;
 };
 
 }  // namespace app

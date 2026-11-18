@@ -24,6 +24,7 @@
 
 #include "data/DataManager.h"
 #include "engine/EngineConfig.h"
+#include "engine/StepTiming.h"
 
 #include <map>
 #include <string>
@@ -46,6 +47,8 @@ void engine_reset();
 
 // --- Setup ---
 
+// features_sh is [N, K, 3]: SH bands, then `sb_lobes` lobes at the end of
+// each row (core/ColorBasis.h).
 void set_data_3dgs(
     int64_t num_splats,
     TorchTensorView means,
@@ -53,8 +56,17 @@ void set_data_3dgs(
     TorchTensorView scales,
     TorchTensorView opacities,
     TorchTensorView features_dc,
-    TorchTensorView features_sh
+    TorchTensorView features_sh,
+    int sb_lobes
 );
+
+// The region the run may grow in (data/RegionProgram.h): program [n, 6, 4],
+// field nodes [m, 8] and seeds [k, 4], a camera field (labels = index) for
+// normals, sample pattern [s, 4]; copied now. Empty program clears it.
+void engine_set_region(TorchTensorView program, TorchTensorView field_bvh,
+                       TorchTensorView field_seeds, TorchTensorView camera_bvh,
+                       TorchTensorView camera_seeds, TorchTensorView pattern,
+                       float outside_weight, float outside_opacity_decay = 1.0f);
 
 void set_camera_params(
     int width,
@@ -84,13 +96,9 @@ void set_training_data(
 );
 
 
-// Warp-fused GT upload used by engine_train_step_managed when the current
-// batch needs fisheye / equirectangular -> pinhole splitting. The GT RGB
-// (and optionally mask / depth / normal) byte buffer is warped on GPU
-// directly into a post-split float buffer; no full-res float intermediate is
-// allocated. Throws when PPISP is enabled. Depth is warped to per-face ray
-// depth; normal is rotated into each face's camera frame. Pass null
-// gt_depth / gt_normal to disable those.
+// Warp-fused GT upload for a fisheye / equirectangular -> pinhole split: the
+// byte GT is warped on GPU straight into post-split float buffers, through
+// the camera table set_camera_params installed (call it FIRST).
 void set_training_data_warped(
     std::string  input_model_name,    // "FISHEYE" / "EQUISOLID" / "EQUIRECTANGULAR"
     std::string  input_distortion,
@@ -108,10 +116,25 @@ void set_training_data_warped(
     TorchTensorView input_dist_coeffs,// [B_in, 8] float
     TorchTensorView input_source_models,  // [B_in] int32 (nullable)
     TorchTensorView input_source_params,  // [B_in, 16] float
-    uint64_t axes_dev                 // device float ptr [K, 3, 3]
+    TorchTensorView face_axes         // [B_in*K, 3, 3] float (host or device)
 );
 
 // --- Forward ---
+
+// Binning tile edge in pixels for subsequent forwards: a power of two in
+// [8, 128], or 0 to choose from the splat footprint each forward measures.
+// Sticky; throws on a size that is not a supported power of two.
+void engine_set_bin_tile_size(int pixels);
+
+// One training step's fwd+bwd wall time, which the automatic binning search
+// compares between granularities. Training only -- a viewport render must not
+// feed it. No-op when a size is forced.
+void engine_bin_tile_observe(double step_seconds);
+
+// Binning granularity the next forward at the current camera size will use.
+// Anything sized against the tile grid before the forward -- the live-tile
+// map -- has to ask, or it builds a grid the intersect then indexes wrongly.
+int engine_bin_macro_log2();
 
 void forward_3dgs(
     std::string primitive,
@@ -139,6 +162,7 @@ std::map<std::string, float> engine_compute_loss_backward(
     // loss weights
     std::array<float, (int)LossWeightIndex::length> loss_weights,
     float w_ssim,
+    int perceptual_loss,  // PerceptualLoss: what w_ssim weights
     int num_loss_scales,
     // When positive, overrides num_loss_scales based on the render resolution
     // (see LossConfig::loss_scale_min_pixels). Zero leaves it untouched.
@@ -146,6 +170,16 @@ std::map<std::string, float> engine_compute_loss_backward(
     bool compute_loss_map,
     int loss_map_mode,
     float robust_edge_aware_quantile,
+    // Per-side survival factor for the *_nms modes (see LossConfig).
+    float nms_falloff,
+    // In-place post-processing of the finished loss map (see LossConfig).
+    bool loss_map_normalize,
+    float loss_map_clip_quantile,
+    float loss_map_power,
+    // DensifyAccumMode as an int (see LossConfig::loss_map_accum_mode).
+    int loss_map_accum_mode,
+    // Clipped-highlight cutoff (see LossConfig::saturation_threshold).
+    float saturation_threshold,
     // Image-space overexposure regularization weight (see LossConfig).
     // Zero (default) disables the kernel launch entirely.
     float overexposure_reg_weight = 0.0f,
@@ -154,6 +188,11 @@ std::map<std::string, float> engine_compute_loss_backward(
     float color_shift_reg_weight  = 0.0f,
     float color_shift_reg_beta    = 0.0f
 );
+
+// The densification error map for the last forward -- the buffer
+// engine_compute_loss_backward hands the raster backward -- into a host
+// [C, H, W, 1]. Touches no gradient, optimizer or colour-transform state.
+bool engine_preview_loss_map(const LossConfig& loss, TorchTensorView out);
 
 // --- Backward from supplied output cotangents (no loss) ---
 //
@@ -208,20 +247,18 @@ void engine_bilagrid_forward(TorchTensorView cam_indices);
 // Adam step + optional TV-loss regularization for each enabled bilagrid type.
 void engine_bilagrid_optim_step(int step, const BilagridStepConfig& cfg);
 
-// --- PPISP (RGB only, applied AFTER bilagrid). ---
-// Allocates a per-camera PPISP parameter table and seeds it with the type's
-// default values ("original" -> 12 zeros, 12 zeros, 3x(a,a,b,0); "rqs" -> all 0).
-//
-// use_adagrad: if true, PPISP uses unscheduled AdaGrad (lr_decay=0,
-// weight_decay=0, initial_accumulator_value=0, eps=1e-15) instead of Adam.
-// No quantization path is provided for PPISP either way -- the parameter
-// table is small (N_cam x ~36 floats), so the fp32 store/state suffices.
-void engine_init_ppisp(int n_grids, std::string param_type, bool use_adagrad);
+// --- PPISP (RGB only; PpispStepConfig picks where in the chain it runs) ---
+// ppisp_param_spec (kernels/pixelwise/PixelWise.cuh) owns the param_type list.
+
+// exposure_init optionally seeds params[:, 0] with [n_grids] log2 gains;
+// exposure_arithmetic_mean regularizes log2(mean gain), else mean(log2 gain).
+void engine_init_ppisp(int n_grids, std::string param_type, bool use_adagrad,
+                       bool exposure_arithmetic_mean,
+                       const std::vector<float>& exposure_init = {});
 
 // Apply PPISP forward in place on the current rendered RGB; saves a pre-PPISP
-// copy used by backward. cam_indices: [C_batch] int32, or null/empty for
-// identity. Must be called after forward_3dgs (and after engine_bilagrid_forward
-// when bilagrid is also enabled).
+// copy used by backward. cam_indices: [C_batch] int32, null/empty for identity.
+// After forward_3dgs -- the before-color-space order runs inside it instead.
 void engine_ppisp_forward(TorchTensorView cam_indices);
 
 // Optimizer step over the PPISP parameter table (Adam or AdaGrad depending on
@@ -230,32 +267,52 @@ void engine_ppisp_forward(TorchTensorView cam_indices);
 // in PPISPRegLossIndex order.
 void engine_ppisp_optim_step(int step, const PpispStepConfig& cfg);
 
-// --- Background blending (applied BEFORE bilagrid/PPISP) ---
-//
-// Two modes -- exactly one of these init calls activates background blending:
-//   Noise: random per-pixel color, warmup-weighted via cfg.background.randomize_weight.
-//   SH:    skybox = SH(world ray dir), DC (slot 0) seeds the "background_color"
-//          plus higher-order bands; both updated by Adam when train_color=true.
-//
-// dc_color is the linear-space DC color used at SH init time (set slot 0).
-void engine_init_background_noise(bool splat_color_is_linear);
-void engine_init_background_sh(
-    int sh_degree, bool splat_color_is_linear);
+// Per-image warp of the ground truth onto the render (docs/notes/calib-warp.md);
+// one table row per post camera, none when n_cams is 0.
+void engine_init_calib_warp(int n_cams, const CalibWarpConfig& cfg);
+bool engine_calib_warp_wants_depth();
+// After engine_eval_forward: `src` (the view's render, host [C,H,W,3]) warped onto
+// the staged GT into `out`, by a flow fitted on `est` (it colour-corrected), the
+// staged mask's pixels left out with `use_mask`; outside pixels take the GT.
+void engine_calib_warp_align_to_gt(const float* est, const float* src, float* out,
+                                   bool use_mask);
 
-// Per-iter (seed, randomize_weight) for the next forward_3dgs background blend.
-// Training calls this each step; the viewer/eval path can ignore it and reuse
-// the last-stashed values (the engine defaults of 0/0 produce a uniform
-// half-gray noise blend, avoiding per-frame flicker in noise-mode viewer renders).
-void engine_set_background_step_params(uint32_t seed, float randomize_weight);
+// --- Background blending (applied BEFORE bilagrid/PPISP) ---
+// Exactly one of these init calls activates it; `--background-mode` picks.
+
+// Random color per pixel, warmup-weighted via cfg.background.randomize_weight.
+void engine_init_background_noise(int splat_transfer, bool splat_is_linear);
+// Same blend, but the draw is one of the 8 RGB cube corners per tile instead
+// of per-pixel noise: the extremes cost residual transparency the most, and a
+// tile survives the SSIM window that averages per-pixel noise back to grey.
+void engine_init_background_pseudorandom(int splat_transfer, bool splat_is_linear);
+// Same blend again over one cell covering the whole frame: a flat color that
+// changes every step, warmup-weighted like the other two.
+void engine_init_background_random(int splat_transfer, bool splat_is_linear);
+// `color` is display-referred RGB in [0, 1]; the engine converts it once, and
+// all-black turns the background OFF instead of blending a no-op.
+void engine_init_background_color(const float color[3], int splat_transfer,
+                                  bool splat_is_linear);
+// Skybox = SH(world ray dir); slot 0 is the DC color, and Adam updates the
+// whole table.
+void engine_init_background_sh(
+    int sh_degree, int splat_transfer, bool splat_is_linear);
+bool engine_has_background_sh(int* out_degree = nullptr);
+
+// Per-iter values for the next forward_3dgs blend. The loss scale pair is the
+// LossConfig's, because the randomized backgrounds size their cells over the
+// same pyramid. All-zero is the flicker-free viewer/eval default.
+void engine_set_background_step_params(uint32_t seed, float randomize_weight,
+                                       int num_loss_scales,
+                                       int loss_scale_min_pixels);
 
 // Adam step over the SH coefficient table. No-op for Noise mode or when SH
 // training was not enabled at init.
 void engine_background_optim_step(int step, const BackgroundStepConfig& cfg);
 
-// Copy the engine's background image for the current camera setup to a host
-// (..., H, W, 3) float buffer. SH mode: returns the skybox rendered by the
-// most recent forward_3dgs. Noise mode: returns a uniform mean-color image.
-// Returns 1 on success, 0 if no engine background is active.
+// Copy the engine's background for the current cameras into a host
+// (..., H, W, 3) float buffer: SH gives the last forward's skybox, Color and
+// the randomized modes a flat fill. 0 when no background is active.
 int engine_copy_background_to_host(TorchTensorView out_image);
 
 // --- Linear / wide-gamut color space ---
@@ -269,9 +326,11 @@ int engine_copy_background_to_host(TorchTensorView out_image);
 // matrices when the corresponding side is not enabled.
 void engine_init_color_space(
     bool splat_enabled,
-    bool splat_is_linear,
+    int splat_transfer,                       // colorspace::Transfer
+    bool splat_is_linear,                     // splats store linear light
     std::vector<float> splat_color_matrix,    // [9], row-major
     bool image_enabled,
+    int image_transfer,
     bool image_is_linear,
     std::vector<float> image_color_matrix     // [9], row-major
 );
@@ -329,16 +388,19 @@ std::map<std::string, float> engine_train_step_warped(
     int depth_in_H, int depth_in_W,
     TorchTensorView gt_normal_byte,
     int normal_in_H, int normal_in_W,
-    uint64_t axes_dev,
+    TorchTensorView face_axes,
+    // Runs of equal-size faces (DecodedBatch::face_passes). Empty or a single
+    // entry renders every face in one pass at out_W x out_H; more than one
+    // needs the accumulating path, so the fused optimizer must be off.
+    const std::vector<WarpFacePass>& face_passes,
     TorchTensorView bilagrid_cam_indices,
     const EngineStepConfig& cfg
 );
 
 
-// One homogeneous, non-warp sub-batch of a heterogeneous training step. All
-// cameras in a sub-batch share (width, height, camera_model); different
-// sub-batches of the same step may differ. Views point at host buffers that
-// must stay alive for the whole engine_train_step_hetero call.
+// One homogeneous, non-warp sub-batch of a heterogeneous training step: all its
+// cameras share (width, height, camera_model, distortion). The views point at
+// host buffers that must outlive the whole engine_train_step_hetero call.
 struct HeteroSubBatch {
     int width  = 0;
     int height = 0;
@@ -406,6 +468,11 @@ void engine_setup_data_manager(
     std::vector<float>        viewmats,
     std::vector<float>        intrins,
     std::vector<float>        dist_coeffs,
+    // POST-split face size and frame (PostSplitCameras::post_widths /
+    // post_heights / face_axes); empty when the warp path is off.
+    std::vector<int32_t>      post_widths,
+    std::vector<int32_t>      post_heights,
+    std::vector<float>        face_axes,
     // Per-INPUT intrins / dist_coeffs (length N). Required for the wide
     // warp kernel (fisheye / equisolid); pass empty when no fisheye-warp
     // camera is in the dataset.
@@ -423,32 +490,26 @@ std::map<std::string, float> engine_train_step_managed(
     bool packed,
     const EngineStepConfig& cfg);
 
-// Pull the next batch from the DataManager, install it as GT + camera params,
-// and run the forward pass only -- no loss, no backward, no optimizer, no
-// densification. What an eval pass needs: it reuses the same decode, mask and
-// fisheye/equirect warp path training does, so eval GT is the warped GT and
-// not a host-side reconstruction of it.
-//
-// Afterwards `engine_copy_gt_rgb_to_host` and `engine_copy_render_to_host`
-// read the pair back. Returns the POST-split view count in the batch (K per
-// input image), or 0 when the stream is exhausted.
-//
-// Call `engine_setup_data_manager` with the eval split first; that replaces
-// the training DataManager, so this belongs after the training loop.
-int engine_eval_forward(std::string primitive, int sh_degree, bool packed);
+// The progressive-resolution divisor of the last managed step (1 = loaded size).
+int engine_train_resolution_divisor();
+// Seconds managed steps waited for the DataManager since the last call; resets it.
+double engine_take_data_wait_seconds();
 
-// Same, for ONE image chosen by dataset index instead of the next one in the
-// stream: the GUI's ground-truth-vs-render view. `apply_color_correction`
-// additionally runs the per-image bilagrid / PPISP forward the training step
-// runs, so the pair read back is the pair the loss is computed on rather than
-// the raw render.
-//
-// This overwrites the GT and camera-parameter state a training step owns. The
-// next engine_train_step_managed sets both again, so it is safe BETWEEN steps
-// -- take the same mutex the trainer does. Returns the POST-split view count
-// (K) for that image.
+// Answer the DataDecodeError a managed step threw: true re-runs the decode
+// the worker is parked on, false abandons the pipeline. See DataManager.h.
+void engine_resolve_data_error(bool retry);
+
+// Render one eval image by dataset index, using the training decode and warp path.
+// The installed GT remains available to the host-copy functions. Returns face count.
+int engine_eval_forward(int index, std::string primitive, int sh_degree, bool packed);
+
+// Same, for ONE image (the GUI's compare view), one pass of its faces as step `cfg`
+// renders it: returns its views, `out_passes` the image's count. `apply_calib_warp`
+// stages the GT the loss reads. Overwrites a step's GT and camera -- BETWEEN steps.
 int engine_preview_forward(int index, std::string primitive, int sh_degree,
-                           bool packed, bool apply_color_correction);
+                           bool packed, bool apply_color_correction,
+                           bool apply_calib_warp, const EngineStepConfig& cfg,
+                           int pass = 0, int* out_passes = nullptr);
 
 // --- Debug rendering ---
 
@@ -461,8 +522,15 @@ void engine_debug_forward(
 // --- Query internal state ---
 
 void engine_copy_accum_buffer(TorchTensorView dst);
+// Per-camera visit stats for deficit view sampling: accumulated after every
+// backward once enabled, read back as [num_post] sums and counts.
+void engine_set_view_stats(bool enabled);
+void engine_read_view_stats(std::vector<float>& cam_sum, std::vector<uint32_t>& cam_cnt);
+
 int64_t engine_get_cur_num_splats();
 int64_t engine_get_max_num_splats();
+int engine_get_num_sh();   // float3 per features_sh row: SH bands, then lobes
+int engine_get_sb_lobes();
 
 // `out_rgb_raw` is the pre-color-space-conversion render (linear / wide-gamut)
 // stashed by the color-space forward hook. Null OK; when the engine has no
@@ -526,20 +594,10 @@ void engine_copy_grads_to_host(
 );
 
 // --- Viewer ---
-//
-// engine_viewer_init: lazy one-shot upload of the dataset-wide POST-split
-// camera arrays (intrins / dist_coeffs + tier / c2w / camera_models / W / H)
-// and allocation of the device-side per-camera thumbnail cache + done-mask.
-// After this, every set_training_data / set_training_data_warped also runs
-// the thumbnail-fill kernel for any new post-camera ids in the batch (cheap
-// kernel; gated on host counter once all cams have a thumbnail). Idempotent;
-// safe to call multiple times (re-uploads + resets thumbnail state).
-//
-// camera_models / intrins / dist_coeffs / distortions / camera_to_worlds /
-// widths / heights are at POST-split layout (length N_post == sum over input
-// cameras of K), matching the DataManager's post-split arrays.
-//
-// camera_size: the visualization-frustum scale (knn-style), in world units.
+
+// One-shot upload of the POST-split camera table (N_post rows, the
+// DataManager's layout) and the thumbnail cache set_training_data fills.
+// Idempotent (re-upload resets thumbnails). camera_size: frustum scale, world units.
 void engine_viewer_init(
     TorchTensorView camera_models,   // [N_post]   int32
     TorchTensorView intrins,         // [N_post,4] float32
@@ -584,6 +642,7 @@ void engine_blit_view(
     TorchTensorView render_buffer,   // [H,W,1|3] float (channel matches buffer_key)
     TorchTensorView render_depth,    // [H,W,1] float, may be null when buffer_key=="alpha"
     TorchTensorView render_alpha,    // [H,W,1] float
+    bool            alpha_is_transmittance,  // render_alpha holds 1 - alpha
     int             view_camera_model,
     std::string     distortion,
     TorchTensorView view_intrins,    // [1,4]   float
@@ -600,12 +659,28 @@ void engine_blit_view(
     TorchTensorView out_rgb          // [H,W,3] uint8, pre-allocated CUDA
 );
 
+// engine_blit_view of the last forward_3dgs's own rgb, depth and coverage,
+// read where they are: no host round trip. False, drawing nothing, when that
+// render is not one float32 rgb image (a training step's half images).
+bool engine_blit_render(int view_camera_model, std::string distortion,
+                        TorchTensorView view_intrins, TorchTensorView view_viewmat,
+                        TorchTensorView view_dist_coeffs, bool show_training_cameras,
+                        bool show_overlay, float grid_dist, float grid_target_x,
+                        float grid_target_y, float grid_target_z,
+                        TorchTensorView out_rgb);
+// Ray depth (not normalized by coverage) and coverage of the last render at
+// one pixel; false outside it or without a depth channel.
+bool engine_render_sample(int x, int y, float& depth, float& alpha);
+
 // --- Viewer scenes (docs/notes/compare-view.md) ---
 //
 // Several splat sets resident at once, one bound at a time; activating one is
 // a pointer swap. Viewer-only: a slot has no optimizer or densify state.
 constexpr int kMaxEngineScenes = 8;
 
+// sh_value_bits is the slot's SH storage: 32, or 16 / 8 packed
+// (docs/notes/sh-quant-layout.md). 0 picks 16, or 8 when the free VRAM
+// could not also hold a render of every splat.
 void engine_scene_set_data_3dgs(
     int slot,
     int64_t num_splats,
@@ -614,14 +689,36 @@ void engine_scene_set_data_3dgs(
     TorchTensorView scales,
     TorchTensorView opacities,
     TorchTensorView features_dc,
-    TorchTensorView features_sh
+    TorchTensorView features_sh,
+    int sb_lobes,
+    int sh_value_bits = 0
 );
+// The same upload in pieces, for a model too big to hold on the host whole:
+// begin sizes the slot, then runs of rows follow, each starting on a multiple
+// of 256 splats. The slot activates once every row has arrived.
+void engine_scene_begin_3dgs(int slot, int64_t num_splats, int num_sh, int sb_lobes,
+                             int sh_value_bits = 0);
+void engine_scene_upload_3dgs(int slot, int64_t first, TorchTensorView means,
+                              TorchTensorView quats, TorchTensorView scales,
+                              TorchTensorView opacities, TorchTensorView features_dc,
+                              TorchTensorView features_sh);
 
 // The model's own colour space, applied by engine_scene_activate. Two models
 // trained in different spaces are converted each its own way, which is the
 // whole point of carrying it here rather than in the engine's one slot.
-void engine_scene_set_color_space(int slot, bool enabled, bool is_linear,
+void engine_scene_set_color_space(int slot, bool enabled, int transfer,
+                                  bool is_linear,
                                   std::vector<float> color_matrix);
+
+void engine_scene_set_background_sh(int slot, int sh_degree,
+                                   TorchTensorView coeffs, int transfer = 0,
+                                   bool is_linear = false);
+
+// Overwrite one attribute array of a loaded slot in place, at the shape
+// engine_scene_set_data_3dgs uploaded it with. `field` names one of means /
+// quats / scales / opacities / features_dc / features_sh.
+void engine_scene_update(int slot, const std::string& field,
+                         TorchTensorView data);
 
 // Bind `slot` to the world buffers. Throws when the slot holds nothing.
 void engine_scene_activate(int slot);
@@ -636,32 +733,47 @@ std::vector<std::tuple<std::string, size_t, size_t>> engine_get_pool_breakdown()
 std::vector<std::tuple<std::string, std::string, size_t, size_t>>
 engine_get_pool_breakdown_categorized();
 size_t engine_get_scratch_bytes();
+// The most visible and splat-tile pairs one forward has made since the reset,
+// and the splat-tile pairs of the last one.
+void engine_get_isect_peaks(int64_t& pairs, int64_t& isects, int64_t& last_isects);
+// That peak at the finest binning tile the search may still try from here
+// (one size down, or two), or 0 when it cannot go finer: a forced size, the
+// floor, a size that keeps losing, too little free device memory.
+int64_t engine_bin_finer_isects();
+// A timed pass of the PCA regularizer whose device time is now known: the
+// seconds one pass over `splats` takes -- a probe's per-splat slope times
+// them, before the start step. False when there is none to report.
+bool engine_pca_reg_take_timing(double& seconds, int64_t& splats, bool& probed);
 
-// --- Checkpoint save ---
-//
-// Writes into `output_dir`:
-//   splat.ply  : cur_num_splats only, NaN+low-opacity-filtered (inference).
-//   state.tar  : POSIX ustar (zero-dep) containing
-//                  state.json          -- runtime + validation manifest
-//                  <slot_name>.npy     -- one flat typed array per saved pool
-//                                         slot (e.g. world.means.npy,
-//                                         eng.sh_quant.q.npy). Quantized codecs
-//                                         emit .q (packed) and .qb (bounds).
-// Which slots are saved is driven by SaveClass metadata (PoolSlots.h), so the
-// set can never drift from the live buffers:
-//   full_dump=false -> Always slots  (appearance / inference params)
-//   full_dump=true  -> Always+Resume (world raw params + all optimizer state,
-//                                      i.e. sufficient to resume training)
-// The device->host copy is chunked, using no extra device memory.
+// GPU seconds the next step spends in its splat stages (forward, raster and
+// projection backward, optimizer, densify) for the trainer's ETA model. Arm
+// before the step, read after; < 0 if not armed or the device has no timer.
+void engine_step_timing_arm();
+double engine_step_timing_read();
+// Every kernel, fill and copy from arm to read, classified by StepTiming.h;
+// false when the backend timed nothing (CUDA, or no device timestamps).
+void engine_dispatch_timing_arm();
+bool engine_dispatch_timing_read(StepCells& out);
+
+// Formatted per-category pool report (SS_PROFILE). Reads the pool's
+// high-water capacities, so it is a peak, not an instantaneous figure.
+std::string engine_vram_report();
+// Hand that report to the profiler, which prints it at process exit -- by
+// which time the pool this reads is already destroyed. No-op unless
+// SS_PROFILE is set.
+void engine_profile_capture_vram();
+
+// Writes basename.ply/.tar and, for SH backgrounds, background.webp.
+// An empty basename selects the legacy splat.ply/state.tar names.
+// full_dump includes optimizer state for resume; otherwise saves appearance only.
 void engine_save_checkpoint(
     std::string output_dir,
     bool full_dump,
-    int step
+    int step,
+    int background_export_height = 512,
+    std::string basename = "",
+    bool y_up = false
 );
 
-// Restore engine state from `input_dir`/state.tar (resume training). The engine
-// skeleton must already be configured (world seeded at max_num_splats; any
-// bilagrid/PPISP channels in the checkpoint initialized). Sets runtime scalars +
-// optimizer layout from state.json, force-allocates optimizer/appearance-optim
-// buffers, and restores every saved buffer by slot name. Returns the saved step.
-int engine_load_checkpoint(std::string input_dir);
+// Requires seeded world buffers and initialized appearance channels; returns the saved step.
+int engine_load_checkpoint(std::string input_dir, bool restore_projective_depth = true);

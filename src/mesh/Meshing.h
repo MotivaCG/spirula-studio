@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "mesh/MeshExport.h"   // MeshColorMode + format helpers
+#include "mesh/MeshProgress.h"
 
 namespace meshing {
 
@@ -91,16 +92,18 @@ struct MeshingConfig {
     int   carve_k = 1;
 
     // --- export ---
-    // Output color: none, per-vertex color, or a baked texture atlas (UVs via
-    // LSCM charts, see MeshUV.h). Formats that cannot represent the chosen
-    // mode (PLY+texture, OBJ+vertex) are rejected up front.
-    MeshColorMode color_mode = MeshColorMode::Vertex;
-    std::vector<std::string> formats = {"ply"};   // any of ply obj gltf glb
+    // None, per-vertex color, or a baked texture atlas (MeshUV.h). More than
+    // one may be asked for: one extraction, written in each (MeshExport.h).
+    std::vector<MeshColorMode> colors = {MeshColorMode::Vertex};
+    std::vector<std::string> formats = {"ply"};   // any of ply obj gltf glb stl
     int   texture_size = 0;         // square texture atlas resolution;
                                     // 0 = auto from the observed-detail texel
                                     // budget (power of two in [1024, 8192])
     int   tex_gutter_px = 4;        // atlas spacing between charts (texels)
     float chart_angle_deg = 60.0f;  // max normal deviation within a UV chart
+
+    // Told at every stage how far the run is and the memory it expects.
+    MeshProgressSink on_progress;
 };
 
 // Full camera intrinsics/extrinsics for the rasterize-and-sample (dataset)
@@ -113,12 +116,16 @@ struct CameraParams {
     const float* dist_coeffs = nullptr; // [C*8] (may be null => treated as 0)
     const int* widths  = nullptr;       // [C] per-camera image width
     const int* heights = nullptr;       // [C] per-camera image height
-    std::string camera_model;           // engine name, e.g. "PINHOLE"/"FISHEYE"
-    std::string distortion = "NONE";    // tier name, e.g. "OPENCV"/"THIN_PRISM"
+    const int* camera_models = nullptr; // [C] CameraModelType values
+    const int* distortions = nullptr;   // [C] CameraDistortionType values
+                                        //     (may be null => NONE)
     bool valid() const {
-        return viewmats && intrins && widths && heights;
+        return viewmats && intrins && widths && heights && camera_models;
     }
 };
+
+// The distinct camera models in models[0..C), joined for a log line.
+std::string camera_models_summary(const int* models, int C);
 
 // Owns the device-side Gaussian buffers and an LBVH built over their support,
 // plus the (optional) camera positions. Constructed once from host-side raw

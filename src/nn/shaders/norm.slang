@@ -92,6 +92,42 @@ void layer_norm(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID,
 }
 
 // ---------------------------------------------------------------------------
+// RMSNorm of each head, in place. One workgroup per (token, head); the heads are
+// head_dim <= WG wide, so every thread holds at most one element.
+// ---------------------------------------------------------------------------
+
+struct RmsNormHeadsParams {
+    float* x;
+    uint*  weight;     // [head_dim] f32
+    uint   heads;      // tokens * n_heads
+    uint   n_heads;
+    uint   head_dim;
+    uint   row_stride;
+    float  eps;
+    uint   groups_per_row;
+};
+
+[shader("compute")]
+[numthreads(WG, 1, 1)]
+void rms_norm_heads(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID,
+                    uniform RmsNormHeadsParams p) {
+    const uint head = gid.y * p.groups_per_row + gid.x;
+    if (head >= p.heads) return;
+    const uint t = tid.x;
+    const uint off = (head / p.n_heads) * p.row_stride + (head % p.n_heads) * p.head_dim;
+    const float v = t < p.head_dim ? load_f_at(p.x, off + t) : 0.0f;
+    sSqs[t] = v * v;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = WG / 2; stride > 0; stride >>= 1) {
+        if (t < stride) sSqs[t] += sSqs[t + stride];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (t < p.head_dim)
+        store_at(p.x, off + t,
+                 v * rsqrt(sSqs[0] / float(p.head_dim) + p.eps) * asfloat(p.weight[t]));
+}
+
+// ---------------------------------------------------------------------------
 // GroupNorm over a channel-last [N, C] map (N = H*W), C split into `groups`.
 //
 // Two passes: one workgroup per group reduces the whole N*C/groups slice, then
@@ -124,7 +160,7 @@ void group_norm_stats(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID,
     for (uint i = t; i < total; i += uint(WG)) {
         uint row = i / per_group;
         uint c = c0 + (i % per_group);
-        float v = load_elem(p.x, row * p.channels + c, kInputF16 != 0);
+        float v = load_at(p.x, row * p.channels + c, kInputF16 != 0);
         s += v;
         q += v * v;
     }
@@ -173,7 +209,7 @@ void group_norm_apply(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID,
     uint g = c / (p.channels / p.groups);
     float mean = p.stats[g * 2 + 0];
     float inv = p.stats[g * 2 + 1];
-    float v = (load_elem(p.x, i, kInputF16 != 0) - mean) * inv;
+    float v = (load_at(p.x, i, kInputF16 != 0) - mean) * inv;
     v = v * asfloat(p.weight[c]) + asfloat(p.bias[c]);
-    p.out[i] = apply_act(v, int(p.act));
+    store_at(p.out, i, apply_act(v, int(p.act)));
 }

@@ -60,15 +60,33 @@ struct OnnxNode {
     std::vector<std::string> outputs;
 };
 
+// A graph input or output. `shape` carries -1 where the dimension is a
+// symbolic name rather than a number, which is how a fixed input size the
+// export baked in ("image" at [1, 3, 784, 784]) is told from a dynamic one.
+struct OnnxValueInfo {
+    std::string          name;
+    std::vector<int64_t> shape;
+};
+
 struct OnnxFile {
     std::vector<OnnxTensor> initializers;
     std::vector<OnnxNode>   nodes;
+    std::vector<OnnxValueInfo> inputs;
+    std::vector<OnnxValueInfo> outputs;
+    // Unique external initializer files, resolved exactly as the loader opens them.
+    // Populated by read_onnx_structure without reading their payloads.
+    std::vector<std::string> external_files;
     // Keyed by the *scale* initializer's name -- BatchNormalization's input 1,
     // which is the only name a caller folding BN into a conv already knows.
     // Absent means the node did not spell epsilon out, i.e. the ONNX default.
     std::unordered_map<std::string, float> bn_epsilon;
 
     const OnnxTensor* find(const std::string& name) const;
+
+    // A graph input by name, or null. Initializers appear as graph inputs in
+    // some exporters, so this is only trustworthy for the real ones.
+    const OnnxValueInfo* input(const std::string& name) const;
+    const OnnxValueInfo* output(const std::string& name) const;
 
     // The node that produces `tensor`, or null.
     const OnnxNode* producer(const std::string& tensor) const;

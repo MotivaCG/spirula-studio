@@ -1,4 +1,10 @@
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
+if(POLICY CMP0156)
+    cmake_policy(SET CMP0156 NEW)
+endif()
+if(POLICY CMP0179)
+    cmake_policy(SET CMP0179 NEW)
+endif()
 project(spirula_studio LANGUAGES C CXX)  # CUDA enabled by the cuda backend module
 
 # The build (see build_develop.bash / build_develop.bat and docs/build.md).
@@ -12,6 +18,7 @@ project(spirula_studio LANGUAGES C CXX)  # CUDA enabled by the cuda backend modu
 #   SsSfm.cmake            the SfM module (optional; Vulkan-only)
 #   SsNn.cmake             inference layer + SAM + video (optional; Vulkan-only)
 #   SsI18n.cmake           ss_i18n, the translation library (a leaf)
+#   SsLicense.cmake        ss_license, accepted model licences and their texts (a leaf)
 #   SsApps.cmake           the `spirula` executable (every tool in one)
 #   SsPackage.cmake        the redistributable form of it (macOS .app / .dmg)
 #   SsChecks.cmake         the source lints every build runs (last: it makes
@@ -27,6 +34,7 @@ include(SsSources)
 # A leaf everything else may link: the backends print device names, and their
 # test binaries link a backend without the engine.
 include(SsI18n)
+include(SsLicense)
 
 # The web viewer's browser client is compiled into the engine library
 # (app/webviewer/Viewer.cpp), so it must be embedded before either backend
@@ -51,6 +59,10 @@ endif()
 # Likewise for `spirula sam` and the GUI's built-in masking.
 if(SS_BUILD_SAM)
     include(SsNn)
+endif()
+
+if(COMMAND ss_shader_limits_test)
+    ss_shader_limits_test()
 endif()
 
 include(SsApps)
