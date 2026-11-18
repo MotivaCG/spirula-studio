@@ -4306,6 +4306,15 @@ SS_MSG_EN(spacetime_spare, "Spare records");
 SS_MSG_EN(spacetime_spare_help,
     "Records shown in no frame added after the chunk run's, as a share of them, "
     "for relocation to take from the start.");
+SS_MSG_EN(spacetime_motion, "Spacetime scene flow");
+SS_MSG_EN(spacetime_motion_help,
+    "A folder of scene flow fields (fwd_NNN.bin, bwd_NNN.bin) that each record's "
+    "step to the next and the previous frame should follow, as a robust loss "
+    "next to the photometric one. Needs --spacetime-motion-weight.");
+SS_MSG_EN(spacetime_motion_weight, "Spacetime scene flow weight");
+SS_MSG_EN(spacetime_motion_weight_help,
+    "Scale of the scene flow loss: 1 makes a 2 mm step error pull as hard as the "
+    "median photometric position gradient of the first views. 0 turns it off.");
 SS_MSG_EN(temporal_room_ply, "Static room");
 SS_MSG_EN(temporal_room_ply_help,
     "A PLY of everything around the subject, loaded before the seed: rendered and "

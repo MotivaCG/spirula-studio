@@ -3,6 +3,7 @@
 #include "backend/api/BackendRuntime.h"
 #include "data/DataManager.h"
 #include "engine/EngineInternal.h"
+#include "engine/EngineSpacetimeMotion.h"
 #include "engine/EngineState.h"
 #include "nn/core/Parallel.h"
 
@@ -274,6 +275,11 @@ void engine_spacetime_after_step(const SpacetimeRates& lr) {
             st.seen[r] = 1;
         }
     });
+    if (spacetime_motion_active()) {
+        const std::vector<float> ls = download(after_room(s.world.scales.data_ptr(), 12), 3 * n);
+        spacetime_motion_view({&st.rec, st.frame, ls.data(), gm.data(), gq.data(), go.data(), gd.data(),
+                               st.acc.data() + kGradPos, kGradWidth});
+    }
     if (++st.views < std::max(lr.batch, 1)) return;
 
     // One Adam step per record the batch saw, on the batch's mean gradient.
@@ -366,6 +372,7 @@ int64_t engine_spacetime_relocate(int64_t max_new, float min_opacity, uint64_t s
             std::fill_n(st.acc.begin() + r * kGradWidth, kGradWidth, 0.0f);
             st.seen[r] = 0;
         }
+        spacetime_motion_forget((int64_t)r);
     };
     for (size_t j = 0; j < count; j++) {
         const size_t src = (size_t)keys[j].second, dst = (size_t)dead[j];

@@ -245,6 +245,8 @@ inline bool train_choices_free_form(const char* choices) {
     X(float, spacetime_relocate, 0.0f, "splats", "expert", "")               \
     X(int, spacetime_relocate_every, 100, "splats", "expert", "")            \
     X(float, spacetime_spare, 0.0f, "splats", "expert", "")                  \
+    X(std::string, spacetime_motion, "", "splats", "expert", "none")         \
+    X(float, spacetime_motion_weight, 0.0f, "splats", "expert", "")          \
     X(bool, background_match_luminance, false, "splats", "advanced", "")     \
     X(float, viewer_kernel_fraction, 0.3f, "splats", "advanced", "")         \
     X(std::optional<float>, scale_init, 0.35f, "splats", "advanced", "") \

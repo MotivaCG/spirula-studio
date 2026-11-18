@@ -4,6 +4,7 @@
 
 #include "app/TrainerCore.h"
 #include "engine/EngineSpacetime.h"
+#include "engine/EngineSpacetimeMotion.h"
 #include "nn/core/Parallel.h"
 
 #include <algorithm>
@@ -201,6 +202,8 @@ void TrainerSession::setup_spacetime() {
     install_data_manager(images, masks, depths, normals, F);
     engine_spacetime_begin(std::move(_spacetime), F, (int)ds.num_cameras, _room_rows);
     _spacetime = SpacetimeRecords{};
+    if (cfg.spacetime_motion_weight > 0.0f)
+        spacetime_motion_begin(cfg.spacetime_motion, cfg.spacetime_motion_weight, F, engine_spacetime_records().rows);
     fs::create_directories(out_dir / "frames");
     log("spacetime: " + std::to_string(F) + " frames x " + std::to_string(ds.num_cameras) + " views, " +
         std::to_string(engine_get_cur_num_splats()) + " splats");
