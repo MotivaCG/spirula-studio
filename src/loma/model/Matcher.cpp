@@ -13,6 +13,7 @@
 #include "loma/Common.h"
 #include "loma/model/Fetch.h"
 #include "loma/model/Weights.h"
+#include "nn/Blocks.h"
 #include "nn/Ops.h"
 #include "nn/Tensor.h"
 #include "nn/vk/EmbeddedSpirv.h"
@@ -58,24 +59,14 @@ struct Matcher::Impl {
         char p[128];
         std::snprintf(p, sizeof p, "model.transformers.%d.%s", layer, which);
         const std::string b = p;
-        const int64_t d = dim();
-        vk::ArenaScope scope(arena);
-
-        Tensor cat = nn::arena_tensor(arena, DType::F32, n, 2 * d);
-        nn::strided_copy(cat, x, n, d, d, 2 * d);
-        nn::strided_copy(cat.offsetElems(d), message, n, d, d, 2 * d);
-
-        Tensor h = nn::arena_tensor(arena, DType::F32, n, 2 * d);
-        LinearOpts l0;
-        l0.bias = w.get(b + ".ffn.0.bias");
-        nn::linear(h, cat, w.get(b + ".ffn.0.weight"), l0);
-        nn::layer_norm(h, h, w.get(b + ".ffn.1.weight"), w.get(b + ".ffn.1.bias"), 1e-5f);
-        nn::unary(h, h, Act::GeluErf);
-
-        LinearOpts l1;
-        l1.bias = w.get(b + ".ffn.3.bias");
-        l1.residual = x;
-        nn::linear(x, h, w.get(b + ".ffn.3.weight"), l1);
+        nn::ConcatFfn f;
+        f.w0 = w.get(b + ".ffn.0.weight");
+        f.b0 = w.get(b + ".ffn.0.bias");
+        f.ln_w = w.get(b + ".ffn.1.weight");
+        f.ln_b = w.get(b + ".ffn.1.bias");
+        f.w3 = w.get(b + ".ffn.3.weight");
+        f.b3 = w.get(b + ".ffn.3.bias");
+        nn::concat_ffn(arena, x, message, n, dim(), f);
     }
 };
 
@@ -263,10 +254,11 @@ std::vector<Match> Matcher::match(const MatchInput& A, const MatchInput& B,
         const vk::SpecList spec{0u, 0u};
         vk::Stream& st = vk::Stream::get();
         st.dispatchFlat("loma.lse_cols", spec, n1, 256, &ap, sizeof(ap),
-                        &ap.groups_per_row);
+                        &ap.groups_per_row, (double)n0 * n1 * vk::Stream::kElemWork);
         const vk::Stream::Fold f = vk::Stream::fold1D(n0, 1);
         ap.groups_per_row = f.per_row;
-        st.dispatch("loma.assign_rows", spec, f.per_row, f.rows, 1, &ap, sizeof(ap));
+        st.dispatch("loma.assign_rows", spec, f.per_row, f.rows, 1, &ap, sizeof(ap),
+                    (double)n0 * n1 * vk::Stream::kElemWork);
         st.download(idx.data(), oi.ptr, (uint64_t)n0 * 4);
         st.download(sc.data(), os.ptr, (uint64_t)n0 * 4);
     }

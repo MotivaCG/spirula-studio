@@ -5,10 +5,13 @@ describe is gone -- see §3 for what it covered and what now does not.
 
 ## 1. Native cross-backend parity tests (the important ones)
 
-`src/backend/tests/*.cpp` — currently 20 tools covering projection (fwd, bwd,
+`src/backend/tests/*.cpp` — tools covering projection (fwd, bwd,
 quant-grad), rasterization bwd, tile intersect, warp, FPBO, optimizer (general
-+ geometry), densify, per-pixel train, PPISP, bilagrid, multi-scale loss
-(`mask_loss_semantics`, `reg_loss_underflow` and `fpbo_split_parity` are
++ geometry), densify, per-pixel train, PPISP, bilagrid, multi-scale loss, the
+fused appearance chain and float16 / uint8 images (`appearance_parity check`
+holds the fused chain to the per-stage kernels, and `pixel_format_parity`
+holds every compact-format reader and writer to float32;
+`mask_loss_semantics`, `reg_loss_underflow` and `fpbo_split_parity` are
 self-checking rather than dump-then-compare: the first pins what an image mask
 means in the loss, in both mask modes and with none; the second sweeps log
 scales past every exp(scales) underflow threshold, down to -inf, and fails if
@@ -19,13 +22,47 @@ linear splat colour are held together),
 meshing (activation, LBVH, occupancy/bisection/color, moment raster, the
 per-camera samplers and the visibility cull), plus
 `backend/tests/engine/` which drives the *real* engine end to end
-(render parity, train parity, and two self-checking tools rather than
+(render parity, train parity, and three self-checking tools rather than
 dump-then-compare: `engine_reset_state` trains the same scene twice across an
-`engine_reset()` and the two must land in the same place, and
+`engine_reset()` and the two must land in the same place,
 `gt_bilagrid_sentinels` pins the GT bilateral grids' invariants -- one depth
-scalar per camera, and the no-GT sentinels passing through untouched).
+scalar per camera, and the no-GT sentinels passing through untouched -- and
+`bilagrid_split_batch` trains the same batches split and unsplit: every
+camera's grid must move, and its grid and PPISP row must land in the same
+place either way -- which holds only while both weigh a camera's image
+gradient against its regularizers at the scale of one batch's mean loss).
 `backend/vulkan/tests/` adds 3 Vulkan-only smoke tests (runtime, pipeline,
 sort/scan).
+
+`missing_depth_supervision` is self-checking on both backends: missing and
+all-zero reference depth must give zero depth loss and gradients, while valid
+depth must retain finite supervision. It covers masks, multiple scales and
+3-million-pixel frames.
+
+`projective_depth_test` checks anchor projection invariance, depth descent,
+bearing information, and packed observation indexing; it also supports the
+dump/compare workflow below. `fpbo_parity` and `fpbo_split_parity` exercise
+projective updates with compressed and full-precision optimizer state.
+`noise_moments` checks zero mean, covariance, and temporal independence for
+identical Gaussians in both exploration kernels.
+`projective_camera_batches` checks host/device camera maps, coincident virtual
+views, geometry-supervision fallback, and reset.
+`projective_memory` checks lazy camera/state allocation, zero disabled GPU
+capacity, release on disable, and enabled/disabled checkpoint restoration.
+`projective_resume` checks that full checkpoints retain their anchors, moments,
+and information. `eval_views_once` checks exact indexed traversal with CPU and
+disk caches, and `masked_eval_metrics` checks valid-pixel normalization, SSIM
+support, and masked color fitting. See
+[projective depth optimization](notes/projective-depth.md) for the update and
+evaluation definitions.
+
+`checkpoint_ply` checks checkpoint filtering, row order, partial output chunks,
+empty output, and 8/16/32-bit SH with both packed layouts; Vulkan also covers
+spherical-beta lobes. Run with `OMP_NUM_THREADS=1` to check serial packing.
+`./build_vulkan/checkpoint_ply . 2000000 8 1` times three saves of two million
+synthetic splats with 8-bit SH and FPBO storage (last argument: 0 for per-cell
+storage). Temporary outputs are removed. Timings include device readback and
+buffered file writes, but not a durability flush to the physical drive.
 
 **The same source builds under both backends.** Each file only touches
 `backend::`, the generated launch declarations, and `Tensor.h`. The workflow
@@ -35,7 +72,7 @@ is dump-then-compare:
 # on the CUDA machine
 ./build_cuda/projection_parity dump ref.bin
 # on the target machine / device
-./build/projection_parity compare ref.bin
+./build_vulkan/projection_parity compare ref.bin
 ```
 
 Inputs are deterministic, and comparison is tolerance-based — fast-math
@@ -89,12 +126,13 @@ of guessing.
 
 ```bash
 # CUDA branch: opt-in
-bash build_develop.bash -B build_cuda -DSS_BACKEND=cuda -DSS_BUILD_BACKEND_TESTS=ON
+bash build_develop.bash -DSS_BACKEND=cuda -DSS_BUILD_BACKEND_TESTS=ON
 # Vulkan branch: built unconditionally
 bash build_develop.bash -DSS_BACKEND=vulkan
 ```
 
-Each `.cpp` becomes an executable of the same base name in the build dir.
+Each `.cpp` becomes an executable of the same base name in that backend's
+build tree -- `build_cuda/` or `build_vulkan/` (`build/` on macOS).
 
 ### Cross-machine / cross-vendor runs
 
@@ -141,6 +179,43 @@ was 140x) and brute-force matching at 22x (43 vs 1.9 ms per 8192x8192 pair, was
 64x); the matcher's remainder is DP4A, which Apple has no instruction for. The
 third is "slangc `[unroll]`" in `src/backend/vulkan/README.md`.
 
+### Under the Vulkan validation layer
+
+`SS_VK_VALIDATION=1` turns on `VK_LAYER_KHRONOS_validation` in all three
+Vulkan contexts (engine, SfM, inference), so one variable covers a whole
+`sam extract` → `sfm auto` → `geometry` → `train` → `mesh` loop. The layer
+comes with the LunarG SDK; Ubuntu's `vulkan-validationlayers` predates
+extensions the inference layer uses. The inference context logs through a
+debug messenger (`[vk-validation]`); the other two print the layer's own
+`Validation Error:` lines, errors only unless
+`VK_KHRONOS_VALIDATION_REPORT_FLAGS=error,warn,perf`.
+
+Three things that cost time:
+
+- The inference context turns the layer's handle wrapping off
+  (`unique_handles`): NVIDIA 595 reads `vkCmdDecodeVideoKHR`'s codec `pNext`
+  again at `vkQueueSubmit`, by when the layer's copy is freed, so a wrapped
+  decode segfaults at its first submit.
+- The deprecated `VK_KHRONOS_VALIDATION_ENABLES` / `VK_LAYER_ENABLES`
+  variables make the layer ignore every new-style setting, that one included.
+  Ask for Best Practices with `VK_KHRONOS_VALIDATION_VALIDATE_BEST_PRACTICES=true`.
+- Synchronization validation (`VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true`)
+  only sees descriptor-bound resources and copies. The engine and the
+  inference layer reach memory through buffer device addresses, so a clean
+  run there says nothing about their barriers; SfM binds descriptors and is
+  covered.
+
+### At wave64
+
+AMD GCN runs every kernel 64 lanes wide, and RDNA runs the `kWave64Entries`
+kernels that way. An RDNA device stands in for GCN: dump each test's
+reference at `SS_VK_SUBGROUP=32`, then compare at `SS_VK_SUBGROUP=64` on the
+same device, so only the width differs. On a Ryzen 7000 iGPU (RADV,
+2026-10-08) every dump-compare and self-checking test passed at 64, with
+errors at the level of a wave32 run compared against itself (float-atomic
+order): raster_bwd_parity max_abs 9.8e-4 against 7.3e-4, engine_train_parity
+loose rel_rms 1.3e-10 against 1.4e-10.
+
 ## 2. GUI / viewer checks
 
 The web viewer can be driven headlessly over the Chrome DevTools Protocol.
@@ -177,17 +252,202 @@ expectation, one executable. Neither exists yet.
 
 ## What to run before calling a change done
 
+`train_config_test` checks built-in training presets, loading older configs,
+omitting retired fields when saving, and rejecting invalid saved choices such
+as GPU image caching. It runs without a GPU on either backend.
+
 | change | gate |
 |---|---|
 | any kernel | CUDA build + Vulkan build + the relevant parity test on both |
 | engine logic | both builds + `engine_render_parity` + `engine_train_step`-level check |
-| config field | add the row in `src/config/TrainConfig.h`; check `spirula train --help` and the GUI's All Options editor |
+| config field | `train_config_test`; check `spirula train --help` and the GUI's All Options editor |
 | training-loop logic | `TrainerCore.cpp` — `build_step_config()` is the only place it lives |
 | build system | every mode in [build.md](build.md) |
 | a comment you wrote | `python3 tools/check_comment_length.py` — the build runs it anyway ([lints](build.md#lints)) |
-| `SS_FILE` or `SS_SOURCE_ROOT` | `./build/source_path` on each toolchain — MSVC, GCC and nvcc spell `__FILE__` differently |
+| `SS_FILE` or `SS_SOURCE_ROOT` | `source_path` on each toolchain — MSVC, GCC and nvcc spell `__FILE__` differently |
+| a mesh format, or which colors it carries | `mesh_format_roundtrip` — writes every format and reads it back through the other implementation |
+| the UV atlas | `uv_atlas_split` — tens of thousands of charts that fail to flatten and must split |
+| a preset field | `preset_roundtrip_test` |
+| a batch row's shape or training overrides | `batch_process_test` |
+| what a typed-in command line becomes, or what a message may carry into it | `command_argv_test` — the message stays one argument and stays JSON-safe |
+| the home screen's recent list, or how `gui.conf` stores it | `recent_list_test` |
 | a per-cell optimizer launcher (Vulkan) | `SS_OPTIM_SLICE_CELLS=2048` on `optim_parity` / `optimgeo_parity`, which forces the multi-slice path only an SH buffer past ~24M splats would otherwise take ([SH layouts](notes/sh-quant-layout.md)) |
+| a launch through `dispatch_budgeted` (Vulkan), or a new one | its parity tool under `SS_SUBMIT_BUDGET_MS=0.01`, which splits every budgeted launch after its entry's first into ranges of one slice (`SS_VK_VERBOSE=1` prints the dispatch-base pipelines that ran them); compare against a dump made without it ([submit budget](notes/gpu-submit-budget.md)) |
+| H.265 reference handling | `hevc_reference_retention_test` on a non-NVIDIA Vulkan video-decode device with `SS_ENABLE_PATENTED=ON` |
+| H.265 encode dimensions or HEIF image correctness | `hevc_sps_crop_test` (CPU) and `heif_test` (non-NVIDIA Vulkan encode/decode); fixtures are generated at runtime |
+| `run_process`, `ProcessPipe`, `ProcessReader` or `ProcessDuplex` | `subprocess_lifecycle_test` (CPU): cancellation and owner death stop nested children too |
+| the web viewer's `HttpServer` | `http_server_test` (CPU, not Windows): a connection that never sends stalls neither other requests nor `stop()` |
+| how masking or depth/normal work is split across GPUs | `inference_worker_test`, `inference_worker_devices_test`, `mask_worker_manifest_test`, `geometry_model_budget_test` (CPU); `mask_worker_parity_test` with a cached model on one GPU, then two |
 | anything | one short training run per backend on a public scene |
+
+## H.265 retained-reference regression
+
+With patented decoding explicitly enabled, run `build_vulkan/hevc_reference_retention_test`
+on a supported **non-NVIDIA Vulkan device** advertising H.265 Main and Main10
+video decode (on Windows, use `build_vulkan\hevc_reference_retention_test.exe`).
+Build with `build_develop.bat -DSS_BACKEND=vulkan -DSS_ENABLE_PATENTED=ON`
+on Windows or the corresponding `build_develop.bash` command on Linux.
+The committed 320×180, 72-frame fixtures in `src/video/tests/data/` are
+synthetic FFmpeg `testsrc2` clips, not private recordings. The test checks
+software-decoded RGB pixels in both the full run and after seeking backward
+across GOP boundaries; an exit code alone is not a pixel-correctness check.
+It requires an actual video-decode-capable GPU, not a CPU-only test runner.
+
+To regenerate either `hevc_main_retention` (8-bit `yuv420p`) or
+`hevc_main10_retention` (10-bit `yuv420p10le`), substitute `<format>` and
+`<name>` in these commands; FFmpeg must have `libx265`:
+
+```sh
+ffmpeg -f lavfi -i 'testsrc2=size=320x180:rate=24:duration=3' -pix_fmt <format> -c:v libx265 -preset medium -crf 20 -x265-params 'keyint=24:min-keyint=24:bframes=4:ref=4:scenecut=0:pools=2:log-level=error' <name>.mp4
+ffmpeg -i <name>.mp4 -vf 'select=eq(n\,22)+eq(n\,46)' -fps_mode passthrough -frames:v 2 -pix_fmt rgb24 -f rawvideo <name>.rgb
+```
+
+At POC 24, the short-term RPS retains four pictures marked unused by the
+current picture; following pictures use them. The second GOP exercises
+retirement and slot reuse. The Main10 test failed before the correction
+(frame 22: 10.53 dB PSNR against software) and passes with retained references;
+the threshold is 28 dB to allow host/GPU color-conversion differences.
+
+## H.265 encode cropping and HEIF round trips
+
+These regressions generate their inputs at runtime; no downloaded images,
+binary fixtures, or FFmpeg installation are needed.
+
+```bat
+build_develop.bat -DSS_BACKEND=vulkan -DSS_ENABLE_PATENTED=ON
+build_vulkan\hevc_sps_crop_test.exe
+build_vulkan\heif_test.exe
+```
+
+On Linux, use `bash build_develop.bash` with the same options and run the
+executables under `build_vulkan/` without `.exe`.
+`hevc_sps_crop_test` is CPU-only and is also registered with CTest's
+`headless` label. It checks crop arithmetic, preserved SPS syntax, sub-layer
+profile/level records, emulation prevention, and rejected malformed inputs.
+`heif_test` requires a supported non-NVIDIA Vulkan H.265 encode/decode device;
+a skipped round trip is not GPU acceptance.
+
+Keep the HEIF fixture's 256×160 tiles and its 32 dB PSNR threshold. On AMD
+Radeon AI PRO R9700, the encoder's minimum width is 384: applying a 128-pixel
+conformance crop before encoding produced a 256-wide CTB grid while the SPS
+advertised 384. Encoding uncropped and setting the display crop only in the
+returned SPS preserves the coded grid. The grid/rotated-tile checks measured
+8.0/13.7 dB before this correction and 47.9/47.5 dB afterward. The same test
+also checks grid assembly, crop, rotation, mirroring, dimensions, and EXIF.
+
+## CPU-only subprocess lifecycle regression
+
+`subprocess_lifecycle_test` builds in the existing Vulkan development tree,
+independently of GUI, SAM and patented-feature options. Its target links only
+the C++ runtime, native OS process APIs and threads; execution needs no GPU,
+models, FFmpeg, Python, network or dataset. Normal Vulkan configure-time
+prerequisites still apply (see [build.md](build.md)).
+
+From the repository root, with the normal native compiler environment active
+(an MSVC developer shell on Windows):
+
+```sh
+cmake -S . -B build_vulkan -DSS_BACKEND=vulkan -DSS_ENABLE_PATENTED=OFF
+cmake --build build_vulkan --config Release --target subprocess_lifecycle_test
+ctest --test-dir build_vulkan -C Release -R "^subprocess_lifecycle_test$" --output-on-failure
+```
+
+The executable re-launches itself in synthetic helper modes, including a
+child that natively spawns a nested child retaining inherited output handles.
+Readiness is acknowledged through PID files in a unique temporary directory
+whose name contains spaces; no fixed startup sleeps determine success.
+For each of `run_process`, `ProcessPipe`, `ProcessReader` and `ProcessDuplex`, it checks:
+
+- Cancellation (`run_process`) or explicit `kill()` (pipe/reader/duplex) stops both
+  child and nested child, does not report success, and returns without hanging
+  on inherited pipes.
+- Abrupt owner death (`TerminateProcess` on Windows, `SIGKILL` on POSIX) stops
+  both child and nested child without relying on owner destructors.
+- Cancellation and owner death also stop a chain whose child itself uses
+  `run_process` to launch the synthetic tree.
+- Direct-child exit cleans up a descendant retaining output pipes, allowing
+  reader EOF and successful `finish()` without hanging.
+- Cancellation still works after both child and descendant close stdout/stderr
+  while remaining alive.
+- An independently spawned unrelated process remains alive.
+
+`ProcessDuplex` also checks binary request/response round trips with stderr
+delivered separately as diagnostic lines, that `kill()` unblocks a read and a
+4 MiB write already in flight on other threads (both fail and `finish()` returns
+nonzero), and that destroying it without `finish()` stops the tree.
+
+Normal completion separately checks merged stdout/stderr including a final
+unterminated line, preserved nonzero exit codes, exact reader bytes, and pipe
+stdin delivery followed by EOF. These assertions reject partial output or
+failed work being treated as successful completion.
+
+Every long-lived synthetic process holds an exclusive native file resource.
+The runner must reacquire those resources immediately after `run_process` or
+`finish()` returns, without polling or a grace period. `kill()` is a cancellation
+signal; `finish()` is the resource-reclamation barrier. Only abrupt owner death
+uses an eventual termination deadline, because no API return exists to join.
+Resource checks distinguish stopped work from unreaped POSIX zombie PIDs.
+
+Each readiness/exit wait has a five-second failure deadline; CTest has a
+600-second overall timeout. The supervisor cleans up surviving fixtures after
+each case. Linux uses a child subreaper to reap orphaned synthetic descendants;
+other POSIX hosts rely on their system orphan reaper. It is a synthetic
+regression: it does not cover real FFmpeg, application output cleanup, escape
+via new sessions, or any GPU pipeline. POSIX descendants that close the
+inherited lifecycle lease descriptors or discard their associated environment
+metadata are outside the synchronous nested-cleanup guarantee. Windows waits
+on retained job-member process handles; teardown of raw descendants that
+already exited before the membership snapshot is outside that guarantee.
+
+## Local inference worker checks
+
+`inference_worker_test` needs no GPU, model or license. It runs real child
+processes and checks dynamic dispatch to children of unequal speed, exact task
+and output ownership, separate diagnostic and protocol streams, byte-exact
+frames containing newlines (the child's stdout starts in text mode on Windows),
+complete response acknowledgement, output-family rejection, byte and frame
+admission limits, worker death (including a nonzero exit after a valid
+response), and cancellation while a response is blocked or acceptance is slow.
+`inference_worker_devices_test` checks which GPUs Auto, None and an explicit
+list give workers. `geometry_model_budget_test` checks the host memory reserved
+for an ONNX geometry model: each external weight file is charged once, unrelated
+files are not, and a missing one is refused.
+
+`mask_worker_manifest_test` (`mask_worker_parity_test --manifest-check`) needs
+`SS_BUILD_SAM=ON` but no GPU, model or license. It round-trips the JSONL input
+and output records mask workers exchange, including escaped path characters and
+a sequence manifest larger than the 1 MiB transport frame, and rejects
+oversized, truncated and empty records. Write records with `JsonWriter(false)`:
+the default pretty format contains newlines, which the record writer rejects.
+
+`dataset_prep_test` also checks the mask workers' output ownership preflight:
+paths too long once staged, duplicate stems, aliases (relative/absolute,
+lexical, directory symlinks, and Windows case and extended-path forms), and
+that existing masks are kept.
+
+```sh
+cmake --build build_vulkan --config Release --target inference_worker_test inference_worker_devices_test geometry_model_budget_test mask_worker_parity_test
+ctest --test-dir build_vulkan -C Release -R "^(inference_worker_test|inference_worker_devices_test|mask_worker_manifest_test|geometry_model_budget_test)$" --output-on-failure
+```
+
+`mask_worker_parity_test` needs a SAM 3 or BiRefNet checkpoint the application
+has already downloaded. It masks synthetic images in-process, then through one
+worker process per given GPU, and requires byte-identical train and feature
+masks, for independent images and for one tracked sequence (with a click seed
+for SAM 3), plus a clean worker exit. Run it on one GPU first, then on two of
+the same model; `spirula sam devices` lists the UUIDs. A failed run keeps its
+scratch directory and prints its path. `spirula geometry --check` includes the
+worker publication cases: an image's staged maps complete together or not at
+all, and unmarked maps still need `--overwrite`.
+
+```sh
+build_vulkan/mask_worker_parity_test /path/to/sam3-q4_0.ggml uuid:<32 hex digits>
+build_vulkan/mask_worker_parity_test /path/to/sam3-q4_0.ggml uuid:<first>,uuid:<second>
+build_vulkan/spirula geometry --check
+```
+
+Byte equality is only expected between identical GPUs. Different GPU models
+need a mask/depth tolerance and a visual check instead.
 
 ## Profiling
 
@@ -214,9 +474,47 @@ hold to ~1%, so they can be A/B'd from a training run directly; for the rest
 use the benchmark tools, which fix the workload:
 
 ```bash
-./build/raster_bench [num_splats] [iters] [macro_log2]   # raster fwd/bwd, binning
-./build/fpbo_bench   [num_splats] [iters]                # fused projection bwd + optimizer
+./build_vulkan/raster_bench [num_splats] [iters] [macro_log2] [cut] [scene] [2d|3dgut] [width] [height] [dist] [dump|-] [depth_grad]
+./build_vulkan/fpbo_bench [num_splats] [iters] [sh_degree] [sb_lobes] [fpbo|qgrad|adam]
+./build_vulkan/image_loss_bench [mode] [width] [height] [iters] [dump]
 ```
+
+`train_forecast_replay <trace> [every_steps]` is not a test either: it runs
+the trainer's VRAM forecast and its ETA over a run recorded with
+`SS_FORECAST_DUMP=<file>` and prints what each projected against the peak the
+run reached and the time the rest of it took (docs/notes/train-forecast.md).
+
+`fpbo_bench` defaults to fused projection backward and Adam. `qgrad` measures
+the separate quantized projection backward, including gradient clears and
+camera-range preparation; `adam` measures only the separate quantized SH Adam
+update. Both separate modes use the per-cell-block value/state layout.
+
+`raster_bench` fixes projection, intersections, forward state and incoming
+pixel gradients. `scene` selects `mixed`, `tiny`, `large`, `heavy_tail`,
+`clustered` or `transparent`; it prints tile-list length percentiles.
+`dist` is 0 (off), 1 (depth) or 2 (depth and RGB); `cut` selects the 2D
+kernel cutoff. Backward timings include accumulation weights, with a
+separate measurement enabling the maximum-weight output. The optional dump
+contains world gradients, screen gradients, accumulation weights and maximum
+weights. `depth_grad=0` omits the incoming render-depth gradient; distortion
+gradients remain independent. Use `-` to omit the dump when setting this flag.
+Each stage warms the device for at least 100 ms after lazy pipeline creation.
+Sweep both primitives and distortion settings when changing the
+raster schedule; a speedup on one footprint distribution is insufficient.
+
+`image_loss_bench` fixes images, incoming gradients and a 16x16x8 grid.
+Modes `ssim` / `ssim_bt` include the single-scale L1/SSIM loss stack and its
+contrast-structure map; `_u8` and `_f16_u8` suffixes select image formats.
+`bilagrid` uses the PPISP grid sampler, `affine` the affine sampler; `_q16`
+selects quantized cells. Both include forward and v1 backward with target
+tile size 4. `ppisp:<type>` measures standalone PPISP, and
+`appearance:<type>` measures the background/color-space/PPISP chain;
+`appearance:off` disables PPISP. Types include `no_crf_no_vig`, `no_crf`,
+`original` and `rqs`. The dump contains the RGB gradient followed by the
+loss map, grid gradient, or PPISP parameter gradient (and transmittance
+gradient for the appearance chain). Non-multiple image sizes exercise tile
+edges; parity tests additionally cover masks, odd and single-layer grids,
+multiple cameras and subgroup widths 8–64.
 
 A run that trains also prints a VRAM breakdown after the timing table: pool
 capacity per `VramCategory` (`src/core/PoolSlots.h`), the scratch buffer, the

@@ -1,10 +1,25 @@
 #!/bin/bash
 
-# Development build for Linux. Extra arguments are passed to CMake, e.g.
+# Development build for Linux and macOS. Extra arguments are passed to CMake:
 #   ./build_develop.bash -DSS_BACKEND=vulkan -DSS_BUILD_GUI=OFF
-# SS_BUILD_DIR picks the tree (default "build"), so a second backend does
-# not have to reconfigure the first one away. See build_presets/.
-: "${SS_BUILD_DIR:=build}"
+
+# One tree per backend, so building one does not reconfigure the other. The
+# arguments are read, never consumed: your own -B still reaches CMake, and the
+# build step below would then target a tree it did not configure.
+ss_backend=cuda
+for arg in "$@"; do
+    case "$arg" in
+        -DSS_BACKEND=*|-DSSPLAT_BACKEND=*)
+            ss_backend=$(printf '%s' "${arg#*=}" | tr 'A-Z' 'a-z') ;;
+    esac
+done
+if [ "$(uname)" = "Darwin" ]; then
+    build_dir=build     # one backend on macOS (Vulkan via MoltenVK)
+else
+    build_dir="build_$ss_backend"
+fi
+SS_BUILD_DIR="${SS_BUILD_DIR:-$build_dir}"
+build_dir="$SS_BUILD_DIR"
 
 # Regenerate headers. Skipped when python3 is unavailable -- the generated
 # files are committed, so the build still works without it.
@@ -36,11 +51,33 @@ fi
 # pointer reads exactly like a live one.
 bash tools/check_comments.sh >/dev/null || { bash tools/check_comments.sh; exit 1; }
 
-# Comment blocks in uncommitted work must fit the AGENTS.md budget. Also wired
-# into CMake (cmake/SsChecks.cmake), which covers a bare cmake/ninja build;
-# running it here fails before the configure step rather than after it.
+# The mask editor's testable half is built without SS_BUILD_SAM; an unguarded
+# sam/ include there is invisible to mask_doc_test's link-level symbol gate.
+bash tools/check_sam_guard.sh >/dev/null || { bash tools/check_sam_guard.sh; exit 1; }
+
+# The mask panel has no unit seam; this pins its gates as text, and names each
+# one that went missing.
+bash tools/mask_editor_checks/survivors.sh >/dev/null ||
+    { bash tools/mask_editor_checks/survivors.sh | command grep '^FAIL'; exit 1; }
+
+# The licence dialog has no unit seam either; this pins that its Accept records
+# through the store the CLI reads.
+bash tools/license_checks/survivors.sh >/dev/null ||
+    { bash tools/license_checks/survivors.sh | command grep '^FAIL'; exit 1; }
+
+# The embedded licence texts are generated from LICENSES/; a stale copy would show
+# the user terms other than the file says.
+if command -v python3 >/dev/null 2>&1; then
+    python3 tools/gen_license_texts.py --check ||
+        { echo "src/core/LicenseTexts.cpp is stale: python3 tools/gen_license_texts.py"; exit 1; }
+fi
+
+# Comment blocks in uncommitted work must fit the AGENTS.md budget, and no
+# source may name a <windows.h> macro. CMake (cmake/SsChecks.cmake) runs both
+# too; running them here fails before the configure step rather than after it.
 if command -v python3 >/dev/null 2>&1; then
     python3 tools/check_comment_length.py || exit 1
+    python3 tools/check_winmacro.py --quiet || exit 1
 fi
 
 # SS_CUDA_FATBIN=1 builds Turing-Blackwell (consumer archs) plus PTX, instead
@@ -130,6 +167,7 @@ fi
 MAX_JOBS_FROM_RAM=$(( AVAILABLE_MB / JOB_RAM_MB ))
 JOBS=$(( MAX_JOBS_FROM_RAM < CPU_CORES ? MAX_JOBS_FROM_RAM : CPU_CORES ))
 [ "$JOBS" -lt 1 ] && JOBS=1
+echo "Build dir     : ${build_dir}"
 echo "Available RAM : ${AVAILABLE_MB} MB"
 echo "CPU cores     : ${CPU_CORES}"
 echo "Using jobs    : ${JOBS}"
@@ -139,3 +177,6 @@ if ! cmake --build "${SS_BUILD_DIR}" --verbose -j"${JOBS}"; then
     echo "BUILD FAILED" >&2
     exit 1
 fi
+
+echo ""
+echo "Build complete: $build_dir/spirula"

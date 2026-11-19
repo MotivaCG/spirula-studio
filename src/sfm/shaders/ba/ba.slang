@@ -1,65 +1,43 @@
-// Bundle adjustment kernels.
+// Bundle adjustment kernels (sfm/ba/README.md).
 //
-// Parameterization: each image has a 6-DOF pose; intrinsics live in "groups"
-// so any number of images can share one set of intrinsics, and each group can
-// use a different camera model. The camera-side unknown vector u (dimension
-// n_dim) is laid out as [pose_0(6), pose_1(6), ..., all group intrinsics].
-// Points are eliminated with the Schur complement; the reduced system
-//   S dU = g,  S = J_u^T J_u - A_up (App + lambda)^-1 A_up^T
-// is assembled directly into a packed lower-triangular dense matrix u_S and
-// solved in place by the blocked Cholesky in cholesky.slang.
-//
-// The Jacobian pass stores only what it evaluated: Jc (2 x dof), Jp (2 x 3) and
-// the weighted residual, per observation. Every consumer of the camera-point
-// block A_cp = Jc^T Jp forms it implicitly instead of reading a materialized
-// dof x 3 block -- the products all factor through the 2-vector residual
-// dimension rather than the 3-vector point dimension:
-//
-//   A_cp^T x       = Jp^T (Jc x)                      (cg_gather, dp_accum)
-//   A_cp v         = Jc^T (Jp v)                      (cg_scatter)
-//   A_cp W A_cp'^T = Jc^T (Jp W Jp'^T) Jc'            (every Schur kernel)
-//
-// which is both smaller (3*dof scalars per observation replaced by 6, and the
-// same again for the prepass product T = A_cp W) and cheaper, since dof > 3.
-// `u_Y` holds (Jp W)^T, the one piece the pair kernel wants precomputed.
-//
-// Push constant slots (meaning per kernel, see host sfm/ba/Solver.h):
-//   u0..u3  - counts / offsets / block index
-//   f0..f3  - damping and loss parameters
+// Parameterization (sfm/ba/Problem.h): a 6-DOF pose per frame, a 6-DOF
+// cam_from_rig per rig member, intrinsics per group; the camera-side unknown
+// vector u (n_dim) is [frame poses | free member extrinsics | free group
+// intrinsics]. Points are Schur-eliminated: S = J_u^T J_u - A_up (App +
+// lambda)^-1 A_up^T is assembled into a packed lower triangle (cholesky.slang)
+// or applied matrix-free (cg.slang). The Jacobian pass stores Jc (2 x dof), Jp
+// (2 x 3) and the weighted residual per observation; A_cp = Jc^T Jp is never
+// materialized. Push constants: u0..u3 counts / offsets, f0..f3 damping / loss,
+// u4 is the first item of a launch the host split into ranges (sfm/ba/Solver.h).
 
 #include "common/camera.slang"
 #include "common/loss.slang"
 
-// Bounds on 6 + kNumIntr for the model-agnostic Schur kernels, which size
-// register arrays by a compile-time dof. These kernels are *not* per-model
-// (a point's observations may span groups with different models), so they take
-// the dof as a generic value parameter MD and are instantiated at three tiers,
-// so a problem pays for only the widest camera it actually uses:
-//   compact 12 -- up to RADIAL (dof 11); byte-identical to the pre-OpenCV kernels
-//   mid     14 -- OpenCV / OpenCV_FISHEYE
-//   wide    18 -- FullOpenCV / ThinPrismFisheye
-// The host (sfm/ba/Solver.h) picks the tier from the problem's actual maximum dof.
-// Adding a model with dof > kDofWide means bumping kDofWide (and kMaxCamDof in
-// sfm/ba/Problem.h).
+// Dof tiers of the model-agnostic kernels (register arrays sized by MD); the
+// host picks the narrowest the problem fits (sfm/ba/Solver.h pickTiers).
+// The rig tier is 6 + 6 + 12; must match kMaxCamDof in sfm/ba/Problem.h.
 static const int kDofCompact = 12;
 static const int kDofMid = 14;
 static const int kDofWide = 18;
-// The implicit-Schur CG kernels (cg.slang) are not tiered -- they run only for
-// very large problems (n_dim > 8192) and keep the full width.
-static const int kMaxCamDof = kDofWide;
+static const int kDofRig = 24;
+// Preconditioner blocks never exceed the wide tier: exclusive problems have no
+// rig, and a rigged problem's blocks are per frame / member / group.
+static const int kPrecDof = kDofWide;
+static const uint kNoMember = 0xFFFFFFFFu;
 
 [[vk::push_constant]] cbuffer PC {
     uint u0; uint u1; uint u2; uint u3;
     float f0; float f1; float f2; float f3;
+    uint u4;
 };
 
 // ---- problem data ----
 [[vk::binding(0)]]  StructuredBuffer<Real> u_obs;          // (2 per obs)
 [[vk::binding(1)]]  StructuredBuffer<uint> u_obs_image;    // (per obs)
 [[vk::binding(2)]]  StructuredBuffer<uint> u_obs_point;    // (per obs)
-[[vk::binding(3)]]  StructuredBuffer<uint> u_image_group;  // (per image)
+[[vk::binding(3)]]  StructuredBuffer<uint4> u_image_info;  // (per image) x=frame, y=member (kNoMember: none), z=group, w=flags (bit0: frame shared)
 [[vk::binding(4)]]  StructuredBuffer<uint4> u_group_info;  // (per group) x=intr param offset, y=intr column base, z=n_intr, w=model id
-[[vk::binding(5)]]  RWStructuredBuffer<Real> u_poses;      // (6 per image)
+[[vk::binding(5)]]  RWStructuredBuffer<Real> u_poses;      // (6 per frame)
 [[vk::binding(6)]]  RWStructuredBuffer<Real> u_intr;       // (flat intrinsics)
 [[vk::binding(7)]]  RWStructuredBuffer<Real> u_points;     // (3 per point)
 [[vk::binding(8)]]  StructuredBuffer<uint> u_obs_ranges;   // (num_points+1) obs sorted by point
@@ -88,6 +66,90 @@ static const int kMaxCamDof = kDofWide;
 [[vk::binding(27)]] RWStructuredBuffer<Real> u_Jc;          // camera Jacobian rows per obs,
                                                             // [2*a+row], offset u_jc_off
 [[vk::binding(28)]] RWStructuredBuffer<Real> u_res;         // weighted residual (2 per obs)
+
+// ---- rigs (bindings 29..44 are cg.slang's, 47..51 prior.slang's, 52..54 the gradient's) ----
+[[vk::binding(45)]] StructuredBuffer<uint4> u_member_info;  // (per member) x=ext offset, y=ext column base, z=n_free, w=free-parameter mask
+[[vk::binding(46)]] RWStructuredBuffer<Real> u_exts;        // (6 per member) cam_from_rig
+
+// ---- the gradient test (sfm/ba/GradientNorm.h) ----
+[[vk::binding(52)]] RWStructuredBuffer<Real> u_gcam;        // (n_dim) d cost / d column, unreduced
+[[vk::binding(53)]] RWStructuredBuffer<AWord> u_gcam_a;
+[[vk::binding(54)]] RWStructuredBuffer<uint> u_gpt_max;     // (1) max |Bp| as float bits
+
+// Jc and Jp only through the accessors below. kJac32 (Solver.h) keeps them at fp32,
+// rounded where made so every kernel assembles one Jacobian's system; kJc/JpChunk
+// split them into <= 4 buffers, as NVIDIA wraps a binding past 4 GB silently.
+[[vk::constant_id(0)]] const bool kJac32 = false;
+[[vk::constant_id(1)]] const uint kJcChunk = 0;  // elements per chunk, 0 = one buffer
+[[vk::constant_id(2)]] const uint kJpChunk = 0;
+[[vk::binding(55)]] RWStructuredBuffer<float> u_Jc32;
+[[vk::binding(56)]] RWStructuredBuffer<float> u_Jp32;
+[[vk::binding(57)]] RWStructuredBuffer<Real> u_Jc1;
+[[vk::binding(58)]] RWStructuredBuffer<Real> u_Jc2;
+[[vk::binding(59)]] RWStructuredBuffer<Real> u_Jc3;
+[[vk::binding(60)]] RWStructuredBuffer<float> u_Jc32_1;
+[[vk::binding(61)]] RWStructuredBuffer<float> u_Jc32_2;
+[[vk::binding(62)]] RWStructuredBuffer<float> u_Jc32_3;
+[[vk::binding(63)]] RWStructuredBuffer<Real> u_Jp1;
+[[vk::binding(64)]] RWStructuredBuffer<Real> u_Jp2;
+[[vk::binding(65)]] RWStructuredBuffer<Real> u_Jp3;
+[[vk::binding(66)]] RWStructuredBuffer<float> u_Jp32_1;
+[[vk::binding(67)]] RWStructuredBuffer<float> u_Jp32_2;
+[[vk::binding(68)]] RWStructuredBuffer<float> u_Jp32_3;
+
+// Selects, not branches: measured faster past one chunk (cg_scatter 9.5 ms against 11.9).
+Real jcAt(uint i) {
+    if (kJcChunk == 0 || i < kJcChunk) return kJac32 ? Real(u_Jc32[i]) : u_Jc[i];
+    const uint c = i / kJcChunk, k = i - c * kJcChunk;
+    if (kJac32) return Real(c == 1 ? u_Jc32_1[k] : c == 2 ? u_Jc32_2[k] : u_Jc32_3[k]);
+    return c == 1 ? u_Jc1[k] : c == 2 ? u_Jc2[k] : u_Jc3[k];
+}
+void jcPut(uint i, Real v) {
+    const uint c = kJcChunk == 0 ? 0 : i / kJcChunk, k = i - c * kJcChunk;
+    if (kJac32) {
+        const float f = rToFloat(v);
+        if (c == 0) u_Jc32[k] = f; else if (c == 1) u_Jc32_1[k] = f;
+        else if (c == 2) u_Jc32_2[k] = f; else u_Jc32_3[k] = f;
+    } else {
+        if (c == 0) u_Jc[k] = v; else if (c == 1) u_Jc1[k] = v;
+        else if (c == 2) u_Jc2[k] = v; else u_Jc3[k] = v;
+    }
+}
+Real jpAt(uint i) {
+    if (kJpChunk == 0 || i < kJpChunk) return kJac32 ? Real(u_Jp32[i]) : u_Jp[i];
+    const uint c = i / kJpChunk, k = i - c * kJpChunk;
+    if (kJac32) return Real(c == 1 ? u_Jp32_1[k] : c == 2 ? u_Jp32_2[k] : u_Jp32_3[k]);
+    return c == 1 ? u_Jp1[k] : c == 2 ? u_Jp2[k] : u_Jp3[k];
+}
+void jpPut(uint i, Real v) {
+    const uint c = kJpChunk == 0 ? 0 : i / kJpChunk, k = i - c * kJpChunk;
+    if (kJac32) {
+        const float f = rToFloat(v);
+        if (c == 0) u_Jp32[k] = f; else if (c == 1) u_Jp32_1[k] = f;
+        else if (c == 2) u_Jp32_2[k] = f; else u_Jp32_3[k] = f;
+    } else {
+        if (c == 0) u_Jp[k] = v; else if (c == 1) u_Jp1[k] = v;
+        else if (c == 2) u_Jp2[k] = v; else u_Jp3[k] = v;
+    }
+}
+Real jRound(Real v) { if (kJac32) return Real(rToFloat(v)); return v; }
+// Three more one-time choices (Solver.h): the observations held as the fp32 they
+// were measured in, when every one is (exact); model_obs left out when it is the
+// identity; and under kJac32, the weighted residual at fp32 like the Jacobians.
+[[vk::constant_id(3)]] const bool kObs32 = false;
+[[vk::constant_id(4)]] const bool kObsIdentity = false;
+[[vk::binding(69)]] StructuredBuffer<float> u_obs32;
+[[vk::binding(70)]] RWStructuredBuffer<float> u_res32;
+RVec2 obsAt(uint o) {
+    if (kObs32) return rvec2(Real(u_obs32[2 * o]), Real(u_obs32[2 * o + 1]));
+    return rvec2(u_obs[2 * o], u_obs[2 * o + 1]);
+}
+uint modelObs(uint i) { return kObsIdentity ? i : u_model_obs[i]; }
+Real resAt(uint i) { if (kJac32) return Real(u_res32[i]); return u_res[i]; }
+void resPut(uint i, Real v) {
+    if (kJac32) u_res32[i] = rToFloat(v);
+    else u_res[i] = v;
+}
 
 // packed lower-triangular index, row >= col
 uint pidx(uint r, uint c) { return r * (r + 1) / 2 + c; }
@@ -119,22 +181,31 @@ groupshared Real g_chol[kShPool];
 groupshared Real g_sh[512];
 
 // u0 = obs count for this model, u1 = offset into u_model_obs, f0 = loss param
-void cost_impl<M : ICameraModel>(uint tid, uint lid) {
+void cost_impl<M : ICameraModel, let RIG : int>(uint tid, uint lid) {
     Real c = Real(0.0);
     if (tid < u0) {
-        uint o = u_model_obs[u1 + tid];
+        uint o = modelObs(u1 + tid);
         uint img = u_obs_image[o];
         uint pt = u_obs_point[o];
-        uint4 gi = u_group_info[u_image_group[img]];
+        uint4 ii = u_image_info[img];
+        uint4 gi = u_group_info[ii.z];
 
         Real pose[6];
-        for (int i = 0; i < 6; i++) pose[i] = u_poses[6 * img + i];
+        for (int i = 0; i < 6; i++) pose[i] = u_poses[6 * ii.x + i];
         Real intr[M.kNumIntr];
         for (int i = 0; i < M.kNumIntr; i++) intr[i] = u_intr[gi.x + i];
         RVec3 X = rvec3(u_points[3 * pt + 0], u_points[3 * pt + 1], u_points[3 * pt + 2]);
-        RVec2 obs = rvec2(u_obs[2 * o + 0], u_obs[2 * o + 1]);
+        RVec2 obs = obsAt(o);
 
-        RVec2 r = reproject<M>(pose, intr, X, obs);
+        RVec2 r;
+        if (RIG != 0) {
+            uint4 mi = u_member_info[ii.y];
+            Real ext[6];
+            for (int i = 0; i < 6; i++) ext[i] = u_exts[mi.x + i];
+            r = reprojectRig<M>(pose, ext, intr, X, obs);
+        } else {
+            r = reproject<M>(pose, intr, X, obs);
+        }
         Real s = r.x * r.x + r.y * r.y;
         c = Real(0.5) * Loss.cost(s, f0);
     }
@@ -162,66 +233,104 @@ void cost_impl<M : ICameraModel>(uint tid, uint lid) {
 // a rejected step restores them and every downstream kernel can simply re-run,
 // which is why no path snapshots S.
 // u0 = obs count for this model, u1 = offset into u_model_obs, f0 = loss param
-void jac_impl<M : ICameraModel>(uint tid) {
+void jac_impl<M : ICameraModel, let RIG : int>(uint tid) {
     if (tid >= u0) return;
-    uint o = u_model_obs[u1 + tid];
+    uint o = modelObs(u1 + tid);
     uint img = u_obs_image[o];
     uint pt = u_obs_point[o];
-    uint4 gi = u_group_info[u_image_group[img]];
+    uint4 ii = u_image_info[img];
+    uint4 gi = u_group_info[ii.z];
 
     Real pose[6];
-    for (int i = 0; i < 6; i++) pose[i] = u_poses[6 * img + i];
+    for (int i = 0; i < 6; i++) pose[i] = u_poses[6 * ii.x + i];
     Real intr[M.kNumIntr];
     for (int i = 0; i < M.kNumIntr; i++) intr[i] = u_intr[gi.x + i];
     RVec3 X = rvec3(u_points[3 * pt + 0], u_points[3 * pt + 1], u_points[3 * pt + 2]);
-    RVec2 obs = rvec2(u_obs[2 * o + 0], u_obs[2 * o + 1]);
+    RVec2 obs = obsAt(o);
 
-    const int DOF = 6 + M.kNumIntr;    // columns the Jacobian is evaluated over
-    // ... and how many of them are assembled. Bundle adjustment refines a
-    // leading prefix of a group's intrinsics (gi.z of them); the rest are held
-    // constant, own no column of the reduced system, and are simply not written
-    // -- COLMAP's refine_principal_point/refine_extra_params, and the whole of
-    // EQUIRECTANGULAR (D49/D50). The loops below stay unrolled over the static
-    // DOF and predicate on this, so the all-free case costs nothing.
-    const uint dofw = 6 + gi.z;
+    // Evaluated over [frame 6 | member 6 if RIG | intrinsics kNumIntr]; stored
+    // packed as [6 | mfree | gi.z], since a held parameter owns no column
+    // (D50). The loops stay unrolled over the static DOF and predicate.
+    const int NE = RIG != 0 ? 6 : 0;
+    const int DOF = 6 + NE + M.kNumIntr;
+    uint mfree = 0, mmask = 0;
+    Real ext[6];
+    for (int i = 0; i < 6; i++) ext[i] = Real(0.0);
+    if (RIG != 0) {
+        uint4 mi = u_member_info[ii.y];
+        for (int i = 0; i < 6; i++) ext[i] = u_exts[mi.x + i];
+        mfree = mi.z;
+        mmask = mfree != 0 ? mi.w : 0;
+    }
 
-    RVec2 r = reproject<M>(pose, intr, X, obs);
+    Real Jc[2][DOF];
+    Real Jp[2][3];
+    RVec2 r;
+    if (RIG != 0) {
+        r = reprojectRig<M>(pose, ext, intr, X, obs);
+    } else {
+        r = reproject<M>(pose, intr, X, obs);
+    }
     Real s = r.x * r.x + r.y * r.y;
     Real sw = sqrt(Loss.weight(s, f0));
 
     // Jacobian rows via two backward passes
-    Real Jc[2][DOF];
-    Real Jp[2][3];
     {
         var dp_pose = diffPair(pose);
+        var dp_ext = diffPair(ext);
         var dp_intr = diffPair(intr);
         var dp_X = diffPair(X);
         [ForceUnroll]
         for (int row = 0; row < 2; row++) {
             RVec2 seed = rvec2(row == 0 ? Real(1.0) : Real(0.0),
                                row == 0 ? Real(0.0) : Real(1.0));
-            bwd_diff(reproject<M>)(dp_pose, dp_intr, dp_X, obs, seed);
-            for (int i = 0; i < 6; i++) Jc[row][i] = dp_pose.d[i] * sw;
-            for (int i = 0; i < M.kNumIntr; i++) Jc[row][6 + i] = dp_intr.d[i] * sw;
-            Jp[row][0] = dp_X.d.x * sw; Jp[row][1] = dp_X.d.y * sw; Jp[row][2] = dp_X.d.z * sw;
+            if (RIG != 0) {
+                bwd_diff(reprojectRig<M>)(dp_pose, dp_ext, dp_intr, dp_X, obs, seed);
+            } else {
+                bwd_diff(reproject<M>)(dp_pose, dp_intr, dp_X, obs, seed);
+            }
+            for (int i = 0; i < 6; i++)
+                Jc[row][i] = u2 != 0 && i < 3 ? Real(0.0) : jRound(dp_pose.d[i] * sw);
+            if (RIG != 0)
+                for (int i = 0; i < 6; i++) Jc[row][6 + i] = jRound(dp_ext.d[i] * sw);
+            for (int i = 0; i < M.kNumIntr; i++) Jc[row][6 + NE + i] = jRound(dp_intr.d[i] * sw);
+            Jp[row][0] = jRound(dp_X.d.x * sw);
+            Jp[row][1] = jRound(dp_X.d.y * sw);
+            Jp[row][2] = jRound(dp_X.d.z * sw);
         }
     }
-    r.x = r.x * sw;
-    r.y = r.y * sw;
+    r.x = jRound(r.x * sw);
+    r.y = jRound(r.y * sw);
 
     uint jb = u_jc_off[o];
     [ForceUnroll]
-    for (int a = 0; a < DOF; a++)
-        if (uint(a) < dofw) {
-            u_Jc[jb + 2 * a] = Jc[0][a];
-            u_Jc[jb + 2 * a + 1] = Jc[1][a];
+    for (int a = 0; a < DOF; a++) {
+        // Where column `a` of the evaluated block lands in the packed one.
+        uint dst;
+        bool write;
+        if (a < 6) {
+            dst = uint(a);
+            write = true;
+        } else if (a < 6 + NE) {
+            uint i = uint(a - 6);
+            dst = 6 + countbits(mmask & ((1u << i) - 1u));
+            write = ((mmask >> i) & 1u) != 0;
+        } else {
+            uint i = uint(a - 6 - NE);
+            dst = 6 + mfree + i;
+            write = i < gi.z;
         }
-    for (int j = 0; j < 3; j++) {
-        u_Jp[6 * o + 2 * j] = Jp[0][j];
-        u_Jp[6 * o + 2 * j + 1] = Jp[1][j];
+        if (write) {
+            jcPut(jb + 2 * dst, Jc[0][a]);
+            jcPut(jb + 2 * dst + 1, Jc[1][a]);
+        }
     }
-    u_res[2 * o] = r.x;
-    u_res[2 * o + 1] = r.y;
+    for (int j = 0; j < 3; j++) {
+        jpPut(6 * o + 2 * j, Jp[0][j]);
+        jpPut(6 * o + 2 * j + 1, Jp[1][j]);
+    }
+    resPut(2 * o, r.x);
+    resPut(2 * o + 1, r.y);
 
     // App += Jp^T Jp (full 3x3), Bp += Jp^T r
     for (int i = 0; i < 3; i++) {
@@ -240,13 +349,25 @@ void jac_impl<M : ICameraModel>(uint tid) {
 // Schur complement (model-agnostic; uses per-obs tables only)
 // =====================================================================
 
+// Global columns of image `img`: [frame | member extrinsic | intrinsics],
+// the packed Jacobian's order (jac_impl).
+void camCols<let MD : int>(uint img, out uint dof, out uint cols[MD]) {
+    uint4 ii = u_image_info[img];
+    uint4 gi = u_group_info[ii.z];
+    for (int i = 0; i < 6; i++) cols[i] = 6 * ii.x + i;
+    uint k = 6;
+    if (ii.y != kNoMember) {
+        uint4 mi = u_member_info[ii.y];
+        for (uint i = 0; i < mi.z; i++) cols[k + i] = mi.y + i;
+        k += mi.z;
+    }
+    for (uint i = 0; i < gi.z; i++) cols[k + i] = gi.y + i;
+    dof = k + gi.z;
+}
+
 void obsCamCols<let MD : int>(uint o, out uint dof, out uint base, out uint cols[MD]) {
-    uint img = u_obs_image[o];
-    uint4 gi = u_group_info[u_image_group[img]];
-    dof = 6 + gi.z;
+    camCols<MD>(u_obs_image[o], dof, cols);
     base = u_jc_off[o];
-    for (int i = 0; i < 6; i++) cols[i] = 6 * img + i;
-    for (uint i = 0; i < gi.z; i++) cols[6 + i] = gi.y + i;
 }
 
 // One thread per observation ("row" i of its point's pair block):
@@ -271,20 +392,20 @@ void schurObsImpl<let MD : int>(uint ti) {
     uint cols_i[MD];
     obsCamCols<MD>(ti, dof_i, jb_i, cols_i);
     Real Jci[2 * MD];
-    for (uint a = 0; a < 2 * dof_i; a++) Jci[a] = u_Jc[jb_i + a];
+    for (uint a = 0; a < 2 * dof_i; a++) Jci[a] = jcAt(jb_i + a);
 
     // Y = (Jp_i W)^T, 2x3 stored column-major like u_Jp
     Real Y[6];
     for (int j = 0; j < 3; j++)
         for (int row = 0; row < 2; row++)
-            Y[2 * j + row] = u_Jp[6 * ti + row] * W[j]
-                           + u_Jp[6 * ti + 2 + row] * W[3 + j]
-                           + u_Jp[6 * ti + 4 + row] * W[6 + j];
+            Y[2 * j + row] = jpAt(6 * ti + row) * W[j]
+                           + jpAt(6 * ti + 2 + row) * W[3 + j]
+                           + jpAt(6 * ti + 4 + row) * W[6 + j];
 
     // S += Jc^T Jc (damped diagonal), g += Jc^T r - Jc^T (Y Bp)
     Real yb0 = Y[0] * u_Bp[3 * p] + Y[2] * u_Bp[3 * p + 1] + Y[4] * u_Bp[3 * p + 2];
     Real yb1 = Y[1] * u_Bp[3 * p] + Y[3] * u_Bp[3 * p + 1] + Y[5] * u_Bp[3 * p + 2];
-    Real r0 = u_res[2 * ti], r1 = u_res[2 * ti + 1];
+    Real r0 = resAt(2 * ti), r1 = resAt(2 * ti + 1);
     for (uint a = 0; a < dof_i; a++) {
         for (uint b = 0; b <= a; b++) {
             Real v = Jci[2 * a] * Jci[2 * b] + Jci[2 * a + 1] * Jci[2 * b + 1];
@@ -308,7 +429,7 @@ void schurObsImpl<let MD : int>(uint ti) {
         // Q = Y Jp_j^T, 2x2
         Real q00 = Real(0.0), q01 = Real(0.0), q10 = Real(0.0), q11 = Real(0.0);
         for (int j = 0; j < 3; j++) {
-            Real b0 = u_Jp[6 * tj + 2 * j], b1 = u_Jp[6 * tj + 2 * j + 1];
+            Real b0 = jpAt(6 * tj + 2 * j), b1 = jpAt(6 * tj + 2 * j + 1);
             q00 = q00 + Y[2 * j] * b0;
             q01 = q01 + Y[2 * j] * b1;
             q10 = q10 + Y[2 * j + 1] * b0;
@@ -321,7 +442,7 @@ void schurObsImpl<let MD : int>(uint ti) {
             for (uint c = 0; c < dof_j; c++) {
                 uint col = cols_j[c];
                 if (row < col) continue;
-                Real v = z0 * u_Jc[jb_j + 2 * c] + z1 * u_Jc[jb_j + 2 * c + 1];
+                Real v = z0 * jcAt(jb_j + 2 * c) + z1 * jcAt(jb_j + 2 * c + 1);
                 if (isfinite(v))
                     atomicAccum(u_S_a, pidx(row, col), -v);
             }
@@ -350,13 +471,13 @@ void point_prep(uint3 t : SV_DispatchThreadID) {
 // u0 = num_obs
 [shader("compute")] [numthreads(256, 1, 1)]
 void y_prep(uint3 t : SV_DispatchThreadID) {
-    uint o = t.x;
+    uint o = t.x + u4;
     if (o >= u0) return;
     uint p = u_obs_point[o];
     Real W[9];
     for (int i = 0; i < 9; i++) W[i] = u_W[9 * p + i];
     Real Jp[6];
-    for (int i = 0; i < 6; i++) Jp[i] = u_Jp[6 * o + i];
+    for (int i = 0; i < 6; i++) Jp[i] = jpAt(6 * o + i);
     for (int j = 0; j < 3; j++)
         for (int row = 0; row < 2; row++)
             u_Y[6 * o + 2 * j + row] =
@@ -375,7 +496,7 @@ void y_prep(uint3 t : SV_DispatchThreadID) {
 // u0 = num chunks, f0 = lambda
 static const uint kPairWg = 32;
 // Wide-tier element count, used by the (untiered) CG pair kernel in cg.slang.
-static const uint kPairEl = (kMaxCamDof * kMaxCamDof + kPairWg - 1) / kPairWg;
+static const uint kPairEl = (kPrecDof * kPrecDof + kPairWg - 1) / kPairWg;
 
 // Groupshared staging for the per-entry 2x2 middle matrix Q = Y_i Jp_j^T (plus
 // the 2-vector Y_i Bp the diagonal pairs' gradient wants) and the
@@ -390,7 +511,7 @@ static const uint kPairEl = (kMaxCamDof * kMaxCamDof + kPairWg - 1) / kPairWg;
 static const uint kPrB = 8;         // entries staged per barrier round
 static const uint kPrQ = 0;         // 6 per entry: Q (4) then Y_i Bp (2)
 static const uint kPrZ = 6 * kPrB;  // 2*MD per entry, then Jc_j the same again
-groupshared Real g_pair[6 * kPrB + 4 * kPrB * kMaxCamDof];
+groupshared Real g_pair[6 * kPrB + 4 * kPrB * kPrecDof];
 
 void schurPairImpl<let MD : int>(uint wgx, uint gi) {
     const uint kEl = (MD * MD + kPairWg - 1) / kPairWg;
@@ -433,9 +554,9 @@ void schurPairImpl<let MD : int>(uint wgx, uint gi) {
             Real v;
             if (m < 4) {  // Q[qr][qs] = sum_j Y_i[j][qr] Jp_j[j][qs]
                 uint qr = m >> 1, qs = m & 1;
-                v = u_Y[6 * e.x + qr] * u_Jp[6 * e.y + qs]
-                  + u_Y[6 * e.x + 2 + qr] * u_Jp[6 * e.y + 2 + qs]
-                  + u_Y[6 * e.x + 4 + qr] * u_Jp[6 * e.y + 4 + qs];
+                v = u_Y[6 * e.x + qr] * jpAt(6 * e.y + qs)
+                  + u_Y[6 * e.x + 2 + qr] * jpAt(6 * e.y + 2 + qs)
+                  + u_Y[6 * e.x + 4 + qr] * jpAt(6 * e.y + 4 + qs);
             } else if (diag) {  // (Y_i Bp)[row], only the gradient wants it
                 uint row = m - 4;
                 uint p = u_obs_point[e.x];
@@ -448,15 +569,15 @@ void schurPairImpl<let MD : int>(uint wgx, uint gi) {
         }
         for (uint i = gi; i < nb * 2 * dof_j; i += kPairWg) {
             uint b = i / (2 * dof_j), m = i - b * 2 * dof_j;
-            g_pair[kPrJ + kZs * b + m] = u_Jc[u_jc_off[u_pair_entries[off + t0 + b].y] + m];
+            g_pair[kPrJ + kZs * b + m] = jcAt(u_jc_off[u_pair_entries[off + t0 + b].y] + m);
         }
         GroupMemoryBarrierWithGroupSync();
         for (uint i = gi; i < nb * 2 * dof_i; i += kPairWg) {
             uint b = i / (2 * dof_i), m = i - b * 2 * dof_i;
             uint a = m >> 1, s = m & 1;
             uint bi = u_jc_off[u_pair_entries[off + t0 + b].x];
-            g_pair[kPrZ + kZs * b + m] = u_Jc[bi + 2 * a] * g_pair[kPrQ + 6 * b + s]
-                                       + u_Jc[bi + 2 * a + 1] * g_pair[kPrQ + 6 * b + 2 + s];
+            g_pair[kPrZ + kZs * b + m] = jcAt(bi + 2 * a) * g_pair[kPrQ + 6 * b + s]
+                                       + jcAt(bi + 2 * a + 1) * g_pair[kPrQ + 6 * b + 2 + s];
         }
         GroupMemoryBarrierWithGroupSync();
         for (uint b = 0; b < nb; b++) {
@@ -475,13 +596,13 @@ void schurPairImpl<let MD : int>(uint wgx, uint gi) {
                 acc[k] = acc[k] + g_pair[zb + 2 * r] * g_pair[jb + 2 * c]
                                 + g_pair[zb + 2 * r + 1] * g_pair[jb + 2 * c + 1];
                 if (diag)
-                    acc2[k] = acc2[k] + u_Jc[bi + 2 * r] * u_Jc[bi + 2 * c]
-                                      + u_Jc[bi + 2 * r + 1] * u_Jc[bi + 2 * c + 1];
+                    acc2[k] = acc2[k] + jcAt(bi + 2 * r) * jcAt(bi + 2 * c)
+                                      + jcAt(bi + 2 * r + 1) * jcAt(bi + 2 * c + 1);
             }
             if (diag && gi < dof_i) {
                 uint ox = u_pair_entries[off + t0 + b].x;
-                gacc = gacc + u_Jc[bi + 2 * gi] * (g_pair[kPrQ + 6 * b + 4] - u_res[2 * ox])
-                            + u_Jc[bi + 2 * gi + 1] * (g_pair[kPrQ + 6 * b + 5] - u_res[2 * ox + 1]);
+                gacc = gacc + jcAt(bi + 2 * gi) * (g_pair[kPrQ + 6 * b + 4] - resAt(2 * ox))
+                            + jcAt(bi + 2 * gi + 1) * (g_pair[kPrQ + 6 * b + 5] - resAt(2 * ox + 1));
             }
         }
     }
@@ -530,14 +651,42 @@ void dpAccumImpl<let MD : int>(uint o) {
     Real d0 = Real(0.0), d1 = Real(0.0);
     for (uint a = 0; a < dof; a++) {
         Real x = u_g[cols[a]];
-        d0 = d0 + u_Jc[base + 2 * a] * x;
-        d1 = d1 + u_Jc[base + 2 * a + 1] * x;
+        d0 = d0 + jcAt(base + 2 * a) * x;
+        d1 = d1 + jcAt(base + 2 * a + 1) * x;
     }
     for (int j = 0; j < 3; j++) {
-        Real v = u_Jp[6 * o + 2 * j] * d0 + u_Jp[6 * o + 2 * j + 1] * d1;
+        Real v = jpAt(6 * o + 2 * j) * d0 + jpAt(6 * o + 2 * j + 1) * d1;
         if (isfinite(v))
             atomicAccum(u_Bp_a, 3 * pt + j, -v);
     }
+}
+
+// u_gcam += Jc^T r, one thread per observation; u0 = num_obs
+void gradCamImpl<let MD : int>(uint o) {
+    if (o >= u0) return;
+    uint dof, base;
+    uint cols[MD];
+    obsCamCols<MD>(o, dof, base, cols);
+    Real r0 = resAt(2 * o), r1 = resAt(2 * o + 1);
+    for (uint a = 0; a < dof; a++) {
+        Real v = jcAt(base + 2 * a) * r0 + jcAt(base + 2 * a + 1) * r1;
+        if (isfinite(v))
+            atomicAccum(u_gcam_a, cols[a], v);
+    }
+}
+
+// max |Bp| over every point, before the back-substitution rewrites Bp: a
+// non-negative float orders as its bits. u0 = num_points
+[shader("compute")] [numthreads(256, 1, 1)]
+void grad_point_max(uint3 t : SV_DispatchThreadID) {
+    uint p = t.x;
+    if (p >= u0) return;
+    float m = 0.0f;
+    for (int i = 0; i < 3; i++) {
+        float a = abs(rToFloat(u_Bp[3 * p + i]));
+        m = max(m, isfinite(a) ? a : asfloat(0x7f800000u));
+    }
+    InterlockedMax(u_gpt_max[0], asuint(m));
 }
 
 // dP = (App+l)^-1 Bp; points -= dP.  W was precomputed by point_prep with the
@@ -554,7 +703,7 @@ void point_update(uint3 t : SV_DispatchThreadID) {
     }
 }
 
-// poses/intrinsics -= dU.  u0 = n_dim, u1 = 6*num_images
+// frame poses -= dU.  u0 = pose_dim
 [shader("compute")] [numthreads(256, 1, 1)]
 void cam_update(uint3 t : SV_DispatchThreadID) {
     uint i = t.x;
@@ -562,6 +711,23 @@ void cam_update(uint3 t : SV_DispatchThreadID) {
     Real d = u_g[i];
     if (!isfinite(d)) return;
     u_poses[i] = u_poses[i] - d;
+}
+
+// member extrinsics -= dU, one thread per member; a held member has no
+// columns and is skipped.  u0 = num members
+[shader("compute")] [numthreads(64, 1, 1)]
+void ext_update(uint3 t : SV_DispatchThreadID) {
+    uint m = t.x;
+    if (m >= u0) return;
+    uint4 mi = u_member_info[m];
+    if (mi.z == 0) return;
+    uint j = 0;
+    for (uint i = 0; i < 6; i++) {
+        if (((mi.w >> i) & 1u) == 0) continue;
+        Real d = u_g[mi.y + j];
+        j++;
+        if (isfinite(d)) u_exts[mi.x + i] = u_exts[mi.x + i] - d;
+    }
 }
 
 // Apply the intrinsics half of the step: one thread per camera group, walking
@@ -587,79 +753,134 @@ void intr_update(uint3 t : SV_DispatchThreadID) {
 // =====================================================================
 
 [shader("compute")] [numthreads(128, 1, 1)]
-void schur_obs_c(uint3 t : SV_DispatchThreadID) { schurObsImpl<kDofCompact>(t.x); }
+void schur_obs_c(uint3 t : SV_DispatchThreadID) { schurObsImpl<kDofCompact>(t.x + u4); }
 [shader("compute")] [numthreads(128, 1, 1)]
-void schur_obs_m(uint3 t : SV_DispatchThreadID) { schurObsImpl<kDofMid>(t.x); }
+void schur_obs_m(uint3 t : SV_DispatchThreadID) { schurObsImpl<kDofMid>(t.x + u4); }
 [shader("compute")] [numthreads(128, 1, 1)]
-void schur_obs_w(uint3 t : SV_DispatchThreadID) { schurObsImpl<kDofWide>(t.x); }
+void schur_obs_w(uint3 t : SV_DispatchThreadID) { schurObsImpl<kDofWide>(t.x + u4); }
+[shader("compute")] [numthreads(128, 1, 1)]
+void schur_obs_x(uint3 t : SV_DispatchThreadID) { schurObsImpl<kDofRig>(t.x + u4); }
 
 [shader("compute")] [numthreads(kPairWg, 1, 1)]
-void schur_pair_c(uint3 wg : SV_GroupID, uint gi : SV_GroupIndex) { schurPairImpl<kDofCompact>(wg.x, gi); }
+void schur_pair_c(uint3 wg : SV_GroupID, uint gi : SV_GroupIndex) { schurPairImpl<kDofCompact>(wg.x + u4, gi); }
 [shader("compute")] [numthreads(kPairWg, 1, 1)]
-void schur_pair_m(uint3 wg : SV_GroupID, uint gi : SV_GroupIndex) { schurPairImpl<kDofMid>(wg.x, gi); }
+void schur_pair_m(uint3 wg : SV_GroupID, uint gi : SV_GroupIndex) { schurPairImpl<kDofMid>(wg.x + u4, gi); }
 [shader("compute")] [numthreads(kPairWg, 1, 1)]
-void schur_pair_w(uint3 wg : SV_GroupID, uint gi : SV_GroupIndex) { schurPairImpl<kDofWide>(wg.x, gi); }
+void schur_pair_w(uint3 wg : SV_GroupID, uint gi : SV_GroupIndex) { schurPairImpl<kDofWide>(wg.x + u4, gi); }
 
 [shader("compute")] [numthreads(256, 1, 1)]
-void dp_accum_c(uint3 t : SV_DispatchThreadID) { dpAccumImpl<kDofCompact>(t.x); }
+void dp_accum_c(uint3 t : SV_DispatchThreadID) { dpAccumImpl<kDofCompact>(t.x + u4); }
 [shader("compute")] [numthreads(256, 1, 1)]
-void dp_accum_m(uint3 t : SV_DispatchThreadID) { dpAccumImpl<kDofMid>(t.x); }
+void dp_accum_m(uint3 t : SV_DispatchThreadID) { dpAccumImpl<kDofMid>(t.x + u4); }
 [shader("compute")] [numthreads(256, 1, 1)]
-void dp_accum_w(uint3 t : SV_DispatchThreadID) { dpAccumImpl<kDofWide>(t.x); }
+void dp_accum_w(uint3 t : SV_DispatchThreadID) { dpAccumImpl<kDofWide>(t.x + u4); }
+[shader("compute")] [numthreads(256, 1, 1)]
+void dp_accum_x(uint3 t : SV_DispatchThreadID) { dpAccumImpl<kDofRig>(t.x + u4); }
+
+[shader("compute")] [numthreads(256, 1, 1)]
+void grad_cam_c(uint3 t : SV_DispatchThreadID) { gradCamImpl<kDofCompact>(t.x + u4); }
+[shader("compute")] [numthreads(256, 1, 1)]
+void grad_cam_m(uint3 t : SV_DispatchThreadID) { gradCamImpl<kDofMid>(t.x + u4); }
+[shader("compute")] [numthreads(256, 1, 1)]
+void grad_cam_w(uint3 t : SV_DispatchThreadID) { gradCamImpl<kDofWide>(t.x + u4); }
+[shader("compute")] [numthreads(256, 1, 1)]
+void grad_cam_x(uint3 t : SV_DispatchThreadID) { gradCamImpl<kDofRig>(t.x + u4); }
 
 // =====================================================================
-// per-model entry points -- add two lines per new camera model
+// per-model entry points -- four lines per camera model: cost and Jacobian,
+// plain and through a rig (sfm/ba/Problem.h buckets observations by both)
 // =====================================================================
 
 [shader("compute")] [numthreads(256, 1, 1)]
-void cost_snavely(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<SnavelyModel>(t.x, gi); }
+void cost_snavely(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<SnavelyModel, 0>(t.x, gi); }
 [shader("compute")] [numthreads(128, 1, 1)]
-void jac_snavely(uint3 t : SV_DispatchThreadID) { jac_impl<SnavelyModel>(t.x); }
+void jac_snavely(uint3 t : SV_DispatchThreadID) { jac_impl<SnavelyModel, 0>(t.x); }
+[shader("compute")] [numthreads(256, 1, 1)]
+void cost_snavely_rig(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<SnavelyModel, 1>(t.x, gi); }
+[shader("compute")] [numthreads(128, 1, 1)]
+void jac_snavely_rig(uint3 t : SV_DispatchThreadID) { jac_impl<SnavelyModel, 1>(t.x); }
 
 [shader("compute")] [numthreads(256, 1, 1)]
-void cost_snavely_f(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<SnavelyFModel>(t.x, gi); }
+void cost_snavely_f(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<SnavelyFModel, 0>(t.x, gi); }
 [shader("compute")] [numthreads(128, 1, 1)]
-void jac_snavely_f(uint3 t : SV_DispatchThreadID) { jac_impl<SnavelyFModel>(t.x); }
+void jac_snavely_f(uint3 t : SV_DispatchThreadID) { jac_impl<SnavelyFModel, 0>(t.x); }
+[shader("compute")] [numthreads(256, 1, 1)]
+void cost_snavely_f_rig(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<SnavelyFModel, 1>(t.x, gi); }
+[shader("compute")] [numthreads(128, 1, 1)]
+void jac_snavely_f_rig(uint3 t : SV_DispatchThreadID) { jac_impl<SnavelyFModel, 1>(t.x); }
 
 [shader("compute")] [numthreads(256, 1, 1)]
-void cost_pinhole_radial(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<PinholeRadialModel>(t.x, gi); }
+void cost_pinhole_radial(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<PinholeRadialModel, 0>(t.x, gi); }
 [shader("compute")] [numthreads(128, 1, 1)]
-void jac_pinhole_radial(uint3 t : SV_DispatchThreadID) { jac_impl<PinholeRadialModel>(t.x); }
+void jac_pinhole_radial(uint3 t : SV_DispatchThreadID) { jac_impl<PinholeRadialModel, 0>(t.x); }
+[shader("compute")] [numthreads(256, 1, 1)]
+void cost_pinhole_radial_rig(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<PinholeRadialModel, 1>(t.x, gi); }
+[shader("compute")] [numthreads(128, 1, 1)]
+void jac_pinhole_radial_rig(uint3 t : SV_DispatchThreadID) { jac_impl<PinholeRadialModel, 1>(t.x); }
 
 [shader("compute")] [numthreads(256, 1, 1)]
-void cost_opencv(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<OpenCVModel>(t.x, gi); }
+void cost_opencv(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<OpenCVModel, 0>(t.x, gi); }
 [shader("compute")] [numthreads(128, 1, 1)]
-void jac_opencv(uint3 t : SV_DispatchThreadID) { jac_impl<OpenCVModel>(t.x); }
+void jac_opencv(uint3 t : SV_DispatchThreadID) { jac_impl<OpenCVModel, 0>(t.x); }
+[shader("compute")] [numthreads(256, 1, 1)]
+void cost_opencv_rig(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<OpenCVModel, 1>(t.x, gi); }
+[shader("compute")] [numthreads(128, 1, 1)]
+void jac_opencv_rig(uint3 t : SV_DispatchThreadID) { jac_impl<OpenCVModel, 1>(t.x); }
 
 [shader("compute")] [numthreads(256, 1, 1)]
-void cost_simple_pinhole(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<SimplePinholeModel>(t.x, gi); }
+void cost_simple_pinhole(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<SimplePinholeModel, 0>(t.x, gi); }
 [shader("compute")] [numthreads(128, 1, 1)]
-void jac_simple_pinhole(uint3 t : SV_DispatchThreadID) { jac_impl<SimplePinholeModel>(t.x); }
+void jac_simple_pinhole(uint3 t : SV_DispatchThreadID) { jac_impl<SimplePinholeModel, 0>(t.x); }
+[shader("compute")] [numthreads(256, 1, 1)]
+void cost_simple_pinhole_rig(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<SimplePinholeModel, 1>(t.x, gi); }
+[shader("compute")] [numthreads(128, 1, 1)]
+void jac_simple_pinhole_rig(uint3 t : SV_DispatchThreadID) { jac_impl<SimplePinholeModel, 1>(t.x); }
 
 [shader("compute")] [numthreads(256, 1, 1)]
-void cost_pinhole(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<PinholeModel>(t.x, gi); }
+void cost_pinhole(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<PinholeModel, 0>(t.x, gi); }
 [shader("compute")] [numthreads(128, 1, 1)]
-void jac_pinhole(uint3 t : SV_DispatchThreadID) { jac_impl<PinholeModel>(t.x); }
+void jac_pinhole(uint3 t : SV_DispatchThreadID) { jac_impl<PinholeModel, 0>(t.x); }
+[shader("compute")] [numthreads(256, 1, 1)]
+void cost_pinhole_rig(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<PinholeModel, 1>(t.x, gi); }
+[shader("compute")] [numthreads(128, 1, 1)]
+void jac_pinhole_rig(uint3 t : SV_DispatchThreadID) { jac_impl<PinholeModel, 1>(t.x); }
 
 [shader("compute")] [numthreads(256, 1, 1)]
-void cost_opencv_fisheye(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<FisheyeModel>(t.x, gi); }
+void cost_opencv_fisheye(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<FisheyeModel, 0>(t.x, gi); }
 [shader("compute")] [numthreads(128, 1, 1)]
-void jac_opencv_fisheye(uint3 t : SV_DispatchThreadID) { jac_impl<FisheyeModel>(t.x); }
+void jac_opencv_fisheye(uint3 t : SV_DispatchThreadID) { jac_impl<FisheyeModel, 0>(t.x); }
+[shader("compute")] [numthreads(256, 1, 1)]
+void cost_opencv_fisheye_rig(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<FisheyeModel, 1>(t.x, gi); }
+[shader("compute")] [numthreads(128, 1, 1)]
+void jac_opencv_fisheye_rig(uint3 t : SV_DispatchThreadID) { jac_impl<FisheyeModel, 1>(t.x); }
 
 [shader("compute")] [numthreads(256, 1, 1)]
-void cost_full_opencv(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<FullOpenCVModel>(t.x, gi); }
+void cost_full_opencv(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<FullOpenCVModel, 0>(t.x, gi); }
 [shader("compute")] [numthreads(128, 1, 1)]
-void jac_full_opencv(uint3 t : SV_DispatchThreadID) { jac_impl<FullOpenCVModel>(t.x); }
+void jac_full_opencv(uint3 t : SV_DispatchThreadID) { jac_impl<FullOpenCVModel, 0>(t.x); }
+[shader("compute")] [numthreads(256, 1, 1)]
+void cost_full_opencv_rig(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<FullOpenCVModel, 1>(t.x, gi); }
+[shader("compute")] [numthreads(128, 1, 1)]
+void jac_full_opencv_rig(uint3 t : SV_DispatchThreadID) { jac_impl<FullOpenCVModel, 1>(t.x); }
 
 [shader("compute")] [numthreads(256, 1, 1)]
-void cost_equirect(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<EquirectModel>(t.x, gi); }
+void cost_equirect(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<EquirectModel, 0>(t.x, gi); }
 [shader("compute")] [numthreads(128, 1, 1)]
-void jac_equirect(uint3 t : SV_DispatchThreadID) { jac_impl<EquirectModel>(t.x); }
+void jac_equirect(uint3 t : SV_DispatchThreadID) { jac_impl<EquirectModel, 0>(t.x); }
+[shader("compute")] [numthreads(256, 1, 1)]
+void cost_equirect_rig(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<EquirectModel, 1>(t.x, gi); }
+[shader("compute")] [numthreads(128, 1, 1)]
+void jac_equirect_rig(uint3 t : SV_DispatchThreadID) { jac_impl<EquirectModel, 1>(t.x); }
 
 [shader("compute")] [numthreads(256, 1, 1)]
-void cost_thin_prism_fisheye(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<ThinPrismFisheyeModel>(t.x, gi); }
+void cost_thin_prism_fisheye(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<ThinPrismFisheyeModel, 0>(t.x, gi); }
 [shader("compute")] [numthreads(128, 1, 1)]
-void jac_thin_prism_fisheye(uint3 t : SV_DispatchThreadID) { jac_impl<ThinPrismFisheyeModel>(t.x); }
+void jac_thin_prism_fisheye(uint3 t : SV_DispatchThreadID) { jac_impl<ThinPrismFisheyeModel, 0>(t.x); }
+[shader("compute")] [numthreads(256, 1, 1)]
+void cost_thin_prism_fisheye_rig(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<ThinPrismFisheyeModel, 1>(t.x, gi); }
+[shader("compute")] [numthreads(128, 1, 1)]
+void jac_thin_prism_fisheye_rig(uint3 t : SV_DispatchThreadID) { jac_impl<ThinPrismFisheyeModel, 1>(t.x); }
 
 #include "cholesky.slang"
 #include "cg.slang"
+#include "prior.slang"

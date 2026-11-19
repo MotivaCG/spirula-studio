@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <map>
 #include <numeric>
@@ -37,11 +38,13 @@
 #include <utility>
 #include <vector>
 
+#include "sfm/core/Events.h"
 #include "sfm/core/Model.h"
 #include "sfm/map/Mapper.h"
 #include "sfm/map/Merge.h"
 #include "sfm/core/Log.h"
 #include "sfm/map/ModelOps.h"
+#include "i18n/TimeFormat.h"
 #include "i18n/catalog/Sfm.h"
 
 namespace sfm {
@@ -132,8 +135,11 @@ struct AssembleStats {
     // wildly different amounts, and a single total hides which one is worth its
     // price on a given capture.
     double t_audit = 0, t_split = 0, t_grow_tail = 0, t_reseed = 0, t_final_merge = 0, t_fold = 0;
+    double t_weld = 0;
+    // SS_SFM_MAP_PROF only, and only when a seam was welded: every model as it was before.
+    std::vector<Reconstruction> pre_weld;
     double finishSecs() const {
-        return t_audit + t_split + t_grow_tail + t_reseed + t_final_merge + t_fold;
+        return t_audit + t_split + t_grow_tail + t_reseed + t_final_merge + t_fold + t_weld;
     }
 };
 
@@ -358,7 +364,12 @@ inline void mergeUpwards(Mapper& mapper, std::vector<Reconstruction>& models,
     int grow_passes = 0;
     bool solve_pending = false;  // a level merged and its joint solve was deferred
     if (!mopt.do_merge && !mopt.do_grow) return;
+    // The bar's count: a level halves the models, and the two on top are for
+    // the extra levels a refused pair earns -- over rather than under.
+    const int64_t levels =
+        (int64_t)std::ceil(std::log2((double)std::max<size_t>(2, models.size()))) + 2;
     for (int round = 0; round < std::max(1, opt.max_rounds) && models.size() > 1; round++) {
+        events::progress(Stage::Merge, std::min<int64_t>(round, levels - 1), levels);
         st.rounds = (size_t)round + 1;
         size_t refused = 0;
         std::map<std::string, size_t> why;
@@ -489,12 +500,14 @@ inline void mergeUpwards(Mapper& mapper, std::vector<Reconstruction>& models,
         st.joint_ba++;
         st.t_ba += secs(t0, clk());
     }
+    events::progress(Stage::Merge, levels, levels);
 
     if (opt.verbose) {
         const ManagerStats& f = st.finish;
         slog::out(slog::Tag::Map, spirula::i18n::msg::sfm::map_assembled,
-                 {slog::num(st.t_merge + st.t_grow + st.t_ba, 2), (long long)st.models_in,
-                  (long long)models.size(), (long long)st.rounds, (long long)st.merges,
+                 {spirula::i18n::format_duration(st.t_merge + st.t_grow + st.t_ba),
+                  (long long)st.models_in, (long long)models.size(),
+                  (long long)st.rounds, (long long)st.merges,
                   (long long)st.merges_refused, (long long)st.grown_images,
                   (long long)f.covered_before, (long long)coveredImages(models).size()});
         // The seam test's own numbers stay English: they are a diagnostic for
@@ -680,11 +693,28 @@ inline std::vector<Reconstruction> finishModels(Mapper& mapper,
         t0 = clk();
         const size_t before = models.size();
         models = splitFoldedModels(mapper, std::move(models), fopt, memo, st.finish);
-        if (models.size() != before)
-            for (Reconstruction& m : models)
-                if (m.numRegistered() >= 2 && memo.audited.insert(ModelMemo::of(m)).second)
-                    m = mapper.refine(m);
+        if (models.size() != before) {
+            models = refineAfterFoldSplit(std::move(models), memo, mopt, st.finish,
+                                          [&](const Reconstruction& m) { return mapper.refine(m); });
+        }
         st.t_fold = secs(t0, clk());
+    }
+
+    // Last, on the models as written: the weld moves poses, and a pass after it that
+    // re-solved without the fused points could reopen what it closed.
+    t0 = clk();
+    std::vector<Reconstruction> pre;
+    for (Reconstruction& m : models) {
+        if (MapProf::enabled()) pre.push_back(m);
+        if (m.numRegistered() < 2) continue;
+        Mapper::SeamStats ss;
+        m = mapper.weldSeams(m, &ss);
+        if (!ss.undone) st.finish.seams_welded += ss.open.size();
+    }
+    st.t_weld = secs(t0, clk());
+    if (st.finish.seams_welded) {
+        sortModels(pre);
+        st.pre_weld = std::move(pre);
     }
 
     sortModels(models);
@@ -692,12 +722,13 @@ inline std::vector<Reconstruction> finishModels(Mapper& mapper,
     st.finish.covered_after = coveredImages(models).size();
     if (opt.verbose)
         slog::out(slog::Tag::Map, spirula::i18n::msg::sfm::map_finishing,
-                 {slog::num(st.finishSecs(), 1), (long long)st.finish.splits,
+                 {spirula::i18n::format_duration(st.finishSecs()),
+                  (long long)st.finish.splits,
                   (long long)st.finish.duplicate_splits,
                   (long long)st.finish.reseeded_models,
                   (long long)st.finish.dropped_redundant,
                   (long long)st.finish.audited_repaired,
-                  (long long)st.finish.audited_out});
+                  (long long)st.finish.audited_out, (long long)st.finish.seams_welded});
     mapper.claimAll(models);
     return models;
 }
@@ -726,6 +757,7 @@ inline std::vector<Reconstruction> assembleModels(Mapper& mapper,
     MergeOptions merge_opt = mopt.merge;
     merge_opt.duplicate = mopt.duplicate;
     merge_opt.validate = seamValidator(mapper, mopt, &st.finish);
+    merge_opt.rigs = mapper.rigs();
 
     // A component that fitted its own focal to its own noise cannot align with
     // anything, and on a rig every component is looking at the same physical

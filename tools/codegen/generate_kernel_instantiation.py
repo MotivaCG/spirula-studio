@@ -244,6 +244,15 @@ def generate_ProjectionFwd():
         )] * 5
 
         generate_kernel_instantiation(prefix, definition, map_header, map_body, includes)
+        # Separate files preserve the existing forward batches and compile cache.
+        ortho_maps = [(prim, "CameraModelType::ORTHOGRAPHIC", "CameraDistortionType::None")
+                      for prim in kPrimitives]
+        ortho_includes = [("primitives/Primitive3DGUT.cuh" if "3DGUT" in prim
+                           else "primitives/Primitive3DGS.cuh", kernel_filename)
+                          for prim in kPrimitives]
+        generate_kernel_instantiation(prefix + "Ortho", definition, map_header,
+                                      ortho_maps, ortho_includes)
+
 
 
 def _generate_projection_bwd(prefix, source, wrapper_name, kernel_filename):
@@ -308,15 +317,16 @@ def generate_FusedProjectionBwdOptim():
 
 def generate_RasterizationFwd():
     definition = extract_kernel_definition("kernels/raster/RasterizationFwd.cu", "rasterize_to_pixels_fwd_kernel_wrapper")
-    map_header = ["typename SplatPrimitive", None, None]
+    map_header = ["typename SplatPrimitive", None, None, None]
     map_body = [*itertools.product(
         ["Vanilla3DGS<0>"],
         # distortion channel set; DN/RGB_DN (normal) added when a normal-
         # rendering primitive exists.
         ["DistortionType::None", "DistortionType::D", "DistortionType::RGB_D"],
         ["true", "false"],   # output_median
+        ["true", "false"],   # output_score
     )]
-    includes = [("primitives/Primitive3DGS.cuh", "kernels/raster/RasterizationFwd_kernel.cuh")] * 6
+    includes = [("primitives/Primitive3DGS.cuh", "kernels/raster/RasterizationFwd_kernel.cuh")] * len(map_body)
 
     generate_kernel_instantiation("RasterizationFwd", definition, map_header, map_body, includes)
 
@@ -337,17 +347,24 @@ def generate_RasterizationBwd():
 
 def generate_RasterizationEval3DFwd():
     definition = extract_kernel_definition("kernels/raster/RasterizationEval3DFwd.cu", "rasterize_to_pixels_eval3d_fwd_kernel_wrapper")
-    map_header = ["typename SplatPrimitive", None, None, None, None]
+    map_header = ["typename SplatPrimitive", None, None, None, None, None]
     map_body = [
-        (prim, cam, dist, dt, median)
+        (prim, cam, dist, dt, median, score)
         for prim in ["Vanilla3DGUT<0>"]
         for cam, dist in kCameraVariants
         for dt in ("DistortionType::None", "DistortionType::D", "DistortionType::RGB_D")
         for median in ("true", "false")
+        for score in ("true", "false")
     ]
     includes = [("primitives/Primitive3DGUT.cuh", "kernels/raster/RasterizationEval3DFwd_kernel.cuh")] * len(map_body)
 
     generate_kernel_instantiation("RasterizationEval3DFwd", definition, map_header, map_body, includes)
+    ortho_maps = [(prim, "CameraModelType::ORTHOGRAPHIC", dist, dt, median, score)
+                  for prim, cam, dist, dt, median, score in map_body
+                  if cam == "CameraModelType::PINHOLE" and dist == "CameraDistortionType::None"]
+    generate_kernel_instantiation("RasterizationEval3DFwdOrtho", definition, map_header,
+                                  ortho_maps, [includes[0]] * len(ortho_maps))
+
 
 
 def generate_RasterizationEval3DBwd():

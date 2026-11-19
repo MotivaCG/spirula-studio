@@ -6,8 +6,8 @@
 // a single distant SfM outlier inflated the box, collapsed all points into
 // one cell, and degenerated the scan to O(N^2). The kd-tree median split is
 // insensitive to outliers and exact.
-//
-// Self-contained, no dependencies beyond the standard library.
+
+#include "core/HardwareThreads.h"
 
 #include <algorithm>
 #include <atomic>
@@ -33,10 +33,11 @@ public:
     }
 
     // Squared distances to the (up to) k nearest neighbors of q, excluding
-    // the point with original index `self` (-1 to disable). Writes ascending
-    // into d2_out (capacity >= k); returns the count found.
-    int query(const float q[3], int32_t self, int k, float* d2_out) const {
-        KBest best{d2_out, k, 0};
+    // index `self` (-1 to disable), ascending into d2_out (capacity >= k) and
+    // their indices into idx_out when given; returns the count found.
+    int query(const float q[3], int32_t self, int k, float* d2_out,
+              int32_t* idx_out = nullptr) const {
+        KBest best{d2_out, idx_out, k, 0};
         search(0, _n, q, self, best);
         return best.count;
     }
@@ -90,12 +91,18 @@ private:
     // Fixed-capacity sorted list of the k smallest d^2 (k is tiny here).
     struct KBest {
         float* d2;
+        int32_t* idx;
         int k, count;
         float worst() const { return count < k ? 1e30f : d2[k - 1]; }
-        void push(float v) {
+        void push(float v, int32_t id) {
             int i = count < k ? count++ : k - 1;
-            while (i > 0 && v < d2[i - 1]) { d2[i] = d2[i - 1]; i--; }
+            while (i > 0 && v < d2[i - 1]) {
+                d2[i] = d2[i - 1];
+                if (idx) idx[i] = idx[i - 1];
+                i--;
+            }
             d2[i] = v;
+            if (idx) idx[i] = id;
         }
     };
 
@@ -107,16 +114,16 @@ private:
         if (_idx[mid] != self) {
             float dx = q[0]-p[0], dy = q[1]-p[1], dz = q[2]-p[2];
             float d2 = dx*dx + dy*dy + dz*dz;
-            if (d2 < best.worst()) best.push(d2);
+            if (d2 < best.worst()) best.push(d2, _idx[mid]);
         }
         if (hi - lo == 1) return;
         int ax = _axis[mid];
         float delta = q[ax] - p[ax];
         int64_t nlo[2] = {lo, mid + 1}, nhi[2] = {mid, hi};
-        int near = delta < 0.f ? 0 : 1;
-        search(nlo[near], nhi[near], q, self, best);
+        int side = delta < 0.f ? 0 : 1;
+        search(nlo[side], nhi[side], q, self, best);
         if (delta * delta < best.worst())
-            search(nlo[1 - near], nhi[1 - near], q, self, best);
+            search(nlo[1 - side], nhi[1 - side], q, self, best);
     }
 };
 
@@ -131,7 +138,7 @@ inline std::vector<float> mean_knn_dist(
 
     KdTree3 tree(xyz.data(), n);
 
-    int n_threads = (int)std::max(1u, std::thread::hardware_concurrency());
+    int n_threads = (int)std::max(1u, spirula::hardware_threads());
     n_threads = (int)std::min<int64_t>(n_threads, n);
     std::atomic<int64_t> next(0);
     const int64_t CHUNK = 1024;

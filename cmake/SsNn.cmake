@@ -25,7 +25,6 @@ find_package(Threads REQUIRED)
 
 include(SsSlang)
 ss_find_slangc(SS_NN_SLANGC)
-ss_build_spirv_tool(SS_NN_SPIRV_TOOL)
 
 set(SS_NN_SHADER_ROOT ${SS_SRC}/nn/shaders)
 
@@ -83,17 +82,10 @@ function(ss_nn_shaders tag shader_dir out_embed_cpp)
     list(LENGTH _blobs _n)
     message(STATUS "Inference SPIR-V (${tag}): ${_n} modules")
 
-    set(_listfile ${_spv_dir}/blobs.txt)
-    string(REPLACE ";" "\n" _listbody "${_blobs}")
-    ss_write_if_different(${_listfile} "${_listbody}\n")
-
     set(_embed ${CMAKE_CURRENT_BINARY_DIR}/nn_shaders_${tag}.cpp)
-    add_custom_command(OUTPUT ${_embed}
-        COMMAND ${SS_NN_SPIRV_TOOL} embed --nn ${tag} ${_embed}
-                --list ${_listfile}
-        DEPENDS ${SS_NN_SPIRV_TOOL} ${_blobs} ${_listfile}
-        COMMENT "Embedding SPIR-V (${tag}: ${_n} modules)"
-        VERBATIM)
+    ss_embed_spirv(${_embed} ${_spv_dir}/blobs.txt
+        "Embedding SPIR-V (${tag}: ${_n} modules)"
+        BLOBS ${_blobs} FLAGS --nn ${tag})
 
     set(${out_embed_cpp} ${_embed} PARENT_SCOPE)
 endfunction()
@@ -115,6 +107,10 @@ add_library(ss_nn STATIC
     ${SS_SRC}/external/stb_image_impl.cpp
     ${SS_SRC}/external/stb_image_write_impl.cpp
     ${SS_SRC}/core/ExrImage.cpp
+    ${SS_SRC}/core/IccProfile.cpp
+    ${SS_SRC}/core/ImageFile.cpp
+    ${SS_SRC}/core/MappedFile.cpp
+    ${SS_SRC}/core/TiffImage.cpp
     ${SS_SRC}/external/miniz.c
 )
 target_include_directories(ss_nn PUBLIC ${SS_SRC})
@@ -126,10 +122,38 @@ if(SS_ENABLE_PATENTED)
     target_compile_definitions(ss_nn PUBLIC SS_HAVE_VIDEO=1)
 endif()
 target_link_libraries(ss_nn PUBLIC ss_vulkan Threads::Threads)
+if(SS_NN_METAL)
+    # Compiled as CXX, which clang reads as Objective-C++ from the extension.
+    # No enable_language(OBJCXX): it would turn every .m (GLFW's Cocoa layer)
+    # into Objective-C++ too; cmake/SsApps.cmake does NativeDialogMac.mm the same way.
+    target_sources(ss_nn PRIVATE ${SS_SRC}/nn/OpMetal.mm ${SS_SRC}/nn/vk/MetalInterop.mm)
+    set_source_files_properties(${SS_SRC}/nn/OpMetal.mm ${SS_SRC}/nn/vk/MetalInterop.mm
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_compile_definitions(ss_nn PRIVATE SS_HAVE_NN_METAL=1)
+    target_link_libraries(ss_nn PUBLIC "-framework Metal" "-framework Foundation"
+        "-framework MetalPerformanceShaders" "-framework MetalPerformanceShadersGraph")
+endif()
 target_compile_options(ss_nn PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:${SPLAT_CXX_FLAGS}>
     $<$<COMPILE_LANGUAGE:C>:${SPLAT_C_FLAGS}>)
 set_property(TARGET ss_nn PROPERTY CXX_STANDARD 17)
+
+# ---------------------------------------------------------------------------
+# ss_swin -- the Swin Transformer backbone BiRefNet and Grounding DINO share;
+# ss_birefnet -- subject masks; ss_gdino -- text-prompted boxes. No shaders of
+# their own: every op they needed was general and went into nn/.
+# ---------------------------------------------------------------------------
+foreach(_lib swin birefnet gdino)
+    file(GLOB_RECURSE _srcs CONFIGURE_DEPENDS ${SS_SRC}/${_lib}/*.cpp)
+    list(FILTER _srcs EXCLUDE REGEX "/tests/")
+    add_library(ss_${_lib} STATIC ${_srcs})
+    target_compile_options(ss_${_lib} PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:${SPLAT_CXX_FLAGS}>)
+    set_property(TARGET ss_${_lib} PROPERTY CXX_STANDARD 17)
+endforeach()
+target_link_libraries(ss_swin PUBLIC ss_nn)
+target_link_libraries(ss_birefnet PUBLIC ss_swin)
+target_link_libraries(ss_gdino PUBLIC ss_swin)
 
 # ---------------------------------------------------------------------------
 # ss_sam -- SAM 2 / SAM 3
@@ -140,7 +164,9 @@ file(GLOB_RECURSE SS_SAM_SOURCES CONFIGURE_DEPENDS ${SS_SRC}/sam/*.cpp)
 list(FILTER SS_SAM_SOURCES EXCLUDE REGEX "/tests/")
 
 add_library(ss_sam STATIC ${SS_SAM_SOURCES} ${SS_SAM_EMBED})
-target_link_libraries(ss_sam PUBLIC ss_nn)
+# Masking.cpp is the one mask policy, and Grounding DINO and BiRefNet are two
+# of the models it drives.
+target_link_libraries(ss_sam PUBLIC ss_nn ss_gdino ss_birefnet)
 target_compile_options(ss_sam PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:${SPLAT_CXX_FLAGS}>)
 set_property(TARGET ss_sam PROPERTY CXX_STANDARD 17)
@@ -184,6 +210,21 @@ target_compile_options(ss_loma PRIVATE
 set_property(TARGET ss_loma PROPERTY CXX_STANDARD 17)
 
 # ---------------------------------------------------------------------------
+# ss_flexglue -- FlexGlue's dense descriptor and sparse matcher. Its checkpoint
+# is the authors' .pth, read by nn::TorchCheckpoint.
+# ---------------------------------------------------------------------------
+ss_nn_shaders(flexglue ${SS_SRC}/flexglue/shaders SS_FLEXGLUE_EMBED)
+
+file(GLOB_RECURSE SS_FLEXGLUE_SOURCES CONFIGURE_DEPENDS ${SS_SRC}/flexglue/*.cpp)
+list(FILTER SS_FLEXGLUE_SOURCES EXCLUDE REGEX "/tests/")
+
+add_library(ss_flexglue STATIC ${SS_FLEXGLUE_SOURCES} ${SS_FLEXGLUE_EMBED})
+target_link_libraries(ss_flexglue PUBLIC ss_nn)
+target_compile_options(ss_flexglue PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:${SPLAT_CXX_FLAGS}>)
+set_property(TARGET ss_flexglue PROPERTY CXX_STANDARD 17)
+
+# ---------------------------------------------------------------------------
 # ss_metric3d -- Metric3D v2 monocular depth and normals
 #
 # Same shape as ss_aliked: the checkpoint is an ONNX file fetched from the
@@ -205,7 +246,7 @@ target_compile_options(ss_metric3d PRIVATE
 set_property(TARGET ss_metric3d PROPERTY CXX_STANDARD 17)
 
 # ---------------------------------------------------------------------------
-# ss_moge -- MoGe-2 monocular point maps, normals and a validity mask
+# ss_moge -- MoGe-2 / MoGe-3 monocular point maps, normals and a validity mask
 #
 # The only one of these libraries with NO shaders of its own, hence no
 # ss_nn_shaders() edge: the ops it needed were general and went into nn/.
@@ -220,6 +261,64 @@ target_compile_options(ss_moge PRIVATE
 set_property(TARGET ss_moge PROPERTY CXX_STANDARD 17)
 
 # ---------------------------------------------------------------------------
+# ss_marigold -- Marigold v2 depth and normals on Qwen-Image-Edit-2509, from
+# 4-bit weights streamed to the device. No shaders of its own: the NF4
+# expansion and the per-head RMSNorm it needed are general and went into nn/.
+# ---------------------------------------------------------------------------
+file(GLOB_RECURSE SS_MARIGOLD_SOURCES CONFIGURE_DEPENDS ${SS_SRC}/marigold/*.cpp)
+list(FILTER SS_MARIGOLD_SOURCES EXCLUDE REGEX "/tests/")
+
+add_library(ss_marigold STATIC ${SS_MARIGOLD_SOURCES})
+target_link_libraries(ss_marigold PUBLIC ss_nn)
+target_compile_options(ss_marigold PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:${SPLAT_CXX_FLAGS}>)
+set_property(TARGET ss_marigold PROPERTY CXX_STANDARD 17)
+
+# ---------------------------------------------------------------------------
+# ss_roma -- native RoMa v2 inference
+# ---------------------------------------------------------------------------
+ss_nn_shaders(roma ${SS_SRC}/roma/shaders SS_ROMA_EMBED)
+file(GLOB_RECURSE SS_ROMA_SOURCES CONFIGURE_DEPENDS ${SS_SRC}/roma/*.cpp)
+list(FILTER SS_ROMA_SOURCES EXCLUDE REGEX "/tests/")
+add_library(ss_roma STATIC ${SS_ROMA_SOURCES} ${SS_ROMA_EMBED})
+target_link_libraries(ss_roma PUBLIC ss_nn)
+target_compile_options(ss_roma PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:${SPLAT_CXX_FLAGS}>)
+set_property(TARGET ss_roma PROPERTY CXX_STANDARD 17)
+
+# ---------------------------------------------------------------------------
+# ss_blur -- the edge-width blur measure on the device. app/FrameSharpness.cpp
+# is the host copy every build has; edge_width_test holds the two together.
+# ---------------------------------------------------------------------------
+ss_nn_shaders(blur ${SS_SRC}/blur/shaders SS_BLUR_EMBED)
+add_library(ss_blur STATIC ${SS_SRC}/blur/EdgeWidthGpu.cpp ${SS_BLUR_EMBED})
+target_link_libraries(ss_blur PUBLIC ss_nn)
+target_compile_options(ss_blur PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:${SPLAT_CXX_FLAGS}>)
+set_property(TARGET ss_blur PROPERTY CXX_STANDARD 17)
+
+# ---------------------------------------------------------------------------
+# ss_lpips -- LPIPS for the eval pass, which reaches it through the hook
+# app/EvalLpips.cpp installs: TrainerCore lives in the engine library and
+# cannot link this. Its one shader is the per-tap distance.
+# ---------------------------------------------------------------------------
+ss_nn_shaders(lpips ${SS_SRC}/lpips/shaders SS_LPIPS_EMBED)
+file(GLOB SS_LPIPS_SOURCES CONFIGURE_DEPENDS ${SS_SRC}/lpips/*.cpp)
+add_library(ss_lpips STATIC ${SS_LPIPS_SOURCES} ${SS_LPIPS_EMBED})
+target_link_libraries(ss_lpips PUBLIC ss_nn)
+target_compile_options(ss_lpips PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:${SPLAT_CXX_FLAGS}>)
+set_property(TARGET ss_lpips PROPERTY CXX_STANDARD 17)
+
+add_executable(edge_width_test ${SS_SRC}/blur/tests/edge_width_test.cpp
+                               ${SS_SRC}/app/FrameSharpness.cpp)
+target_link_libraries(edge_width_test PRIVATE ss_blur)
+target_compile_definitions(edge_width_test PRIVATE SS_HAVE_BLUR_GPU=1)
+set_property(TARGET edge_width_test PROPERTY CXX_STANDARD 17)
+target_compile_options(edge_width_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:${SPLAT_CXX_FLAGS}>)
+
+# ---------------------------------------------------------------------------
 # ss_video -- container demux + VK_KHR_video_decode_*
 #
 # Gated on SS_ENABLE_PATENTED: H.264 / H.265 / AV1 bitstream parsing is the
@@ -232,11 +331,29 @@ if(SS_ENABLE_PATENTED)
 
     file(GLOB_RECURSE SS_VIDEO_SOURCES CONFIGURE_DEPENDS
          ${SS_SRC}/video/*.cpp)
+    list(FILTER SS_VIDEO_SOURCES EXCLUDE REGEX "/tests/")
     add_library(ss_video STATIC ${SS_VIDEO_SOURCES} ${SS_VIDEO_EMBED})
     target_link_libraries(ss_video PUBLIC ss_nn)
     target_compile_options(ss_video PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:${SPLAT_CXX_FLAGS}>)
     set_property(TARGET ss_video PROPERTY CXX_STANDARD 17)
+
+    file(GLOB SS_VIDEO_TESTS CONFIGURE_DEPENDS ${SS_SRC}/video/tests/*.cpp)
+    foreach(test_src ${SS_VIDEO_TESTS})
+        get_filename_component(test_name ${test_src} NAME_WE)
+        add_executable(${test_name} ${test_src})
+        if(test_name STREQUAL "hevc_sps_crop_test")
+            target_include_directories(${test_name} PRIVATE ${SS_SRC})
+            enable_testing()
+            add_test(NAME ${test_name} COMMAND ${test_name})
+            set_tests_properties(${test_name} PROPERTIES LABELS "cpu;headless")
+        else()
+            target_link_libraries(${test_name} PRIVATE ss_video)
+        endif()
+        set_property(TARGET ${test_name} PROPERTY CXX_STANDARD 17)
+        target_compile_options(${test_name} PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:${SPLAT_CXX_FLAGS}>)
+    endforeach()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -245,16 +362,35 @@ endif()
 file(GLOB SS_NN_TESTS CONFIGURE_DEPENDS
      ${SS_SRC}/nn/tests/*.cpp ${SS_SRC}/sam/tests/*.cpp
      ${SS_SRC}/aliked/tests/*.cpp ${SS_SRC}/loma/tests/*.cpp
-     ${SS_SRC}/metric3d/tests/*.cpp
-     ${SS_SRC}/moge/tests/*.cpp)
+     ${SS_SRC}/flexglue/tests/*.cpp ${SS_SRC}/metric3d/tests/*.cpp
+     ${SS_SRC}/moge/tests/*.cpp ${SS_SRC}/marigold/tests/*.cpp
+     ${SS_SRC}/birefnet/tests/*.cpp
+     ${SS_SRC}/gdino/tests/*.cpp ${SS_SRC}/roma/tests/*.cpp
+     ${SS_SRC}/lpips/tests/*.cpp)
 foreach(test_src ${SS_NN_TESTS})
     get_filename_component(test_name ${test_src} NAME_WE)
     add_executable(${test_name} ${test_src})
     # Every test links every library above it: the four are small, and one
     # rule here beats a per-directory list that drifts.
     target_link_libraries(${test_name} PRIVATE ss_sam ss_aliked ss_loma ss_metric3d
-                                                ss_moge)
+                                               ss_moge ss_marigold ss_roma ss_lpips
+                                               ss_flexglue)
     set_property(TARGET ${test_name} PROPERTY CXX_STANDARD 17)
+    target_compile_definitions(${test_name} PRIVATE SS_REPO_ROOT="${SS_ROOT}")
     target_compile_options(${test_name} PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:${SPLAT_CXX_FLAGS}>)
 endforeach()
+
+# The licence tests reach outside the inference layer: the app's path logic and
+# terminal prompt, the licence table, and the translation catalogs.
+foreach(t license_paths_test license_text_test fetch_consent_test)
+    if(TARGET ${t})
+        target_link_libraries(${t} PRIVATE ss_license ss_i18n)
+    endif()
+endforeach()
+if(TARGET license_paths_test)
+    target_sources(license_paths_test PRIVATE ${SS_SRC}/app/AppPaths.cpp)
+endif()
+if(TARGET fetch_consent_test)
+    target_sources(fetch_consent_test PRIVATE ${SS_SRC}/app/cli/LicenseCli.cpp)
+endif()

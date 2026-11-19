@@ -115,6 +115,7 @@ void set_training_data_warped(
     // [B_in*K, 3, 3] frame of each post camera in its input camera's frame.
     TorchTensorView face_axes)
 {
+    StepTimingScope timing(StepPart::Loading, StepScale::Pixels);
     // Depth / normal are warped below; clear stale buffers first so a step
     // that supplies neither leaves the loss kernels seeing "no GT".
     engine().gt.depth  = DeviceTensor3D<float>();
@@ -203,7 +204,7 @@ void set_training_data_warped(
     {
         TorchTensorView dv((uint64_t)d_rgb_float, 4,
                            {(int64_t)B_post, (int64_t)out_H, (int64_t)out_W, 3LL});
-        engine().gt.rgb = DeviceTensor3D<float3>(dv);
+        engine().gt.rgb = dv;
     }
 
     // ---- Mask byte warp ---------------------------------------------------

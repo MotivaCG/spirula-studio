@@ -39,9 +39,15 @@ src/data/*.cpp
 src/data/parsers/*.cpp
 src/app/webviewer/*.cpp
 src/app/TrainerCore.cpp
+src/app/TrainForecast.cpp
+src/app/ResourceForecast.cpp
+src/app/RunReport.cpp
+src/app/SystemRecorder.cpp
 src/app/EvalMetrics.cpp
 src/external/*.cpp
 src/external/*.c
+src/external/apriltag/*.c
+src/external/apriltag/common/*.c
 
 [portable]
 # The same list minus the CUDA kernels. Compiled as csrc_portable by the
@@ -55,6 +61,12 @@ src/data/*.cpp
 src/data/parsers/*.cpp
 src/app/webviewer/*.cpp
 src/app/TrainerCore.cpp
+src/app/TrainForecast.cpp
+src/app/ResourceForecast.cpp
+src/app/RunReport.cpp
+src/app/SystemRecorder.cpp
 src/app/EvalMetrics.cpp
 src/external/*.cpp
 src/external/*.c
+src/external/apriltag/*.c
+src/external/apriltag/common/*.c

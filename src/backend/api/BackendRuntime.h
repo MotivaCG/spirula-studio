@@ -19,8 +19,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <vector>
+
+#include "core/Env.h"
 
 struct CUstream_st;
 
@@ -49,12 +53,24 @@ inline constexpr Stream kDefaultStream = nullptr;
 // A process runs on ONE device, picked lazily on the first device operation.
 // Enumeration is side-effect-free (it does not initialize the backend), so
 // apps can list devices and call device_select before starting work.
+
+// A GPU + driver that passes the feature checks yet is known to fail training.
+enum class DeviceIssue {
+    NoneKnown,
+    // AMD's Windows driver without native fp32 buffer atomic add (Radeon RX
+    // 6000 series and older) and without fp32 atomic exchange to work around
+    // it: training crashes or diverges. Issue #23.
+    AmdWindowsFloatAtomics,
+};
+
 struct DeviceInfo {
     char name[256];       // human-readable device name ("" if index invalid)
     const char* type;     // "discrete"|"integrated"|"virtual"|"cpu"|"other"
                           // (static storage)
+    std::string uuid;     // canonical uuid:<hex>; empty when unavailable
     uint64_t vram_bytes;  // device-local memory
     bool usable;          // meets the backend's feature requirements
+    DeviceIssue issue = DeviceIssue::NoneKnown;
 };
 // Number of devices visible to the backend (0: none / no driver).
 int device_count();
@@ -64,6 +80,32 @@ DeviceInfo device_info(int index);
 // first device operation. Returns false if `index` is out of range or not
 // usable, or if the backend already initialized on a different device.
 bool device_select(int index);
+#ifndef SS_BACKEND_VULKAN
+// CUDA current-device state is per thread; each worker must bind before device
+// work. Returns false when the selected device can no longer be made current.
+bool device_bind();
+#endif
+#ifdef SS_BACKEND_VULKAN
+// Selects by a Vulkan selector; prefer it over device_select, since an ordinal
+// is reinterpreted by every enumeration. Returns false on an unknown,
+// ambiguous or unusable selector.
+bool device_select_identity(const char* selector);
+// Detail from the last failed identity selection, or empty after success.
+std::string device_selection_error();
+// Canonical selector of device `index`, "" when the index is invalid or the
+// driver reported no UUID (the only case a caller must fall back to an ordinal).
+std::string device_selector(int index);
+// Canonical selector of the device in use -- or, before initialization, of the
+// one that would be picked.
+std::string device_current_selector();
+// True when `selector` resolves to the device already in use. False before the
+// backend initializes.
+bool device_identity_matches_current(const char* selector);
+// Index of the device a request would select, without selecting it: `selector`
+// as the user gave it ("" is Auto), or with `explicit_set` false SS_VK_DEVICE
+// first. -1 when nothing usable matches.
+int device_resolve(const std::string& selector, bool explicit_set);
+#endif
 // Index of the device in use — or, before the backend initializes, the one
 // it would pick (explicit selection, then backend env override, then
 // auto-score). -1 if no usable device.
@@ -77,13 +119,20 @@ int device_current();
 // treat 0 as "empty". Never throws; cheap enough to poll per frame.
 struct MemoryUsage {
     uint64_t process_bytes = 0;  // device memory allocated by THIS process
+    uint64_t process_peak_bytes = 0;  // process_bytes' high-water since memory_peak_reset
     uint64_t used_bytes = 0;     // device memory in use system-wide (all apps)
     uint64_t total_bytes = 0;    // device-local memory capacity
+    // System commit still free, where device allocations are charged to it
+    // (Windows): a second ceiling, below the VRAM when the page file is small.
+    uint64_t commit_free_bytes = 0;
     bool has_process = false;
     bool has_used = false;
     bool has_total = false;
+    bool has_commit = false;
 };
 MemoryUsage memory_usage();
+// Restarts process_peak_bytes from what the process holds now.
+void memory_peak_reset();
 
 // --- memory ---
 void* device_malloc(size_t bytes);
@@ -128,17 +177,37 @@ inline std::string _fmt_bytes(uint64_t bytes) {
                _fmt_bytes(m.total_bytes) + ".";
     if (m.has_process)
         msg += " Used by this process: " + _fmt_bytes(m.process_bytes) + ".";
+    if (m.has_commit && m.commit_free_bytes < (uint64_t)bytes + (1ull << 30))
+        msg += " Windows has only " + _fmt_bytes(m.commit_free_bytes) +
+               " of commit charge left, and every GPU allocation reserves commit:"
+               " a larger page file or closing other applications raises the"
+               " effective VRAM limit.";
     msg += err ? " If the device is out of memory, try"
                : " Try";
     msg += " a smaller model (fewer splats / SH), a lower "
            "training image resolution, or a GPU with more memory.";
     throw std::runtime_error(msg);
 }
+// SS_VRAM_TRACE=<MiB>: print every checked allocation at least that large, with
+// the process total it brings, to find the step that sets the peak.
+inline size_t vram_trace_bytes() {
+    static const size_t v = [] {
+        const char* e = spirula::env("VRAM_TRACE");
+        return e && e[0] ? (size_t)(std::strtod(e, nullptr) * 1048576.0) : SIZE_MAX;
+    }();
+    return v;
+}
 // device_malloc that throws the friendly OOM error above instead of returning
 // null. A zero-byte request still returns null (a valid no-op allocation).
 inline void* device_malloc_checked(size_t bytes, const char* what = nullptr) {
     void* ptr = device_malloc(bytes);
     if (!ptr && bytes > 0) throw_out_of_memory(bytes, what);
+    if (bytes >= vram_trace_bytes()) {
+        const MemoryUsage m = memory_usage();
+        std::fprintf(stderr, "[vram] +%.1f MiB %s -> %.1f MiB (peak %.1f)\n",
+                     bytes / 1048576.0, what ? what : "?",
+                     m.process_bytes / 1048576.0, m.process_peak_bytes / 1048576.0);
+    }
     return ptr;
 }
 
@@ -166,6 +235,26 @@ void   event_record(Event* event, Stream stream = kDefaultStream);
 void   event_synchronize(Event* event);
 void   event_destroy(Event* event);
 float  event_elapsed_ms(Event* start, Event* end);  // requires enable_timing
+
+// --- per-dispatch timing (the step breakdown, docs/notes/step-timing.md) ---
+// While armed, each kernel dispatch, fill and copy is bracketed by device
+// timestamps and tagged with its recording thread's tag. Vulkan only.
+struct DispatchTime {
+    const char* entry;   // "module.entry", "@fill" or "@copy"; static storage
+    uint16_t tag;
+    bool foreign;        // recorded by a thread other than the one that armed
+    double ms;
+};
+void dispatch_timing_arm();
+// Drains the device, appends what the armed span recorded and disarms; false
+// when nothing could be timed (no timestamps, or the CUDA backend).
+bool dispatch_timing_collect(std::vector<DispatchTime>& out);
+
+namespace detail {
+inline thread_local uint16_t g_dispatch_tag = 0;
+}
+inline void dispatch_timing_set_tag(uint16_t tag) { detail::g_dispatch_tag = tag; }
+inline uint16_t dispatch_timing_tag() { return detail::g_dispatch_tag; }
 
 }  // namespace backend
 

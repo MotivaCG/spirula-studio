@@ -3,25 +3,32 @@
 // pipelines from one SPIR-V module, and command recording helpers.
 #pragma once
 
-#include <atomic>
 
 #include <chrono>
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
 #include "core/Env.h"
 #include "core/SourcePath.h"
+#include "core/VulkanDeviceSelection.h"
+#include "core/VulkanMemoryBudget.h"
 
 #include "sfm/core/Log.h"
 #include "i18n/catalog/Sfm.h"
+
+// One shared device record: the SfM context stores the resolved identity so a
+// BA capability probe can be keyed by UUID instead of an ordinal.
+using VkDeviceRecord = spirula::vkselect::DeviceRecord;
 
 // The result codes worth naming: the ones a user can act on. Everything else
 // prints its number. Out-of-memory in particular used to surface as a bare
@@ -51,6 +58,25 @@ inline bool hasDeviceExtension(VkPhysicalDevice phys, const char* name) {
     for (const auto& e : exts)
         if (std::strcmp(e.extensionName, name) == 0) return true;
     return false;
+}
+
+// Width for the kernels whose two RDNA widths differ, GPU time at that width over
+// the other on a Ryzen 7000 iGPU (RADV RDNA2, 2026-10-08); 0 leaves it to the
+// driver. Nothing here uses subgroup operations, so any width is correct.
+inline uint32_t rdnaSubgroupWidth(const std::string& entry) {
+    static const std::pair<const char*, uint32_t> kWidths[] = {
+        {"blur_dog", 32},     // 0.91
+        {"descriptor", 32},   // 0.88
+        {"orient", 32},       // 0.98
+        {"extrema", 64},      // 0.67
+        {"upsample", 64},     // 0.83
+        {"downsample", 64},   // 0.73
+        {"match_pair", 64},   // 0.99
+        {"reduce_cols", 64},  // 0.66
+    };
+    for (const auto& w : kWidths)
+        if (entry == w.first) return w.second;
+    return 0;
 }
 
 // A driver implementing only a subset of Vulkan (MoltenVK, the sole driver on
@@ -111,6 +137,20 @@ struct Push {
     uint32_t u4 = 0, u5 = 0, u6 = 0, u7 = 0;
 };
 
+// Device memory every SfM context in this process holds, for a front end that
+// runs the module in its own process: no one outside the module sees its devices.
+// `others` is the device less this process's budget; 0 when the driver will not say.
+namespace sfm {
+struct DeviceMemoryTally {
+    std::atomic<uint64_t> bytes{0}, capacity{0}, others{0};
+    std::atomic<int64_t> refreshed_ms{0};
+    static DeviceMemoryTally& get() {
+        static DeviceMemoryTally t;
+        return t;
+    }
+};
+}  // namespace sfm
+
 struct GpuBuffer {
     VkBuffer buf = VK_NULL_HANDLE;
     VkDeviceMemory mem = VK_NULL_HANDLE;
@@ -122,7 +162,11 @@ struct VkContextOptions {
     bool needFloatAtomics = false;   // VK_EXT_shader_atomic_float (f32 add, and f64 add if needFloat64)
     bool needInt64Atomics = false;   // buffer int64 atomics (emulated-double CAS)
     bool needIntDotProduct = false;  // VK_KHR_shader_integer_dot_product (packed uint8x4, matcher)
-    int deviceIndex = -1;            // -1 = prefer discrete GPU
+    // External/test input only, and only when `selector` is empty; -1 = auto.
+    int deviceIndex = -1;
+    // Resolved identity (core/VulkanDeviceSelection.h), re-resolved in each
+    // context's own instance -- what makes a uuid request survive reordering.
+    std::string selector;
     bool validate = false;
     bool profile = false;            // per-dispatch GPU timestamps, aggregated by pipeline name
 };
@@ -145,6 +189,23 @@ struct VkDeviceCaps {
     // 43 ms per 8192x8192 pair on an M2), so this is what picks the blob.
     bool intDotProductFast = false;
 };
+
+// The resolver's reason for the last refused device request in this thread.
+// Kept beside the context rather than in it: the failure happens before any
+// context exists, and the caller (or the test) needs the wording.
+inline std::string& lastVkSelectError() {
+    static thread_local std::string e;
+    return e;
+}
+
+// Options carrying only the device request, for a capability probe. Callers
+// that need features add them to the copy that actually creates a context.
+inline VkContextOptions deviceOnlyOpt(int deviceIndex, const std::string& selector) {
+    VkContextOptions o;
+    o.deviceIndex = deviceIndex;
+    o.selector = selector;
+    return o;
+}
 
 class VkContext {
 public:
@@ -178,6 +239,7 @@ public:
             vkDestroyBuffer(device_, a.first, nullptr);
             vkFreeMemory(device_, a.second, nullptr);
         }
+        tally(totalAllocated_, false);
         if (fence_ != VK_NULL_HANDLE) vkDestroyFence(device_, fence_, nullptr);
         if (cmdPool_ != VK_NULL_HANDLE) vkDestroyCommandPool(device_, cmdPool_, nullptr);
         vkDestroyDevice(device_, nullptr);
@@ -187,11 +249,85 @@ public:
     // The device this context runs on, as probed at init(). Zeroed before then.
     const VkDeviceCaps& caps() const { return caps_; }
 
-    // Same features, without owning a context: creates a throwaway instance,
-    // picks the device `deviceIndex` would pick and asks it what it has. For
-    // callers that must choose a code path (a BA scalar type, say) before any
-    // context exists. Returns all-false if there is no usable device.
+    // Identity of the device this context resolved to: the canonical selector
+    // (what a cache key and a log line want) and the driver's reported name.
+    // Empty before init().
+    const std::string& selector() const { return selector_; }
+    const std::string& deviceName() const { return deviceName_; }
+
+    // Same features without owning a context, for callers that must choose a
+    // code path (a BA scalar type, say) before one exists. All-false when the
+    // request names no usable device.
+    static VkDeviceCaps probeCaps(const VkContextOptions& opt) {
+        return probe(opt).caps;
+    }
     static VkDeviceCaps probeCaps(int deviceIndex) {
+        return probeCaps(deviceOnlyOpt(deviceIndex, std::string()));
+    }
+
+    // Side-effect-free enumeration used by pickers and entry-point resolution;
+    // no logical device or allocation.
+    static std::vector<VkDeviceRecord> listDevices() {
+        std::vector<VkDeviceRecord> out;
+        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+        app.pApplicationName = "vk_ba";
+        app.apiVersion = VK_API_VERSION_1_2;
+        VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+        ici.pApplicationInfo = &app;
+        std::vector<const char*> instExts;
+        vkEnablePortability(ici, instExts);
+        VkInstance inst = VK_NULL_HANDLE;
+        if (vkCreateInstance(&ici, nullptr, &inst) != VK_SUCCESS) return out;
+        out = enumerateRecords(inst);
+        vkDestroyInstance(inst, nullptr);
+        return out;
+    }
+
+    // Resolve to canonical UUID; failures return an error without creating hardware.
+    static spirula::vkselect::Resolution resolveSelector(
+        const spirula::vkselect::Request& req) {
+        return spirula::vkselect::resolveRequest(req, listDevices());
+    }
+
+    // The same, memoized on the request's spelling. Enumeration means an
+    // instance plus a device walk, and the mapper's scoped solves would pay it
+    // per bundle adjustment; the machine's device set does not change under us.
+    static const spirula::vkselect::Resolution& cachedSelector(
+        const spirula::vkselect::Request& req) {
+        static std::mutex m;
+        static std::map<std::string, spirula::vkselect::Resolution> cache;
+        const std::string key = std::to_string((int)req.kind) + "|" + req.text;
+        std::lock_guard<std::mutex> g(m);
+        auto it = cache.find(key);
+        if (it == cache.end()) it = cache.emplace(key, resolveSelector(req)).first;
+        return it->second;
+    }
+
+    // The same, for a caller that already has an options object (an int
+    // boundary or a resolved selector), memoized like cachedSelector.
+    static const spirula::vkselect::Resolution& cachedResolution(const VkContextOptions& opt) {
+        spirula::vkselect::Request req;
+        if (!opt.selector.empty()) {
+            req = spirula::vkselect::parseRequest(opt.selector);
+        } else if (opt.deviceIndex >= 0) {
+            req = spirula::vkselect::parseRequest(std::to_string(opt.deviceIndex));
+            req.explicit_request = true;
+        } else {
+            req = spirula::vkselect::requestFrom("", false);
+        }
+        return cachedSelector(req);
+    }
+
+    // Same probe, keeping the identity it resolved to: `resolved` is false when
+    // the request names no device this instance can see, which is a selection
+    // error rather than a featureless device.
+    struct Probe {
+        VkDeviceCaps caps;
+        VkDeviceRecord device;
+        bool resolved = false;
+    };
+    static Probe probe(const VkContextOptions& opt) {
+        Probe out;
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
         app.pApplicationName = "vk_ba_probe";
         app.apiVersion = VK_API_VERSION_1_2;
@@ -200,11 +336,14 @@ public:
         std::vector<const char*> instExts;
         vkEnablePortability(ici, instExts);
         VkInstance inst = VK_NULL_HANDLE;
-        if (vkCreateInstance(&ici, nullptr, &inst) != VK_SUCCESS) return {};
-        VkPhysicalDevice phys = choosePhysical(inst, deviceIndex);
-        VkDeviceCaps c = phys == VK_NULL_HANDLE ? VkDeviceCaps{} : queryCaps(phys);
+        if (vkCreateInstance(&ici, nullptr, &inst) != VK_SUCCESS) return out;
+        const VkPhysicalDevice phys = choosePhysical(inst, opt, &out.device);
+        if (phys != VK_NULL_HANDLE) {
+            out.caps = queryCaps(phys);
+            out.resolved = true;
+        }
         vkDestroyInstance(inst, nullptr);
-        return c;
+        return out;
     }
 
     void init(const VkContextOptions& opt) {
@@ -217,25 +356,50 @@ public:
         std::vector<const char*> instExts;
         vkEnablePortability(ici, instExts);
         const char* layers[] = {"VK_LAYER_KHRONOS_validation"};
-        if (opt.validate) {
-            ici.enabledLayerCount = 1;
-            ici.ppEnabledLayerNames = layers;
+        if (opt.validate || spirula::env_on("VK_VALIDATION")) {
+            uint32_t n = 0;
+            vkEnumerateInstanceLayerProperties(&n, nullptr);
+            std::vector<VkLayerProperties> props(n);
+            vkEnumerateInstanceLayerProperties(&n, props.data());
+            const bool present = std::any_of(props.begin(), props.end(), [&](const VkLayerProperties& p) {
+                return std::strcmp(p.layerName, layers[0]) == 0;
+            });
+            if (present) {
+                ici.enabledLayerCount = 1;
+                ici.ppEnabledLayerNames = layers;
+            } else {
+                std::fprintf(stderr, "[vk_ba] validation requested but %s is not installed\n", layers[0]);
+            }
         }
         VK_CHECK(vkCreateInstance(&ici, nullptr, &instance_));
 
         // ---- physical device ----
-        phys_ = choosePhysical(instance_, opt.deviceIndex);
-        if (phys_ == VK_NULL_HANDLE) throw std::runtime_error("no Vulkan devices");
+        VkDeviceRecord record;
+        phys_ = choosePhysical(instance_, opt, &record);
+        if (phys_ == VK_NULL_HANDLE) {
+            // A refused request is a selection error, not a missing device: the
+            // resolver already said which value failed and why.
+            const std::string& why = lastVkSelectError();
+            throw std::runtime_error(why.empty() ? "no Vulkan devices" : why);
+        }
+        std::copy(record.uuid, record.uuid + VK_UUID_SIZE, deviceUUID_);
+        deviceName_ = record.name;
+        selector_ = spirula::vkselect::uuidSelector(deviceUUID_);
         caps_ = queryCaps(phys_);
-        VkPhysicalDeviceProperties props;
+        VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(phys_, &props);
-        // Once per process. The atom workers of a bottom-up run create a
-        // context each, and eight identical banner lines in the middle of a
-        // reconstruction say nothing the first one did not.
-        static std::atomic<bool> announced{false};
-        if (!announced.exchange(true))
-            sfm::slog::out(sfm::slog::Tag::Device,
-                           spirula::i18n::msg::sfm::device_using, {props.deviceName});
+        {
+            VkPhysicalDeviceMaintenance3Properties m3{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES};
+            VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            p2.pNext = &m3;
+            vkGetPhysicalDeviceProperties2(phys_, &p2);
+            maxBufferBytes_ = std::min<VkDeviceSize>(props.limits.maxStorageBufferRange,
+                                                     m3.maxMemoryAllocationSize);
+        }
+        sfm::slog::out(
+            sfm::slog::Tag::Device, spirula::i18n::msg::sfm::device_using,
+            {deviceName_ + " [" + selector_ + "]"});
 
         // ---- queue family ----
         uint32_t qn = 0;
@@ -316,6 +480,31 @@ public:
             exts.push_back(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
         }
 
+        // Only where the range holds both 32 and 64 (RDNA): Intel's compiler
+        // picks its own width per kernel, and pinning it would overrule that.
+        VkPhysicalDeviceSubgroupSizeControlFeaturesEXT fSgc{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT};
+        if (hasDeviceExtension(phys_, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) {
+            VkPhysicalDeviceFeatures2 sf2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            sf2.pNext = &fSgc;
+            vkGetPhysicalDeviceFeatures2(phys_, &sf2);
+            VkPhysicalDeviceSubgroupSizeControlPropertiesEXT sp{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT};
+            VkPhysicalDeviceProperties2 sp2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            sp2.pNext = &sp;
+            vkGetPhysicalDeviceProperties2(phys_, &sp2);
+            pinWidths_ = fSgc.subgroupSizeControl &&
+                         (sp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+                         sp.minSubgroupSize <= 32 && sp.maxSubgroupSize >= 64;
+        }
+        if (pinWidths_) {
+            fSgc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT};
+            fSgc.subgroupSizeControl = VK_TRUE;
+            fSgc.pNext = feat2.pNext;
+            feat2.pNext = &fSgc;
+            exts.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
+        }
+
         VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
         dci.pNext = &feat2;
         dci.queueCreateInfoCount = 1;
@@ -363,12 +552,13 @@ public:
         }
     }
 
-    GpuBuffer createBuffer(VkDeviceSize size) {
+    GpuBuffer createBuffer(VkDeviceSize size, VkBufferUsageFlags extra_usage = 0) {
         GpuBuffer b = createBufferRaw(size,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT | extra_usage,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         totalAllocated_ += size;
+        tally(size, true);
         return b;
     }
 
@@ -386,13 +576,24 @@ public:
                 break;
             }
         totalAllocated_ -= b.size;
+        tally(b.size, false);
         b = GpuBuffer{};
     }
 
     bool initialized() const { return device_ != VK_NULL_HANDLE; }
-    bool hasPipeline(const std::string& name) const { return pipelines_.count(name) != 0; }
+    bool hasPipeline(const std::string& name) const { return pipelines_.count(key(name)) != 0; }
+
+    // Specialization constants 0, 1, ... of every pipeline loaded or dispatched
+    // from here on; each set of values keeps pipelines of its own. Empty is the
+    // module's defaults.
+    void setSpecialization(std::vector<uint32_t> v) {
+        spec_ = std::move(v);
+        specKey_.clear();
+        for (uint32_t x : spec_) specKey_ += "#" + std::to_string(x);
+    }
 
     void upload(const GpuBuffer& dst, const void* src, VkDeviceSize size, VkDeviceSize dstOff = 0) {
+        if (pendingReadsStaging_) waitPending();
         const uint8_t* p = (const uint8_t*)src;
         for (VkDeviceSize off = 0; off < size; off += kStagingSize) {
             VkDeviceSize chunk = std::min<VkDeviceSize>(kStagingSize, size - off);
@@ -443,7 +644,10 @@ public:
                 continue;
             }
             if (used + it.size > kStagingSize) flush();
-            if (cb == VK_NULL_HANDLE) cb = begin();
+            if (cb == VK_NULL_HANDLE) {
+                if (pendingReadsStaging_) waitPending();
+                cb = begin();
+            }
             memcpy((uint8_t*)stagingPtr_ + used, it.src, it.size);
             copies.push_back(VkBufferCopy{used, 0, it.size});
             dsts.push_back(it.dst->buf);
@@ -478,6 +682,17 @@ public:
     }
     const void* stagingDownloadPtr() const { return stagingDlPtr_; }
     static constexpr VkDeviceSize stagingCapacity() { return kStagingSize; }
+
+    // The same for an upload: stage `src` now, copy when `cb` runs. Nothing else
+    // may stage until `cb` is submitted. `size` must not exceed stagingCapacity().
+    void recordUpload(VkCommandBuffer cb, const GpuBuffer& dst, const void* src,
+                      VkDeviceSize size) {
+        if (pendingReadsStaging_) waitPending();
+        recordedUpload_ = true;
+        memcpy(stagingPtr_, src, size);
+        VkBufferCopy c{0, 0, size};
+        vkCmdCopyBuffer(cb, staging_.buf, dst.buf, 1, &c);
+    }
 
     // ---- descriptor set (one set of N storage buffers shared by all pipelines) ----
     // Idempotent: the first call builds layout/pool/set, later calls (same
@@ -570,18 +785,28 @@ public:
         // entry points that cost more than 100 ms, which is how you find out
         // that one kernel is carrying the whole bill.
         const bool prof = spirula::env("SFM_MAP_PROF") != nullptr;
+        std::vector<VkSpecializationMapEntry> specEntries;
+        for (uint32_t i = 0; i < spec_.size(); i++)
+            specEntries.push_back({i, i * (uint32_t)sizeof(uint32_t), sizeof(uint32_t)});
+        const VkSpecializationInfo specInfo{(uint32_t)specEntries.size(), specEntries.data(),
+                                            spec_.size() * sizeof(uint32_t), spec_.data()};
         for (const auto& e : entries) {
-            if (pipelines_.count(e)) continue;
+            if (pipelines_.count(key(e))) continue;
             auto t0 = std::chrono::steady_clock::now();
             VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
             cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
             cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
             cpi.stage.module = shaderModule_;
             cpi.stage.pName = e.c_str();
+            cpi.stage.pSpecializationInfo = spec_.empty() ? nullptr : &specInfo;
+            VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss{
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT};
+            if (pinWidths_) rss.requiredSubgroupSize = rdnaSubgroupWidth(e);
+            if (rss.requiredSubgroupSize) cpi.stage.pNext = &rss;
             cpi.layout = pipeLayout_;
             VkPipeline p;
             VK_CHECK(vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &cpi, nullptr, &p));
-            pipelines_[e] = p;
+            pipelines_[key(e)] = p;
             if (prof) {
                 double dt = std::chrono::duration<double>(
                                 std::chrono::steady_clock::now() - t0).count();
@@ -615,7 +840,7 @@ public:
 
     void dispatch(VkCommandBuffer cb, const std::string& name, uint32_t gx, const Push& push,
                   uint32_t gy = 1) {
-        auto it = pipelines_.find(name);
+        auto it = pipelines_.find(key(name));
         if (it == pipelines_.end()) throw std::runtime_error("unknown pipeline " + name);
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, it->second);
         vkCmdPushConstants(cb, pipeLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Push), &push);
@@ -631,6 +856,15 @@ public:
         }
     }
 
+    void dispatchIndirect(VkCommandBuffer cb, const std::string& name, const GpuBuffer& commands,
+                          VkDeviceSize offset, const Push& push) {
+        auto it = pipelines_.find(key(name));
+        if (it == pipelines_.end()) throw std::runtime_error("unknown pipeline " + name);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, it->second);
+        vkCmdPushConstants(cb, pipeLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Push), &push);
+        vkCmdDispatchIndirect(cb, commands.buf, offset);
+    }
+
     void barrier(VkCommandBuffer cb,
                  VkPipelineStageFlags src = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                  VkPipelineStageFlags dst = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT) {
@@ -640,6 +874,14 @@ public:
                            VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(cb, src | VK_PIPELINE_STAGE_TRANSFER_BIT,
                              dst | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
+
+    void indirectBarrier(VkCommandBuffer cb) {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     }
 
     void fillZero(VkCommandBuffer cb, const GpuBuffer& b) {
@@ -657,11 +899,31 @@ public:
     }
 
     void submit(VkCommandBuffer cb) {
+        submitAsync(cb);
+        waitPending();
+    }
+
+    // Submit without waiting, so the host can get on with something else.
+    // Every other submit waits for it first: at most one is ever in flight.
+    // With profiling on it waits at once, since begin() resets the queries.
+    void submitAsync(VkCommandBuffer cb) {
+        waitPending();
         VK_CHECK(vkEndCommandBuffer(cb));
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1;
         si.pCommandBuffers = &cb;
         VK_CHECK(vkQueueSubmit(queue_, 1, &si, fence_));
+        pending_ = cb;
+        pendingReadsStaging_ = recordedUpload_;
+        recordedUpload_ = false;
+        if (profiling_) waitPending();
+    }
+
+    void waitPending() {
+        if (pending_ == VK_NULL_HANDLE) return;
+        VkCommandBuffer cb = pending_;
+        pending_ = VK_NULL_HANDLE;
+        pendingReadsStaging_ = false;
         VK_CHECK(vkWaitForFences(device_, 1, &fence_, VK_TRUE, ~0ull));
         VK_CHECK(vkResetFences(device_, 1, &fence_));
         vkFreeCommandBuffers(device_, cmdPool_, 1, &cb);
@@ -696,6 +958,10 @@ public:
 
     VkDevice device() const { return device_; }
     double totalAllocatedMB() const { return totalAllocated_ / (1024.0 * 1024.0); }
+    // The largest buffer a kernel may bind: maxStorageBufferRange (4 GB on
+    // NVIDIA, which wraps an access past it rather than failing) and the
+    // allocation limit (4 GB on RADV), whatever VRAM is free.
+    VkDeviceSize maxBufferBytes() const { return maxBufferBytes_; }
     double deviceLocalHeapMB() const {
         VkDeviceSize best = 0;
         for (uint32_t i = 0; i < memProps_.memoryHeapCount; i++)
@@ -707,24 +973,82 @@ public:
 private:
     static constexpr VkDeviceSize kStagingSize = 64ull << 20;
 
-    // `deviceIndex` < 0 prefers the first discrete GPU, else device 0.
-    static VkPhysicalDevice choosePhysical(VkInstance inst, int deviceIndex) {
+    // Enumeration uses the same usability probe as choosePhysical.
+    static std::vector<VkDeviceRecord> enumerateRecords(
+        VkInstance inst, std::vector<VkPhysicalDevice>* handles = nullptr) {
         uint32_t n = 0;
         vkEnumeratePhysicalDevices(inst, &n, nullptr);
-        if (n == 0) return VK_NULL_HANDLE;
         std::vector<VkPhysicalDevice> devs(n);
-        vkEnumeratePhysicalDevices(inst, &n, devs.data());
-        int pick = deviceIndex;
-        if (pick < 0) {
-            pick = 0;
-            for (uint32_t i = 0; i < n; i++) {
-                VkPhysicalDeviceProperties p;
-                vkGetPhysicalDeviceProperties(devs[i], &p);
-                if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { pick = (int)i; break; }
-            }
+        if (n) vkEnumeratePhysicalDevices(inst, &n, devs.data());
+        if (handles) *handles = devs;
+
+        std::vector<spirula::vkselect::DeviceRecord> list;
+        list.reserve(n);
+        for (uint32_t i = 0; i < n; i++) {
+            spirula::vkselect::DeviceRecord r;
+            r.index = (int)i;
+            spirula::vkselect::probeIdentity(devs[i], &r);
+            VkPhysicalDeviceMemoryProperties mp{};
+            vkGetPhysicalDeviceMemoryProperties(devs[i], &mp);
+            for (uint32_t h = 0; h < mp.memoryHeapCount; ++h)
+                if (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                    r.vram_bytes += mp.memoryHeaps[h].size;
+            // The same baseline the other runtimes require, so an unusable
+            // device is rejected here rather than at vkCreateDevice.
+            VkPhysicalDeviceVulkan12Features f12{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+            VkPhysicalDeviceFeatures2 f2{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            f2.pNext = &f12;
+            vkGetPhysicalDeviceFeatures2(devs[i], &f2);
+            uint32_t qn = 0;
+            vkGetPhysicalDeviceQueueFamilyProperties(devs[i], &qn, nullptr);
+            std::vector<VkQueueFamilyProperties> qf(qn);
+            if (qn) vkGetPhysicalDeviceQueueFamilyProperties(devs[i], &qn, qf.data());
+            bool compute = false;
+            for (uint32_t q = 0; q < qn; q++)
+                if (qf[q].queueFlags & VK_QUEUE_COMPUTE_BIT) compute = true;
+            if (r.props.apiVersion < VK_API_VERSION_1_2)
+                r.unusable_reason = "driver reports Vulkan < 1.2";
+            else if (!f12.bufferDeviceAddress)
+                r.unusable_reason = "no bufferDeviceAddress";
+            else if (!f12.timelineSemaphore)
+                r.unusable_reason = "no timelineSemaphore";
+            else if (!compute)
+                r.unusable_reason = "no compute queue";
+            else
+                r.usable = true;
+            list.push_back(std::move(r));
         }
-        if (pick >= (int)n) return VK_NULL_HANDLE;
-        return devs[pick];
+
+        return list;
+    }
+
+    static VkPhysicalDevice choosePhysical(VkInstance inst, const VkContextOptions& opt,
+                                           VkDeviceRecord* record = nullptr) {
+        std::vector<VkPhysicalDevice> devs;
+        const std::vector<VkDeviceRecord> list = enumerateRecords(inst, &devs);
+        const spirula::vkselect::Resolution res =
+            spirula::vkselect::resolveRequest(deviceRequest(opt), list);
+        if (!res.ok()) {
+            lastVkSelectError() = res.error;
+            return VK_NULL_HANDLE;
+        }
+        if (record) *record = res.device;
+        return devs[(size_t)res.device.index];
+    }
+
+    // What the options ask for: the resolved identity first, then the legacy
+    // ordinal (a caller that still hands one in), then the shared precedence.
+    static spirula::vkselect::Request deviceRequest(const VkContextOptions& opt) {
+        if (!opt.selector.empty()) return spirula::vkselect::parseRequest(opt.selector);
+        if (opt.deviceIndex >= 0) {
+            spirula::vkselect::Request r =
+                spirula::vkselect::parseRequest(std::to_string(opt.deviceIndex));
+            r.explicit_request = true;
+            return r;
+        }
+        return spirula::vkselect::requestFrom("", false);
     }
 
     static VkDeviceCaps queryCaps(VkPhysicalDevice phys) {
@@ -808,28 +1132,62 @@ private:
         VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         mai.allocationSize = req.size;
         mai.memoryTypeIndex = typeIdx;
-        VK_CHECK(vkAllocateMemory(device_, &mai, nullptr, &b.mem));
+        if (const VkResult r = vkAllocateMemory(device_, &mai, nullptr, &b.mem); r != VK_SUCCESS) {
+            vkDestroyBuffer(device_, b.buf, nullptr);
+            throw VkError(r, vkErrorText(r, SS_FILE, __LINE__));
+        }
         VK_CHECK(vkBindBufferMemory(device_, b.buf, b.mem, 0));
         allocations_.emplace_back(b.buf, b.mem);
         return b;
     }
 
+    // DeviceMemoryTally's bytes follow every device-local buffer; capacity and
+    // others are read off the budget at most twice a second.
+    void tally(VkDeviceSize size, bool add) {
+        sfm::DeviceMemoryTally& t = sfm::DeviceMemoryTally::get();
+        if (add) t.bytes += size;
+        else t.bytes -= std::min<uint64_t>(size, t.bytes.load());
+        const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now - t.refreshed_ms.load() < 500 || phys_ == VK_NULL_HANDLE) return;
+        t.refreshed_ms = now;
+        uint64_t capacity = 0;
+        for (uint32_t i = 0; i < memProps_.memoryHeapCount; i++)
+            if (memProps_.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                capacity += memProps_.memoryHeaps[i].size;
+        const spirula::vkmemory::Budget b = spirula::vkmemory::queryBudget(phys_);
+        t.capacity = capacity;
+        t.others = b.budget_bytes && capacity > b.budget_bytes ? capacity - b.budget_bytes : 0;
+    }
+
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice phys_ = VK_NULL_HANDLE;
     VkDeviceCaps caps_{};
+    bool pinWidths_ = false;  // rdnaSubgroupWidth() applies
+    std::string selector_;   // canonical uuid:<hex> of phys_, empty before init
+    std::string deviceName_;
+    uint8_t deviceUUID_[VK_UUID_SIZE] = {};
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue queue_ = VK_NULL_HANDLE;
     uint32_t queueFamily_ = 0;
     VkPhysicalDeviceMemoryProperties memProps_{};
     VkCommandPool cmdPool_ = VK_NULL_HANDLE;
     VkFence fence_ = VK_NULL_HANDLE;
+    VkCommandBuffer pending_ = VK_NULL_HANDLE;  // submitAsync()'s, until waited for
+    // Whether the command buffer being recorded, and the one in flight, copy
+    // out of the upload staging buffer; the next upload must wait for the latter.
+    bool recordedUpload_ = false, pendingReadsStaging_ = false;
     VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipeLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool descPool_ = VK_NULL_HANDLE;
     VkDescriptorSet descSet_ = VK_NULL_HANDLE;
     uint32_t descBindingCount_ = 0;
     VkShaderModule shaderModule_ = VK_NULL_HANDLE;
-    std::map<std::string, VkPipeline> pipelines_;
+    std::map<std::string, VkPipeline> pipelines_;   // by key(): entry name + specKey_
+    std::vector<uint32_t> spec_;
+    std::string specKey_;
+    VkDeviceSize maxBufferBytes_ = ~VkDeviceSize(0);
+    std::string key(const std::string& name) const { return name + specKey_; }
     GpuBuffer staging_, stagingDl_;
     void* stagingPtr_ = nullptr;
     void* stagingDlPtr_ = nullptr;

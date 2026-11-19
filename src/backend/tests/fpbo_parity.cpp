@@ -30,7 +30,7 @@ using backend::MemcpyKind;
 static constexpr int64_t N = 3072;
 static constexpr int64_t C = 2;
 static constexpr uint32_t W = 200, H = 150;
-static constexpr int NUM_SH = 15;
+static constexpr int NUM_SH = 24;
 static constexpr int64_t NB = (N + 255) / 256;
 
 template <typename T>
@@ -55,6 +55,13 @@ void readback_f(std::vector<float>& acc, const float* d, int64_t n) {
 
 // qadam cells: BITS=16 -> one u32 word (u16 | s16<<16); BITS=8 -> one
 // halfword (u8 | s8<<8). Emits two codes per cell.
+void readback_i(std::vector<int32_t>& acc, const int32_t* d, int64_t n) {
+    size_t off = acc.size();
+    acc.resize(off + n);
+    backend::memcpy_sync(acc.data() + off, d, n * sizeof(int32_t),
+                         MemcpyKind::DeviceToHost);
+}
+
 void readback_qadam(std::vector<int32_t>& acc, const uint8_t* d,
                     int64_t cells, int bits) {
     std::vector<uint8_t> raw(cells * (bits == 16 ? 4 : 2));
@@ -173,12 +180,12 @@ int main(int argc, char** argv) {
         {0, false, 0, 1, 3, 0, false, false, false, 31, false, true},
         {1, false, 1, 2, 2, 0, false, true, false, 0, true, false},
         {2, false, 0, 2, 3, 0, false, false, true, 7, false, true},
-        // NOTE: scale-agnostic means x non-SH quant is excluded: the mixed
-        // g1/g2 units make u = g1/sqrt(g2) unbounded for edge splats
-        // (radii 0 with nonzero grad), so +-1 quantum decode differences
-        // amplify chaotically -- inherent to the lossy codec, on CUDA too.
+        // Mixed g1/g2 units make scale-agnostic quantized means unbounded
+        // at radii == 0; a one-code difference amplifies on either backend.
         {0, true, 2, 1, 3, 1, true, false, false, 31, false, false},
         {2, true, 3, 0, 1, 1, false, false, true, 7, false, false},
+        {0, true, 0, 0, 4, 0, false, false, false, 31, false, true},
+        {0, true, 0, 0, 4, 1, true, false, false, 31, false, false},
     };
 
     for (const Cfg& cfg : cfgs) {
@@ -248,7 +255,7 @@ int main(int argc, char** argv) {
             auto fn = cfg.prim == 0   ? projection_3dgs_packed_forward
                       : cfg.prim == 1 ? projection_mip_packed_forward
                                       : projection_3dgut_packed_forward;
-            auto out = fn(N, cfg.max_deg, splats_fwd, ttv(d_vm, {C, 16}),
+            auto out = fn(N, ColorBasis{cfg.max_deg, 0}, splats_fwd, ttv(d_vm, {C, 16}),
                           ttv(d_intr, {C, 4}), W, H, cams[cfg.cam],
                           dist_fixture::kTierNames[cfg.dist],
                           dist_tv(cfg.dist), radii, q_val_packed,
@@ -262,7 +269,7 @@ int main(int argc, char** argv) {
             auto fn = cfg.prim == 0   ? projection_3dgs_forward
                       : cfg.prim == 1 ? projection_mip_forward
                                       : projection_3dgut_forward;
-            auto out = fn(N, cfg.max_deg, splats_fwd, ttv(d_vm, {C, 16}),
+            auto out = fn(N, ColorBasis{cfg.max_deg, 0}, splats_fwd, ttv(d_vm, {C, 16}),
                           ttv(d_intr, {C, 4}), W, H, cams[cfg.cam],
                           dist_fixture::kTierNames[cfg.dist],
                           dist_tv(cfg.dist), radii, q_val_packed,
@@ -364,6 +371,32 @@ int main(int argc, char** argv) {
         } else {
             step = (int32_t)10;
         }
+        std::vector<int32_t> vis(N);
+        for (auto& v : vis) v = (int32_t)((rng() % 50u) | ((rng() % 30u) << 16));
+        uint32_t* d_visit = (uint32_t*)upload(vis);
+        SplatVisitState visit;
+        visit.counters = d_visit;
+        visit.skip_unrendered_reg = cfg.per_splat_steps;
+
+        ProjectiveDepthOptim depth;
+        float* depth_rows = nullptr;
+        float* depth_information = nullptr;
+        float* depth_centers = nullptr;
+        int32_t* depth_cameras = nullptr;
+        if (cfg.cam == 0 && cfg.dist == 0) {
+            std::vector<float> rows(4*N,0);
+            for (int64_t i = 0; i < N; ++i) rows[4*i] = 1;
+            depth_rows = upload(rows);
+            depth_information = upload(std::vector<float>(N,100));
+            depth_centers = upload(std::vector<float>{0,0,-4,1});
+            depth_cameras = upload(std::vector<int32_t>{0});
+            depth.states = (float4*)depth_rows;
+            depth.information = depth_information;
+            depth.centers = (float4*)depth_centers;
+            depth.camera_indices = depth_cameras;
+            depth.lr = .001f; depth.angular_lr = .001f;
+        }
+
         float* d_ds = nullptr;
         DeviceVector<float> densify_score;
         if (cfg.densify) {
@@ -385,18 +418,20 @@ int main(int argc, char** argv) {
                   : cfg.prim == 1 ? fused_projection_bwd_optimizer_mip
                                   : fused_projection_bwd_optimizer_3dgut;
         for (int call = 0; call < 2; call++) {
+            pool_begin_phase(PoolPhase::RasterBwd);
             if (cfg.packed && call == 1)
                 backend::memcpy_sync(gauss_ids.data_ptr(), gauss_host.data(),
                                      n_isect * 4, MemcpyKind::HostToDevice);
-            fn(N, cfg.max_deg, splats, ttv(d_vm, {C, 16}),
+            fn(N, ColorBasis{cfg.max_deg, 0}, splats, ttv(d_vm, {C, 16}),
                ttv(d_intr, {C, 4}), W, H, cams[cfg.cam],
                dist_fixture::kTierNames[cfg.dist], dist_tv(cfg.dist),
                cam_ids, gauss_ids, aabb_2d, v_world,
                v_screen, g1_world, g2_world, shq_tv, shq_b_tv, shv_tv,
-               shv_b_tv, non_sh, radii, densify_score,
+               shv_b_tv, non_sh, visit, depth, radii, densify_score,
                /*lr_means=*/1.6e-4f, /*lr_quats=*/1e-3f, /*lr_scales=*/5e-3f,
                /*lr_opacs=*/5e-2f, /*lr_features_dc=*/2.5e-3f,
-               /*lr_features_sh=*/1.25e-4f, /*max_gauss_ratio=*/10.f,
+               /*lr_features_sh=*/1.25e-4f, /*lr_features_sb=*/2.5e-3f,
+               /*max_gauss_ratio=*/10.f,
                /*scale_reg=*/0.1f, /*mcmc_op=*/0.01f, /*mcmc_scale=*/0.01f,
                /*erank=*/0.1f, /*erank_s3=*/0.02f, /*quat_norm=*/0.01f,
                /*dc_reg=*/0.02f, /*sh_reg=*/0.05f,
@@ -411,6 +446,11 @@ int main(int argc, char** argv) {
             if (check_error("fpbo")) return 1;
         }
 
+        if (depth.states) {
+            readback_f(acc_f,depth_rows,4*N);
+            backend::device_free(depth_rows); backend::device_free(depth_information);
+            backend::device_free(depth_centers); backend::device_free(depth_cameras);
+        }
         // --- readback: updated params, Adam state, bounds, scores ---
         readback_f(acc_f, d_means, N * 3);
         readback_f(acc_f, d_quats, N * 4);
@@ -442,6 +482,7 @@ int main(int argc, char** argv) {
         }
         if (cfg.densify)
             readback_f(acc_f, d_ds, N);
+        readback_i(acc_c, (const int32_t*)d_visit, N);
     }
 
     if (dumping) {

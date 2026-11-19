@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <random>
 #include <string>
@@ -141,7 +142,7 @@ int main(int argc, char** argv) {
                   ttv(quats.data(), 4, {N, 4}),
                   ttv(scales.data(), 4, {N, 3}),
                   ttv(opac.data(), 4, {N, 1}), ttv(dc.data(), 4, {N, 3}),
-                  ttv(sh.data(), 4, {N, NUM_SH, 3}));
+                  ttv(sh.data(), 4, {N, NUM_SH, 3}), 0);
 
     // --- shared step config: multi-scale loss + SSIM + Adam, no densify ---
     EngineStepConfig cfg{};
@@ -166,11 +167,12 @@ int main(int argc, char** argv) {
     cfg.optim.lr_features_dc = 2.5e-3f;
     cfg.optim.lr_features_sh = 1.25e-4f;
     cfg.optim.sh_value_bits = 32;
-    // Disable densification via refine_start_iter: the step gate evaluates
-    // `step % refine_every` whenever step > refine_start_iter, so a zero
-    // refine_every alone SIGFPEs. Keep both fields out of reach.
+    // A zero refine_every alone divides by zero in the step gate.
     cfg.densify.refine_start_iter = 1 << 20;
     cfg.densify.refine_every = 1 << 20;
+    // Clipping runs even without refinement; a zero world limit makes log-scales -inf.
+    cfg.densify.max_screen_size = std::numeric_limits<float>::infinity();
+    cfg.densify.max_world_size = std::numeric_limits<float>::infinity();
 
     const int max_steps = 100;
     int step = 1;
@@ -208,6 +210,33 @@ int main(int argc, char** argv) {
                 ttv(gt_alpha.data(), 1, {C, H, W, 1}), ttv_null(), cfg);
             push_losses(losses);
         }
+
+        // float16 images: the background blend and the sRGB encode write
+        // them, an affine grid reads and writes them, and the loss reads them;
+        // the encode's backward reads the float16 copy of the raw render.
+        const float bg[3] = {0.2f, 0.45f, 0.7f}, off[3] = {0.0f, 0.0f, 0.0f};
+        const std::vector<float> eye = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+        engine_init_color_space(true, 0, true, eye, false, 0, false, {});
+        engine_init_background_color(bg, 0, true);
+        engine_init_bilagrid_rgb(C, "affine", 4, 5, 6, 32, 32, false);
+        EngineStepConfig cfg_h = cfg;
+        cfg_h.optim.image_bits = 16;
+        for (int s = 0; s < 2; s++, step++) {
+            auto losses = engine_train_step(
+                step, max_steps, "3dgs", 3, /*packed=*/false, W, H,
+                "PINHOLE", dist_fixture::kTierNames[0],
+                ttv(vm.data(), 4, {C, 4, 4}), ttv(intr.data(), 4, {C, 4}),
+                ttv(dist.data() + dist_fixture::row_offset(0, C), 4,
+                    {C, kCameraDistortionParams}),
+                ttv(gt_rgb.data(), 1, {C, H, W, 3}),
+                ttv(gt_depth.data(), 2, {C, H, W, 1}),
+                ttv(gt_normal.data(), 1, {C, H, W, 3}),
+                ttv(gt_alpha.data(), 1, {C, H, W, 1}), ttv_null(), cfg_h);
+            push_losses(losses);
+        }
+        engine_init_background_color(off, 0, false);
+        engine_init_color_space(false, 0, false, {}, false, 0, false, {});
+        engine().bilagrid_rgb.enabled = false;
     }
 
     // --- warped steps (fisheye wide + equirectangular) ---------------------
@@ -299,7 +328,7 @@ int main(int argc, char** argv) {
     // --- tight: engine GT buffers after the last (equirect) warped upload --
     {
         auto& gt = engine().gt;
-        readback_dev_f(g_tight, gt.rgb.data_ptr(),
+        readback_dev_f(g_tight, (const float*)std::get<0>(gt.rgb),
                        (int64_t)B_post * out_H * out_W * 3);
         readback_dev_f(g_tight, gt.depth.data_ptr(),
                        (int64_t)B_post * out_H * out_W);
@@ -317,11 +346,18 @@ int main(int argc, char** argv) {
                      (long long)engine().cur_num_splats);
         return 1;
     }
+    const size_t params_begin = g_loose.size();
     readback_dev_f(g_loose, engine().world.means.data_ptr(), N * 3);
     readback_dev_f(g_loose, engine().world.quats.data_ptr(), N * 4);
     readback_dev_f(g_loose, engine().world.scales.data_ptr(), N * 3);
     readback_dev_f(g_loose, engine().world.opacities.data_ptr(), N);
     readback_dev_f(g_loose, engine().world.features_dc.data_ptr(), N * 3);
+    for (size_t i = params_begin; i < g_loose.size(); ++i) {
+        if (!std::isfinite(g_loose[i])) {
+            std::fprintf(stderr, "non-finite trained parameter at %zu\n", i - params_begin);
+            return 1;
+        }
+    }
 
     const int64_t nt = (int64_t)g_tight.size(),
                   nl = (int64_t)g_loose.size();

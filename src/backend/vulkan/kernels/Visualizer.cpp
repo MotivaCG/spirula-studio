@@ -26,6 +26,7 @@
 
 #include "backend/common/SortScan.h"
 #include "backend/vulkan/kernels/KernelCommon.h"
+#include "core/PixelFormat.h"
 
 #include <cmath>
 #include <cstdio>
@@ -66,11 +67,9 @@ struct VisFrustumParams {
     uint64_t intrins, widths, heights, camera_models, dist_coeffs, distortions,
         camera_to_worlds, lss_buffer, tri_buffer;
     float size;
-    uint32_t N;
-    uint32_t _pad0;
+    uint32_t N, wgs_per_row;
 };
-static_assert(sizeof(VisFrustumParams) == 9 * 8 + 3 * 4 + 4 /*pad*/,
-              "layout");
+static_assert(sizeof(VisFrustumParams) == 9 * 8 + 4 * 4, "layout");
 
 struct VisAabbParams {
     uint64_t buffer, aabb_reduced;
@@ -132,8 +131,9 @@ struct VisBlitParams {
     int32_t num_cam_lss, show_cams, show_overlay, thumb_w, thumb_h;
     int32_t has_lss, has_tri;
     int32_t alpha_stride;
+    int32_t alpha_is_T, _pad0;
 };
-static_assert(sizeof(VisBlitParams) == 16 * 8 + 12 * 4, "layout");
+static_assert(sizeof(VisBlitParams) == 16 * 8 + 14 * 4, "layout");
 
 struct VisPackParams {
     uint64_t rgba, out_rgb8;
@@ -142,10 +142,12 @@ struct VisPackParams {
 static_assert(sizeof(VisPackParams) == 2 * 8 + 2 * 4, "layout");
 
 struct VisThumbParams {
-    uint64_t rgb_float, cam_indices, thumbnails, done_mask, alpha_mask;
+    uint64_t rgb, cam_indices, thumbnails, done_mask, alpha_mask;
     int32_t H_rgb, W_rgb, B_post, N, S, H_alpha, W_alpha, has_alpha;
+    uint32_t rgb_fmt;
+    int32_t _pad0;
 };
-static_assert(sizeof(VisThumbParams) == 5 * 8 + 8 * 4, "layout");
+static_assert(sizeof(VisThumbParams) == 5 * 8 + 10 * 4, "layout");
 
 /* ---- LBVH build (mirrors Visualizer.cu build_bvh<>) ---- */
 
@@ -300,9 +302,10 @@ void fill_frustums(int64_t n, const void* intrins, const void* widths,
     p.tri_buffer = (uint64_t)tri_buffer;
     p.size = size;
     p.N = (uint32_t)n;
-    vkk::dispatch("visualizer.vis_fill_frustum",
-                 backend::vk::SpecList{0u, 0u}, (uint32_t)n, 1, 1, &p,
-                 sizeof(p));
+    vkk::dispatch_flat("visualizer.vis_fill_frustum",
+                       backend::vk::SpecList{0u, 0u},
+                       n * 4 * kNumFrustumSegments, 4 * kNumFrustumSegments,
+                       &p, sizeof(p), &p.wgs_per_row);
 }
 
 // root_aabb: u32[6] mapped; min words init 0xffffffff, max words 0.
@@ -351,7 +354,8 @@ struct BlitGeom {
 
 void run_blit(const TorchTensorView& render_rgbs,
               const TorchTensorView& render_depths,
-              const TorchTensorView& render_alphas, int view_camera_model,
+              const TorchTensorView& render_alphas, bool alpha_is_T,
+              int view_camera_model,
               uint32_t dist_spec, const TorchTensorView& view_intrins,
               const TorchTensorView& view_viewmat,
               const TorchTensorView& view_dist_coeffs, const BlitGeom& geom,
@@ -395,6 +399,7 @@ void run_blit(const TorchTensorView& render_rgbs,
     p.has_lss = geom.lss_buffer ? 1 : 0;
     p.has_tri = geom.tri_buffer ? 1 : 0;
     p.alpha_stride = (int32_t)alpha_stride;
+    p.alpha_is_T = alpha_is_T ? 1 : 0;
 
     uint64_t params_addr = 0;
     void* params_mapped = nullptr;
@@ -572,7 +577,7 @@ void engine_viewer_init(
         PoolSlot::ViewerC2w,
         TorchTensorView(std::get<0>(camera_to_worlds), 4, {N * 12LL}));
 
-    constexpr int S = VIEWER_THUMBNAIL_SIZE;
+    const int S = v.thumb_size = viewer_thumbnail_size(N);
     v.thumbnails.resize(PoolSlot::ViewerThumb, (int64_t)N * S * S * 4);
     backend::memset_sync(v.thumbnails.data_ptr(), 0,
                          (size_t)N * S * S * 4);
@@ -608,15 +613,17 @@ void engine_viewer_capture_thumbnails(TorchTensorView cam_indices_tv) {
     if (!engine().viewer.initialized || engine().viewer.pending_thumb <= 0)
         return;
     if (!engine().gt.has_gt) return;
-    if (engine().gt.rgb.data_ptr() == nullptr) return;
+    const TorchTensorView& gt_rgb = engine().gt.rgb;
+    if (std::get<0>(gt_rgb) == 0) return;
 
     std::lock_guard<std::mutex> _vlock(viewer_mutex());
     auto& v = engine().viewer;
     if (!v.initialized || v.pending_thumb <= 0) return;
 
-    int64_t B_post = engine().gt.rgb.size<0>();
-    int64_t H = engine().gt.rgb.size<1>();
-    int64_t W = engine().gt.rgb.size<2>();
+    const auto& gt_shape = std::get<2>(gt_rgb);
+    int64_t B_post = gt_shape[0];
+    int64_t H = gt_shape[1];
+    int64_t W = gt_shape[2];
     if (B_post <= 0 || H <= 0 || W <= 0) return;
 
     uint64_t ci_ptr = std::get<0>(cam_indices_tv);
@@ -663,7 +670,8 @@ void engine_viewer_capture_thumbnails(TorchTensorView cam_indices_tv) {
     }
 
     VisThumbParams p{};
-    p.rgb_float = (uint64_t)engine().gt.rgb.data_ptr();
+    p.rgb = std::get<0>(gt_rgb);
+    p.rgb_fmt = (uint32_t)pixel_format(gt_rgb);
     p.cam_indices = (uint64_t)d_ci;
     p.thumbnails = (uint64_t)v.thumbnails.data_ptr();
     p.done_mask = (uint64_t)v.thumbnail_done_mask.data_ptr();
@@ -672,7 +680,7 @@ void engine_viewer_capture_thumbnails(TorchTensorView cam_indices_tv) {
     p.W_rgb = (int)W;
     p.B_post = (int)B_post;
     p.N = v.N_post;
-    p.S = VIEWER_THUMBNAIL_SIZE;
+    p.S = v.thumb_size;
     p.H_alpha = H_alpha;
     p.W_alpha = W_alpha;
     p.has_alpha = d_alpha_mask ? 1 : 0;
@@ -686,6 +694,7 @@ void engine_blit_view(
     TorchTensorView render_buffer,
     TorchTensorView render_depth,
     TorchTensorView render_alpha,
+    bool            alpha_is_transmittance,
     int             view_camera_model,
     std::string     distortion,
     TorchTensorView view_intrins,
@@ -744,10 +753,10 @@ void engine_blit_view(
         geom.show_overlay = show_overlay;
     }
 
-    run_blit(render_buffer, render_depth, render_alpha, view_camera_model,
+    run_blit(render_buffer, render_depth, render_alpha, alpha_is_transmittance,
+             view_camera_model,
              dist_spec, view_intrins, view_viewmat, view_dist_coeffs, geom,
-             v.thumbnails.data_ptr(), VIEWER_THUMBNAIL_SIZE,
-             VIEWER_THUMBNAIL_SIZE, min_max, out_rgb);
+             v.thumbnails.data_ptr(), v.thumb_size, v.thumb_size, min_max, out_rgb);
 }
 
 /*[AutoHeaderGeneratorExport]*/
@@ -787,7 +796,7 @@ void blit_train_cameras_tensor(
 
     if (!show_training_cameras) {
         BlitGeom geom;  // no frusta, no overlay
-        run_blit(render_rgbs, render_depths, render_alphas,
+        run_blit(render_rgbs, render_depths, render_alphas, false,
                  view_camera_model, dist_spec, view_intrins, view_viewmat,
                  view_dist_coeffs, geom, (void*)std::get<0>(thumbnails),
                  thumb_w, thumb_h, min_max, out_rgb);
@@ -830,7 +839,7 @@ void blit_train_cameras_tensor(
     geom.num_cam_lss = (int)num_lss;  // no overlay in the legacy path
     geom.show_cams = true;
     geom.show_overlay = false;
-    run_blit(render_rgbs, render_depths, render_alphas, view_camera_model,
+    run_blit(render_rgbs, render_depths, render_alphas, false, view_camera_model,
              dist_spec, view_intrins, view_viewmat, view_dist_coeffs, geom,
              (void*)std::get<0>(thumbnails), thumb_w, thumb_h, min_max,
              out_rgb);

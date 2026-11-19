@@ -12,16 +12,19 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
 #include "sfm/ba/CpuCamera.h"
 #include "sfm/ba/CpuDense.h"
 #include "sfm/ba/CpuParallel.h"
+#include "sfm/ba/GradientNorm.h"
 #include "sfm/ba/Options.h"
+#include "sfm/ba/Priors.h"
 #include "sfm/ba/Problem.h"
 #include "core/Env.h"
-#include "sfm/core/HostMemory.h"
+#include "core/HostMemory.h"
 #include "sfm/core/Cancel.h"
 #include "sfm/core/Log.h"
 
@@ -30,6 +33,7 @@ namespace bacpu {
 class Solver {
     static constexpr uint32_t kCamBlk = kMaxCamDof * (kMaxCamDof + 1) / 2;
     static constexpr uint32_t kDenseMaxDim = 8192;
+    static constexpr uint32_t kNoSlot = 0xFFFFFFFFu;
     static uint32_t pidx(uint32_t r, uint32_t c) { return r * (r + 1) / 2 + c; }
 
 public:
@@ -48,9 +52,16 @@ public:
         buildImageTables();
         decidePaths();
         allocate();
+        hasPriors_ = P_.priors && !P_.priors->empty();
+        if (hasPriors_) {
+            prior_.init(P_);
+            hasPriors_ = !prior_.empty();
+        }
+        absCentres_ = hasPriors_ && prior_.hasAbsoluteCentres();
 
         stats_.vram_mb = allocatedMB();
         stats_.solver = useCG_ ? (haveFallback_ ? "cg+fallback" : "cg") : "dense";
+        stats_.jac32 = jac32_;
         if (opt_.verbose)
             sfm::slog::diag(sfm::slog::Tag::Map,
                             "[cpu] n_dim = %u, solver = %s, threads = %d, RAM = %.1f MB",
@@ -72,8 +83,14 @@ public:
                     const uint32_t img = P_.obs_image[o], pt = P_.obs_point[o];
                     withModel(model_[img], [&](auto M) {
                         double r[2];
-                        residual<decltype(M)>(&P_.poses[6 * (size_t)img], &P_.intr[ioff_[img]],
-                                              &P_.points[3 * (size_t)pt], &P_.obs_xy[2 * o], r);
+                        const double* pose = &P_.poses[6 * (size_t)frame_[img]];
+                        if (eoff_[img] == kNoSlot)
+                            residual<decltype(M)>(pose, &P_.intr[ioff_[img]],
+                                                  &P_.points[3 * (size_t)pt], &P_.obs_xy[2 * o], r);
+                        else
+                            residualRig<decltype(M)>(pose, &P_.exts[eoff_[img]], &P_.intr[ioff_[img]],
+                                                     &P_.points[3 * (size_t)pt], &P_.obs_xy[2 * o],
+                                                     r);
                         c += 0.5 * LT::cost(r[0] * r[0] + r[1] * r[1], lossParam_);
                     });
                 }
@@ -81,14 +98,17 @@ public:
             });
         });
         for (double v : part_) total += v;
-        return total;
+        lastPrior_ = hasPriors_ ? prior_.cost(P_, P_.poses.data(), P_.exts.data()) : 0.0;
+        return total + lastPrior_;
     }
 
     void solve() {
         auto t0 = std::chrono::high_resolution_clock::now();
         double damping = opt_.init_damping;
         double cost = computeCost();
+        double prior = lastPrior_;
         stats_.initial_cost = cost;
+        stats_.prior_initial = prior;
         int noimprov = 0;
 
         bool reuse = false;  // after a reject, the assembly still matches the params
@@ -102,12 +122,43 @@ public:
                            damping,
                            reuse ? " (reuse)" : "");
             const bool cg = useCG_;
+            // as sfm/ba/Solver.h: A_c when CG is slow, rebuilt every third
+            // solve or once the damping has moved tenfold
+            tcUse_ = cg && tcN_ && !tcOff_ && lastCg_ > kTcMinIters;
+            tcBuild_ = tcUse_ && (!tcHave_ || tcAge_ >= 2 ||
+                                  std::fabs(std::log(damping / tcLambda_)) > std::log(10.0));
+            if (tcBuild_) {
+                tcHave_ = true;
+                tcAge_ = 0;
+                tcLambda_ = damping;
+            } else if (tcUse_) {
+                tcAge_++;
+            }
             double newCost = iterate(damping, reuse, cg);
+            if (stats_.gradient_stop) {
+                stats_.iterations = it;
+                break;
+            }
+            // as sfm/ba/Solver.h: a CG that stopped before its first step is
+            // retried without the coarse correction, then taken as a failed step
+            if (cg && cgIters_ == 0 && !cgConverged_ && tcUse_) {
+                tcUse_ = tcBuild_ = false;
+                restore();
+                newCost = iterate(damping, true, cg);
+                if (cgIters_ > 0 || cgConverged_) {
+                    tcOff_ = true;
+                    sfm::slog::diag(sfm::slog::Tag::Map,
+                                    "[cpu] coarse correction broke down; continuing without it");
+                }
+            }
+            if (cg && cgIters_ == 0 && !cgConverged_)
+                newCost = std::numeric_limits<double>::infinity();
             stats_.iterations = it + 1;
 
             if (cg) {
                 stats_.cg_solves++;
                 stats_.cg_iters_total += cgIters_;
+                lastCg_ = cgConverged_ ? cgIters_ : 1e9;
                 if (cgConverged_) {
                     consec_fallbacks = 0;
                     cgMaxit_ = std::min<uint32_t>(
@@ -138,14 +189,23 @@ public:
                 }
             }
 
+            const double newPrior = lastPrior_;
             if (std::isfinite(newCost) && newCost <= cost * (1.0 + opt_.rtol)) {
-                if (newCost / cost >= 1.0 - opt_.rtol) {
-                    if (++noimprov >= opt_.patience) { cost = newCost; break; }
+                const LmAccept acc = classifyAccept(opt_, cost, newCost, absCentres_, prior,
+                                                    newPrior, stats_.prior_steps);
+                if (acc == LmAccept::Tie) {
+                    if (++noimprov >= opt_.patience) {
+                        cost = newCost;
+                        prior = newPrior;
+                        break;
+                    }
                 } else {
-                    noimprov = 0;
-                    damping *= 1.0 / 3.0;
+                    if (acc == LmAccept::Improved) noimprov = 0;
+                    else stats_.prior_steps++;
+                    damping = std::max(damping / 3.0, 1e-8);  // kMinDamping in sfm/ba/Solver.h
                 }
                 cost = newCost;
+                prior = newPrior;
                 stats_.accepted++;
                 reuse = false;
                 reject_mult = 2.0;
@@ -161,6 +221,8 @@ public:
             }
         }
         stats_.final_cost = cost;
+        stats_.prior_final = prior;
+        stats_.final_damping = damping;
         stats_.solve_seconds =
             std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
         if (spirula::env("SFM_MAP_PROF"))
@@ -171,13 +233,17 @@ public:
     }
 
     const SolverStats& stats() const { return stats_; }
+    const std::vector<double>& lastGradient() const { return gfull_; }
+    double lastPointGradientMax() const { return gptMax_; }
 
     // ---- debug hooks, mirroring BundleSolver's ----
 
     void assembleOnly(double damping) {
         jacobianPass();
+        if (hasPriors_) prior_.assemble(P_, P_.poses.data(), P_.exts.data(), damping, opt_.fix_rotations);
         pointPrep(damping);
         schurAssemble(damping);
+        if (hasPriors_) addPriorDense();
     }
     std::vector<double> packedS() const { return S_.data(); }
     std::vector<double> gradient() const { return g_; }
@@ -186,12 +252,15 @@ public:
         if (!useCG_ || !haveFallback_)
             throw std::runtime_error("step comparison needs --solver cg + fallback on");
         jacobianPass();
+        if (hasPriors_) prior_.assemble(P_, P_.poses.data(), P_.exts.data(), damping, opt_.fix_rotations);
         pointPrep(damping);
         cgCamDiag(damping);
+        if (hasPriors_) addPriorCg();
         cgPrecFactor();
         cgIters_ = runPCG((uint32_t)opt_.cg_max_iters);
         std::vector<double> xcg = g_;
         schurAssemble(damping);
+        if (hasPriors_) addPriorDense();
         S_.factorSolve(g_.data(), *pool_, nthreads_);
         double dmax = 0, xmax = 0;
         for (uint32_t i = 0; i < n_; i++) {
@@ -216,40 +285,56 @@ private:
         icol_.resize(nImg_);
         ioff_.resize(nImg_);
         model_.resize(nImg_);
+        frame_.resize(nImg_);
+        eoff_.resize(nImg_);
+        efree_.resize(nImg_);
+        emask_.resize(nImg_);
         std::vector<uint32_t> guse(P_.groups.size(), 0);
         for (uint32_t i = 0; i < nImg_; i++) guse[P_.image_group[i]]++;
         for (uint32_t i = 0; i < nImg_; i++) {
             const BAProblem::Group& g = P_.groups[P_.image_group[i]];
             if (g.model >= (uint32_t)kNumModels)
                 throw std::runtime_error("camera model index outside the registry");
-            dof_[i] = (uint8_t)(6 + g.n_intr);
+            const uint32_t m = P_.image_member[i];
+            frame_[i] = P_.image_frame[i];
+            eoff_[i] = m == kNoMember ? kNoSlot : P_.members[m].ext_offset;
+            efree_[i] = (uint8_t)(m == kNoMember ? 0 : P_.members[m].n_free);
+            emask_[i] = (uint8_t)(efree_[i] ? P_.members[m].mask : 0);
+            dof_[i] = (uint8_t)(6 + efree_[i] + g.n_intr);
             gz_[i] = (uint8_t)g.n_intr;
             icol_[i] = g.intr_col;
             ioff_[i] = g.intr_offset;
             model_[i] = (uint8_t)g.model;
         }
         exclusive_ = exclusiveGroups(P_);
+        tail_ = n_ - poseDim_;
 
-        // Columns of an intrinsics group that more than one image refines are
-        // the only ones an image-per-task assembly cannot own outright.
-        srow_.assign(P_.free_intr, -1);
+        // Rows an image-per-task assembly cannot own outright: a member's
+        // extrinsic columns (every frame of the rig touches them) and the
+        // columns of an intrinsics group that more than one image refines.
+        srow_.assign(tail_, -1);
         sharedCol_.clear();
-        grpSlot_.assign(P_.groups.size(), -1);
-        nSharedGrp_ = 0;
+        for (const BAProblem::Member& m : P_.members)
+            for (uint32_t j = 0; j < m.n_free; j++) {
+                srow_[m.ext_col - poseDim_ + j] = (int)sharedCol_.size();
+                sharedCol_.push_back(m.ext_col + j);
+            }
         for (size_t g = 0; g < P_.groups.size(); g++) {
             const BAProblem::Group& gr = P_.groups[g];
             if (guse[g] < 2 || gr.n_intr == 0) continue;
-            grpSlot_[g] = (int)nSharedGrp_++;
             for (uint32_t j = 0; j < gr.n_intr; j++) {
                 srow_[gr.intr_col - poseDim_ + j] = (int)sharedCol_.size();
                 sharedCol_.push_back(gr.intr_col + j);
             }
         }
         m_ = (uint32_t)sharedCol_.size();
+        // Preconditioner blocks of the shared partition that several tasks
+        // feed: every member's and every group's (buildPrecBlocks' numbering).
+        nSharedBlk_ = exclusive_ ? 0 : (uint32_t)(P_.members.size() + P_.groups.size());
     }
 
     static double defaultBudgetMB() {
-        const size_t ram = sfm::physicalRamBytes();
+        const size_t ram = spirula::physicalRamBytes();
         // Half the machine, not nine tenths of it: unlike a GPU heap this is
         // shared with the rest of the pipeline (features, matches, the
         // reconstruction) and with the page cache.
@@ -259,22 +344,46 @@ private:
     double estimateMB(bool withDense, bool withCG) const {
         const double no = (double)nObs_, np = (double)nPts_, ni = (double)nImg_, n = (double)n_;
         double b = 0;
-        b += ((double)P_.jc_total + 8 * no) * 8;              // Jc, Jp, res
+        b += ((double)P_.jc_total + 6 * no) * (jac32_ ? 4 : 8) + 2 * no * 8;  // Jc, Jp, res
         b += (9 + 9 + 3 + 3) * np * 8;                        // App, W, Bp, Bp0
-        b += (6 * ni + P_.total_intr + 3 * np) * 8;           // parameter backups
+        b += (P_.pose_dim + P_.exts.size() + P_.total_intr + 3 * np) * 8;  // parameter backups
         b += 4 * no + 4 * (ni + 1) + 12 * (no / 1024 + ni);   // obs-by-image CSR + chunks
         b += n * 8;                                           // g
         if (withDense) {
             b += (double)DenseSpd::elems(n_) * 8 + 2.0 * n * DenseSpd::kBlock * 8;
             b += (double)nthreads_ * m_ * n * 8;
         }
+        if (withCG && tcN_)
+            b += ((double)DenseSpd::elems(tcN_) + 2.0 * tcN_ * DenseSpd::kBlock +
+                  42.0 * P_.num_frames + tcN_) * 8 + 8.0 * tcEntries_;
         if (withCG) {
-            const double nblk = exclusive_ ? ni : ni + (double)P_.groups.size();
+            const double nblk = exclusive_ ? ni : (double)P_.num_frames + nSharedBlk_;
             b += (4 * n + 3 * np) * 8 + (double)kCamBlk * (ni + nblk) * 8 +
                  16.0 * (ni + (double)P_.groups.size()) +
-                 (double)nthreads_ * (2 * P_.free_intr + nSharedGrp_ * (double)kCamBlk) * 8;
+                 (double)nthreads_ * (2.0 * tail_ + nSharedBlk_ * (double)kCamBlk) * 8;
         }
         return b / (1024.0 * 1024.0);
+    }
+
+    // One LM iteration of each path in seconds on 8 cores, fitted where dense
+    // assembly's quadratic cost in track length shows: 7.4 s dense against 1.5 s
+    // CG, same cost, on 1068 images averaging 70 a track (GPU's: Solver.h).
+    double denseSeconds() const {
+        double t1 = 0, t2 = 0;
+        for (uint32_t p = 0; p < nPts_; p++) {
+            const double t = P_.obs_ranges[p + 1] - P_.obs_ranges[p];
+            t1 += t;
+            t2 += t * t;
+        }
+        double dof2 = 0;
+        for (uint32_t i = 0; i < nImg_; i++) dof2 = std::max(dof2, (double)dof_[i] * dof_[i]);
+        const double n = n_;
+        return 9e-11 * t2 * dof2 + n * n * n / 3e11;
+    }
+    double cgSeconds() const {
+        double dof = 0;
+        for (uint32_t i = 0; i < nImg_; i++) dof = std::max(dof, (double)dof_[i]);
+        return (7e-9 + 20 * 1.4e-9) * nObs_ * dof;
     }
 
     void decidePaths() {
@@ -282,8 +391,8 @@ private:
             opt_.vram_budget_mb > 0 ? opt_.vram_budget_mb : defaultBudgetMB();
         const bool cgOk = nObs_ > 0;
         const double denseMB = estimateMB(true, false);
-        const double cgMB = estimateMB(false, true);
-        const double bothMB = estimateMB(true, true);
+        double cgMB = estimateMB(false, true);
+        double bothMB = estimateMB(true, true);
 
         switch (opt_.solver) {
             case SolverSel::Dense: useCG_ = false; break;
@@ -293,19 +402,34 @@ private:
                                       "[cpu] warning: no observations, falling back to dense");
                 break;
             case SolverSel::Auto:
-                useCG_ = cgOk && (n_ > kDenseMaxDim || denseMB > budget);
+                useCG_ = cgOk && (n_ > kDenseMaxDim || denseMB > budget ||
+                                  cgSeconds() < 0.5 * denseSeconds());
                 break;
+        }
+        if (useCG_ && planCoarse(P_, kTcMaxDim, tcK_, tcN_, tcEntries_)) {
+            cgMB = estimateMB(false, true);
+            bothMB = estimateMB(true, true);
         }
         haveFallback_ = false;
         if (useCG_)
             haveFallback_ = opt_.cg_fallback == CgFallback::On ||
                             (opt_.cg_fallback == CgFallback::Auto && bothMB <= 0.5 * budget);
+        // As the device solver does (Solver.h): Jc and Jp at fp32 when the solve
+        // would not fit the budget otherwise, or SS_SFM_BA_JAC32 says.
+        const char* jacEnv = spirula::env("SFM_BA_JAC32");
+        const double fullMB = (useCG_ ? cgMB : denseMB) + (haveFallback_ ? denseMB : 0);
+        jac32_ = jacEnv ? jacEnv[0] == '1' : fullMB > budget;
+        if (jac32_) {
+            cgMB = estimateMB(false, true);
+            bothMB = estimateMB(true, true);
+        }
+        const double denseNowMB = jac32_ ? estimateMB(true, false) : denseMB;
 
         if (opt_.verbose)
             sfm::slog::diag(sfm::slog::Tag::Map,
                        "[cpu] RAM estimates: dense %.0f MB, cg %.0f MB (budget %.0f MB)",
                        denseMB, cgMB, budget);
-        const double needMB = (useCG_ ? cgMB : denseMB) + (haveFallback_ ? denseMB : 0);
+        const double needMB = (useCG_ ? cgMB : denseNowMB) + (haveFallback_ ? denseNowMB : 0);
         if (needMB > budget) {
             if (opt_.over_budget_throws) throw BAOverBudget(needMB, budget);
             sfm::slog::diag(sfm::slog::Tag::Map,
@@ -317,11 +441,31 @@ private:
         buildCamTables(P_);         // the dense path walks the same per-image lists
         if (useCG_) buildPrecBlocks(P_, exclusive_);
         cgMaxit_ = (uint32_t)opt_.cg_max_iters;
+        if (tcN_) {
+            buildCoarseEntries(P_, tcK_, tcEnt_, tcKey_);
+            const uint32_t nc = tcN_ / 7;
+            std::vector<uint64_t> w(nc + 1, 0);
+            for (uint32_t c = 0; c < nc; c++)
+                w[c + 1] = w[c] + tcK_ + tcKey_[(uint64_t)(c + 1) * (c + 2) / 2] -
+                           tcKey_[(uint64_t)c * (c + 1) / 2];
+            splitByWeight(w, taskCount((int64_t)w[nc], 1 << 12, nthreads_), tcSplit_);
+            frameImg_.assign(P_.num_frames + 1, nImg_);
+            for (uint32_t i = nImg_; i-- > 0;) frameImg_[frame_[i]] = i;
+            tcA_.init(tcN_);
+            tcP_.assign(42 * (size_t)P_.num_frames, 0.0);
+            tcY_.assign(tcN_, 0.0);
+            tcDiag_.assign(tcN_, 0.0);
+        }
     }
 
     void allocate() {
-        Jc_.assign(P_.jc_total, 0.0);
-        Jp_.assign(6 * (size_t)nObs_, 0.0);
+        if (jac32_) {
+            Jc32_.assign(P_.jc_total, 0.0f);
+            Jp32_.assign(6 * (size_t)nObs_, 0.0f);
+        } else {
+            Jc_.assign(P_.jc_total, 0.0);
+            Jp_.assign(6 * (size_t)nObs_, 0.0);
+        }
         res_.assign(2 * (size_t)nObs_, 0.0);
         App_.assign(9 * (size_t)nPts_, 0.0);
         W_.assign(9 * (size_t)nPts_, 0.0);
@@ -329,6 +473,7 @@ private:
         Bp0_.assign(3 * (size_t)nPts_, 0.0);
         g_.assign(n_, 0.0);
         poses0_ = P_.poses;
+        exts0_ = P_.exts;
         intr0_ = P_.intr;
         points0_ = P_.points;
 
@@ -347,6 +492,10 @@ private:
         }
         splitByWeight(ew, taskCount((int64_t)ew[nImg_], 1 << 14, nthreads_), asmSplit_);
         splitByWeight(ow, taskCount((int64_t)ow[nImg_], 1 << 13, nthreads_), cgSplit_);
+        // A task owns whole frames: the rows of a frame's pose are written by
+        // every image in it, so a split inside one would race.
+        snapToFrames(asmSplit_);
+        snapToFrames(cgSplit_);
         const int nAsm = (int)asmSplit_.size() - 1, nCg = (int)cgSplit_.size() - 1;
 
         if (!useCG_ || haveFallback_) {
@@ -365,9 +514,9 @@ private:
             cgB_.assign((size_t)kCamBlk * nImg_, 0.0);
             cgM_.assign((size_t)kCamBlk * P_.num_prec_blocks, 0.0);
             if (!exclusive_) {
-                cgGIntr_.assign((size_t)nCg * P_.free_intr, 0.0);
-                cgSpIntr_.assign((size_t)nCg * P_.free_intr, 0.0);
-                cgGrp_.assign((size_t)nCg * nSharedGrp_ * kCamBlk, 0.0);
+                cgGIntr_.assign((size_t)nCg * tail_, 0.0);
+                cgSpIntr_.assign((size_t)nCg * tail_, 0.0);
+                cgGrp_.assign((size_t)nCg * nSharedBlk_ * kCamBlk, 0.0);
             }
         }
     }
@@ -375,12 +524,15 @@ private:
     double allocatedMB() const {
         size_t b = (Jc_.capacity() + Jp_.capacity() + res_.capacity() + App_.capacity() +
                     W_.capacity() + Bp_.capacity() + Bp0_.capacity() + g_.capacity() +
-                    poses0_.capacity() + intr0_.capacity() + points0_.capacity() +
+                    poses0_.capacity() + exts0_.capacity() + intr0_.capacity() +
+                    points0_.capacity() +
                     sbuf_.capacity() + sgbuf_.capacity() + cgR_.capacity() + cgZ_.capacity() +
                     cgP_.capacity() + cgSp_.capacity() + cgV_.capacity() + cgB_.capacity() +
                     cgM_.capacity() + cgGIntr_.capacity() + cgSpIntr_.capacity() +
                     cgGrp_.capacity()) *
                    8;
+        b += tcA_.bytes() + (tcP_.capacity() + tcY_.capacity()) * 8 +
+             (tcEnt_.capacity() + tcKey_.capacity() + Jc32_.capacity() + Jp32_.capacity()) * 4;
         b += S_.bytes() + (P_.cam_obs.capacity() + P_.cam_obs_ranges.capacity() +
                            P_.cam_chunks.capacity() + P_.prec_blocks.capacity()) * 4;
         return (double)b / (1024.0 * 1024.0);
@@ -399,11 +551,18 @@ private:
         for (size_t i = 1; i < out.size(); i++) out[i] = std::max(out[i], out[i - 1]);
     }
 
+    // Move each boundary of an image split up to the start of its frame.
+    void snapToFrames(std::vector<uint32_t>& split) const {
+        if (!P_.hasRigs()) return;
+        for (size_t k = 1; k + 1 < split.size(); k++) {
+            uint32_t i = split[k];
+            while (i > 0 && i < nImg_ && frame_[i - 1] == frame_[i]) i--;
+            split[k] = std::max(i, split[k - 1]);
+        }
+    }
+
     uint32_t imgCols(uint32_t img, uint32_t* cols) const {
-        const uint32_t d = dof_[img], c0 = icol_[img];
-        for (uint32_t i = 0; i < 6; i++) cols[i] = 6 * img + i;
-        for (uint32_t i = 6; i < d; i++) cols[i] = c0 + i - 6;
-        return d;
+        return imageColumns(P_, img, cols);
     }
 
     // ================
@@ -422,22 +581,28 @@ private:
             Bp_ = Bp0_;  // the point back-substitution overwrote it in place
         } else {
             poses0_ = P_.poses;
+            exts0_ = P_.exts;
             intr0_ = P_.intr;
             points0_ = P_.points;
             jacobianPass();
             Bp0_ = Bp_;
         }
+        if (hasPriors_) prior_.assemble(P_, P_.poses.data(), P_.exts.data(), damping, opt_.fix_rotations);
+        if (!reuse && opt_.gradient_tol > 0 && gradientConverged()) return 0;
         prof_.jac += lap();
         pointPrep(damping);
         prof_.prep += lap();
         if (cg) {
             cgCamDiag(damping);
+            if (hasPriors_) addPriorCg();
             cgPrecFactor();
+            if (tcBuild_) coarseBuild();
             prof_.schur += lap();
             cgIters_ = runPCG(cgMaxit_);
         } else {
             schurAssemble(damping);
             prof_.schur += lap();
+            if (hasPriors_) addPriorDense();
             S_.factorSolve(g_.data(), *pool_, nthreads_);
         }
         prof_.lin += lap();
@@ -450,8 +615,38 @@ private:
         return c;
     }
 
+    // Ceres' gradient test at the point the Jacobian pass has just evaluated,
+    // before any Schur reduction: every column and point, priors included.
+    bool gradientConverged() {
+        gfull_.assign(n_, 0.0);
+        uint32_t cols[kMaxCamDof];
+        for (uint32_t a = 0; a < nImg_; a++) {
+            const uint32_t dof = imgCols(a, cols);
+            for (uint32_t t = P_.cam_obs_ranges[a]; t < P_.cam_obs_ranges[a + 1]; t++) {
+                const uint32_t o = P_.cam_obs[t];
+                double J_b[2 * kMaxCamDof];
+                const double* J = jcRow(o, J_b);
+                const double r0 = res_[2 * (size_t)o], r1 = res_[2 * (size_t)o + 1];
+                for (uint32_t r = 0; r < dof; r++) {
+                    const double v = J[r] * r0 + J[dof + r] * r1;
+                    if (std::isfinite(v)) gfull_[cols[r]] += v;
+                }
+            }
+        }
+        if (hasPriors_)
+            for (uint32_t i = 0; i < poseDim_; i++) gfull_[i] += prior_.gradient()[i];
+        gptMax_ = 0;
+        for (double v : Bp_) gptMax_ = std::max(gptMax_, std::isfinite(v) ? std::fabs(v) : INFINITY);
+        const double gn = sfm::gradientNormParts(P_, P_.poses.data(), P_.exts.data(), gfull_.data(),
+                                                 gptMax_, opt_.metres_per_unit).max();
+        stats_.gradient_norms.push_back(gn);
+        stats_.gradient_stop = gn <= opt_.gradient_tol;
+        return stats_.gradient_stop;
+    }
+
     void restore() {
         P_.poses = poses0_;
+        P_.exts = exts0_;
         P_.intr = intr0_;
         P_.points = points0_;
     }
@@ -466,30 +661,52 @@ private:
             pool_->run(nt, nthreads_, [&](int t, int) {
                 int64_t lo, hi;
                 taskRange(nPts_, nt, t, lo, hi);
-                double jcf[2 * kMaxCamDof], jpf[6], r[2];
+                double jcf[2 * kMaxCamDof], jpf[6], r[2], jcl[2 * kMaxCamDof], jpl[6];
                 for (int64_t p = lo; p < hi; p++) {
                     double App[9] = {}, Bp[3] = {};
                     for (uint32_t o = P_.obs_ranges[p]; o < P_.obs_ranges[p + 1]; o++) {
                         const uint32_t img = P_.obs_image[o];
-                        const uint32_t dofw = dof_[img];
-                        double* jc = &Jc_[P_.jc_off[o]];
-                        double* jp = &Jp_[6 * (size_t)o];
+                        const uint32_t dofw = dof_[img], ne = efree_[img], gz = gz_[img];
+                        const uint32_t emask = emask_[img];
+                        double* jc = jac32_ ? jcl : &Jc_[P_.jc_off[o]];
+                        double* jp = jac32_ ? jpl : &Jp_[6 * (size_t)o];
+                        const double* pose = &P_.poses[6 * (size_t)frame_[img]];
                         withModel(model_[img], [&](auto M) {
                             using MT = decltype(M);
-                            constexpr int DOF = 6 + MT::kNumIntr;
-                            jacobian<MT>(&P_.poses[6 * (size_t)img], &P_.intr[ioff_[img]],
-                                         &P_.points[3 * (size_t)p], &P_.obs_xy[2 * (size_t)o], r,
-                                         jcf, jpf);
+                            // The evaluated block is [6 | NE | kNumIntr]; the
+                            // stored one [6 | ne | gz] (sfm/ba/Problem.h).
+                            const bool rig = eoff_[img] != kNoSlot;
+                            const int NE = rig ? 6 : 0;
+                            const int DOF = 6 + NE + MT::kNumIntr;
+                            if (rig)
+                                jacobianRig<MT>(pose, &P_.exts[eoff_[img]], &P_.intr[ioff_[img]],
+                                                &P_.points[3 * (size_t)p], &P_.obs_xy[2 * (size_t)o],
+                                                r, jcf, jpf);
+                            else
+                                jacobian<MT>(pose, &P_.intr[ioff_[img]], &P_.points[3 * (size_t)p],
+                                             &P_.obs_xy[2 * (size_t)o], r, jcf, jpf);
                             const double sw =
                                 std::sqrt(LT::weight(r[0] * r[0] + r[1] * r[1], lossParam_));
                             for (int row = 0; row < 2; row++) {
-                                for (uint32_t a = 0; a < dofw; a++)
-                                    jc[row * dofw + a] = jcf[row * DOF + a] * sw;
+                                const double* src = jcf + row * DOF;
+                                double* dst = jc + row * dofw;
+                                for (uint32_t a = 0; a < 6; a++)
+                                    dst[a] = opt_.fix_rotations && a < 3 ? 0 : src[a] * sw;
+                                for (uint32_t i = 0, k = 6; i < 6; i++)
+                                    if ((emask >> i) & 1u) dst[k++] = src[6 + i] * sw;
+                                for (uint32_t i = 0; i < gz; i++)
+                                    dst[6 + ne + i] = src[6 + NE + i] * sw;
                                 for (int j = 0; j < 3; j++) jp[row * 3 + j] = jpf[row * 3 + j] * sw;
                             }
                             r[0] *= sw;
                             r[1] *= sw;
                         });
+                        if (jac32_) {  // rounded before the point blocks see them
+                            float* fc = &Jc32_[P_.jc_off[o]];
+                            float* fp = &Jp32_[6 * (size_t)o];
+                            for (uint32_t k = 0; k < 2 * dofw; k++) jc[k] = fc[k] = (float)jc[k];
+                            for (int k = 0; k < 6; k++) jp[k] = fp[k] = (float)jp[k];
+                        }
                         res_[2 * (size_t)o] = r[0];
                         res_[2 * (size_t)o + 1] = r[1];
                         for (int i = 0; i < 3; i++) {
@@ -593,15 +810,18 @@ private:
                     const uint32_t oi = P_.cam_obs[t];
                     const uint32_t p = P_.obs_point[oi];
                     const double* Wp = &W_[9 * (size_t)p];
-                    const double* Jpi = &Jp_[6 * (size_t)oi];
-                    const double* Jci = &Jc_[P_.jc_off[oi]];
+                    double Jpi_b[6];
+                    const double* Jpi = jpRow(oi, Jpi_b);
+                    double Jci_b[2 * kMaxCamDof];
+                    const double* Jci = jcRow(oi, Jci_b);
                     double Y[6];
                     for (int row = 0; row < 2; row++)
                         for (int j = 0; j < 3; j++)
                             Y[3 * row + j] = Jpi[3 * row] * Wp[j] + Jpi[3 * row + 1] * Wp[3 + j] +
                                              Jpi[3 * row + 2] * Wp[6 + j];
                     for (uint32_t oj = P_.obs_ranges[p]; oj <= oi; oj++) {
-                        const double* Jpj = &Jp_[6 * (size_t)oj];
+                        double Jpj_b[6];
+                        const double* Jpj = jpRow(oj, Jpj_b);
                         const double q00 = Y[0] * Jpj[0] + Y[1] * Jpj[1] + Y[2] * Jpj[2];
                         const double q01 = Y[0] * Jpj[3] + Y[1] * Jpj[4] + Y[2] * Jpj[5];
                         const double q10 = Y[3] * Jpj[0] + Y[4] * Jpj[1] + Y[5] * Jpj[2];
@@ -631,32 +851,36 @@ private:
                         }
                         const uint32_t b = P_.obs_image[oj];
                         const uint32_t dofj = dof_[b];
-                        const double* Jcj = &Jc_[P_.jc_off[oj]];
-                        const uint32_t bp = 6 * b, bi = icol_[b];
-                        if (a > b) {
+                        double Jcj_b[2 * kMaxCamDof];
+                        const double* Jcj = jcRow(oj, Jcj_b);
+                        uint32_t colsB[kMaxCamDof];
+                        imgCols(b, colsB);
+                        // Track images ascend, so frame(b) <= frame(a): two
+                        // frames put the pose x pose block below the diagonal,
+                        // one frame (rig-mates) folds both orderings onto it.
+                        if (frame_[a] != frame_[b]) {
+                            const uint32_t bp = 6 * frame_[b];
                             for (uint32_t r = 0; r < 6; r++) {
-                                double* Srow = S_.row(6 * a + r) + bp;
+                                double* Srow = S_.row(colsA[r]) + bp;
                                 for (uint32_t c = 0; c < 6; c++) {
                                     const double v = -(z0[r] * Jcj[c] + z1[r] * Jcj[dofj + c]);
                                     if (std::isfinite(v)) Srow[c] += v;
                                 }
                                 for (uint32_t c = 6; c < dofj; c++) {
                                     const double v = -(z0[r] * Jcj[c] + z1[r] * Jcj[dofj + c]);
-                                    if (std::isfinite(v)) addAt(bi + c - 6, colsA[r], v, sb);
+                                    if (std::isfinite(v)) addAt(colsB[c], colsA[r], v, sb);
                                 }
                             }
                             for (uint32_t r = 6; r < dofi; r++)
                                 for (uint32_t c = 0; c < dofj; c++) {
                                     const double v = -(z0[r] * Jcj[c] + z1[r] * Jcj[dofj + c]);
-                                    if (std::isfinite(v))
-                                        addSym(colsA[r], c < 6 ? bp + c : bi + c - 6, v, sb);
+                                    if (std::isfinite(v)) addSym(colsA[r], colsB[c], v, sb);
                                 }
                         } else {
                             for (uint32_t r = 0; r < dofi; r++)
                                 for (uint32_t c = 0; c < dofj; c++) {
                                     const double v = -(z0[r] * Jcj[c] + z1[r] * Jcj[dofj + c]);
-                                    if (std::isfinite(v))
-                                        addSym(colsA[r], c < 6 ? bp + c : bi + c - 6, v, sb);
+                                    if (std::isfinite(v)) addSym(colsA[r], colsB[c], v, sb);
                                 }
                         }
                     }
@@ -687,6 +911,67 @@ private:
     }
 
     // ================
+    // priors (sfm/ba/Priors.h): the assembled frame blocks into whichever
+    // system this iteration builds
+    // ================
+
+    void addPriorDense() {
+        const std::vector<uint32_t>& cols = prior_.cols();
+        const std::vector<uint32_t>& erow = prior_.entryRow();
+        const std::vector<double>& blk = prior_.blocks();
+        for (uint32_t e = 0; e < cols.size(); e++) {
+            const uint32_t r = erow[e], c = cols[e];
+            if (r < c) continue;
+            for (uint32_t a = 0; a < 6; a++)
+                for (uint32_t b = 0; b < 6; b++) {
+                    if (r == c && b > a) continue;
+                    S_.row(6 * r + a)[6 * c + b] += blk[36 * (size_t)e + 6 * a + b];
+                }
+        }
+        const std::vector<double>& g = prior_.gradient();
+        for (uint32_t i = 0; i < poseDim_; i++) g_[i] += g[i];
+    }
+
+    // Diagonal blocks into the preconditioner (frame f's block is block f on
+    // either partition, pose rows first) and the gradient.
+    void addPriorCg() {
+        const std::vector<uint32_t>& cols = prior_.cols();
+        const std::vector<uint32_t>& erow = prior_.entryRow();
+        const std::vector<double>& blk = prior_.blocks();
+        for (uint32_t e = 0; e < cols.size(); e++) {
+            const uint32_t r = erow[e];
+            if (cols[e] != r) continue;
+            double* M = &cgM_[(size_t)kCamBlk * r];
+            for (uint32_t a = 0; a < 6; a++)
+                for (uint32_t b = 0; b <= a; b++) M[pidx(a, b)] += blk[36 * (size_t)e + 6 * a + b];
+        }
+        const std::vector<double>& g = prior_.gradient();
+        for (uint32_t i = 0; i < poseDim_; i++) g_[i] += g[i];
+    }
+
+    void priorMatvec() {
+        const std::vector<uint32_t>& rows = prior_.rows();
+        const std::vector<uint32_t>& cols = prior_.cols();
+        const std::vector<double>& blk = prior_.blocks();
+        const uint32_t nf = P_.num_frames;
+        const int nt = taskCount(nf, 256, nthreads_);
+        pool_->run(nt, nthreads_, [&](int t, int) {
+            int64_t lo, hi;
+            taskRange(nf, nt, t, lo, hi);
+            for (int64_t f = lo; f < hi; f++) {
+                double acc[6] = {0, 0, 0, 0, 0, 0};
+                for (uint32_t e = rows[f]; e < rows[f + 1]; e++) {
+                    const double* B = &blk[36 * (size_t)e];
+                    const double* x = &cgP_[6 * (size_t)cols[e]];
+                    for (int a = 0; a < 6; a++)
+                        for (int b = 0; b < 6; b++) acc[a] += B[6 * a + b] * x[b];
+                }
+                for (int a = 0; a < 6; a++) cgSp_[6 * (size_t)f + a] += acc[a];
+            }
+        });
+    }
+
+    // ================
     // implicit-Schur PCG
     // ================
 
@@ -703,9 +988,10 @@ private:
         }
         const double dmp = 1.0 + lambda;
         const int nt = (int)cgSplit_.size() - 1;
+        const uint32_t mbase = P_.num_frames;
         pool_->run(nt, nthreads_, [&](int task, int) {
-            double* gi = exclusive_ ? nullptr : &cgGIntr_[(size_t)task * P_.free_intr];
-            double* gb = exclusive_ ? nullptr : &cgGrp_[(size_t)task * nSharedGrp_ * kCamBlk];
+            double* gi = exclusive_ ? nullptr : &cgGIntr_[(size_t)task * tail_];
+            double* gb = exclusive_ ? nullptr : &cgGrp_[(size_t)task * nSharedBlk_ * kCamBlk];
             uint32_t cols[kMaxCamDof];
             double accB[kCamBlk], accM[kCamBlk], gacc[kMaxCamDof], z0[kMaxCamDof], z1[kMaxCamDof];
             for (uint32_t img = cgSplit_[task]; img < cgSplit_[task + 1]; img++) {
@@ -716,8 +1002,10 @@ private:
                 std::fill(gacc, gacc + dof, 0.0);
                 for (uint32_t t = P_.cam_obs_ranges[img]; t < P_.cam_obs_ranges[img + 1]; t++) {
                     const uint32_t o = P_.cam_obs[t], p = P_.obs_point[o];
-                    const double* Jc = &Jc_[P_.jc_off[o]];
-                    const double* Jp = &Jp_[6 * (size_t)o];
+                    double Jc_b[2 * kMaxCamDof];
+                    const double* Jc = jcRow(o, Jc_b);
+                    double Jp_b[6];
+                    const double* Jp = jpRow(o, Jp_b);
                     const double* Wp = &W_[9 * (size_t)p];
                     const double* Bp = &Bp_[3 * (size_t)p];
                     double Y[6];
@@ -746,12 +1034,17 @@ private:
                         gacc[r] += Jc[r] * d0 + Jc[dof + r] * d1;
                 }
                 double* Bblk = &cgB_[(size_t)kCamBlk * img];
-                double* Mblk = &cgM_[(size_t)kCamBlk * img];
+                // M's rows go to the partition block owning them: the image's
+                // (exclusive) or the frame's directly, this task's both; the
+                // member's and group's through per-task slots summed afterwards.
+                double* Fblk = exclusive_ ? &cgM_[(size_t)kCamBlk * img]
+                                          : &cgM_[(size_t)kCamBlk * frame_[img]];
+                double* Mblk = nullptr;
                 double* Gblk = nullptr;
+                const uint32_t ne = efree_[img];
                 if (!exclusive_) {
-                    const uint32_t grp = P_.image_group[img];
-                    Gblk = grpSlot_[grp] >= 0 ? gb + (size_t)grpSlot_[grp] * kCamBlk
-                                              : &cgM_[(size_t)kCamBlk * (nImg_ + grp)];
+                    if (ne) Mblk = gb + (size_t)(P_.image_member[img]) * kCamBlk;
+                    Gblk = gb + (size_t)(P_.members.size() + P_.image_group[img]) * kCamBlk;
                 }
                 for (uint32_t r = 0; r < dof; r++)
                     for (uint32_t c = 0; c <= r; c++) {
@@ -760,8 +1053,9 @@ private:
                         const double mv = jj - accM[pidx(r, c)];
                         if (std::isfinite(jj)) Bblk[pidx(r, c)] += jj;
                         if (!std::isfinite(mv)) continue;
-                        if (exclusive_ || r < 6) Mblk[pidx(r, c)] += mv;
-                        else if (c >= 6) Gblk[pidx(r - 6, c - 6)] += mv;
+                        if (exclusive_ || r < 6) Fblk[pidx(r, c)] += mv;
+                        else if (r < 6 + ne) { if (c >= 6) Mblk[pidx(r - 6, c - 6)] += mv; }
+                        else if (c >= 6 + ne) Gblk[pidx(r - 6 - ne, c - 6 - ne)] += mv;
                     }
                 for (uint32_t r = 0; r < dof; r++) {
                     if (!std::isfinite(gacc[r])) continue;
@@ -772,15 +1066,13 @@ private:
         });
         if (exclusive_) return;
         for (int q = 0; q < nt; q++) {
-            const double* gq = &cgGIntr_[(size_t)q * P_.free_intr];
-            for (uint32_t i = 0; i < P_.free_intr; i++) g_[poseDim_ + i] += gq[i];
+            const double* gq = &cgGIntr_[(size_t)q * tail_];
+            for (uint32_t i = 0; i < tail_; i++) g_[poseDim_ + i] += gq[i];
         }
-        for (size_t g = 0; g < P_.groups.size(); g++) {
-            if (grpSlot_[g] < 0) continue;
-            double* dst = &cgM_[(size_t)kCamBlk * (nImg_ + g)];
+        for (uint32_t b = 0; b < nSharedBlk_; b++) {
+            double* dst = &cgM_[(size_t)kCamBlk * (mbase + b)];
             for (int q = 0; q < nt; q++) {
-                const double* src =
-                    &cgGrp_[((size_t)q * nSharedGrp_ + (size_t)grpSlot_[g]) * kCamBlk];
+                const double* src = &cgGrp_[((size_t)q * nSharedBlk_ + b) * kCamBlk];
                 for (uint32_t i = 0; i < kCamBlk; i++) dst[i] += src[i];
             }
         }
@@ -796,10 +1088,16 @@ private:
                 const uint32_t dof = P_.prec_blocks[4 * b + 1] + P_.prec_blocks[4 * b + 3];
                 if (!dof) continue;
                 double* L = &cgM_[(size_t)kCamBlk * b];
+                // as cg_prec_fact: a failed pivot is floored and decoupled
+                double f = 1e-30;
+                for (uint32_t j = 0; j < dof; j++)
+                    if (L[pidx(j, j)] > f) f = L[pidx(j, j)];
+                f = std::max(1e-10 * f, 1e-30);
                 for (uint32_t j = 0; j < dof; j++) {
-                    const double d = std::sqrt(std::max(L[pidx(j, j)], 1e-30));
+                    const bool ok = L[pidx(j, j)] > f;
+                    const double d = std::sqrt(ok ? L[pidx(j, j)] : f);
                     L[pidx(j, j)] = d;
-                    for (uint32_t i = j + 1; i < dof; i++) L[pidx(i, j)] /= d;
+                    for (uint32_t i = j + 1; i < dof; i++) L[pidx(i, j)] = ok ? L[pidx(i, j)] / d : 0.0;
                     for (uint32_t c = j + 1; c < dof; c++)
                         for (uint32_t i = c; i < dof; i++)
                             L[pidx(i, c)] -= L[pidx(i, j)] * L[pidx(c, j)];
@@ -842,6 +1140,156 @@ private:
                 for (uint32_t i = 0; i < dof; i++) z[cols[i]] = y[i];
             }
         });
+        if (tcUse_) coarseApply(r, z);
+    }
+
+    // ================
+    // coarse correction (README.md, "Coarse correction")
+    // ================
+
+    // P_f: pose deltas of a similarity motion (w, tau, s) of the world,
+    // d(angle-axis) = -Jr^-1 w and dt = s t - R tau; 6x7 row-major per frame.
+    void coarseBasis() {
+        const uint32_t nf = P_.num_frames;
+        const int nt = taskCount(nf, 1024, nthreads_);
+        pool_->run(nt, nthreads_, [&](int task, int) {
+            int64_t lo, hi;
+            taskRange(nf, nt, task, lo, hi);
+            for (int64_t f = lo; f < hi; f++) {
+                const double* q = &P_.poses[6 * (size_t)f];
+                double* B = &tcP_[42 * (size_t)f];
+                std::fill(B, B + 42, 0.0);
+                const double th2 = q[0] * q[0] + q[1] * q[1] + q[2] * q[2], th = std::sqrt(th2);
+                const double K[9] = {0, -q[2], q[1], q[2], 0, -q[0], -q[1], q[0], 0};
+                double K2[9];
+                for (int i = 0; i < 3; i++)
+                    for (int j = 0; j < 3; j++)
+                        K2[3 * i + j] = K[3 * i] * K[j] + K[3 * i + 1] * K[3 + j] + K[3 * i + 2] * K[6 + j];
+                const bool nearZero = th < 1e-3;
+                const double s1 = nearZero ? 1.0 : std::sin(th) / th;
+                const double c1 = nearZero ? 0.5 : (1 - std::cos(th)) / th2;
+                const double c2 =
+                    nearZero ? 1.0 / 12 : 1 / th2 - (1 + std::cos(th)) / (2 * th * std::sin(th));
+                for (int i = 0; i < 3; i++) {
+                    for (int j = 0; j < 3; j++) {
+                        B[7 * i + j] = -((i == j) + 0.5 * K[3 * i + j] + c2 * K2[3 * i + j]);
+                        B[7 * (3 + i) + 3 + j] = -((i == j) + s1 * K[3 * i + j] + c1 * K2[3 * i + j]);
+                    }
+                    B[7 * (3 + i) + 6] = q[3 + i];
+                }
+            }
+        });
+    }
+
+    // G = sum over the run starting at observation o of P_f^T Jc_pose^T Jp.
+    void coarseRunG(uint32_t o, uint32_t end, double* G) const {
+        std::fill(G, G + 21, 0.0);
+        const uint32_t c = frame_[P_.obs_image[o]] / tcK_;
+        for (; o < end && frame_[P_.obs_image[o]] / tcK_ == c; o++) {
+            const uint32_t img = P_.obs_image[o], dof = dof_[img];
+            const double* Pf = &tcP_[42 * (size_t)frame_[img]];
+            double Jc_b[2 * kMaxCamDof];
+            const double* Jc = jcRow(o, Jc_b);
+            double Jp_b[6];
+            const double* Jp = jpRow(o, Jp_b);
+            for (int i = 0; i < 7; i++) {
+                double q0 = 0, q1 = 0;
+                for (int a = 0; a < 6; a++) {
+                    q0 += Pf[7 * a + i] * Jc[a];
+                    q1 += Pf[7 * a + i] * Jc[dof + a];
+                }
+                for (int j = 0; j < 3; j++) G[3 * i + j] += q0 * Jp[j] + q1 * Jp[3 + j];
+            }
+        }
+    }
+
+    // A_c = P^T S P, factored. A task owns a range of block rows, so every
+    // write is its own: the B part from its frames' images, the Schur part
+    // from the run pairs keyed to its rows.
+    void coarseBuild() {
+        coarseBasis();
+        tcA_.zero(*pool_, nthreads_);
+        const int nt = (int)tcSplit_.size() - 1;
+        pool_->run(nt, nthreads_, [&](int task, int) {
+            for (uint32_t c = tcSplit_[task]; c < tcSplit_[task + 1]; c++) {
+                const uint32_t f1 = std::min(P_.num_frames, (c + 1) * tcK_);
+                for (uint32_t img = frameImg_[c * tcK_]; img < frameImg_[f1]; img++) {
+                    const double* Bb = &cgB_[(size_t)kCamBlk * img];
+                    const double* Pf = &tcP_[42 * (size_t)frame_[img]];
+                    double BP[42];
+                    for (int r = 0; r < 6; r++)
+                        for (int j = 0; j < 7; j++) {
+                            double v = 0;
+                            for (int l = 0; l < 6; l++)
+                                v += Bb[r >= l ? pidx(r, l) : pidx(l, r)] * Pf[7 * l + j];
+                            BP[7 * r + j] = v;
+                        }
+                    for (uint32_t i = 0; i < 7; i++) {
+                        double* row = tcA_.row(7 * c + i) + 7 * c;
+                        for (uint32_t j = 0; j <= i; j++) {
+                            double v = 0;
+                            for (int l = 0; l < 6; l++) v += Pf[7 * l + i] * BP[7 * l + j];
+                            if (std::isfinite(v)) row[j] += v;
+                        }
+                    }
+                }
+                double G[21], GW[21];
+                for (uint32_t cv = 0; cv <= c; cv++) {
+                    const uint64_t key = (uint64_t)c * (c + 1) / 2 + cv;
+                    for (uint32_t e = tcKey_[key]; e < tcKey_[key + 1]; e++) {
+                        const uint32_t ou = tcEnt_[2 * (size_t)e], ov = tcEnt_[2 * (size_t)e + 1];
+                        const uint32_t p = P_.obs_point[ou], end = P_.obs_ranges[p + 1];
+                        const double* W = &W_[9 * (size_t)p];
+                        coarseRunG(ou, end, G);
+                        for (int i = 0; i < 7; i++)
+                            for (int j = 0; j < 3; j++)
+                                GW[3 * i + j] = G[3 * i] * W[j] + G[3 * i + 1] * W[3 + j] +
+                                                G[3 * i + 2] * W[6 + j];
+                        if (ov != ou) coarseRunG(ov, end, G);
+                        for (uint32_t i = 0; i < 7; i++) {
+                            double* row = tcA_.row(7 * c + i) + 7 * cv;
+                            for (uint32_t j = 0; j < 7 && 7 * cv + j <= 7 * c + i; j++) {
+                                const double v = GW[3 * i] * G[3 * j] + GW[3 * i + 1] * G[3 * j + 1] +
+                                                 GW[3 * i + 2] * G[3 * j + 2];
+                                if (std::isfinite(v)) row[j] -= v;
+                            }
+                        }
+                    }
+                }
+                // the global similarity is a gauge freedom: A_c is singular up
+                // to the damping
+                for (uint32_t i = 0; i < 7; i++) {
+                    double& d = tcA_.row(7 * c + i)[7 * c + i];
+                    tcDiag_[7 * c + i] = d;
+                    d *= 1 + 1e-8;
+                }
+            }
+        });
+        tcA_.factor(*pool_, nthreads_, tcDiag_.data(), 1e-6);
+    }
+
+    void coarseApply(const std::vector<double>& r, std::vector<double>& z) {
+        const uint32_t nf = P_.num_frames;
+        std::fill(tcY_.begin(), tcY_.end(), 0.0);
+        for (uint32_t f = 0; f < nf; f++) {
+            const double* Pf = &tcP_[42 * (size_t)f];
+            double* y = &tcY_[7 * (f / tcK_)];
+            for (int j = 0; j < 7; j++) {
+                double v = 0;
+                for (int a = 0; a < 6; a++) v += Pf[7 * a + j] * r[6 * (size_t)f + a];
+                y[j] += v;
+            }
+        }
+        tcA_.solve(tcY_.data(), *pool_, nthreads_);
+        for (uint32_t f = 0; f < nf; f++) {
+            const double* Pf = &tcP_[42 * (size_t)f];
+            const double* y = &tcY_[7 * (f / tcK_)];
+            for (int a = 0; a < 6; a++) {
+                double v = 0;
+                for (int j = 0; j < 7; j++) v += Pf[7 * a + j] * y[j];
+                z[6 * (size_t)f + a] += v;
+            }
+        }
     }
 
     void cgGather() {
@@ -849,18 +1297,19 @@ private:
         pool_->run(nt, nthreads_, [&](int t, int) {
             int64_t lo, hi;
             taskRange(nPts_, nt, t, lo, hi);
+            uint32_t cols[kMaxCamDof];
             for (int64_t p = lo; p < hi; p++) {
                 double u0 = 0, u1 = 0, u2 = 0;
                 for (uint32_t o = P_.obs_ranges[p]; o < P_.obs_ranges[p + 1]; o++) {
-                    const uint32_t img = P_.obs_image[o], dof = dof_[img];
-                    const double* Jc = &Jc_[P_.jc_off[o]];
-                    const double* Jp = &Jp_[6 * (size_t)o];
-                    // pose and intrinsics columns are each contiguous
-                    const double* xp = &cgP_[6 * (size_t)img];
-                    const double* xi = &cgP_[icol_[img]] - 6;
+                    const uint32_t img = P_.obs_image[o];
+                    double Jc_b[2 * kMaxCamDof];
+                    const double* Jc = jcRow(o, Jc_b);
+                    double Jp_b[6];
+                    const double* Jp = jpRow(o, Jp_b);
+                    const uint32_t dof = imgCols(img, cols);
                     double d0 = 0, d1 = 0;
                     for (uint32_t a = 0; a < dof; a++) {
-                        const double xa = a < 6 ? xp[a] : xi[a];
+                        const double xa = cgP_[cols[a]];
                         d0 += Jc[a] * xa;
                         d1 += Jc[dof + a] * xa;
                     }
@@ -875,13 +1324,15 @@ private:
         });
     }
 
-    // Sp = B p, then Sp -= sum_obs Acp v. The pose rows of an image belong to
-    // it alone; columns of a shared intrinsics group are summed per task.
+    // Sp = B p, then Sp -= sum_obs Acp v. A frame's rows belong to one task
+    // (rig-mates share a task); the tail past the poses is summed per task.
     void cgMatvec() {
         const int nt = (int)cgSplit_.size() - 1;
         if (!exclusive_) std::fill(cgSpIntr_.begin(), cgSpIntr_.end(), 0.0);
+        const bool rigs = P_.hasRigs();
+        if (rigs) std::fill(cgSp_.begin(), cgSp_.begin() + poseDim_, 0.0);
         pool_->run(nt, nthreads_, [&](int task, int) {
-            double* si = exclusive_ ? nullptr : &cgSpIntr_[(size_t)task * P_.free_intr];
+            double* si = exclusive_ ? nullptr : &cgSpIntr_[(size_t)task * tail_];
             uint32_t cols[kMaxCamDof];
             for (uint32_t img = cgSplit_[task]; img < cgSplit_[task + 1]; img++) {
                 const uint32_t dof = imgCols(img, cols);
@@ -890,13 +1341,17 @@ private:
                     double acc = 0;
                     for (uint32_t c = 0; c < dof; c++)
                         acc += B[r >= c ? pidx(r, c) : pidx(c, r)] * cgP_[cols[c]];
-                    if (exclusive_ || r < 6) cgSp_[cols[r]] = acc;
-                    else if (std::isfinite(acc)) si[cols[r] - poseDim_] += acc;
+                    if (exclusive_ || r < 6) {
+                        if (rigs) cgSp_[cols[r]] += acc;
+                        else cgSp_[cols[r]] = acc;
+                    } else if (std::isfinite(acc)) {
+                        si[cols[r] - poseDim_] += acc;
+                    }
                 }
             }
         });
         pool_->run(nt, nthreads_, [&](int task, int) {
-            double* si = exclusive_ ? nullptr : &cgSpIntr_[(size_t)task * P_.free_intr];
+            double* si = exclusive_ ? nullptr : &cgSpIntr_[(size_t)task * tail_];
             uint32_t cols[kMaxCamDof];
             double acc[kMaxCamDof];
             for (uint32_t img = cgSplit_[task]; img < cgSplit_[task + 1]; img++) {
@@ -904,8 +1359,10 @@ private:
                 std::fill(acc, acc + dof, 0.0);
                 for (uint32_t t = P_.cam_obs_ranges[img]; t < P_.cam_obs_ranges[img + 1]; t++) {
                     const uint32_t o = P_.cam_obs[t], p = P_.obs_point[o];
-                    const double* Jc = &Jc_[P_.jc_off[o]];
-                    const double* Jp = &Jp_[6 * (size_t)o];
+                    double Jc_b[2 * kMaxCamDof];
+                    const double* Jc = jcRow(o, Jc_b);
+                    double Jp_b[6];
+                    const double* Jp = jpRow(o, Jp_b);
                     const double* v = &cgV_[3 * (size_t)p];
                     const double d0 = Jp[0] * v[0] + Jp[1] * v[1] + Jp[2] * v[2];
                     const double d1 = Jp[3] * v[0] + Jp[4] * v[1] + Jp[5] * v[2];
@@ -918,10 +1375,11 @@ private:
                 }
             }
         });
+        if (hasPriors_) priorMatvec();
         if (exclusive_) return;
-        for (uint32_t i = 0; i < P_.free_intr; i++) {
+        for (uint32_t i = 0; i < tail_; i++) {
             double s = 0;
-            for (int q = 0; q < nt; q++) s += cgSpIntr_[(size_t)q * P_.free_intr + i];
+            for (int q = 0; q < nt; q++) s += cgSpIntr_[(size_t)q * tail_ + i];
             cgSp_[poseDim_ + i] = s;
         }
     }
@@ -950,6 +1408,8 @@ private:
         bool conv = !(std::isfinite(rho) && rho > 0.0);
         uint32_t iters = 0;
         cgP_ = cgZ_;
+        double Q = 0;  // the quadratic model at g, for cg_fin's Nash-Sofer test
+        bool qstop = false;
         while (!conv && iters < maxit) {
             cgGather();
             cgMatvec();
@@ -959,6 +1419,8 @@ private:
                 break;
             }
             const double alpha = rho / pAp;
+            const double dq = -0.5 * rho * alpha;
+            Q += dq;
             const int nt = taskCount(n_, 1 << 14, nthreads_);
             pool_->run(nt, nthreads_, [&](int t, int) {
                 int64_t lo, hi;
@@ -978,13 +1440,17 @@ private:
                 conv = true;
                 break;
             }
+            if (opt_.cg_model_tol > 0 && Q < 0 && iters * dq / Q < opt_.cg_model_tol) {
+                conv = qstop = true;
+                break;
+            }
             pool_->run(nt, nthreads_, [&](int t, int) {
                 int64_t lo, hi;
                 taskRange(n_, nt, t, lo, hi);
                 for (int64_t i = lo; i < hi; i++) cgP_[i] = cgZ_[i] + beta * cgP_[i];
             });
         }
-        cgConverged_ = conv && rr <= tol2;
+        cgConverged_ = conv && (rr <= tol2 || qstop);
         return iters;
     }
 
@@ -997,17 +1463,19 @@ private:
         pool_->run(nt, nthreads_, [&](int t, int) {
             int64_t lo, hi;
             taskRange(nPts_, nt, t, lo, hi);
+            uint32_t cols[kMaxCamDof];
             for (int64_t p = lo; p < hi; p++) {
                 double* Bp = &Bp_[3 * (size_t)p];
                 for (uint32_t o = P_.obs_ranges[p]; o < P_.obs_ranges[p + 1]; o++) {
-                    const uint32_t img = P_.obs_image[o], dof = dof_[img];
-                    const double* Jc = &Jc_[P_.jc_off[o]];
-                    const double* Jp = &Jp_[6 * (size_t)o];
-                    const double* xp = &g_[6 * (size_t)img];
-                    const double* xi = &g_[icol_[img]] - 6;
+                    const uint32_t img = P_.obs_image[o];
+                    double Jc_b[2 * kMaxCamDof];
+                    const double* Jc = jcRow(o, Jc_b);
+                    double Jp_b[6];
+                    const double* Jp = jpRow(o, Jp_b);
+                    const uint32_t dof = imgCols(img, cols);
                     double d0 = 0, d1 = 0;
                     for (uint32_t a = 0; a < dof; a++) {
-                        const double x = a < 6 ? xp[a] : xi[a];
+                        const double x = g_[cols[a]];
                         d0 += Jc[a] * x;
                         d1 += Jc[dof + a] * x;
                     }
@@ -1039,6 +1507,12 @@ private:
     void camUpdate() {
         for (uint32_t i = 0; i < poseDim_; i++)
             if (std::isfinite(g_[i])) P_.poses[i] -= g_[i];
+        for (const BAProblem::Member& m : P_.members)
+            for (uint32_t i = 0, j = 0; m.n_free && i < 6; i++) {
+                if (!((m.mask >> i) & 1u)) continue;
+                if (std::isfinite(g_[m.ext_col + j])) P_.exts[m.ext_offset + i] -= g_[m.ext_col + j];
+                j++;
+            }
         for (const BAProblem::Group& g : P_.groups)
             for (uint32_t j = 0; j < g.n_intr; j++)
                 if (std::isfinite(g_[g.intr_col + j])) P_.intr[g.intr_offset + j] -= g_[g.intr_col + j];
@@ -1047,28 +1521,60 @@ private:
     BAProblem& P_;
     SolverOptions opt_;
     SolverStats stats_;
+    double lastPrior_ = 0;  // the priors' share of the last computeCost()
     Pool* pool_ = nullptr;
     int nthreads_ = 1;
     double lossParam_ = 1.0;
 
-    uint32_t n_ = 0, poseDim_ = 0, nImg_ = 0, nPts_ = 0, nObs_ = 0;
-    std::vector<uint8_t> dof_, gz_, model_;
-    std::vector<uint32_t> icol_, ioff_;
+    uint32_t n_ = 0, poseDim_ = 0, tail_ = 0, nImg_ = 0, nPts_ = 0, nObs_ = 0;
+    std::vector<uint8_t> dof_, gz_, model_, efree_, emask_;
+    std::vector<uint32_t> icol_, ioff_, frame_, eoff_;  // eoff_: into exts, or kNoSlot
     bool exclusive_ = true;
 
-    std::vector<int32_t> srow_;       // intrinsics column -> shared-row slot, or -1
+    std::vector<int32_t> srow_;       // tail column -> shared-row slot, or -1
     std::vector<uint32_t> sharedCol_;
-    std::vector<int32_t> grpSlot_;    // group -> shared-group slot, or -1
-    uint32_t m_ = 0, nSharedGrp_ = 0;
+    uint32_t m_ = 0, nSharedBlk_ = 0;
 
     bool useCG_ = false, haveFallback_ = false, cgConverged_ = false;
     uint32_t cgMaxit_ = 100, cgIters_ = 0;
 
     std::vector<double> Jc_, Jp_, res_, App_, W_, Bp_, Bp0_, g_;
-    std::vector<double> poses0_, intr0_, points0_;
+    std::vector<float> Jc32_, Jp32_;  // instead of Jc_ / Jp_ when jac32_
+    bool jac32_ = false;
+    // Observation o's Jc / Jp rows: the stored ones, or decoded into `buf`.
+    const double* jcRow(uint32_t o, double* buf) const {
+        if (!jac32_) return &Jc_[P_.jc_off[o]];
+        const float* f = &Jc32_[P_.jc_off[o]];
+        for (uint32_t k = 0, n = 2 * dof_[P_.obs_image[o]]; k < n; k++) buf[k] = f[k];
+        return buf;
+    }
+    const double* jpRow(uint32_t o, double* buf) const {
+        if (!jac32_) return &Jp_[6 * (size_t)o];
+        const float* f = &Jp32_[6 * (size_t)o];
+        for (int k = 0; k < 6; k++) buf[k] = f[k];
+        return buf;
+    }
+    std::vector<double> gfull_;  // gradientConverged's d cost / d column
+    double gptMax_ = 0;
+    std::vector<double> poses0_, exts0_, intr0_, points0_;
     std::vector<double> sbuf_, sgbuf_, part_;
     std::vector<double> cgR_, cgZ_, cgP_, cgSp_, cgV_, cgB_, cgM_, cgGIntr_, cgSpIntr_, cgGrp_;
+    // Coarse correction: frames per cluster, dimension (0: off), the run-pair
+    // entries by cluster pair, block rows per task, and each frame's first image.
+    uint32_t tcK_ = 0, tcN_ = 0;
+    uint64_t tcEntries_ = 0;
+    std::vector<uint32_t> tcEnt_, tcKey_, tcSplit_, frameImg_;
+    std::vector<double> tcP_, tcY_, tcDiag_;
+    DenseSpd tcA_;
+    bool tcUse_ = false, tcBuild_ = false, tcHave_ = false, tcOff_ = false;
+    int tcAge_ = 0;
+    double tcLambda_ = 0, lastCg_ = 0;
+    static constexpr uint32_t kTcMaxDim = 4096;
+    static constexpr double kTcMinIters = 12;
     std::vector<uint32_t> asmSplit_, cgSplit_;
+    sfm::PriorAssembler prior_;
+    bool hasPriors_ = false;
+    bool absCentres_ = false;
     DenseSpd S_;
     struct { double jac = 0, prep = 0, schur = 0, lin = 0, back = 0, cost = 0; } prof_;
 };

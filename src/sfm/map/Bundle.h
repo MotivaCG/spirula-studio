@@ -15,9 +15,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <map>
+#include <set>
 #include <vector>
 
+#include "sfm/ba/Priors.h"
 #include "sfm/ba/Problem.h"
 #include "sfm/ba/Solver.h"
 #include "sfm/core/Model.h"
@@ -28,8 +31,12 @@ namespace sfm {
 
 struct BundleOptions {
     RealCfg real = RealCfg::F64;
+    bool fix_rotations = false;
     int max_iters = 25;
     bool verbose = false;
+    // Canonical uuid:<hex> of the device this solve runs on; "" = the shared
+    // precedence. The int below is the CLI/API input boundary only.
+    std::string device_selector;
     int device = -1;
     // Robust loss for mapping-time BA (D36). COLMAP's global BA is trivial
     // because local BA cleans each registration first; without local BA, a
@@ -43,6 +50,9 @@ struct BundleOptions {
     // 0 keeps the solver defaults (the final refinement passes do).
     double rtol = 0;
     int patience = 0;
+    // SolverOptions::gradient_tol and metres_per_unit; 0 = no gradient stop.
+    double gradient_tol = 0;
+    double metres_per_unit = 1;
     // Refine each camera's principal point, or hold it where the setup put it
     // (the image centre, unless something measured otherwise). COLMAP's
     // refine_principal_point, false there and here.
@@ -86,8 +96,23 @@ struct BundleOptions {
     // outlive one solve. The caller owns it and must keep (real, loss) fixed
     // across calls on the same context. Null = scoped context per call.
     VkContext* shared_ctx = nullptr;
-    // Host worker threads, for the `cpu` scalar; 0 = hardware_concurrency.
+    // Host worker threads, for the `cpu` scalar; 0 = hardware_threads().
     int threads = 0;
+    // Rigs (sfm/core/Rig.h): with a table, every frame whose members have an
+    // established calibration is one pose block and the member extrinsics are
+    // refined; `use_rigs` off treats every image as its own frame.
+    const RigTable* rigs = nullptr;
+    bool use_rigs = true;
+    bool refine_rigs = true;
+    // Frames holding a member together with another member of its rig before
+    // its extrinsic is refined rather than held; below that, the two would
+    // trade off against each other.
+    int rig_min_frames = 3;
+    // ... and observations of the member's images in the problem.
+    int rig_min_obs = 100;
+    // Pose priors on the reconstruction's image ids (sfm/ba/Priors.h);
+    // factors naming an image the problem lacks are dropped.
+    const PosePriors* priors = nullptr;
 };
 
 // The problem built from a reconstruction, plus what writing the solution back
@@ -99,7 +124,46 @@ struct BundleLayout {
     std::vector<Image*> imgOf;      // by BA image index
     std::vector<Point3D*> ptOf;     // by BA point index
     std::vector<uint32_t> camIds;   // by group
+    std::vector<std::pair<uint32_t, uint32_t>> memberOf;  // by BA member: (rig, member)
+    // The priors on BA indices. P.priors points here once the layout has its
+    // final address (attachPriors), never before: the struct is returned by value.
+    PosePriors priors;
+    void attachPriors() { P.priors = priors.empty() ? nullptr : &priors; }
 };
+
+namespace bundle_detail {
+
+// The frame a registered image's pose block belongs to: (rig, frame) for a rig
+// image whose member is calibrated, (kNoRig, image id) otherwise.
+struct FrameKey {
+    uint32_t rig, frame;
+    bool operator<(const FrameKey& o) const {
+        return rig != o.rig ? rig < o.rig : frame < o.frame;
+    }
+    bool operator==(const FrameKey& o) const { return rig == o.rig && frame == o.frame; }
+};
+
+inline FrameKey frameKeyOf(const Reconstruction& rec, const RigTable* rigs, bool use,
+                           uint32_t image_id) {
+    if (rigs && use && !rec.rig_detached.count(image_id)) {
+        const RigSlot sl = rigs->slot(image_id);
+        if (sl.valid() && sl.rig < rec.rigs.size() && rec.rigs[sl.rig].usable(sl.member))
+            return {sl.rig, sl.frame};
+    }
+    return {kNoRig, image_id};
+}
+
+inline void packPose(const Pose& p, double* out) {
+    const Vec3 aa = rotationToAngleAxis(p.R);
+    out[0] = aa.x; out[1] = aa.y; out[2] = aa.z;
+    out[3] = p.t.x; out[4] = p.t.y; out[5] = p.t.z;
+}
+
+inline Pose unpackPose(const double* v) {
+    return {angleAxisToRotation({v[0], v[1], v[2]}), {v[3], v[4], v[5]}};
+}
+
+}  // namespace bundle_detail
 
 // Pack `rec` into a BAProblem. Empty layout (num_images < 2) if there is
 // nothing to optimize.
@@ -116,12 +180,22 @@ inline BundleLayout buildBundle(Reconstruction& rec, const BundleOptions& bopt) 
     uint32_t max_img_id = 0;
     for (auto& kv : rec.images) max_img_id = std::max(max_img_id, kv.first);
     std::vector<uint32_t> imgBA(max_img_id + 1, UINT32_MAX);
+    // Images ordered by frame, so a rig frame's images are one contiguous pose
+    // block (the host solver relies on it; sfm/ba/Problem.h).
+    using bundle_detail::FrameKey;
+    const RigTable* rigs = bopt.use_rigs ? bopt.rigs : nullptr;
+    std::vector<std::pair<FrameKey, uint32_t>> order;
     for (auto& kv : rec.images)
-        if (kv.second.registered) {
-            imgBA[kv.first] = (uint32_t)imgIds.size();
-            imgIds.push_back(kv.first);
-            imgOf.push_back(&kv.second);
-        }
+        if (kv.second.registered)
+            order.push_back({bundle_detail::frameKeyOf(rec, rigs, true, kv.first), kv.first});
+    std::stable_sort(order.begin(), order.end(),
+                     [](const std::pair<FrameKey, uint32_t>& a,
+                        const std::pair<FrameKey, uint32_t>& b) { return a.first < b.first; });
+    for (const auto& o : order) {
+        imgBA[o.second] = (uint32_t)imgIds.size();
+        imgIds.push_back(o.second);
+        imgOf.push_back(&rec.images.at(o.second));
+    }
     std::vector<uint64_t> ptIds;
     std::vector<Point3D*>& ptOf = L.ptOf;  // by BA index
     for (auto& kv : rec.points3D) {
@@ -177,14 +251,70 @@ inline BundleLayout buildBundle(Reconstruction& rec, const BundleOptions& bopt) 
         P.obs_xy[2 * i + 1] = obs[i].y;
     }
 
-    // Poses (angle-axis + t).
-    P.poses.resize(6 * P.num_images);
+    // Frames and members. A rig frame's pose is taken from the image with the
+    // most observations (its rig-mates are snapped to the calibration; the
+    // solve reconciles them); a plain image is its own frame.
+    P.image_frame.assign(P.num_images, 0);
+    P.image_member.assign(P.num_images, kNoMember);
+    std::map<std::pair<uint32_t, uint32_t>, uint32_t> memberBA;  // (rig, member) -> index
+    std::vector<uint32_t> memberCo;  // per BA member, frames shared with another member
+    std::vector<std::vector<uint32_t>> frameImgs;  // per BA frame, its BA images
     for (uint32_t i = 0; i < P.num_images; i++) {
-        const Image& im = *imgOf[i];
-        Vec3 aa = rotationToAngleAxis(im.pose.R);
-        P.poses[6 * i + 0] = aa.x; P.poses[6 * i + 1] = aa.y; P.poses[6 * i + 2] = aa.z;
-        P.poses[6 * i + 3] = im.pose.t.x; P.poses[6 * i + 4] = im.pose.t.y;
-        P.poses[6 * i + 5] = im.pose.t.z;
+        const FrameKey key = order[i].first;
+        if (i == 0 || !(order[i - 1].first == key)) frameImgs.emplace_back();
+        P.image_frame[i] = (uint32_t)frameImgs.size() - 1;
+        frameImgs.back().push_back(i);
+        if (key.rig == kNoRig) continue;
+        const RigSlot sl = rigs->slot(imgIds[i]);
+        auto it = memberBA.find({sl.rig, sl.member});
+        if (it == memberBA.end()) {
+            it = memberBA.emplace(std::make_pair(sl.rig, sl.member), (uint32_t)L.memberOf.size()).first;
+            L.memberOf.push_back({sl.rig, sl.member});
+            memberCo.push_back(0);
+        }
+        P.image_member[i] = it->second;
+    }
+    P.num_frames = (uint32_t)frameImgs.size();
+    for (const std::vector<uint32_t>& fi : frameImgs)
+        if (fi.size() > 1)
+            for (uint32_t i : fi) memberCo[P.image_member[i]]++;
+
+    P.poses.resize(6 * P.num_frames);
+    for (uint32_t f = 0; f < P.num_frames; f++) {
+        uint32_t best = frameImgs[f][0];
+        for (uint32_t i : frameImgs[f])
+            if (imgOf[i]->numPoint3D() > imgOf[best]->numPoint3D()) best = i;
+        const Image& im = *imgOf[best];
+        Pose fp = im.pose;
+        if (P.image_member[best] != kNoMember) {
+            const auto& rm = L.memberOf[P.image_member[best]];
+            fp = rec.rigs[rm.first].rigFromWorld(rm.second, im.pose);
+        }
+        bundle_detail::packPose(fp, &P.poses[6 * f]);
+    }
+    // Members: cam_from_rig from the calibration, refined when asked, when
+    // enough frames tie the member to its rig, and when it sees enough: a known
+    // member is established before it has observed anything (a lens on the sky).
+    std::vector<uint32_t> memberObs(L.memberOf.size(), 0);
+    for (uint32_t o = 0; o < P.num_obs; o++) {
+        const uint32_t m = P.image_member[P.obs_image[o]];
+        if (m != kNoMember) memberObs[m]++;
+    }
+    P.members.resize(L.memberOf.size());
+    P.exts.resize(6 * L.memberOf.size());
+    P.ext_dim = 0;
+    for (uint32_t m = 0; m < L.memberOf.size(); m++) {
+        const RigCalib& c = rec.rigs[L.memberOf[m].first];
+        const uint32_t member = L.memberOf[m].second;
+        bundle_detail::packPose(c.cam_from_rig[member], &P.exts[6 * m]);
+        const uint32_t mask = rigs->rigs[L.memberOf[m].first].members[member].dof;
+        const bool held = !bopt.refine_rigs || (int)member == c.ref ||
+                          (member < c.fixed.size() && c.fixed[member]) || mask == 0 ||
+                          (int)memberCo[m] < bopt.rig_min_frames ||
+                          (int)memberObs[m] < bopt.rig_min_obs;
+        const uint32_t nf = held ? 0u : extFreeCount(mask);
+        P.members[m] = {6 * m, P.ext_dim, nf, mask};
+        P.ext_dim += nf;
     }
 
     // Intrinsics groups. Model + parameter count are per group (each camera may
@@ -229,11 +359,40 @@ inline BundleLayout buildBundle(Reconstruction& rec, const BundleOptions& bopt) 
         P.points[3 * i] = X.x; P.points[3 * i + 1] = X.y; P.points[3 * i + 2] = X.z;
     }
 
-    P.pose_dim = 6 * P.num_images;
+    P.pose_dim = 6 * P.num_frames;
     P.total_intr = (uint32_t)P.intr.size();
-    P.n_dim = P.pose_dim + P.free_intr;
-    for (auto& g : P.groups) g.intr_col += P.pose_dim;
+    P.n_dim = P.pose_dim + P.ext_dim + P.free_intr;
+    for (auto& m : P.members) m.ext_col += P.pose_dim;
+    for (auto& g : P.groups) g.intr_col += P.pose_dim + P.ext_dim;
     finalizeTables(P);
+
+    // Priors onto BA indices. One rotation factor per frame pair: a rig's
+    // lenses each carry the chain, and both name the same two pose blocks.
+    if (bopt.priors && !bopt.priors->empty()) {
+        const PosePriors& in = *bopt.priors;
+        PosePriors& out = L.priors;
+        out.up_w = in.up_w;
+        out.huber = in.huber;
+        auto ba = [&](uint32_t id, uint32_t& idx) {
+            if (id > max_img_id || imgBA[id] == UINT32_MAX) return false;
+            idx = imgBA[id];
+            return true;
+        };
+        std::set<std::pair<uint32_t, uint32_t>> seen;
+        for (PriorRotation r : in.rotations) {
+            if (!ba(r.i, r.i) || !ba(r.j, r.j)) continue;
+            const uint32_t fi = P.image_frame[r.i], fj = P.image_frame[r.j];
+            if (fi == fj || !seen.insert({std::min(fi, fj), std::max(fi, fj)}).second) continue;
+            out.rotations.push_back(r);
+        }
+        for (PriorUp u : in.ups)
+            if (ba(u.i, u.i)) out.ups.push_back(u);
+        for (PriorCentre c : in.centres) {
+            bool ok = true;
+            for (int k = 0; k < c.n; k++) ok = ok && ba(c.img[k], c.img[k]);
+            if (ok) out.centres.push_back(c);
+        }
+    }
     return L;
 }
 
@@ -241,13 +400,17 @@ inline BundleLayout buildBundle(Reconstruction& rec, const BundleOptions& bopt) 
 inline SolverOptions bundleSolverOptions(const BundleOptions& bopt) {
     SolverOptions sopt;
     sopt.real = bopt.real;
+    sopt.fix_rotations = bopt.fix_rotations;
     sopt.max_iters = bopt.max_iters;
     sopt.verbose = bopt.verbose;
+    sopt.device_selector = bopt.device_selector;
     sopt.device = bopt.device;
     sopt.loss = bopt.loss;
     sopt.loss_param = bopt.loss_param;
     if (bopt.rtol > 0) sopt.rtol = bopt.rtol;
     if (bopt.patience > 0) sopt.patience = bopt.patience;
+    sopt.gradient_tol = bopt.gradient_tol;
+    sopt.metres_per_unit = bopt.metres_per_unit;
     if (bopt.solver == "dense") sopt.solver = SolverSel::Dense;
     else if (bopt.solver == "cg") sopt.solver = SolverSel::CG;
     sopt.over_budget_throws = bopt.over_budget_throws;
@@ -259,10 +422,16 @@ inline SolverOptions bundleSolverOptions(const BundleOptions& bopt) {
 // `P` is the layout's own problem unless the caller moved it out to hand to a
 // solver, which `spirula-sfm ba` does.
 inline void writeBundle(Reconstruction& rec, const BundleLayout& L, const BAProblem& P) {
+    for (uint32_t m = 0; m < P.members.size(); m++) {
+        const auto& rm = L.memberOf[m];
+        rec.rigs[rm.first].cam_from_rig[rm.second] = bundle_detail::unpackPose(&P.exts[6 * m]);
+    }
     for (uint32_t i = 0; i < P.num_images; i++) {
         Image& im = *L.imgOf[i];
-        im.pose.R = angleAxisToRotation({P.poses[6 * i], P.poses[6 * i + 1], P.poses[6 * i + 2]});
-        im.pose.t = {P.poses[6 * i + 3], P.poses[6 * i + 4], P.poses[6 * i + 5]};
+        const Pose fp = bundle_detail::unpackPose(&P.poses[6 * P.image_frame[i]]);
+        const uint32_t m = P.image_member[i];
+        im.pose = m == kNoMember ? fp
+                                 : rec.rigs[L.memberOf[m].first].camFromWorld(L.memberOf[m].second, fp);
     }
     for (size_t g = 0; g < L.camIds.size(); g++) {
         Camera& c = rec.cameras[L.camIds[g]];
@@ -291,6 +460,64 @@ inline void noteBaDeviceFailure(const VkError& e, uint64_t num_obs) {
         slog::warn(slog::Tag::Map, spirula::i18n::msg::sfm::ba_host_fallback, {e.what()});
 }
 
+struct BundleRun {
+    SolverStats stats;
+    RealCfg real = RealCfg::F64;  // what the solve that finished ran in
+    double t_init = 0, t_solve = 0;
+};
+
+// Solve `P` in place, on the host from the device's last checkpoint if the
+// device fails. With `rebuild` (makes `P` anew) the device solve frees P's
+// tables once uploaded, and a host solve takes a rebuilt copy.
+inline BundleRun solveBundle(BAProblem& P, SolverOptions sopt, VkContext* shared,
+                             const std::function<BAProblem()>& rebuild = {}) {
+    BundleRun r;
+    if (P.num_obs >= baHostObsThreshold().load()) sopt.real = RealCfg::CPU;
+    SolverCheckpoint ck;
+    sopt.checkpoint = &ck;
+    bool released = false;
+    auto attempt = [&] {
+        auto t0 = std::chrono::steady_clock::now();
+        BundleSolver solver(P, sopt, shared);
+        solver.init();
+        if (rebuild) released = solver.releaseHostTables() || released;
+        auto t1 = std::chrono::steady_clock::now();
+        solver.solve();
+        auto t2 = std::chrono::steady_clock::now();
+        solver.downloadParams();
+        r.stats = solver.stats();
+        r.real = solver.real();
+        r.t_init = std::chrono::duration<double>(t1 - t0).count();
+        r.t_solve = std::chrono::duration<double>(t2 - t1).count();
+    };
+    try {
+        attempt();
+    } catch (const VkError& e) {
+        if (!vkErrorIsResourceFailure(e.result)) throw;
+        noteBaDeviceFailure(e, P.num_obs);
+        if (released) {
+            BAProblem fresh = rebuild();
+            fresh.poses = std::move(P.poses);
+            fresh.exts = std::move(P.exts);
+            fresh.intr = std::move(P.intr);
+            fresh.points = std::move(P.points);
+            fresh.priors = P.priors;
+            P = std::move(fresh);
+        }
+        sopt.real = RealCfg::CPU;
+        sopt.checkpoint = nullptr;
+        if (ck.iterations > 0) {
+            sopt.init_damping = ck.damping;
+            sopt.max_iters = std::max(1, sopt.max_iters - ck.iterations);
+            slog::diag(slog::Tag::Map, "[ba] resuming on the host at iteration %d, cost %.6e",
+                       ck.iterations, ck.cost);
+        }
+        attempt();
+        r.stats.iterations += ck.iterations;
+    }
+    return r;
+}
+
 // Global BA over all registered images and all 3D points. Overwrites poses,
 // point positions, and intrinsics in `rec`. Returns the final RMS reprojection
 // cost reported by the solver (0 if nothing to optimize).
@@ -303,35 +530,16 @@ inline double runGlobalBA(Reconstruction& rec, const BundleOptions& bopt) {
         return dt;
     };
     BundleLayout L = buildBundle(rec, bopt);
+    L.attachPriors();
     BAProblem& P = L.P;
     if (P.num_images < 2) return 0;
-
-    SolverOptions sopt = bundleSolverOptions(bopt);
-    if (P.num_obs >= baHostObsThreshold().load()) sopt.real = RealCfg::CPU;
     double t_build = prof_lap();
 
-    double t_init = 0, t_solve = 0;
-    SolverStats stats;
-    // The solver reads the problem's host parameters at init() and writes them
-    // only in downloadParams(), so a failed attempt leaves `P` where it
-    // started and the host solver can restart from the same model.
-    auto attempt = [&] {
-        BundleSolver solver(P, sopt, bopt.shared_ctx);
-        solver.init();
-        t_init = prof_lap();
-        solver.solve();
-        t_solve = prof_lap();
-        solver.downloadParams();
-        stats = solver.stats();
-    };
-    try {
-        attempt();
-    } catch (const VkError& e) {
-        if (!vkErrorIsResourceFailure(e.result)) throw;
-        noteBaDeviceFailure(e, P.num_obs);
-        sopt.real = RealCfg::CPU;
-        attempt();
-    }
+    const BundleRun run = solveBundle(P, bundleSolverOptions(bopt), bopt.shared_ctx,
+                                      [&] { return buildBundle(rec, bopt).P; });
+    const SolverStats& stats = run.stats;
+    const double t_init = run.t_init, t_solve = run.t_solve;
+    prof_lap();
     writeBundle(rec, L, P);
 
     double t_write = prof_lap();
@@ -341,40 +549,43 @@ inline double runGlobalBA(Reconstruction& rec, const BundleOptions& bopt) {
     g_map_prof.ba_write += t_write;
     g_map_prof.n_ba++;
     g_map_prof.n_ba_iters += stats.iterations;
+    char grad[64] = "";
+    if (!stats.gradient_norms.empty())
+        std::snprintf(grad, sizeof grad, ", gradient %.3e%s", stats.gradient_norms.back(),
+                      stats.gradient_stop ? " (stop)" : "");
     if (MapProf::enabled())
         slog::diag(slog::Tag::Map,
                    "[prof] BA #%ld: %u img %u pt %u obs | build %.3f init %.3f solve %.3f "
-                   "write %.3f s | %d LM iters",
+                   "write %.3f s | %d LM iters, %s%s%s | prior %.3f -> %.3f, %d prior-driven, "
+                   "final damping %.1e, cost %.6e -> %.6e%s",
                    (long)g_map_prof.n_ba, P.num_images, P.num_points, P.num_obs, t_build, t_init,
-                   t_solve, t_write, stats.iterations);
+                   t_solve, t_write, stats.iterations, stats.solver, stats.jac32 ? " fp32-J" : "",
+                   stats.cg_solves ? (" " + std::to_string((int)std::lround(
+                                                 stats.cg_iters_total / stats.cg_solves)) +
+                                      " its/solve").c_str()
+                                   : "",
+                   stats.prior_initial, stats.prior_final, stats.prior_steps,
+                   stats.final_damping, stats.initial_cost, stats.final_cost, grad);
     return stats.final_cost;
 }
 
 // ---- joint refinement of several components (D45) -------------------------
-//
-// Components are separate reconstructions but they are not separate cameras:
-// the same lens took all of them, so its intrinsics are one set of unknowns
-// that every component's observations constrain. Refining each component alone
-// splits that evidence -- a 20-image component fits its own focal to its own
-// noise, drifts, and then aligns with nothing.
-//
-// This packs every component into one BAProblem by giving each its own id
-// range for images and points while leaving camera ids shared, so the solver
-// sees one intrinsics group per lens fed by every component at once. The
-// components stay geometrically independent (no observation links them, and
-// each keeps its own gauge freedom, which the solver's damping handles exactly
-// as it does for a single free-floating model).
-//
-// Intrinsics start from the best-constrained component's values -- averaging
-// distortion coefficients across models that disagree is not meaningful, and
-// the largest model's are the ones with evidence behind them.
-inline double runJointBA(std::vector<Reconstruction*> models, const BundleOptions& bopt) {
+
+// One lens took every component, so its intrinsics are one set of unknowns:
+// every model goes into one BAProblem under its own id range, the camera ids
+// shared. `priors[k]`, when given, are model k's factors on its own image ids.
+inline double runJointBA(std::vector<Reconstruction*> models, const BundleOptions& bopt,
+                         const std::vector<const PosePriors*>* priors = nullptr) {
     if (models.empty()) return 0;
     size_t live = 0;
     for (const Reconstruction* m : models)
         if (m->numRegistered() >= 2) live++;
     if (live == 0) return 0;
-    if (live == 1 && models.size() == 1) return runGlobalBA(*models[0], bopt);
+    if (live == 1 && models.size() == 1) {
+        BundleOptions one = bopt;
+        one.priors = priors && !priors->empty() ? (*priors)[0] : nullptr;
+        return runGlobalBA(*models[0], one);
+    }
 
     // Id strides, so a merged view can be split apart again unambiguously.
     uint32_t img_stride = 0;
@@ -384,8 +595,23 @@ inline double runJointBA(std::vector<Reconstruction*> models, const BundleOption
         for (const auto& kv : m->points3D) pt_stride = std::max(pt_stride, kv.first + 1);
     }
     if (img_stride == 0 || pt_stride == 0) return 0;
+    // A rig frame names images a component may not hold; the stride has to
+    // clear every id the table can produce, not only the ones present.
+    if (bopt.rigs && bopt.use_rigs)
+        img_stride = std::max(img_stride, (uint32_t)bopt.rigs->of_image.size());
 
     Reconstruction all;
+    // Each model's priors travel with its shifted image ids; the up axis is
+    // per model too, so the stacked problem takes it from the first model
+    // that has up factors and drops the others' (their gauges differ).
+    PosePriors joint_priors;
+    bool joint_up = false;
+    // Rigs: each component keeps its own calibration (its own scale), so the
+    // stacked problem gets one copy of the table per component, image ids
+    // shifted with the component, and one calibration set per copy.
+    RigTable joint_rigs;
+    const bool rigs = bopt.rigs && bopt.use_rigs && !bopt.rigs->empty();
+    std::vector<uint32_t> rig_base(models.size(), 0);
     // Cameras: shared by id, taken from the component with the most images.
     std::map<uint32_t, double> cam_weight;
     for (const Reconstruction* m : models) {
@@ -406,6 +632,22 @@ inline double runJointBA(std::vector<Reconstruction*> models, const BundleOption
         if (m.numRegistered() < 2) continue;
         const uint32_t io = (uint32_t)mi * img_stride;
         const uint64_t po = (uint64_t)mi * pt_stride;
+        if (rigs) {
+            rig_base[mi] = (uint32_t)joint_rigs.rigs.size();
+            for (const RigSpec& r : bopt.rigs->rigs) {
+                RigSpec c = r;
+                for (auto& fr : c.frames)
+                    for (uint32_t& img : fr) {
+                        if (img == kNoImage) continue;
+                        auto it = m.images.find(img);
+                        img = it != m.images.end() && it->second.registered ? img + io : kNoImage;
+                    }
+                joint_rigs.rigs.push_back(std::move(c));
+            }
+            std::vector<RigCalib> calib = m.rigs;
+            calib.resize(bopt.rigs->rigs.size());
+            all.rigs.insert(all.rigs.end(), calib.begin(), calib.end());
+        }
         for (const auto& kv : m.images) {
             if (!kv.second.registered) continue;
             Image im = kv.second;
@@ -419,10 +661,37 @@ inline double runJointBA(std::vector<Reconstruction*> models, const BundleOption
             for (TrackElement& e : pt.track) e.image_id += io;
             all.points3D[kv.first + po] = std::move(pt);
         }
+        if (priors && mi < priors->size() && (*priors)[mi] && !(*priors)[mi]->empty()) {
+            const PosePriors& pr = *(*priors)[mi];
+            joint_priors.huber = pr.huber;
+            for (PriorRotation r : pr.rotations) {
+                r.i += io;
+                r.j += io;
+                joint_priors.rotations.push_back(r);
+            }
+            if (!pr.ups.empty() && (!joint_up || pr.up_w.dot(joint_priors.up_w) > 0.9999)) {
+                if (!joint_up) joint_priors.up_w = pr.up_w;
+                joint_up = true;
+                for (PriorUp u : pr.ups) {
+                    u.i += io;
+                    joint_priors.ups.push_back(u);
+                }
+            }
+            for (PriorCentre c : pr.centres) {
+                for (int k = 0; k < c.n; k++) c.img[k] += io;
+                joint_priors.centres.push_back(c);
+            }
+        }
     }
     if (all.images.size() < 2 || all.points3D.empty()) return 0;
 
-    double cost = runGlobalBA(all, bopt);
+    BundleOptions jopt = bopt;
+    jopt.priors = joint_priors.empty() ? nullptr : &joint_priors;
+    if (rigs) {
+        joint_rigs.index((size_t)models.size() * img_stride);
+        jopt.rigs = &joint_rigs;
+    }
+    double cost = runGlobalBA(all, jopt);
 
     // Scatter back. Intrinsics land in every component, which is the point.
     for (size_t mi = 0; mi < models.size(); mi++) {
@@ -449,15 +718,19 @@ inline double runJointBA(std::vector<Reconstruction*> models, const BundleOption
             auto it = all.cameras.find(kv.first);
             if (it != all.cameras.end()) kv.second = it->second;
         }
+        if (rigs)
+            for (size_t r = 0; r < bopt.rigs->rigs.size() && r < m.rigs.size(); r++)
+                m.rigs[r] = all.rigs[rig_base[mi] + r];
     }
     return cost;
 }
 
-inline double runJointBA(std::vector<Reconstruction>& models, const BundleOptions& bopt) {
+inline double runJointBA(std::vector<Reconstruction>& models, const BundleOptions& bopt,
+                         const std::vector<const PosePriors*>* priors = nullptr) {
     std::vector<Reconstruction*> p;
     p.reserve(models.size());
     for (Reconstruction& m : models) p.push_back(&m);
-    return runJointBA(std::move(p), bopt);
+    return runJointBA(std::move(p), bopt, priors);
 }
 
 }  // namespace sfm

@@ -1,5 +1,9 @@
 #include "nn/vk/Memory.h"
 
+#ifdef __APPLE__
+#include <vulkan/vulkan_metal.h>
+#endif
+
 #include "nn/core/Error.h"
 #include "nn/core/Log.h"
 
@@ -142,7 +146,7 @@ const char* oom_platform_hint() {
 DevicePtr Allocator::allocRaw(VkDeviceSize bytes, VkBufferUsageFlags usage,
                               VkMemoryPropertyFlags required,
                               VkMemoryPropertyFlags preferred, bool map,
-                              void** mapped_out, const char* what) {
+                              void** mapped_out, const char* what, bool shared) {
     if (bytes == 0) return 0;
     // 16-byte rounding: shaders read uint8 buffers as whole u32 words and
     // vector loads may overrun the logical end; the slack keeps them in bounds.
@@ -156,6 +160,12 @@ DevicePtr Allocator::allocRaw(VkDeviceSize bytes, VkBufferUsageFlags usage,
     bci.size = bytes;
     bci.usage = usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    const uint32_t families[2] = {ctx.queueFamily(), ctx.transferFamily()};
+    if (shared && ctx.transferFamily() != UINT32_MAX) {
+        bci.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        bci.queueFamilyIndexCount = 2;
+        bci.pQueueFamilyIndices = families;
+    }
     NN_VK_CHECK(vkCreateBuffer(ctx.device(), &bci, nullptr, &a.buffer));
 
     VkMemoryRequirements req{};
@@ -182,6 +192,17 @@ DevicePtr Allocator::allocRaw(VkDeviceSize bytes, VkBufferUsageFlags usage,
     fi.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
     VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     mai.pNext = &fi;
+#ifdef VK_EXT_metal_objects
+    // Without it MoltenVK has no MTLBuffer to export. It goes BEFORE `fi`:
+    // MoltenVK 1.4.2's switch falls through from this case and reads
+    // exportObjectType as the allocate flags, so the later `fi` must win.
+    VkExportMetalObjectCreateInfoEXT xi{VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT};
+    xi.exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_BUFFER_BIT_EXT;
+    if (ctx.hasMetalObjects()) {
+        xi.pNext = &fi;
+        mai.pNext = &xi;
+    }
+#endif
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = type_index;
 
@@ -213,6 +234,7 @@ DevicePtr Allocator::allocRaw(VkDeviceSize bytes, VkBufferUsageFlags usage,
         allocs_[a.addr] = a;
         bases_.insert(std::lower_bound(bases_.begin(), bases_.end(), a.addr), a.addr);
         total_ += bytes;
+        peak_ = std::max(peak_,total_);
     }
     NN_LOG_DEBUG("[vk] alloc %s for %s\n", fmtBytes(bytes).c_str(), what);
     return a.addr;
@@ -224,6 +246,14 @@ DevicePtr Allocator::allocDevice(VkDeviceSize bytes, const char* what) {
                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                         VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, false, nullptr, what);
+}
+
+DevicePtr Allocator::allocDeviceShared(VkDeviceSize bytes, const char* what) {
+    return allocRaw(bytes,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, false, nullptr, what, true);
 }
 
 DevicePtr Allocator::allocHost(VkDeviceSize bytes, void** mapped_out, const char* what,
@@ -310,6 +340,16 @@ bool Allocator::isDevicePointer(DevicePtr ptr) const {
 VkDeviceSize Allocator::totalBytes() const {
     std::lock_guard<std::mutex> lock(mu_);
     return total_;
+}
+
+VkDeviceSize Allocator::peakBytes() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return peak_;
+}
+
+size_t Allocator::allocationCount() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return allocs_.size();
 }
 
 DevicePtr Allocator::nullFallback() {

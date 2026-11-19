@@ -26,7 +26,8 @@ reproduced.
 ## Device baseline
 
 Vulkan 1.2 core with features: `bufferDeviceAddress`, `timelineSemaphore`
-(both core-1.2 features; MoltenVK exposes both on Apple silicon). Optional,
+(both core-1.2 features; MoltenVK exposes both on Apple silicon), and compute
+subgroups of at most 64 lanes, pinned per kernel where the device allows (below). Optional,
 probed per device and reflected as pipeline variants where needed
 (spirv_tool compiles every subset of an entry's applicable variants, so
 any capability combination finds an exact blob; SS_VK_NATIVE_ATOMICS=0 /
@@ -39,7 +40,27 @@ for A/B testing):
   blob uses a CAS-loop emulation (Intel ANV), and a
   `.atomicadd`-suffixed blob uses native `OpAtomicFAddEXT`; the pipeline
   layer picks per device at module load (no in-shader branch). Unlike
-  VkSplat, both variants are always built.
+  VkSplat, both variants are always built. In Windows builds the CAS-loop
+  blob has a second shape behind the spec constant `kXchgFloatAdd` (ID 1000,
+  clear of every kernel's own 0..n-1): an add built from two float atomic
+  exchanges. Its float atomics are in the module whether the constant takes
+  them or not, so every device loading a CAS-loop blob there enables
+  `shaderBufferFloat32Atomics` where it has it; elsewhere the path is not
+  compiled, since SPIRV-Cross emits it as `atomic_float`, which MSL lacks
+  before 3.0. The pipeline layer sets the constant only on AMD's Windows
+  driver without native fp32 add (`amd_windows_emulated_fadd`,
+  `VulkanContext.cpp`); such a device without the exchange either is what
+  still reports `backend::DeviceIssue::AmdWindowsFloatAtomics`. That driver drops the
+  index of an indexed float pointer once it is reinterpreted as `uint*`
+  (OpBitcast and OpConvertPtrToU alike; the SPIR-V validates), so every CAS
+  of an array element hit the array's base and float sums came out
+  thousands of times too large (issue #23). Seen in the ISA of an
+  RX 6800 XT, Adrenalin 26.8.1 (driverVersion 2.0.353), via
+  VK_KHR_pipeline_executable_properties. `SS_VK_XCHG_FLOAT_ADD=0/1` forces
+  it either way. The same device also gets the word-packed int8 blobs: 13 of
+  the 148 ".int8" ones (ppl_fwd, ppl_bwd, fused_adam_qq, ...) crash its
+  compiler in amdvlk64.dll, and the gindex_t loads index before they cast,
+  the shape the float CAS was miscompiled in.
 - `shaderInt64` — 64-bit sort keys, morton codes, large-buffer indexing.
   Entries in an int64_compat-including source get a `.noint64` variant
   compiled with `-DSS_EMULATE_INT64` (`backend/vulkan/shaders/int64_compat.slang`),
@@ -69,9 +90,15 @@ for A/B testing):
   Forward/render path does not need it (only float atomicMax on radii,
   which is integer-monotonic on non-negative floats → emulate with
   u32 atomicMax over the float bit pattern; exact, not a CAS loop).
-- Subgroup size: never assumed 32. Kernels use `WaveActive*` /
-  `WavePrefixSum` and size-agnostic reductions; AMD wave64 and Intel
-  variable-width are first-class.
+- Subgroup size: 8 to 64 lanes, never assumed. Kernels use `WaveActive*` /
+  `WavePrefixSum`, uint4 ballots and per-wave partials counted with
+  `WaveGetLaneCount()`; a 32-thread workgroup on a 64-wide wave
+  (rasterize_bwd, the single-thread finals) is one half-full wave. Where the
+  device offers both 32 and 64 (RDNA), the kernels in `kWave64Entries`
+  (VulkanPipelines.cpp) run at 64 and the rest at 32. `SS_VK_SUBGROUP=N`
+  forces one width on every kernel: A/B timing, and on RDNA a stand-in for
+  wave64-only GCN (docs/testing.md). A device whose narrowest compute
+  subgroup is over 64 is refused in `probe_device`.
 
 ## Memory model
 
@@ -126,15 +153,29 @@ dropped for now and noted as a limitation).
   slower on desktop drivers, the same way `vkGetFenceStatus` polling beats
   `vkWaitForFences`. CPU devices (llvmpipe) always block
   (`SS_VK_POLL_WAIT=0/1` overrides).
+- Watchdog: a launch that grows with the input (rasterizer, bilateral grid,
+  SSIM, per-pixel losses) goes through `dispatch_budgeted`, which flushes
+  and, past `core/SubmitBudget.h`'s target, splits it into
+  `vkCmdDispatchBase` ranges, each its own submit
+  (docs/notes/gpu-submit-budget.md). Only an entry whose workgroups are
+  independent may use it. `SS_VK_SUBMIT_LOG=<ms>` prints every submit
+  longer than that, with its kernels.
 - Barriers: a conservative global `COMPUTE|TRANSFER → COMPUTE|TRANSFER`
   memory barrier after every dispatch/copy inside a batch reproduces CUDA
   stream ordering exactly. Per-resource narrowing is a later optimization,
   applied with profiling, not by default.
 - `Event` = {timeline value at record, optional timestamp-query slot}.
   `event_elapsed_ms` reads the two timestamps × `timestampPeriod`.
+- Step breakdown: while `dispatch_timing_arm()` is in force, every
+  dispatch, fill and copy is bracketed by its own pair of timestamps in a
+  separate query pool, tagged with the recording thread's scope
+  (docs/notes/step-timing.md).
 - Errors: sticky `VkResult` + message; `last_error()` returns-and-clears
-  (cudaGetLastError semantics). Nothing is compiled out: failures always
-  set the sticky error, and allocation failures return nullptr.
+  (cudaGetLastError semantics). Allocation failures return nullptr.
+  A no-progress timeout is fatal: it prints the configured stall limit and
+  exits with failure without running destructors or exit handlers. A timeout
+  does not cancel queued work; driver teardown can otherwise wait forever.
+  `vk_stall_exit_test` checks this with an unsignaled queue semaphore.
 
 ## Kernel ABI
 
@@ -159,7 +200,8 @@ Variant axes follow the CUDA instantiation structure
   output_median, VALUE_BITS** are value parameters → specialization
   constants on ONE SPIR-V module, folded at pipeline creation. Pipelines are
   created lazily and cached by (entry point, spec-constant tuple, device
-  capability set).
+  capability set). So is **kSbLobes**, the spherical-beta lobe count, which
+  only this backend has (below).
 
 ### The lens-distortion tier (`kDistortion`)
 
@@ -179,13 +221,31 @@ within a module and the host passes `SpecList` by index, so a constant
 inserted mid-module silently renumbers every axis after it (the class of bug
 the densify copy kernel hit — see "Spec IDs follow declaration order" below).
 The resulting IDs: warp 0; background_sh / pixel_wise_{render,train} /
-meshing_raster / visualizer 1; rasterize_moments 3; projection_fwd /
-rasterize_fwd 4; projection_bwd / rasterize_bwd 6; projection_qgrad 8;
-fpbo 11 (12 axes, still under `SpecList::kMax` = 16).
+meshing_raster / visualizer 1; rasterize_moments 3; rasterize_fwd 5;
+projection_fwd 6; rasterize_bwd 7; projection_bwd 7; projection_qgrad 9;
+fpbo 12 (13 axes, still under `SpecList::kMax` = 16).
 
 The one axis declared after `kDistortion` is warp's `kFromSource` (ID 1),
 which selects the source-camera projection in the wide warps: it trails so the
 launches that never re-distort keep passing their one-element `SpecList`.
+
+### The colour row (`kShDegree`, `kSbLobes`)
+
+A splat's view-dependent colour is one row of `features_sh`: the SH bands
+past the DC, then `kSbLobes` spherical-beta lobes of two float3 each
+(`core/ColorBasis.h`; docs/notes/spherical-beta.md). Every storage path --
+the q8/q16 value codec in both layouts, the 8-bit Adam state, the gradq
+accumulator, densify's copies -- treats the row as opaque cells, so the lobes
+ride through them unchanged. What knows the split:
+`backend/vulkan/shaders/view_color.slang` (the colour and its VJP, shared by
+the whole projection family through `ColorRow`), the per-cell optimizers
+(`sb_cells.slang`: their own rate, the regularizer on the amplitude only, no
+colour trust region), and FPBO, whose writeback walks the row's cells in
+order across the active bands, the warmup's zero bands and the lobes.
+Launchers resolve the lobes' first coefficient once (`vkk::color_spec`) and
+pass it as `sb_base`; `kShDegree` is the warmup's degree, so the stored bands
+cannot be inferred from it. The CUDA kernels carry no lobes and refuse a
+launch that asks for any.
 
 ## Shaders: build and shipping
 
@@ -201,6 +261,8 @@ custom command per blob so the build's `-j` bounds how many run at once
 (each blob is a normal Ninja edge, printed `[n/m] SPIR-V <name>`, and only
 stale blobs recompile). The same tool then `embed`s the blobs into one
 generated TU (byte arrays + name registry), so binaries are self-contained.
+The embed also fails on an entry with no row in `engine/StepTimingTable.h`,
+the step-time breakdown's table, and on a row that names no entry.
 CMake locates slangc in PATH / `-DSS_SLANGC=`, checks
 `slangc -v` against the pinned `SS_SLANG_VERSION`, and on miss or
 mismatch downloads + extracts the pinned GitHub release into the build tree
@@ -257,7 +319,7 @@ in registers, and measure on Apple either way.
 MoltenVK translates our SPIR-V to Metal Shading Language through
 SPIRV-Cross, and two of its habits turn correct SPIR-V into wrong or
 uncompilable MSL. Both are invisible on every other driver, and both were
-found the same way: `spirv-cross --msl --stage comp build/spirv/<blob>.spv`
+found the same way: `spirv-cross --msl --stage comp build_vulkan/spirv/<blob>.spv`
 prints exactly what the Metal compiler will see, so read that before
 guessing.
 
@@ -336,14 +398,14 @@ Phase-0/1 hard-won portability rules (validated on NVIDIA proprietary,
 Mesa ANV, llvmpipe — all tests + validation layers clean on all three):
 
 - **Pin the subgroup size.** Compute pipelines are created with
-  VK_EXT_subgroup_size_control's required-size + full-subgroups whenever the
-  device supports it. Intel/ANV's default is a VARYING SIMD width, which
+  VK_EXT_subgroup_size_control's required size whenever the device supports
+  it. Intel/ANV's default is a VARYING SIMD width, which
   silently breaks `tid / WaveGetLaneCount()` subgroup indexing (the radix
-  sort produced garbage on Intel until pinned). Kernel workgroup sizes must
-  stay multiples of every plausible subgroup size (8..128). Specifically the
-  **X dimension** must be the multiple (VUID-02757 under
-  REQUIRE_FULL_SUBGROUPS) — a 16x16 workgroup fails even though its total is
-  256, so 2D kernels use flat 64/128/256-wide X layouts.
+  sort produced garbage on Intel until pinned). Full subgroups are required
+  too wherever the workgroup's **X dimension** is a multiple of the width
+  (VUID-02757) — a 16x16 workgroup fails even though its total is 256, so 2D
+  kernels use flat 64/128/256-wide X layouts. The 32-wide kernels skip it
+  only on a 64-wide device.
 - **No unguarded 8-bit types in shaders.** `uint8_t` loads / `uint8_t*`
   push-constant members require shaderInt8 / 8-bit-storage features outside
   the baseline. Byte access goes through `int8_compat.slang` (packed-u32
@@ -406,7 +468,10 @@ Vulkan.
 - `kernels/IntersectTile.cpp` + `backend/vulkan/shaders/intersect_tile.slang`:
   `do_intersect_tile_generic` = count -> `backend::inclusive_sum<int32>` ->
   4-byte n_isects readback -> key write -> `backend::sort_pairs<int64,int32>`
-  (begin 0, end 32 + tile bits, exactly the CUB call) -> offset kernel.
+  (begin 0, end 32 + tile bits, exactly the CUB call) -> offset kernel, per
+  band of tile rows when the pairs are many (docs/notes/vram-splat-x-img.md,
+  "Sorting in bands"). The sort starts in the payload buffer that leaves its
+  result in the caller's list: one swap per 8 key bits.
   Ellipse-vs-AABB mode is a runtime null-check on proj_conic (the CUDA
   template bool only folds that check).
 - `kernels/RasterizeFwd.cpp` + `backend/vulkan/shaders/rasterize_fwd.slang`: closely
@@ -435,6 +500,7 @@ the engine level.
 - `kernels/PixelWiseRender.cpp` + `backend/vulkan/shaders/pixel_wise_render.slang`:
   the render-path PixelWise subset — `blend_background_forward`,
   `blend_background_noise_forward` (hash_uint3 ported bit-exact),
+  `blend_background_color_forward`,
   `rgb_to_srgb_forward`, `depth_to_normal_forward{,_tv}` (16x16 shared-mem
   apron tile as a flat 256-thread workgroup per the X-dim subgroup rule).
 - `kernels/Visualizer.cpp` + `backend/vulkan/shaders/visualizer.slang`: full
@@ -514,7 +580,7 @@ the engine level.
   randomness — parity compares only its deterministic count channel.
 - **Pixel-wise training + background-SH backward (phase 5, second slice)**:
   `kernels/PixelWiseTrain.cpp` + `pixel_wise_train.slang` implement the
-  blend/noise/srgb backwards, overexposure_grad_add, depth_to_normal_backward
+  blend/noise/color/srgb backwards, overexposure_grad_add, depth_to_normal_backward
   (16x16 tile apron + neighbor scatter), linear_depth_to_ray_depth_inplace,
   and color_shift_reg_step (ColorShiftReg.cu; shared-mem float atomics ->
   groupshared serial reduce + one portable atomic add per channel/block).
@@ -541,17 +607,27 @@ the engine level.
   barrier), ballot compaction -> WavePrefixCountBits + per-wave totals in
   groupshared, float atomicAdd/atomicMax -> atomic_add_f32 CAS loop /
   atomic_max_f32 signed-int-max trick (atomic_float.slang) with CUDA's
-  isfinite filter. Six spec-constant axes (camera, dist, median,
-  accum-weight, viewmat-grad, packed). The 2D fragment vjp math is ported
+  isfinite filter. Seven spec-constant axes (camera, dist, median,
+  accum-weight, viewmat-grad, packed, max-weight). The 2D fragment vjp math is ported
   inline; 3DGUT goes through the evaluate_{alpha,color}_3dgs_vjp +
   compute_3dgut_iscl_rot_vjp slang exports. `raster_bwd_parity` builds real
-  forward state through the ported projection/intersect/raster-fwd chain,
-  then compares 285k gradient floats over 5 configs: NVIDIA 1 violation
-  (0.0004%); Intel/llvmpipe ~0.05% — verified to be inherited upstream
-  near-tie blend-order flips, not a port defect, by comparing those devices
-  against an NVIDIA-Vulkan dump of the SAME shader (identical diffs).
-  Note: Primitive.cuh zeros_pool had a leftover raw cudaMemset (host code)
-  -> backend::memset_sync (both backends re-verified).
+  forward state through projection/intersect/raster-forward, then compares
+  1.06 million gradient floats across 18 configurations, including absent
+  depth gradients, distortion, median depth, packed rows, camera gradients,
+  cutoff kernels and maximum weights. Tolerance caps account for atomic
+  accumulation order and upstream near-tie blend-order differences.
+  `rasterize_bwd_nodepth.slang` compiles the shared raster body with
+  `SS_RASTER_NODEPTH`, specializing away the depth VJP when render-depth gradients,
+  distortion and median depth are all absent. Selection uses those bindings,
+  with no footprint or tile-list heuristic. Both entries keep the same
+  compositing order and buffers. The existing 2D and full 3DGUT modules
+  remain byte-identical, including their atomic and int64 variants.
+  RTX 5070, three interleaved pairs with 100 ms warmup per stage: the
+  depth-free entry reduces backward time 5.3–21.3% across tiny, large,
+  mixed, heavy-tail, clustered and transparent splats at 1237x822.
+  A 2M-splat mixed case takes 2.085 ms against 2.495 ms (16.4% less).
+  The same trained bicycle model and fixed full-resolution camera allocate
+  1,735,471,680 bytes with either build (1585.97 MiB pool plus scratch).
 - **Projection backward family (phase 5, fourth slice)**: three kernels over
   shared machinery in `proj_bwd_common.slang` (splat/camera loaders, the
   per-intersection projection VJP wrappers over the primitive_3dgs.slang
@@ -561,7 +637,8 @@ the engine level.
   address locals and the CUDA `_vjp_atomic` variant needs float
   InterlockedAdd, so the VJP accumulates into an `inout float3[24]` and
   callers either keep it in registers or scatter with atomic_add_f32; source
-  coefficients decode once via fp32 or the word-based q8/q16 codec).
+  coefficients are read on demand through the fp32 or word-based q8/q16
+  reader, without retaining a decoded row).
   - `kernels/ProjectionBwd.cpp` + `projection_bwd.slang`
     (projection_{3dgs,mip,3dgut}_backward): one thread per intersection,
     spec axes camera/degree/antialiased/value-bits/packed/viewmat-grad;
@@ -608,7 +685,7 @@ the engine level.
   (densify_clip_scale, MCMC/revised noise, long-axis-split relocate/add,
   MCMC relocate/add) over `backend/vulkan/shaders/densify.slang`, which includes the
   canonical `shaders/densify.slang` device code (long_axis_split_3dgs, the
-  randn3 noise kernels) and mirrors the McmcRelocation.cu-only mcmc_relocation
+  Gaussian noise kernels) and mirrors the McmcRelocation.cu-only mcmc_relocation
   math; `kernels/Optimizer.cpp` gains the adamtr trust-region color
   variants (`backend/vulkan/shaders/optim_color.slang`) and the fused 3DGS geometry
   step (`backend/vulkan/shaders/optim_geometry.slang`, sharing the FPBO helpers
@@ -653,6 +730,26 @@ the engine level.
     loose floats + 2.8M codes; 10 configs over sh_optim_bits 32/8/4 x
     sh_value_bits 32/16/8 x bounds layouts x non-SH quant x degree
     warmup). All three devices pass; validation clean.
+- **Local covariance regularization**: `kernels/PcaReg.cpp` uses the shared
+  Slang PCA math for centers, opacity-weighted centers, or Gaussian mixtures.
+  It supports PCAsplat eigenspectrum/normal/surfel losses, an effective-rank
+  upper bound, and transmittance along the PCA normal. Specialization IDs are
+  covariance mode 0, enabled-term mask 1, search mode 2; capacities and scale
+  modes have separate entries. `pca_reg_parity` checks double-precision values,
+  finite differences, neighbor search and degenerate inputs. `pca_reg_step`
+  checks optimizer integration, including opacity updates without false camera
+  visits. See [the math and tuning notes](../../../docs/notes/pca-reg.md).
+- **Projective depth**: `kernels/ProjectiveDepth.cpp` and
+  `backend/vulkan/shaders/projective_depth.slang` observe existing raster
+  gradients to update each splat's anchor and geometric information. FPBO and
+  the separate geometry optimizer share `shaders/projective_depth.slang` with
+  CUDA. Densification inherits the added state; full checkpoints preserve it.
+  `projective_depth_test`, `fpbo_parity`, `fpbo_split_parity`,
+  `densify_parity`, `projective_resume`, and `projective_camera_batches` cover
+  both backends, including coincident faces and accumulated passes. Exploration
+  keys hash `(step, splat index, component)` as integers; `noise_moments`
+  checks the shared Box–Muller transform and cross-step independence.
+  See [projective depth optimization](../../../docs/notes/projective-depth.md).
 - **Bilagrid/PPISP color pipeline (phase 5, sixth slice)**:
   `kernels/Bilagrid.cpp` implements the full kernels/bilagrid/BilagridBindings.h raw
   launcher family (affine / PPISP / log-linear / depth / normal samplers:
@@ -683,13 +780,29 @@ the engine level.
   - **backward_v1 grid-grad kernels** keep CUDA's logical 8x8 block
     geometry / mult_x-mult_y tile decomposition exactly (the per-thread
     pixel-range partition determines the writeback structure), but run as
-    flat 64-wide workgroups with an in-shader 8x8 decode — the pinned
-    subgroup size requires workgroup X to be a multiple of 32 (VUID-02757;
+    flat 64-wide workgroups with an in-shader 8x8 decode — full subgroups
+    need workgroup X to be a multiple of the pinned width (VUID-02757;
     same reason the TV/channel-mean 4x4x4 blocks and the single-thread
     reg-loss finals are 64-/32-wide with logical decode / a tid-0 guard).
-    The warp-shuffle block reduce becomes a groupshared tree
-    (`bg_block_add_64`); CUDA's fast/slow writeback three-path split is
-    preserved.
+    `bg_block_add_64` folds across subgroups in shared memory, then finishes
+    with subgroup reads in the shared tree's original addition order.
+    PPISP gathers two neighboring intensity planes per workgroup, sharing
+    each pixel's transform VJP across both planes. The four-plane preload
+    and `ceil(L/2)` host dispatch cover odd and single-layer grids too.
+    Its RGB backward caches the eight corners for the intensity derivative,
+    avoiding a second read/decode. No image-sized scratch is added.
+    RTX 5070, `image_loss_bench bilagrid 4946 3286 40`: 26.184 against
+    35.788 ms, medians of three interleaved pairs (26.8% less time), with
+    identical Vulkan allocation peaks on fixed inputs.
+  - Standalone PPISP and the appearance chain unroll parameter reduction
+    over the fixed maximum layout. `ppisp_reduce.slang` finishes the shared
+    binary tree with subgroup reads in the original addition order, using
+    the same shared scratch. RTX 5070, 1237x822, medians of three interleaved
+    pairs: standalone PPISP takes 0.180–0.440 ms against 0.321–0.704 ms;
+    the appearance chain takes 0.216–0.988 ms against 0.321–1.459 ms,
+    across 9-, 24-, 36- and 39-parameter layouts. The default 9-parameter
+    chain at 4946x3286 takes 3.471 ms against 5.173 ms. Affine-only and
+    grid-only samplers retain their existing implementations.
   - **Fused TV-Adam/AdaGrad**: one 256-cell codec block per workgroup;
     Adam moments through QuantizedAdamState<4|8>, the AdaGrad accumulator
     through a new QuantizedTensorLog<4|8> port in optim_quant.slang
@@ -715,21 +828,22 @@ the engine level.
     scatter utils) and `ppisp_parity` (63K tight + 0.9K loose; 3 param
     types x cam_indices on/off + reg fwd/bwd with synthetic deterministic
     bwd inputs). All three devices pass; validation clean.
-  - **PLANNED — backward-implementation selection**: the grid-gradient
-    backward ships only as `*_bwd_v1_grid` (thread-per-cell *gather*), which
-    profiling flags as a consistent top cost on every device (NVIDIA, amdvlk,
-    RADV, Intel, llvmpipe). The plan is to add a thread-per-pixel *scatter*
-    `*_bwd_v2` alternative (the disabled `#if 0` CUDA
-    `BilagridUniformSampleBwdV2_kernel.cuh` revived + a new Slang port) and
-    pick between v1/v2 at runtime with a small **online contextual** selector
-    keyed on `(family, resolution, grid shape)` — reusing vksplat's
-    Gaussian-Thompson-sampling stats but making them per-key, so it needs no
-    offline calibration pass (unlike fused-bilagrid) and does not average over
-    resolutions (unlike vksplat's context-free bandit). When porting v2, the
-    `needs_image_grad` axis is a Slang spec-constant (false for depth/normal,
-    which skip the image-grad scatter — the v2 analogue of the existing
-    `v_in == nullptr` skip), and the grid-fold tail rule + null-`v_in` guard
-    above apply unchanged.
+  - **Backward-implementation selection**: `BilagridBwdSelector.h` keeps
+    contextual online statistics per family, resolution and grid shape.
+    Shipping arms explore v1 target tile sizes 2, 3, 4, 5, 6 and 8.
+    The v2 pixel-scatter kernels are available through `SS_BILAGRID_BWD`
+    but remain opt-in because their atomic contention measured slower.
+    Depth/normal v2 specializes away discarded input gradients; RGB PPISP
+    v2 retains its image-gradient pass.
+  - **Uniform PPISP backward, Vulkan only**: wherever a 16x16 pixel tile
+    spans at most two cells per axis and L <= 8, every v1 arm runs
+    `bilagrid_ppisp_bwd_tile` instead. v1's grid kernel repeats each
+    pixel's PPISP backward for the ~4 grid nodes that gather it; the tile
+    kernel runs it once per pixel, stages the 9 parameter gradients in
+    groupshared, and sums one (cell, level) row per thread over 32-pixel
+    chunks. Garden at 2594x1681, 2.5M splats: grid + rgb 4.65 ms ->
+    1.31 ms a step. Reducing per subgroup instead cost more than v1 did:
+    a tile's pixels spread over most of the levels.
 - **Multi-scale per-pixel loss stack (phase 5, seventh slice)**:
   `kernels/PerPixelLoss.cpp` mirrors `compute_multi_scale_per_pixel_losses`
   (PerPixelLoss.cu) end to end — pyramid construction, per-scale grad
@@ -753,7 +867,20 @@ the engine level.
     flat 256-wide workgroups (~30 KB, same buffer1/buffer2 overlay reuse).
     Every per-pixel output is a pure function of the zero-padded input, so
     tile size does not change the map or dL/dimg1 (tight); only the
-    display-only scalar's accumulation grouping differs (loose).
+    display-only scalar's accumulation grouping differs (loose). Its
+    `scielab_*` entries port the S-CIELAB loss with the CUDA kernel's own
+    16x16 tile and 28 KB overlay, under the floor on every device; its
+    `flip_*` entries port FLIP the same way at 31.4 KB, keeping each lane's
+    window centres in registers across the passes, as the CUDA kernel does.
+    The `ssim_bt_*` entries are blur-tolerant SSIM: a blur pass, the fused
+    kernel on SSIM's tile (30 KB at 16, 47.7 KB at 24), and the blur's
+    adjoint (`docs/notes/ssim-blur-tolerance.md`).
+    Its 24x24 backward tile uses 512 threads when the device's workgroup
+    and pinned-subgroup limits permit it, reducing live window state per
+    thread. The 256-thread variant remains the portable fallback;
+    `SS_VK_SSIM_THREADS=256|512` overrides selection for comparisons.
+    Both use the same shared allocation; scalar reduction reuses the dead
+    moment buffer rather than enlarging the loss-map buffer.
   - `canny.slang` (canny rgb/scalar + BT.601 residual luma + Tukey
     biweight) with globally-clamped loads -> per-pixel deterministic, so
     even the RobustEdgeAware densification map compares tight.
@@ -872,17 +999,20 @@ the engine level.
   quantized paths; kernels that early-return on a flat-index guard before
   any barrier need nothing.
 - **Device enumeration / selection** (`backend::device_count / device_info /
-  device_select / device_current` in BackendRuntime.h): enumeration uses a
-  throwaway VkInstance (never initializes the Context singleton), so apps
-  can list devices before committing. Selection precedence inside
-  `Context::init`: `device_select()` > `SS_VK_DEVICE` env (index or
-  name substring) > auto-score (discrete > integrated, VRAM tie-break).
-  One device per process: after the context exists, `device_select` only
-  succeeds for the device already in use. The CUDA backend implements the
-  same four calls inline over cudart. `spirula train` prints the device
-  table at startup (`*` marks the device in use, VkSplat-style) and takes
-  `--device <index|name substring>`; the GUI has a Device combo in
-  the train panel that locks once training starts.
+  device_select / device_select_identity / device_selection_error /
+  device_current` in `BackendRuntime.h`): enumeration uses a throwaway
+  VkInstance (never initializes the Context singleton), so apps can list
+  devices before committing. Native selectors accept `auto`, a raw ordinal, a
+  unique case-insensitive name substring, or `uuid:<32 hex digits>`. Explicit
+  selection wins over `SS_VK_DEVICE`, then shared Auto ranking resolves to a
+  canonical UUID plus the diagnostic name; failed selection details are
+  available through `device_selection_error()`.
+  One device per process: after the context exists, selection only succeeds
+  for the device already in use. The CUDA backend is separate and ordinal-only;
+  `device_bind()` reapplies its frozen ordinal on each CUDA worker thread.
+  `spirula train` uses `--device <index|name|auto|uuid:hex>` for Vulkan and
+  `--device <index>` for CUDA. The GUI's native picker is shared by built-in
+  Vulkan workflows; CUDA training has its own ordinal picker.
 - **Training stubs**: `kernels/TrainingStubs.gen.cpp` (generated by
   `tools/codegen/generate_vulkan_stubs.py` from a link probe of
   csrc_portable vs the backend lib) provides throwing

@@ -10,8 +10,31 @@
 #include "sfm/core/Progress.h"
 
 #include "i18n/catalog/Sfm.h"
+#else
+#include "i18n/catalog/Log.h"
+#endif
 
 namespace gui {
+
+#ifndef SS_TOOL_SFM
+
+// SfmRunner::availability() refuses a run long before this, so reaching it is
+// a bug rather than a configuration; it still says which.
+InProcessResult run_sfm_in_process(
+    const std::vector<std::string>& args,
+    const std::function<void(const std::string&)>& log,
+    const std::function<void(const RunStatus&)>& on_status,
+    const std::atomic<bool>& cancel) {
+    (void)args; (void)log; (void)on_status; (void)cancel;
+    InProcessResult out;
+    out.exit_code = -1;
+    out.error = spirula::i18n::msg::log::err_no_sfm_module.get();
+    return out;
+}
+
+bool sfm_device_memory(uint64_t&, uint64_t&, uint64_t&) { return false; }
+
+#else
 
 namespace {
 
@@ -48,15 +71,15 @@ struct StatusFold {
     bool apply(const sfm::Event& e) {
         using K = sfm::Event::Kind;
         if (e.kind == K::PairVerified) return false;
-        st.stage = (uint32_t)e.stage;
+        if (e.kind != K::ModelUpdated) st.stage = (uint32_t)e.stage;
         switch (e.kind) {
             case K::StageBegin: st.done = 0; st.total = e.total; break;
             case K::StageEnd: st.done = st.total; break;
             case K::Progress:
             case K::ImageExtracted: st.done = e.done; st.total = e.total; break;
             case K::ModelUpdated:
-                // Not done/total: mapping's bar is events::map_placed, which
-                // counts the capture rather than the attempt in hand.
+                // Not done/total or the stage: mapping's bar is events::map_placed,
+                // which counts the capture rather than the attempt in hand.
                 st.registered = e.registered;
                 st.images = e.images;
                 st.points = e.points;
@@ -128,24 +151,15 @@ InProcessResult run_sfm_in_process(
     return out;
 }
 
-}  // namespace gui
-
-#else  // no SfM module: SfmRunner::availability() refuses the run before this
-
-#include "i18n/catalog/Log.h"
-
-namespace gui {
-
-InProcessResult run_sfm_in_process(const std::vector<std::string>&,
-                                   const std::function<void(const std::string&)>&,
-                                   const std::function<void(const RunStatus&)>&,
-                                   const std::atomic<bool>&) {
-    InProcessResult out;
-    out.exit_code = 1;
-    out.error = spirula::i18n::msg::log::err_no_sfm_module.get();
-    return out;
+bool sfm_device_memory(uint64_t& ours, uint64_t& others, uint64_t& capacity) {
+    const sfm::DeviceMemoryTally& t = sfm::DeviceMemoryTally::get();
+    capacity = t.capacity.load();
+    if (capacity == 0) return false;
+    ours = t.bytes.load();
+    others = t.others.load();
+    return true;
 }
 
-}  // namespace gui
+#endif  // SS_TOOL_SFM
 
-#endif
+}  // namespace gui

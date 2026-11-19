@@ -29,7 +29,7 @@ using backend::MemcpyKind;
 static constexpr int64_t N = 3000;
 static constexpr int64_t C = 2;
 static constexpr uint32_t W = 200, H = 150;
-static constexpr int NUM_SH = 15;  // degree-3 buffer
+static constexpr int NUM_SH = 24;
 
 template <typename T>
 T* upload(const std::vector<T>& host) {
@@ -181,6 +181,8 @@ int main(int argc, char** argv) {
         {2, true, 1, 0, 1, 0, false, false},
         {0, false, 0, 2, 3, 8, false, false},
         {2, false, 3, 0, 3, 16, true, false},
+        {0, false, 0, 0, 4, 0, false, true},
+        {0, true, 0, 0, 4, 16, true, false},
     };
 
     for (const Cfg& cfg : cfgs) {
@@ -209,7 +211,7 @@ int main(int argc, char** argv) {
             auto fn = cfg.prim == 0   ? projection_3dgs_packed_forward
                       : cfg.prim == 1 ? projection_mip_packed_forward
                                       : projection_3dgut_packed_forward;
-            auto out = fn(N, cfg.max_deg, splats_in, ttv(d_vm, {C, 16}),
+            auto out = fn(N, ColorBasis{cfg.max_deg, 0}, splats_in, ttv(d_vm, {C, 16}),
                           ttv(d_intr, {C, 4}), W, H, cams[cfg.cam],
                           dist_fixture::kTierNames[cfg.dist],
                           dist_tv(cfg.dist), radii, q_packed, q_bounds,
@@ -223,7 +225,7 @@ int main(int argc, char** argv) {
             auto fn = cfg.prim == 0   ? projection_3dgs_forward
                       : cfg.prim == 1 ? projection_mip_forward
                                       : projection_3dgut_forward;
-            auto out = fn(N, cfg.max_deg, splats_in, ttv(d_vm, {C, 16}),
+            auto out = fn(N, ColorBasis{cfg.max_deg, 0}, splats_in, ttv(d_vm, {C, 16}),
                           ttv(d_intr, {C, 4}), W, H, cams[cfg.cam],
                           dist_fixture::kTierNames[cfg.dist],
                           dist_tv(cfg.dist), radii, q_packed, q_bounds,
@@ -278,7 +280,7 @@ int main(int argc, char** argv) {
         auto bwd = cfg.prim == 0   ? projection_3dgs_backward
                    : cfg.prim == 1 ? projection_mip_backward
                                    : projection_3dgut_backward;
-        bwd(N, cfg.max_deg, splats_in, ttv(d_vm, {C, 16}),
+        bwd(N, ColorBasis{cfg.max_deg, 0}, splats_in, ttv(d_vm, {C, 16}),
             ttv(d_intr, {C, 4}), W, H, cams[cfg.cam],
             dist_fixture::kTierNames[cfg.dist], dist_tv(cfg.dist),
             cam_ids, gauss_ids, aabb_2d, v_screen, v_world,

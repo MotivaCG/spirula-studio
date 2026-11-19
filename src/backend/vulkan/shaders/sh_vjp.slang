@@ -1,23 +1,7 @@
-// Register-array SH color VJP (Vulkan backend).
-//
-// Mirrors harmonics.slang's (mean, R, t)-form `_sh_coeffs_to_color_vjp<1>`
-// (dtype float3) with the same operation order, restructured for SPIR-V:
-//  - `v_coeffs` writes accumulate into an `inout float3[24]` register array
-//    instead of a physical float3* -- SPIR-V physical pointers cannot address
-//    function locals, and the CUDA `_vjp_atomic` variant needs float
-//    InterlockedAdd (not in the device baseline). Callers either keep the
-//    array in registers (quantgrad / FPBO camera loops) or scatter it to the
-//    global gradient buffer with atomic_add_f32 (plain projection backward).
-//  - source coefficients are decoded ONCE into a local float3[24]; QBITS
-//    selects fp32 loads (0) or the word-based q8/q16 codec from
-//    sh_quant.slang (8 / 16), matching the sh{N}_to_color_q{8,16}_vjp_*
-//    CUDA exports (decode order does not change any value: the codec is a
-//    pure per-cell function).
-//
-// Include AFTER harmonics.slang (mean_viewmat_to_unnormalized_viewdir) and
-// sh_quant.slang (_sh_load_qw).
+// SH colour VJP for the Vulkan backend. Coefficients are read on demand so
+// the clamp evaluation and direction VJP do not retain a full decoded row.
+// Include after harmonics.slang and sh_quant.slang.
 
-// Source coefficient load: fp32 [3*K] layout or word-based q8/q16 codec.
 #include "int64_compat.slang"
 
 [ForceInline]
@@ -29,12 +13,14 @@ float3 _shv_C<let QBITS : int>(float* coeffs, uint* qpacked, float2* qbounds,
     return float3(coeffs[3 * j], coeffs[3 * j + 1], coeffs[3 * j + 2]);
 }
 
-// Forward SH evaluation from the pre-decoded local array. Verbatim mirror of
-// sh_coeffs_to_color_qw (sh_quant.slang) / harmonics' float3 dir form --
-// only used for the clamp mask, raw colors (no +0.5 / max).
+interface IShCoefficientReader {
+    float3 load(int j);
+}
+
+// Raw colour for the clamp mask; operation order matches shaders/harmonics.slang.
 [ForceInline]
-float3 _shv_forward(const int degree, const float3 viewdir, float3 coeff_dc,
-                    float3 C[24]) {
+float3 _shv_forward<R : IShCoefficientReader>(
+    const int degree, const float3 viewdir, float3 coeff_dc, R C) {
     float3 colors = 0.2820947917738781f * coeff_dc;
 
     if (degree <= 0)
@@ -48,7 +34,7 @@ float3 _shv_forward(const int degree, const float3 viewdir, float3 coeff_dc,
     float z = viewdir.z * inv_norm;
 
     float fTmp0A = 0.48860251190292f;
-    colors += fTmp0A * (-y * C[0] + z * C[1] - x * C[2]);
+    colors += fTmp0A * (-y * C.load(0) + z * C.load(1) - x * C.load(2));
 
     if (degree <= 1)
         return colors;
@@ -63,8 +49,8 @@ float3 _shv_forward(const int degree, const float3 viewdir, float3 coeff_dc,
     float pSH5 = fTmp0B * y;
     float pSH8 = fTmp1A * fC1;
     float pSH4 = fTmp1A * fS1;
-    colors += pSH4 * C[3] + pSH5 * C[4] + pSH6 * C[5] + pSH7 * C[6] +
-              pSH8 * C[7];
+    colors += pSH4 * C.load(3) + pSH5 * C.load(4) + pSH6 * C.load(5) + pSH7 * C.load(6) +
+              pSH8 * C.load(7);
 
     if (degree <= 2)
         return colors;
@@ -81,8 +67,8 @@ float3 _shv_forward(const int degree, const float3 viewdir, float3 coeff_dc,
     float pSH10 = fTmp1B * fS1;
     float pSH15 = fTmp2A * fC2;
     float pSH9  = fTmp2A * fS2;
-    colors += pSH9 * C[8] + pSH10 * C[9] + pSH11 * C[10] + pSH12 * C[11] +
-              pSH13 * C[12] + pSH14 * C[13] + pSH15 * C[14];
+    colors += pSH9 * C.load(8) + pSH10 * C.load(9) + pSH11 * C.load(10) + pSH12 * C.load(11) +
+              pSH13 * C.load(12) + pSH14 * C.load(13) + pSH15 * C.load(14);
 
     if (degree <= 3)
         return colors;
@@ -102,18 +88,15 @@ float3 _shv_forward(const int degree, const float3 viewdir, float3 coeff_dc,
     float pSH24 = 0.6258357354491763f * fC3;
     float pSH16 = 0.6258357354491763f * fS3;
 
-    colors += pSH16 * C[15] + pSH17 * C[16] + pSH18 * C[17] + pSH19 * C[18] +
-              pSH20 * C[19] + pSH21 * C[20] + pSH22 * C[21] + pSH23 * C[22] +
-              pSH24 * C[23];
+    colors += pSH16 * C.load(15) + pSH17 * C.load(16) + pSH18 * C.load(17) + pSH19 * C.load(18) +
+              pSH20 * C.load(19) + pSH21 * C.load(20) + pSH22 * C.load(21) + pSH23 * C.load(22) +
+              pSH24 * C.load(23);
 
     return colors;
 }
 
-// Direction-form VJP: verbatim mirror of harmonics.slang
-// _sh_coeffs_to_color_vjp<1> (float3 dtype) with coeffs[j] -> C[j] and
-// sv(i, v) -> v_coeffs[i] += v.
 [ForceInline]
-void _shv_dir_vjp(const int degree, const float3 dir, float3 C[24],
+void _shv_dir_vjp<R : IShCoefficientReader>(const int degree, const float3 dir, R C,
                   const float3 v_colors, inout float3 v_coeff_dc,
                   inout float3 v_coeffs[24], inout float3 v_dir) {
     #define sv(i, v) v_coeffs[i] += (v)
@@ -132,9 +115,9 @@ void _shv_dir_vjp(const int degree, const float3 dir, float3 C[24],
     sv(1, 0.48860251190292f * z * v_colors);
     sv(2, -0.48860251190292f * x * v_colors);
 
-    v_x += -0.48860251190292f * dot(C[2], v_colors);
-    v_y += -0.48860251190292f * dot(C[0], v_colors);
-    v_z += 0.48860251190292f * dot(C[1], v_colors);
+    v_x += -0.48860251190292f * dot(C.load(2), v_colors);
+    v_y += -0.48860251190292f * dot(C.load(0), v_colors);
+    v_z += 0.48860251190292f * dot(C.load(1), v_colors);
 
     if (degree <= 1) {
         float3 dir_n = float3(x, y, z);
@@ -177,14 +160,14 @@ void _shv_dir_vjp(const int degree, const float3 dir, float3 C[24],
     pSH4_y = 0.5462742152960395f * fS1_y;
 
     v_x += dot(v_colors,
-            pSH4_x * C[3] + pSH8_x * C[7] +
-            pSH7_x * C[6]);
+            pSH4_x * C.load(3) + pSH8_x * C.load(7) +
+            pSH7_x * C.load(6));
     v_y += dot(v_colors,
-            pSH4_y * C[3] + pSH8_y * C[7] +
-            pSH5_y * C[4]);
+            pSH4_y * C.load(3) + pSH8_y * C.load(7) +
+            pSH5_y * C.load(4));
     v_z += dot(v_colors,
-            pSH6_z * C[5] + pSH7_z * C[6] +
-            pSH5_z * C[4]);
+            pSH6_z * C.load(5) + pSH7_z * C.load(6) +
+            pSH5_z * C.load(4));
 
     if (degree <= 2) {
         float3 dir_n = float3(x, y, z);
@@ -239,19 +222,19 @@ void _shv_dir_vjp(const int degree, const float3 dir, float3 C[24],
     pSH9_y = -0.5900435899266435f * fS2_y;
 
     v_x += dot(v_colors,
-            pSH9_x * C[8] + pSH15_x * C[14] +
-            pSH10_x * C[9] + pSH14_x * C[13] +
-            pSH13_x * C[12]);
+            pSH9_x * C.load(8) + pSH15_x * C.load(14) +
+            pSH10_x * C.load(9) + pSH14_x * C.load(13) +
+            pSH13_x * C.load(12));
 
     v_y += dot(v_colors,
-            pSH9_y * C[8] + pSH15_y * C[14] +
-            pSH10_y * C[9] + pSH14_y * C[13] +
-            pSH11_y * C[10]);
+            pSH9_y * C.load(8) + pSH15_y * C.load(14) +
+            pSH10_y * C.load(9) + pSH14_y * C.load(13) +
+            pSH11_y * C.load(10));
 
     v_z += dot(v_colors,
-            pSH12_z * C[11] + pSH13_z * C[12] +
-            pSH11_z * C[10] + pSH14_z * C[13] +
-            pSH10_z * C[9]);
+            pSH12_z * C.load(11) + pSH13_z * C.load(12) +
+            pSH11_z * C.load(10) + pSH14_z * C.load(13) +
+            pSH10_z * C.load(9));
 
     if (degree <= 3) {
         float3 dir_n = float3(x, y, z);
@@ -320,66 +303,24 @@ void _shv_dir_vjp(const int degree, const float3 dir, float3 C[24],
     pSH16_y = 0.6258357354491763f * fS3_y;
 
     v_x += dot(v_colors,
-            pSH16_x * C[15] + pSH24_x * C[23] +
-            pSH17_x * C[16] + pSH23_x * C[22] +
-            pSH18_x * C[17] + pSH22_x * C[21] +
-            pSH21_x * C[20]);
+            pSH16_x * C.load(15) + pSH24_x * C.load(23) +
+            pSH17_x * C.load(16) + pSH23_x * C.load(22) +
+            pSH18_x * C.load(17) + pSH22_x * C.load(21) +
+            pSH21_x * C.load(20));
     v_y += dot(v_colors,
-            pSH16_y * C[15] + pSH24_y * C[23] +
-            pSH17_y * C[16] + pSH23_y * C[22] +
-            pSH18_y * C[17] + pSH22_y * C[21] +
-            pSH19_y * C[18]);
+            pSH16_y * C.load(15) + pSH24_y * C.load(23) +
+            pSH17_y * C.load(16) + pSH23_y * C.load(22) +
+            pSH18_y * C.load(17) + pSH22_y * C.load(21) +
+            pSH19_y * C.load(18));
     v_z += dot(v_colors,
-            pSH20_z * C[19] + pSH21_z * C[20] +
-            pSH19_z * C[18] + pSH22_z * C[21] +
-            pSH18_z * C[17] + pSH23_z * C[22] +
-            pSH17_z * C[16]);
+            pSH20_z * C.load(19) + pSH21_z * C.load(20) +
+            pSH19_z * C.load(18) + pSH22_z * C.load(21) +
+            pSH18_z * C.load(17) + pSH23_z * C.load(22) +
+            pSH17_z * C.load(16));
 
     float3 dir_n = float3(x, y, z);
     float3 v_dir_n = float3(v_x, v_y, v_z);
     v_dir += (v_dir_n - dot(v_dir_n, dir_n) * dir_n) * inorm;
 
     #undef sv
-}
-
-// (mean, R, t)-form wrapper: mirror of harmonics.slang's float3-dtype
-// `_sh_coeffs_to_color_vjp<1>` -- forward eval for the clamp mask, dir VJP,
-// then bwd_diff through the viewdir computation. All v_* accumulate.
-[ForceInline]
-void sh_color_vjp<let QBITS : int>(
-    const int degree,
-    const float3 mean, const float3x3 R, const float3 t,
-    float3 coeff_dc,
-    float* coeffs,                   // fp32 source [3*K] (QBITS == 0)
-    uint* qpacked, float2* qbounds,  // q8/q16 source (QBITS 8/16)
-    gindex_t qbase, gindex_t qstride, gindex_t qpitch,
-    float3 v_colors,
-    inout float3 v_coeff_dc,
-    inout float3 v_coeffs[24],
-    inout float3 v_mean, inout float3x3 v_R, inout float3 v_t
-) {
-    const int K = degree * (degree + 2);
-    float3 C[24];
-    for (int j = 0; j < 24; j++)
-        C[j] = (j < K)
-            ? _shv_C<QBITS>(coeffs, qpacked, qbounds, qbase, qstride, qpitch, j)
-            : float3(0.0f);
-
-    float3 viewdir = mean_viewmat_to_unnormalized_viewdir(mean, R, t);
-    float3 rgb = _shv_forward(degree, viewdir, coeff_dc, C);
-    v_colors *= float3(float(rgb.x >= -0.5f), float(rgb.y >= -0.5f),
-                       float(rgb.z >= -0.5f));
-
-    float3 v_viewdir = float3(0.0f);
-    _shv_dir_vjp(degree, viewdir, C, v_colors, v_coeff_dc, v_coeffs,
-                 v_viewdir);
-
-    DifferentialPair<float3> dp_mean = diffPair(mean);
-    DifferentialPair<float3x3> dp_R = diffPair(R);
-    DifferentialPair<float3> dp_t = diffPair(t);
-    bwd_diff(mean_viewmat_to_unnormalized_viewdir)(dp_mean, dp_R, dp_t,
-                                                   v_viewdir);
-    v_mean += dp_mean.d;
-    v_R += dp_R.d;
-    v_t += dp_t.d;
 }

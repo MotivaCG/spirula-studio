@@ -6,9 +6,8 @@
 // back into occupancy at an arbitrary depth (see MeshingRaster's
 // occ_from_moment) -- plus the optional full-ray DC color image.
 //
-// Only 3DGUT with the three supported camera models is instantiated, matching
-// the CUDA side; the camera model and distortion tier are specialization
-// constants (kDistortion declared last -- see dist_spec.slang).
+// 3DGUT camera model and distortion tier are specialization constants
+// (kDistortion declared last -- see dist_spec.slang).
 
 #define CudaDeviceExport ForceInline
 #include "aabb16.slang"
@@ -111,6 +110,8 @@ void rasterize_moments_3dgut(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
     bool ray_ok = false;
     SS_DISPATCH_DIST(_rm_ray)
     inside = inside && ray_ok;
+    if (kCameraModel == 4)
+        ray_o += transform_ray_d(R, float3((px-intrin.z)/intrin.x, (py-intrin.w)/intrin.y, 0));
     float3 ray_d = transform_ray_d(R, raydir);
 
     bool done = !inside;

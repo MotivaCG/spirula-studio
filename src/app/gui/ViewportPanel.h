@@ -1,33 +1,30 @@
 #pragma once
 
-// ViewportPanel -- the native 3D viewport, with two backends behind the
-// browser-identical NavCamera navigation (see NavCamera.h: four modes,
-// mouse / keyboard / touch-via-OS-pointer / gamepad input):
-//
-//   Preview: pure-GL sparse point cloud + camera frusta (PreviewRenderer),
-//            shown as soon as a dataset is parsed, before training.
-//   Engine:  the shared RenderWorker (same latest-wins engine render path
-//            as the web viewer) once training has set up the engine; all
-//            web-viewer camera models (pinhole / fisheye-equidistant /
-//            fisheye-equisolid / equirectangular) with per-model FOV.
-//
-// GUI thread only. attach*() after the corresponding phase; detach() BEFORE
-// the session it renders from is destroyed.
+// Native viewport over GL previews or RenderWorker engine renders, with NavCamera navigation.
+// GUI thread only; detach before destroying the rendered session.
 
 #include "app/webviewer/RenderWorker.h"
 #include "core/ColorSpace.h"
+#include "core/Similarity.h"
+#include "data/DatasetParser.h"
 #include "app/gui/NavCamera.h"
 #include "app/gui/PreviewRenderer.h"
+#include "app/gui/ViewportInput.h"
 
+#include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
 struct ImVec2;
-namespace spirula { class TrainerSession; }
+namespace spirula { class TrainerSession; struct RegionOverlay; }
 
 namespace gui {
+
+struct ViewBookmark;
+struct ViewBookmarkSet;
 
 // What the viewer's primitive combo offers, in order. These are the
 // `forward_3dgs` primitive names, so they are identifiers, not words.
@@ -55,7 +52,9 @@ public:
     // file has none to show, a live model is half about them.
     void attach_preview_data(const ParsedDataset& ds, const PostSplitCameras& post,
                              const std::string& key, float radius = 1.0f,
-                             bool with_cameras = false);
+                             bool with_cameras = false,
+                             const uint8_t* cam_selected = nullptr,
+                             const float* cam_rgb = nullptr);
     // The same GL preview over an extracted triangle mesh, shaded.
     // `to_normalized` is the row-major 3x4 similarity into the navigated
     // frame (PreviewRenderer's convention); nullptr for identity.
@@ -64,12 +63,15 @@ public:
                              const std::string& key, float radius = 1.0f);
     // Engine renderer (needs engine_ready).
     void attach(spirula::TrainerSession& session);
-    // Engine renderer over something that is not a training session -- a splat
-    // file opened in the viewer (SplatViewer). `key` identifies the scene, so
-    // reopening the same file keeps the pose; `radius` is the scene radius in
-    // the client's normalized frame, which is 1 for anything normalized.
-    // There are no training cameras behind this, so the frustum controls are
-    // not offered.
+    // A region drawn over the view: `engine` in the training frame for engine
+    // renders, `preview` in the frame of the preview's points. Kept across
+    // attaches; null for none.
+    void set_region_overlay(std::shared_ptr<const spirula::RegionOverlay> engine,
+                            std::shared_ptr<const spirula::RegionOverlay> preview,
+                            std::shared_ptr<const std::vector<uint8_t>> points_inside = nullptr);
+    // Engine renderer over a file (SplatViewer): `key` keeps the pose across
+    // a reopen and `radius` is the scene radius in the client frame; the
+    // centering menu comes from cfg.centers.
     void attach_scene(const ViewerRenderConfig& cfg, const ViewerHooks& hooks,
                       const std::string& key, float radius = 1.0f);
     // The render-option controls a VIEWER gets, on top of attach_scene. The
@@ -82,6 +84,8 @@ public:
             apply_color_space,
         std::function<void()> on_primitive_changed);
     void detach();
+    // A saved placement can change the frame without changing element counts.
+    void invalidate_framing() { _framed_key.clear(); }
     bool attached() const { return _mode == Mode::Engine; }
 
     // Hide the controls the view link makes shared -- navigation, camera
@@ -95,6 +99,101 @@ public:
     // otherwise render at different sizes, which is not a comparison.
     float controls_height() const { return _controls_h; }
     void set_controls_pad(float px) { _controls_pad = px; }
+    // The image this wide, left-aligned under controls that keep the whole
+    // width; the owner draws beside it. 0 = all of it.
+    void set_image_width(float w) { _image_w = w; }
+
+    // An editing tool over this viewport. While one is installed it owns the
+    // left button; the other two stay with navigation, so a tool is never a
+    // dead end. Null detaches.
+    void set_interactor(ViewportInteractor* t) { _interactor = t; }
+    // The navigated frame to camera, row-major 3x4 in the CV convention
+    // viewer_pixel_ray works in, plus the intrinsics for a `W` x `H` image
+    // and which display camera model they belong to.
+    void view_camera(int W, int H, float w2c[12], float& fx, float& fy,
+                     int& camera_model, float eye[3]) const;
+    // Where the last draw put the image on screen, in ImGui coordinates.
+    void image_rect(float& x, float& y, float& w, float& h) const;
+    struct WipeSource {
+        const ViewportPanel* panel;
+        std::string name;
+    };
+    // Sources include this panel first. Four sources use X/Y splits;
+    // otherwise splits are ordered fractions across the image.
+    void set_wipe(std::vector<WipeSource> sources = {}, std::vector<float>* splits = nullptr);
+    void render_only(const ImVec2& avail);
+    void last_avail(float& w, float& h) const { w = _last_avail_w; h = _last_avail_h; }
+    // The same pose in the SHARED frame the camera navigates, which is where
+    // a placement is dragged: the model moves through it, the grid does not.
+    void nav_camera(int W, int H, float w2c[12], float& fx, float& fy,
+                    int& camera_model, float eye[3]) const;
+    // The orbit pivot, shared frame: what the view is looking at.
+    void nav_target(float out[3]) const {
+        for (int i = 0; i < 3; i++) out[i] = _cam.target[i];
+    }
+    // A render is due: what a tool calls after changing what is drawn.
+    void invalidate() { _dirty = true; }
+
+    // ---- what render mode drives (app/gui/render/) ----
+
+    // The navigation pose, shared frame: camera-to-world 3x4 in OpenGL axes
+    // and the orbit pivot. Setting it jumps; nothing animates.
+    void nav_pose(float c2w[12], float target[3]) const;
+    void set_nav_pose(const float c2w[12], const float target[3]);
+    // The display lens: camera model index (kViewerCameraModels) and its
+    // field of view, degrees across the width.
+    int view_model() const { return _cam_model; }
+    // The primitive the scene options render with; empty without them.
+    std::string primitive() const;
+    float view_fov() const { return _fov_deg[_cam_model]; }
+    void set_view_lens(int model, float fov_deg);
+    // The point under a fraction of the image (0..1 each way), found on the
+    // next render the way a double-click finds one. take_pick() hands it
+    // over once: true with `hit` false means the ray found nothing.
+    void request_pick(float u, float v);
+    bool take_pick(float out[3], bool& hit);
+    // The placement under edit alone (see set_edit_transform), and the whole
+    // model -> shared similarity.
+    void edit_transform(float out[12]) const;
+    void model_to_shared(float out[12]) const;
+
+    // A placement under edit, model frame -> model frame, composed INSIDE the
+    // owner's: what the editor moves while the owner's alignment stays put.
+    void set_edit_transform(const float a[12]);
+    // Model -> shared with no edit applied: the frame a placement is made in.
+    void base_transform(float out[12]) const;
+    float world_grid_cell() const;
+    // The parsers' up->+Z guess (adopt_gauge). Placing a model means seeing
+    // the axes that get SAVED, which is with the guess switched off.
+    bool has_levelling() const { return !_align_identity; }
+    bool level_cameras() const { return _level_cameras; }
+    void set_level_cameras(bool on);
+    // The scene's up, shared frame, for navigating only: the model, the grid
+    // and the axes stay in the frame the data is in. +Z until set.
+    void set_nav_up(const float up[3]);
+    // The scene moved by S (row-major 3x4 [sR | t], shared frame); the camera
+    // goes with it, so the picture does not change.
+    void move_view(const float S[12]);
+
+    // Take the view along with a step of the shared frame (row-major 3x4
+    // similarity), then stand it upright again: the model stays where it was
+    // on screen and it is the grid that arrives under it.
+    void carry_view(const float step[12]);
+
+    // Glide to look at a sphere, shared frame, from the direction the view
+    // already has, near enough to fill it: what Numpad . does.
+    void frame_view(const float centre[3], float radius);
+    // Look along a world axis (0..2, `negative` for the far side), switching
+    // to the orthographic view; and the switch on its own.
+    void snap_view(int axis, bool negative);
+    bool ortho() const { return _ortho; }
+    void set_ortho(bool on);
+    // Where the centring menu's points come from when the user PICKS one, so
+    // an edited model centres on what is left of it. Asked only on the pick:
+    // a median per frame is a hiccup, and a centre is where you asked for it.
+    void set_center_provider(std::function<bool(dsparse::CenterTable&)> f) {
+        _center_provider = std::move(f);
+    }
 
     // Where this panel's model sits in the SHARED frame the camera navigates
     // (row-major 3x4 similarity, scale*R | t; identity by default). Applied to
@@ -128,12 +227,64 @@ public:
     // (before ImGui/GLFW shutdown).
     void destroy_gl();
 
+    // ---- saved views (ViewBookmarks.cpp) ----
+    // The slots this panel offers and its model frame -> the frame they are
+    // saved in; null hides them.
+    void set_views(std::shared_ptr<ViewBookmarkSet> set, const spirula::Sim3& model_to_store);
+    void save_view(int slot);
+    void go_to_view(int slot);
+    static const char* camera_model_label(int model);
+    // The pose in the saved-views frame (set = false without one), and the
+    // saved view it sits on, -1 when none.
+    ViewBookmark current_pose() const;
+    int current_view() const;
+    const ViewBookmarkSet* views() const { return _views.get(); }
+
+    // ---- screenshots (defined in Screenshot.cpp) ----
+    // W x H from the current view without grid, frusta or outline, after the
+    // frame in flight; `done` runs on the GUI thread. False with no engine.
+    bool request_capture(int W, int H, std::function<void(ViewResult&&)> done);
+    bool capture_pending() const { return (bool)_shot_done; }
+
 private:
+    void submit_capture();
+    void poll_capture();
+    std::function<void(ViewResult&&)> _shot_done;
+    int _shot_w = 0, _shot_h = 0;
+    bool _shot_inflight = false;
+    float views_width() const;
+    void draw_view_buttons();
+    void handle_view_keys();
+    void animate_glide(double now);
+    std::shared_ptr<ViewBookmarkSet> _views;
+    spirula::Sim3 _views_m2s;        // model -> saved frame
+    int _view_rename = -1;
+    std::string _view_name_edit;
+    // A glide to a saved view: pivot and rotation interpolated, the eye kept
+    // where it sits relative to both; stops when anything else moves the camera.
+    bool _glide = false;
+    double _glide_t0 = 0.0;
+    NavCamera _glide_from, _glide_to, _glide_last;
+
     enum class Mode { None, Preview, Engine };
 
     void compute_framing(const spirula::TrainerSession& session);
-    // The client-frame default pose (web viewer cam.reset() + orbit(0,-250)).
+    // The client-frame default pose (web viewer cam.reset() + orbit(0,-250)),
+    // about the chosen centre.
     void reset_pose(float radius);
+    // The centering choices, in the model frame. `has_cameras` says whether
+    // the camera statistics are real or fell back to the point ones.
+    void set_centers(const dsparse::CenterTable* centers, bool has_cameras);
+    // The chosen centre in the shared frame; the origin when none is known.
+    void center_shared(float out[3]) const;
+    // Make the chosen centre the pivot and the home pose's centre, keeping the view.
+    void pivot_on_center();
+    // The capture's navigation mode and centre (data/NavigationHint.h), each
+    // until the user picks one; `first` re-arms both for a new dataset.
+    void follow_navigation_hint(const ParsedDataset& ds, bool first);
+    // The mode the menu shows: the point statistic a camera one fell back to
+    // when there are no cameras.
+    int effective_center_mode() const;
     // Frame the scene only when a different dataset arrives; a preview ->
     // engine transition on the same dataset keeps the navigated pose and
     // intrinsics (no jump when training starts).
@@ -172,13 +323,25 @@ private:
     void draw_controls(bool engine);
     void handle_input(float item_h);         // mouse/keys/gamepad on last item
     void draw_engine(bool training, const ImVec2& avail, int step);
+    void pump_engine(bool training, const ImVec2& avail, int step);
+    unsigned pump_preview(const ImVec2& avail, int& W, int& H);
     void draw_preview(const ImVec2& avail);
+    void draw_wipe(const ImVec2& tl, const ImVec2& size) const;
+    bool wipe_input(const ImVec2& tl, const ImVec2& size);
+    std::vector<WipeSource> _wipe_sources;
+    std::vector<float>* _wipe_splits = nullptr;
+    int _wipe_drag = -1;
+    float _last_avail_w = 0.0f, _last_avail_h = 0.0f;
+    unsigned _preview_tex = 0;
 
     Mode _mode = Mode::None;
     RenderWorker _worker;
     PreviewRenderer _preview;
+    std::array<float, 16> _preview_frame{};   // ParsedDataset::train_to_normalized
 
     // Browser-identical camera + navigation.
+    double _focus_until = 0;
+    NavCamera _focus_pose;
     NavCamera _cam;
     NavCamera _home;                 // pose restored by Reset view
     float _home_dist = 3.0f;         // scene radius (near/far for preview)
@@ -189,10 +352,16 @@ private:
     // (set in handle_input; consumed by draw_preview / draw_engine).
     bool _dbl_pending = false;
     float _dbl_u = 0.0f, _dbl_v = 0.0f;
+    // The same for a tool that asked (request_pick): delivered, not recentred.
+    bool _tool_pick = false, _tool_pick_done = false, _tool_pick_hit = false;
+    bool _tool_pick_inflight = false;
+    float _tool_pick_uv[2] = {0, 0};
+    float _tool_pick_at[3] = {0, 0, 0};
 
     // Camera model + per-model FOV memory (browser _fovMemory equivalent).
     int _cam_model = 0;              // index into kViewerCameraModels
-    float _fov_deg[4] = {90, 180, 180, 0};
+    float _fov_deg[5] = {90, 180, 180, 0, 90};
+    int _previous_cam_model = 0;
 
     // Whether there are training cameras behind what is being rendered. A
     // splat file has none, so the frustum controls are hidden rather than
@@ -215,15 +384,58 @@ private:
     bool _align_identity = true;
     bool _level_cameras = true;
     bool _gauge_metric = false;
+    // What the view orbits about and Reset view frames (dsparse::CenterMode),
+    // a point per mode in the model frame. Moves only the camera.
+    int _center_mode = (int)dsparse::CenterMode::CameraMedian;
+    bool _auto_nav_mode = true;
+    bool _auto_center = true;
+    dsparse::CenterTable _centers{};
+    bool _centers_known = false;
+    bool _center_has_cameras = false;
     // Model units per unit of the navigated frame: what turns the grid's cell
     // size into a length (ParsedDataset::train_frame_scale).
     float _scene_scale = 1.0f;
     // The grid's cell in model units, from the same rule both backends use.
     float grid_cell() const;
     void draw_grid_overlay(float x, float y, int line) const;
+    // The navigation gizmo in the image's corner: drag to orbit, click an
+    // axis to look along it. True while it has the pointer.
+    bool gizmo_input(bool hovered_image);
+    void draw_gizmo() const;
+    void draw_overlays();
+    void animate_view(double now);
+    bool external_grid() const;
+    // Camera-to-world in the shared frame.
+    void render_c2w(float out[12]) const;
+
+    bool _ortho = false;
+    bool _ortho_auto = false;        // entered by an axis click: orbit leaves it
+    // A view change in flight (axis snap): rotation slerped, pivot distance kept.
+    bool _anim = false;
+    double _anim_t0 = 0.0;
+    float _anim_from[4] = {0, 0, 0, 1}, _anim_to[4] = {0, 0, 0, 1};
+    // And a framing: the pivot and its distance glide, the rotation stays.
+    bool _frame_anim = false;
+    double _frame_t0 = 0.0;
+    float _frame_from[4] = {0, 0, 0, 1}, _frame_to[4] = {0, 0, 0, 1};   // pivot, distance
+    // Gizmo pointer state.
+    bool _giz_down = false, _giz_dragged = false, _giz_hover = false;
+    int _giz_hot = -1;               // 0..5: +X +Y +Z -X -Y -Z under the cursor
+    int _giz_button = 0;             // 0 none, 1 pan, 2 zoom (the side buttons)
+    float _giz_press[2] = {0, 0};
+    mutable int _giz_tip_on = -2;    // what the tooltip timer is running for
+    mutable double _giz_tip_since = 0.0;
+    float _m2s_edit[12] = {1,0,0,0, 0,1,0,0, 0,0,1,0};
+    float _m2s_base[12] = {1,0,0,0, 0,1,0,0, 0,0,1,0};
+    ViewportInteractor* _interactor = nullptr;
+    std::function<bool(dsparse::CenterTable&)> _center_provider;
+    // The image rectangle of the last draw, which is the frame a tool's
+    // pointer coordinates and its overlay are both in.
+    float _img_x = 0, _img_y = 0, _img_w = 0, _img_h = 0;
     bool _nav_controls = true;
     float _controls_h = 0.0f;
     float _controls_pad = 0.0f;
+    float _image_w = 0.0f;
 
     // ---- render options a VIEWER may change (a training session may not:
     // what it renders has to be what it is training) ----
@@ -249,11 +461,15 @@ private:
     int _buffer_idx = 0;
     std::vector<std::string> _buffer_keys;
     bool _show_cams = false;
+    bool _show_roi = true;
+    std::shared_ptr<const spirula::RegionOverlay> _roi_engine, _roi_preview;
+    std::shared_ptr<const std::vector<uint8_t>> _roi_points_inside;
     bool _show_grid = false;         // axes + ground-plane grid overlay
     float _frustum_scale = 1.0f;     // camera-frustum size multiplier
+    float _point_px = 2.0f;          // preview cloud's point size, pixels across
     // 0 = auto (see render_scale), 1 = 50%, 2 = 75%, 3 = 100%
     int _scale_idx = 0;
-    float _last_pose[10] = {};       // pos + rot + target, to spot motion
+    float _last_pose[13] = {};       // pos + rot + target + ortho + lens, to spot motion
     // The pose (or camera model / FOV) changed during the last draw. Drives
     // the side-by-side link; note_motion sets it, draw clears it.
     bool _moved_last_draw = false;

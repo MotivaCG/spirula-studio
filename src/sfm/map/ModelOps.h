@@ -165,6 +165,7 @@ struct ManagerStats {
     double seam_bar_sum = 0, seam_reference_sum = 0;
     size_t seam_refused_pairs = 0, seam_passed = 0;
     size_t splits = 0, duplicate_splits = 0, split_dropped = 0;
+    size_t seams_welded = 0;       // open pairs Mapper::weldSeams fused
     size_t models_before = 0, models_after = 0;
     size_t covered_before = 0, covered_after = 0;
 };
@@ -545,6 +546,18 @@ inline std::vector<Reconstruction> splitFoldedModels(Mapper& mapper,
         }
     }
     return out;
+}
+
+// After a fold split: refine unaudited models, then drop duplicates. Refine can re-register
+// a cut piece into the main model, leaving a contained duplicate (4412-image rig).
+template <class Refine>
+std::vector<Reconstruction> refineAfterFoldSplit(std::vector<Reconstruction> models,
+                                                 ModelMemo& memo, const ManagerOptions& opt,
+                                                 ManagerStats& st, Refine&& refine) {
+    for (Reconstruction& m : models)
+        if (m.numRegistered() >= 2 && memo.audited.insert(ModelMemo::of(m)).second)
+            m = refine(m);
+    return dropRedundantModels(std::move(models), opt, st);
 }
 
 // ---- camera consensus ----------------------------------------------------

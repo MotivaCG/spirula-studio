@@ -1,38 +1,31 @@
 #pragma once
 
-// TrainerCore -- the engine-side training session shared by the standalone
-// CLI (app/cli/main.cpp) and the native GUI (app/gui/). This is the single
-// training driver. It began as a port of a Python trainer that no longer
-// exists; the per-step logic lives in build_step_config() and nowhere else,
-// so there is nothing left to keep in sync.
-//
-// TrainerSession splits the run into phases so front-ends can interleave
-// their own UI between them:
-//   check_config()  -> throws for unported features, logs warnings
-//   load_dataset()  -> parse + post-split bake (no GPU work)
-//   setup_engine()  -> output dir, seeding, engine + DataManager init
-//   train()         -> the step loop; pause / stop / render-fairness via
-//                      the public atomics, per-step callback for progress
-//
+// Training session shared by the CLI and GUI.
 // The engine is a process-global singleton: one live session at a time.
-// setup_engine() calls engine_reset(), so a fresh session can follow a
-// finished one in the same process (the GUI's "train again" path).
+// setup_engine() resets it before starting another run.
 
+#include "app/SystemRecorder.h"
+#include "app/TrainPerfLog.h"
+#include "app/TrainForecast.h"
 #include "engine/Engine.h"
 #include "core/ColorSpace.h"
 #include "data/DatasetParser.h"
+#include "data/Region.h"
 #include "app/webviewer/RenderWorker.h"
 #include "config/TrainConfig.h"
+#include "i18n/TimeFormat.h"
 
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <deque>
 #include <filesystem>
 #include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -50,14 +43,16 @@ Mat3f invert3x3(const Mat3f& m);
 struct ColorResolution {
     std::string splat_gamut;   // "" = Rec.709 / none
     std::string image_gamut;
+    std::string point_gamut;   // the seed cloud's colours
     // Storage encoding and output curve are independent: `*_linear` says
     // whether the buffer holds linear light, `*_transfer` is the curve out of
     // it. See docs/notes/color-transfer.md.
     bool splat_linear  = false;
     bool image_linear  = false;
+    bool point_linear  = false;
     colorspace::Transfer splat_transfer = colorspace::Transfer::Srgb;
     colorspace::Transfer image_transfer = colorspace::Transfer::Srgb;
-    bool convert_seed  = false;  // convert_initial_point_cloud_color resolved
+    colorspace::Transfer point_transfer = colorspace::Transfer::Srgb;
 
     // Whether the render needs the conversion pass at all.
     bool splat_on() const {
@@ -67,6 +62,10 @@ struct ColorResolution {
     bool image_on() const {
         return image_linear || image_transfer != colorspace::Transfer::Srgb ||
                !image_gamut.empty();
+    }
+    bool point_is_splat() const {
+        return point_linear == splat_linear && point_transfer == splat_transfer &&
+               point_gamut == splat_gamut;
     }
 };
 
@@ -93,11 +92,14 @@ struct SeedSplats {
     std::vector<float> scales;       // [cap, 3]  (log)
     std::vector<float> opacities;    // [cap, 1]  (logit)
     std::vector<float> features_dc;  // [cap, 3]
-    std::vector<float> features_sh;  // [cap, dim_sh-1, 3]  (zeros)
+    // [cap, K, 3], K = ColorBasis{sh_degree, sb_lobes}.coeffs(): zero bands,
+    // then lobes seeded by core/SphericalBeta.h.
+    std::vector<float> features_sh;
 };
 
 SeedSplats seed_splats(const ColmapPoints3D& pts, const TrainConfig& cfg,
-                       const ColorResolution& color);
+                       const ColorResolution& color,
+                       const PostSplitCameras* post = nullptr);
 
 // A warm start from a trained 3DGS PLY (--init-ply): the file supplies every
 // parameter, and only the layout is re-fitted to this run (cap_max, sh_degree,
@@ -109,7 +111,9 @@ SeedSplats seed_splats_from_ply(const std::string& path, const TrainConfig& cfg,
 // the warm start covers what the source model has and the point cloud covers
 // what it does not. Adds nothing once `s` already fills cap_max.
 void append_point_seeds(SeedSplats& s, const ColmapPoints3D& pts,
-                        const TrainConfig& cfg, const ColorResolution& color);
+                        const TrainConfig& cfg, const ColorResolution& color,
+                        const PostSplitCameras* post = nullptr);
+
 
 
 // ===========================================================================
@@ -118,6 +122,7 @@ void append_point_seeds(SeedSplats& s, const ColmapPoints3D& pts,
 
 struct RunState {
     float train_frame_scale = 1.0f;
+    int   steps_per_epoch = 1;   // optimizer steps per pass over the train set
     bool  splat_linear = false;
     // Resolved against the dataset's lenses when the flag is unset; see
     // TrainerCore.cpp.
@@ -128,6 +133,8 @@ struct RunState {
     bool  ppisp_init           = false;
     // PPISP came from another run's checkpoint: held fixed, see ppisp_from.
     bool  ppisp_frozen         = false;
+    // (first step, splats): the progressive splat budget's growth ceilings.
+    std::vector<std::pair<int, int64_t>> growth_caps;
 };
 
 std::array<float, (int)LossWeightIndex::length>
@@ -139,20 +146,23 @@ EngineStepConfig build_step_config(const TrainConfig& c, const RunState& st,
 // Flat config.json dump, one key per flag (config/TrainConfigJson.h).
 void save_config_json(const TrainConfig& c, const std::filesystem::path& out_dir,
                       const std::string& preset);
+// scene_transform.json: the similarity from the dataset's own frame to the
+// one the splats are trained in (data/SceneTransform.h).
+void save_scene_transform_json(const ParsedDataset& ds, const TrainConfig& c,
+                               const std::filesystem::path& out_dir);
 
-// "" when this config is runnable, else the sentence naming the flag that is
-// not implemented -- exactly what TrainerSession::check_config() throws. A
-// front-end that wants to report the problem instead of catching it (the
-// GUI's batch pre-flight) asks this first.
-std::string train_config_unsupported(const TrainConfig& c);
+// Shared validation for CLI training and GUI preflight; empty means valid.
+std::string train_config_error(const TrainConfig& c);
 
 
 // ===========================================================================
 // TrainerSession
 // ===========================================================================
 
-// "m:ss", or "h:mm:ss" past an hour; negative (not known yet) is "--:--".
-std::string format_duration(double seconds);
+// The one duration format: i18n/TimeFormat.h, which the SfM summary uses too.
+inline std::string format_duration(double seconds) {
+    return i18n::format_duration(seconds);
+}
 
 struct TrainerProgress {
     int step = 0;              // 0-based step that just finished
@@ -163,6 +173,37 @@ struct TrainerProgress {
     int64_t num_splats = 0;
     std::map<std::string, float> losses;
 };
+
+struct EvalProgress {
+    int64_t completed = 0;
+    int64_t total = 0;
+};
+
+// LPIPS for eval(). This library has no inference layer, so a front end built
+// with one installs these (app/EvalLpips.h); without them eval() leaves LPIPS
+// to reference/python/eval_lpips.py.
+class LpipsScorer {
+public:
+    virtual ~LpipsScorer() = default;
+    // The metrics score() fills, in order: "lpips_alex", "lpips_vgg".
+    virtual std::vector<std::string> names() const = 0;
+    // [metric][i]: preds[i] against gt, all [height, width, 3] in [0, 1].
+    virtual std::vector<std::vector<float>> score(const float* gt,
+                                                  const std::vector<const float*>& preds,
+                                                  int width, int height) = 0;
+};
+
+struct LpipsHooks {
+    // The checkpoints on disk, downloading what is missing; throws. Called by
+    // setup_engine(), so a failed download stops the run before it trains.
+    std::function<void(const TrainConfig&)> prepare;
+    // The networks for one eval pass.
+    std::function<std::unique_ptr<LpipsScorer>(const TrainConfig&)> open;
+};
+// Process-wide: Main.cpp installs them once, before any session starts.
+void set_lpips_hooks(LpipsHooks hooks);
+// Whether a run of `cfg` holds views out and scores them with LPIPS.
+bool lpips_wanted(const TrainConfig& cfg);
 
 struct TrainerCallbacks {
     // Called after every completed step, engine mutex released.
@@ -196,6 +237,9 @@ public:
     bool has_mask = false;
     bool has_depth = false;
     bool has_normal = false;
+    bool random_seeded = false;
+    // probe_alpha_masks over `ds`: [N] flags, empty when no image is a cut-out.
+    std::vector<uint8_t> alpha_images;
 
     // Filled by setup_engine().
     std::filesystem::path out_dir;
@@ -230,6 +274,20 @@ public:
 
     // Parse the dataset + bake POST-split cameras. No GPU work.
     void load_dataset();
+    // --partition / --partition-part: keeps one part's frames and points of a
+    // freshly parsed dataset. A no-op without the flag.
+    void apply_partition_config(ParsedDataset& d);
+    // The region the run may grow in (data/Region.h): the partition's part,
+    // --roi-region (by default the dataset's first roi/*.json), or both
+    // intersected. Null for all of space.
+    std::shared_ptr<const Region> roi;
+    // The whole seed cloud (parsed frame) and which of it the part owns, kept
+    // from before the partition cut it down: what the region masks project.
+    std::vector<double> roi_cloud;
+    std::vector<uint8_t> roi_cloud_inside;
+    // Reads --roi-region into `roi`, writing back the file it picked.
+    void load_region();
+    void setup_region();
 
     // Create the output dir, dump config.json, reset + seed the engine,
     // set up the DataManager and bilagrid/PPISP. Requires load_dataset().
@@ -248,22 +306,15 @@ public:
     // caller must hold engine_mutex.
     std::map<std::string, float> train_step(int step);
 
-    // SMN opacity boost: on the two steps that mark 40% and 85% of the run,
-    // multiplies every splat's opacity by cfg.opacity_boost. Called by
-    // train_step(), so a front-end with its own loop gets it as well.
     void maybe_boost_opacity(int step);
 
-    void save_checkpoint(int step);
+    void save_checkpoint(int step, bool full);
 
-    // Held-out eval: render every frame of the eval split, score it, and write
-    // metrics.json. No-op when eval_mode is "all" (nothing is held out) or the
-    // eval split is empty. Replaces the engine's DataManager with one over the
-    // eval split, so it must run AFTER training.
-    //
-    // Reports l1/psnr/ssim and the cc_ variants of each (computed on the
-    // colour-corrected render). LPIPS is not computed here -- pass
-    // --save-eval-images and run reference/python/eval_lpips.py over the PNGs.
-    void eval();
+    // Scores the held-out views into metrics.json: l1/psnr/ssim, LPIPS when its
+    // hooks are installed, and cc_ variants on the colour-corrected render.
+    // Replaces the engine's DataManager, so it must run AFTER training.
+    void eval(const std::function<void(const EvalProgress&)>& on_progress = {});
+
 
     // The seeds setup_engine() hands the engine, from the point cloud and/or
     // cfg.init_ply.
@@ -277,9 +328,14 @@ public:
     // train() starts, frozen once it returns.
     double elapsed_seconds() const;
 
-    // Remaining wall clock over the last 100 steps' average, or -1 before
-    // the first step lands.
+    // Remaining wall clock, from TrainForecast's step-time model and the
+    // densify schedule still to come; -1 before the first step lands.
     double eta_seconds() const;
+    // The run's ETA and VRAM forecast, fed by train().
+    const TrainForecast& forecast() const { return _forecast; }
+    // Where the time goes: per step over the last window, or this whole run
+    // with the steps still to come forecast.
+    TimeBreakdown time_breakdown(bool whole_run) const;
 
     // The /progress response body.
     std::string progress_json();
@@ -291,6 +347,12 @@ public:
     void log(const std::string& msg);
 
 private:
+    // ds.points drawn at random when --random-init asks for it.
+    void seed_at_random();
+    void set_downscale_cache(DataManagerConfig& dm) const;
+    void set_alpha_config(DataManagerConfig& dm,
+                          const std::vector<uint8_t>& alpha) const;
+
     // Bracket the train loop's pause gate so paused time stays out of
     // elapsed_seconds().
     void pause_clock_start();
@@ -307,6 +369,19 @@ private:
     mutable std::mutex _progress_mutex;    // guards the latency window
     std::deque<double> _step_latencies;    // last 100, seconds
     bool _diverged_loss_reported = false;
+
+    void observe_memory(int step, int64_t splats_ran);
+    TrainForecast _forecast;
+    int _batches_per_epoch = 1;
+    int _resolution_divisor = 0;   // of the last step; 0 before the first
+    std::vector<std::pair<int, int>> _resolution_stages;   // (first step, divisor)
+    TrainPerfLog _perf;            // log_performance, SS_TRAIN_PERF
+    std::filesystem::path _perf_dir;   // this session's, under <run>/perf; empty without log_performance
+    SystemRecorder _system;        // log_performance: setup_engine() to the end of train()
+    std::atomic<int64_t> _live_splats{0};
+    OomRisk _warned_risk = OomRisk::Low;
+    size_t _sh_bytes = 0;          // observe_memory's, refreshed once a window
+    std::unique_ptr<std::FILE, int (*)(std::FILE*)> _forecast_dump{nullptr, std::fclose};
 };
 
 }  // namespace spirula

@@ -49,10 +49,7 @@ void rasterize_moments_3dgut_fwd(
     float3* render_moments,
     float3* render_rgb
 ) {
-    const vkk::CamDistSpec cd = vkk::cam_dist_spec(camera_model, distortion);
-    if (cd.cam == (uint32_t)CameraModelType::EQUIRECTANGULAR)
-        throw std::runtime_error(
-            "rasterize_moments_3dgut_fwd: unsupported camera model");
+    const vkk::CamDistSpec cd = vkk::cam_dist_spec(camera_model, distortion, true);
 
     const uint32_t I = (uint32_t)tile_offsets.size<0>();
     const uint32_t tile_height = (uint32_t)tile_offsets.size<1>();

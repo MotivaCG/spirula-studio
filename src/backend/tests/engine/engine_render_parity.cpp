@@ -85,7 +85,7 @@ int main(int argc, char** argv) {
     set_data_3dgs(N, ttv(means.data(), {N, 3}), ttv(quats.data(), {N, 4}),
                   ttv(scales.data(), {N, 3}), ttv(opac.data(), {N, 1}),
                   ttv(dc.data(), {N, 3}),
-                  ttv(sh.data(), {N, NUM_SH, 3}));
+                  ttv(sh.data(), {N, NUM_SH, 3}), 0);
 
     // --- render cameras (2) ---
     const float cy_ = std::cos(0.15f), sy_ = std::sin(0.15f);
@@ -114,7 +114,8 @@ int main(int argc, char** argv) {
                              bg_sh.data(), bg_sh.size() * sizeof(float),
                              MemcpyKind::HostToDevice);
     }
-    engine_set_background_step_params(4321u, 0.6f, /*sh_degree=*/-1);
+    engine_set_background_step_params(4321u, 0.6f, /*num_loss_scales=*/3,
+                                      /*loss_scale_min_pixels=*/0);
 
     // --- color space: mildly non-identity splat matrix (sRGB working) ---
     engine_init_color_space(
@@ -168,6 +169,10 @@ int main(int argc, char** argv) {
         {"mip", "FISHEYE", 2, false, false, 2},
         {"3dgut", "PINHOLE", 2, false, false, 0},
         {"3dgs", "EQUIRECTANGULAR", 0, true, false, 0},
+        {"3dgs", "ORTHOGRAPHIC", 0, false, true, 0},
+        {"3dgs", "ORTHOGRAPHIC", 0, true, false, 0},
+        {"mip", "ORTHOGRAPHIC", 0, false, false, 0},
+        {"3dgut", "ORTHOGRAPHIC", 0, false, false, 0},
     };
     for (const Cfg& c : cfgs) {
         set_cams(c.cam, c.tier);
@@ -181,20 +186,44 @@ int main(int argc, char** argv) {
         pull(c.median, c.dist_type != 0);
     }
 
-    // --- noise background mode ---
-    engine_init_background_noise(/*transfer=*/0, /*linear=*/false);
+    // --- the randomized background modes, then the fixed colour ---
+    // Three loss scales, so the cell size the noise draws is one of three.
     set_cams("PINHOLE", 1);
-    forward_3dgs("3dgs", 3, false, false, 0);
-    backend::device_synchronize();
-    pull(0, 0);
-
-    // --- depth -> normal (viewer buffer path) on the last render ---
+    for (int mode = 0; mode < 3; mode++) {
+        if (mode == 0) engine_init_background_noise(0, false);
+        if (mode == 1) engine_init_background_pseudorandom(0, false);
+        if (mode == 2) engine_init_background_random(0, false);
+        for (uint32_t seed : {7u, 8u, 9u}) {
+            engine_set_background_step_params(seed, 0.6f, 3, 0);
+            forward_3dgs("3dgs", 3, false, false, 0);
+            backend::device_synchronize();
+            pull(0, 0);
+        }
+    }
     {
+        const float color[3] = {0.2f, 0.65f, 0.9f};
+        engine_init_background_color(color, /*transfer=*/0, /*linear=*/false);
+        forward_3dgs("3dgs", 3, false, false, 0);
+        backend::device_synchronize();
+        pull(0, 0);
+
+        const float black[3] = {0.0f, 0.0f, 0.0f};
+        engine_init_background_color(black, /*transfer=*/0, /*linear=*/false);
+        if (engine().background.enabled) {
+            std::fprintf(stderr, "all-black background must disable the blend\n");
+            return 1;
+        }
+    }
+
+    // --- depth -> normal (viewer buffer path) ---
+    for (bool ortho : {false, true}) {
+        set_cams(ortho ? "ORTHOGRAPHIC" : "PINHOLE", ortho ? 0 : 1);
+        forward_3dgs("3dgs", 3, false, false, 0);
         auto& depth_t = std::get<1>(engine().fwd.renders);
         float* d_normals =
             (float*)backend::device_malloc((size_t)C * H * W * 3 * 4);
         depth_to_normal_forward_tv(
-            "PINHOLE", "OPENCV",
+            ortho ? "ORTHOGRAPHIC" : "PINHOLE", ortho ? "NONE" : "OPENCV",
             ttv(engine().camera.intrins.data_ptr(), {C, 4}),
             ttv(engine().camera.dist_coeffs.data_ptr(),
                 {C, kCameraDistortionParams}),
@@ -279,12 +308,13 @@ int main(int argc, char** argv) {
         float* d_Ts = engine().fwd.render_Ts.data_ptr();
         uint8_t* d_out = (uint8_t*)backend::device_malloc((size_t)H * W * 3);
 
-        for (int mode = 0; mode < 2; mode++) {
-            bool cams = mode == 0;
+        for (int mode = 0; mode < 4; mode++) {
+            bool cams = mode % 2 == 0;
             engine_blit_view(
                 "rgb", ttv(rgb_t.data_ptr(), {H, W, 3}),
-                ttv(depth_t.data_ptr(), {H, W, 1}), ttv(d_Ts, {H, W, 1}), 0,
-                "OPENCV", ttv(d_vi, {1, 4}), ttv(d_vm, {4, 4}),
+                ttv(depth_t.data_ptr(), {H, W, 1}), ttv(d_Ts, {H, W, 1}),
+                /*alpha_is_transmittance=*/true, mode >= 2 ? 4 : 0,
+                mode >= 2 ? "NONE" : "OPENCV", ttv(d_vi, {1, 4}), ttv(d_vm, {4, 4}),
                 ttv(d_vd, {1, kCameraDistortionParams}),
                 /*show_training_cameras=*/cams, /*show_overlay=*/true,
                 /*grid_dist=*/3.0f, 0.2f, -0.1f, 0.0f,

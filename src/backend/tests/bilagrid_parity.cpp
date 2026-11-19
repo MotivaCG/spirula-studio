@@ -262,11 +262,11 @@ void test_affine(Rng& r) {
  * PPISP family (autodiff-vs-handwritten bwd -> loose gradients)
  * ======================================================================== */
 
-void test_ppisp(Rng& r) {
-    const int L = 5, Hg = 6, Wg = 8;
+void test_ppisp(Rng& r, int L = 5) {
+    const int Hg = 6, Wg = 8;
 
     for (int vq = 0; vq < 2; vq++) {
-        const int N_img = 2, N_grids = 2, h = 30, w = 36;
+        const int N_img = 2, N_grids = 2, h = 96, w = 128;
         Grid g = make_grid(r, N_grids, 9, L, Hg, Wg, -0.7f, 0.7f, vq != 0);
         int64_t np = (int64_t)N_img * h * w;
         float* rgb = upload(r.vec(3 * np, 0.0f, 1.0f));
@@ -716,17 +716,19 @@ void test_fused_optim(Rng& r) {
             // Two steps (quantized state needs a second step over encoded
             // state to be meaningful).
             for (int step = 7; step <= 8; step++) {
+                // The second step also scales the image gradient.
+                const float scale = step == 8 ? 0.5f : 1.0f;
                 if (variant == 0) {
                     fused_bilagrid_tv_adam(
                         c.vq ? nullptr : g.fp32, g.q16, g.vbounds, g1, g2,
                         packed, qb4, image_grad, cams, N_grids, C_batch, c.C,
-                        L, Hg, Wg, lr, c.tv_w, step, c.qbits != 0, c.qbits,
-                        c.vq, backend::kDefaultStream);
+                        L, Hg, Wg, lr, c.tv_w, scale, step, c.qbits != 0,
+                        c.qbits, c.vq, backend::kDefaultStream);
                 } else {
                     fused_bilagrid_tv_adagrad(
                         c.vq ? nullptr : g.fp32, g.q16, g.vbounds, g1, packed,
                         qb2, image_grad, cams, N_grids, C_batch, c.C, L, Hg,
-                        Wg, lr, c.tv_w, c.qbits != 0, c.qbits, c.vq,
+                        Wg, lr, c.tv_w, scale, c.qbits != 0, c.qbits, c.vq,
                         backend::kDefaultStream);
                 }
             }
@@ -786,13 +788,13 @@ void test_fold_tail(Rng& r) {
         if (variant == 0) {
             fused_bilagrid_tv_adam(grids, nullptr, nullptr, nullptr, nullptr,
                                    packed, qb4, image_grad, nullptr, N_grids,
-                                   C_batch, C, L, Hg, Wg, lr, 0.0f, 7, true,
-                                   8, false, backend::kDefaultStream);
+                                   C_batch, C, L, Hg, Wg, lr, 0.0f, 1.0f, 7,
+                                   true, 8, false, backend::kDefaultStream);
         } else {
             fused_bilagrid_tv_adagrad(grids, nullptr, nullptr, nullptr,
                                       packed, qb2, image_grad, nullptr,
                                       N_grids, C_batch, C, L, Hg, Wg, lr,
-                                      0.0f, true, 8, false,
+                                      0.0f, 1.0f, true, 8, false,
                                       backend::kDefaultStream);
         }
 
@@ -881,7 +883,12 @@ void test_utils(Rng& r) {
         const size_t n = 1000;
         float* src = upload(r.vec(n, -2.0f, 2.0f));
         float* dst = upload(r.vec(n, -2.0f, 2.0f));
-        ppisp_add_into_grad(src, dst, n, backend::kDefaultStream);
+        ppisp_add_into_grad(src, dst, 1.0f, n, backend::kDefaultStream);
+        readback_f(g_tight, dst, n);
+        // Scaled, with and without something to add.
+        ppisp_add_into_grad(src, dst, 0.25f, n, backend::kDefaultStream);
+        readback_f(g_tight, dst, n);
+        ppisp_add_into_grad(nullptr, dst, 3.0f, n, backend::kDefaultStream);
         readback_f(g_tight, dst, n);
     }
 }
@@ -906,6 +913,8 @@ int main(int argc, char** argv) {
     test_fused_optim(r);
     test_fold_tail(r);
     test_utils(r);
+    Rng single_layer(260729u);
+    test_ppisp(single_layer, 1);
 
     auto write_all = [&](const char* path) {
         std::ofstream f(path, std::ios::binary);

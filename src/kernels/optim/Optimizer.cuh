@@ -1,8 +1,11 @@
 #pragma once
 
+#include "core/ProjectiveDepthState.h"
 #include <core/Tensor.h>
+#include "core/ColorBasis.h"
 #include "core/ColorTrustState.h"
 #include "core/NonShQuantState.h"
+#include "core/SplatVisitState.h"
 #include "kernels/projection/ProjectionBwdQuantGrad.cuh"   // GradQuantBuffers
 
 
@@ -124,9 +127,7 @@ void fused_optim_3dgs_geometry(
     DeviceVector<float4> quats, DeviceVector<float4> v_quats, DeviceVector<float4> g1_quats, DeviceVector<float4> g2_quats,
     DeviceVector<float3> scales, DeviceVector<float3> v_scales, DeviceVector<float3> g1_scales, DeviceVector<float3> g2_scales,
     DeviceVector<float> opacities, DeviceVector<float> v_opacities, DeviceVector<float> g1_opacities, DeviceVector<float> g2_opacities,
-    // features_dc + grad: consumed only when non_sh has its quant buffers
-    // populated (via non_sh.enabled flagged in `non_sh`). The fp32 path
-    // ignores them and runs the separate fused_adam_step features_dc call.
+    // The fp32 DC path uses the separate Adam launch.
     DeviceVector<float3> features_dc, DeviceVector<float3> v_features_dc,
     DeviceVector<float> radii,
     // optional [N] densification world-grad score output; empty disables.
@@ -141,9 +142,10 @@ void fused_optim_3dgs_geometry(
     bool use_scale_agnostic_mean,
     ColorTrustState color_trust,
     NonShQuantState non_sh,
-    GradQuantBuffers gq,
+    SplatVisitState visit,
+    GradQuantBuffers gq, ProjectiveDepthOptim depth,
     int32_t step, DeviceVector<int32_t> per_splat_steps,
-    float grad_scale, bool zero_grad
+    float grad_scale, bool zero_grad, DeviceVector<float> auxiliary_opacities
 );
 
 
@@ -157,6 +159,7 @@ void fused_adam_step(
     int32_t step, DeviceVector<int32_t> per_splat_steps,
     float l2_reg,
     float l2_reg_offset,
+    SbOptimCells sb,
     float grad_scale, bool zero_grad
 );
 
@@ -181,6 +184,7 @@ void fused_adam_step_quantized(
     float l2_reg_offset,
     int bits,                           // 4 or 8 -- selects QuantizedAdamState<BITS, 256>
     ColorTrustState color_trust,
+    SbOptimCells sb,
     float grad_scale, bool zero_grad
 );
 
@@ -204,6 +208,7 @@ void fused_adam_step_quantized_value(
     int optim_bits,                     // 4 or 8
     int value_bits,                     // 8 or 16
     ColorTrustState color_trust,
+    SbOptimCells sb,
     float grad_scale, bool zero_grad
 );
 
@@ -358,6 +363,7 @@ void fused_adamtr_linear_rgb_sh_optim(
     float eps_tr,
     float sh_reg_weight,
     int step,
+    SbOptimCells sb,
     float grad_scale, bool zero_grad
 );
 
@@ -376,6 +382,7 @@ void fused_adamtr_rgb_sh_optim(
     float eps_tr,
     float sh_reg_weight,
     int step,
+    SbOptimCells sb,
     float grad_scale, bool zero_grad
 );
 

@@ -2,12 +2,21 @@
 setlocal
 rem Development build for Windows. Extra arguments are passed to CMake, e.g.
 rem   build_develop.bat -DSS_BACKEND=vulkan -DSS_BUILD_GUI=OFF
-rem Builds the standalone spirula.exe.
+rem Builds the standalone spirula.exe into build_cuda\ or build_vulkan\.
 rem Works from a plain cmd prompt: locates VS via vswhere and calls vcvars64,
 rem uses the VS-bundled CMake/Ninja when none are on PATH, and picks the
 rem newest installed CUDA toolkit unless CUDA_PATH is already set.
 
 cd /d "%~dp0"
+
+rem ---------------------------------------------------------------------------
+rem One tree per backend, so building one does not reconfigure the other. The
+rem arguments are read, never rebuilt: your own -B still reaches CMake, and the
+rem build step below would then target a tree it did not configure.
+rem ---------------------------------------------------------------------------
+set "BACKENDSEL=cuda"
+echo %* | findstr /i /c:"BACKEND=vulkan" >nul && set "BACKENDSEL=vulkan"
+set "BUILDDIR=build_%BACKENDSEL%"
 
 rem ---------------------------------------------------------------------------
 rem Codegen (optional -- the generated files are committed)
@@ -23,13 +32,14 @@ goto :comment_check
 echo python not found -- skipping codegen (using committed generated files)
 
 rem ---------------------------------------------------------------------------
-rem Comment-length gate (AGENTS.md). Also wired into CMake
-rem (cmake/SsChecks.cmake), which covers a bare cmake/ninja build; running it
-rem here fails before the configure step rather than after it.
+rem Comment-length gate (AGENTS.md), and no source naming a windows.h macro.
+rem Both are also wired into CMake (cmake/SsChecks.cmake), which covers a bare
+rem cmake/ninja build; running them here fails before the configure step.
 rem ---------------------------------------------------------------------------
 :comment_check
 where python >nul 2>&1 || goto :msvc_env
 python tools\check_comment_length.py || exit /b 1
+python tools\check_winmacro.py --quiet || exit /b 1
 
 rem ---------------------------------------------------------------------------
 rem MSVC environment. vcvars64 is called even when cl is already on PATH: a
@@ -42,8 +52,11 @@ set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 set "VSROOT="
 if exist "%VSWHERE%" for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSROOT=%%i"
 if not defined VSROOT set "VSROOT=%ProgramFiles%\Microsoft Visual Studio\2022\Community"
+if defined SS_VS_ROOT set "VSROOT=%SS_VS_ROOT%"
+set "VCVARSARGS="
+if defined SS_MSVC_TOOLSET set "VCVARSARGS=-vcvars_ver=%SS_MSVC_TOOLSET%"
 if exist "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat" (
-    call "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat" >nul
+    call "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat" %VCVARSARGS% >nul
     goto :have_cl
 )
 where cl >nul 2>&1 && goto :have_cl
@@ -66,8 +79,8 @@ rem this machine, plus PTX so anything newer JITs rather than refusing to start.
 rem Needs CUDA 12.8 (sm_120); costs build time, which is why it is opt-in.
 rem ---------------------------------------------------------------------------
 set "FATBINARG="
+if not defined SS_CUDA_ARCHS set "SS_CUDA_ARCHS=7.5 8.0 8.6 8.9 9.0 10.0 12.0"
 if not "%SS_CUDA_FATBIN%"=="" if not "%SS_CUDA_FATBIN%"=="0" (
-    if not defined SS_CUDA_ARCHS set "SS_CUDA_ARCHS=7.5 8.0 8.6 8.9 9.0 10.0 12.0"
     set FATBINARG=-DSS_CUDA_EMBED_PTX=ON -DTORCH_CUDA_ARCH_LIST="%SS_CUDA_ARCHS%"
 )
 
@@ -99,7 +112,8 @@ set "CUDAARG="
 rem ---------------------------------------------------------------------------
 rem Configure + build (RAM-aware job count, mirrors build_develop.bash)
 rem ---------------------------------------------------------------------------
-if not defined SS_BUILD_DIR set "SS_BUILD_DIR=build"
+if not defined SS_BUILD_DIR set "SS_BUILD_DIR=%BUILDDIR%"
+set "BUILDDIR=%SS_BUILD_DIR%"
 cmake -G Ninja -B "%SS_BUILD_DIR%" -DCMAKE_BUILD_TYPE=Release %CUDAARG% %FATBINARG% %*
 if %ERRORLEVEL% neq 0 exit /b 1
 
@@ -132,7 +146,9 @@ set AVAILABLE_MB=0
 for /f %%m in ('powershell -NoProfile -Command "[int]((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory/1024)"') do set AVAILABLE_MB=%%m
 set /a JOBS=AVAILABLE_MB/JOB_RAM_MB
 if %JOBS% gtr %NUMBER_OF_PROCESSORS% set JOBS=%NUMBER_OF_PROCESSORS%
+if defined SS_BUILD_JOBS if %JOBS% gtr %SS_BUILD_JOBS% set "JOBS=%SS_BUILD_JOBS%"
 if %JOBS% lss 1 set JOBS=1
+echo Build dir     : %BUILDDIR%
 echo Available RAM : %AVAILABLE_MB% MB
 echo CPU cores     : %NUMBER_OF_PROCESSORS%
 echo Using jobs    : %JOBS%
@@ -140,7 +156,8 @@ echo.
 
 rem `if errorlevel 1` is a >= test on a SIGNED value, so it reads a negative
 rem exit code as success -- a failed link returning -1 printed "Build complete".
-cmake --build "%SS_BUILD_DIR%" -j %JOBS%
+if not defined SS_BUILD_TARGET set "SS_BUILD_TARGET=all"
+cmake --build "%SS_BUILD_DIR%" --target "%SS_BUILD_TARGET%" -j %JOBS%
 if %ERRORLEVEL% neq 0 exit /b 1
 
 echo.

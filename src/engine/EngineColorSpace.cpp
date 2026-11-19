@@ -67,6 +67,7 @@ void engine_init_color_space(
 void _engine_color_space_forward() {
     auto& cs = engine().color_space;
     if (!cs.splat_enabled) return;
+    StepTimingScope timing(StepPart::ColorSpace, StepScale::Pixels);
 
     auto& fwd_rgb_tensor = std::get<0>(engine().fwd.renders);
     if (fwd_rgb_tensor.data_ptr() == nullptr) return;
@@ -108,8 +109,8 @@ void _engine_color_space_apply_to_gt() {
     auto& cs = engine().color_space;
     if (!cs.image_enabled) return;
 
-    DeviceTensor3D<float3> rgb = engine().gt.rgb;
-    if (rgb.data_ptr() == nullptr) return;
+    if (std::get<0>(engine().gt.rgb) == 0) return;
+    DeviceTensor3D<float3> rgb(engine().gt.rgb);
 
     working_to_display_forward(cs.image_transfer, cs.image_is_linear, rgb,
                                cs.image_color_matrix, rgb);

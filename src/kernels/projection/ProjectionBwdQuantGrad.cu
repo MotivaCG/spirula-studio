@@ -110,8 +110,10 @@ static inline void launch_projection_bwd_quantgrad(
     // non-decreasing and cid_t is itself the out_idx.
     DeviceVector<int32_t> camera_id_bounds;
     if (is_packed) {
+        if (DevicePool::global().phase() != PoolPhase::RasterBwd)
+            pool_begin_phase(PoolPhase::RasterBwd);
         long nnz = camera_ids.size();
-        camera_id_bounds.resize(PoolSlot::FusedProjBwdCamBounds, (int64_t)(N+1));
+        camera_id_bounds.resize_reused(PoolSlot::FusedProjBwdCamBounds, (int64_t)(N+1));
         qg_camera_id_bounds_kernel<<<_LAUNCH_ARGS_1D(N+1, 256)>>>(
             nnz, N, gaussian_ids.data_ptr(), camera_id_bounds.data_ptr());
         CHECK_DEVICE_ERROR(cudaGetLastError());
@@ -183,7 +185,7 @@ static inline void _projection_bwd_quantgrad_dispatch(
 /*[AutoHeaderGeneratorExport]*/
 void projection_3dgs_backward_quantgrad(
     const int64_t num_splats,
-    const int max_sh_degree,
+    const ColorBasis color,
     const std::vector<DeviceTensorFloatND>& splats_world,
     TorchTensorView viewmats,
     TorchTensorView intrins,
@@ -204,6 +206,7 @@ void projection_3dgs_backward_quantgrad(
     const int sh_value_bits,
     const int64_t sh_value_bounds_stride
 ) {
+    const int max_sh_degree = sh_only_degree(color, "projection_3dgs_backward_quantgrad");
     _projection_bwd_quantgrad_dispatch<Vanilla3DGS>(
         num_splats, max_sh_degree, splats_world, viewmats, intrins,
         image_width, image_height, camera_model, distortion, dist_coeffs,
@@ -215,7 +218,7 @@ void projection_3dgs_backward_quantgrad(
 /*[AutoHeaderGeneratorExport]*/
 void projection_mip_backward_quantgrad(
     const int64_t num_splats,
-    const int max_sh_degree,
+    const ColorBasis color,
     const std::vector<DeviceTensorFloatND>& splats_world,
     TorchTensorView viewmats,
     TorchTensorView intrins,
@@ -236,6 +239,7 @@ void projection_mip_backward_quantgrad(
     const int sh_value_bits,
     const int64_t sh_value_bounds_stride
 ) {
+    const int max_sh_degree = sh_only_degree(color, "projection_mip_backward_quantgrad");
     _projection_bwd_quantgrad_dispatch<MipSplatting>(
         num_splats, max_sh_degree, splats_world, viewmats, intrins,
         image_width, image_height, camera_model, distortion, dist_coeffs,
@@ -247,7 +251,7 @@ void projection_mip_backward_quantgrad(
 /*[AutoHeaderGeneratorExport]*/
 void projection_3dgut_backward_quantgrad(
     const int64_t num_splats,
-    const int max_sh_degree,
+    const ColorBasis color,
     const std::vector<DeviceTensorFloatND>& splats_world,
     TorchTensorView viewmats,
     TorchTensorView intrins,
@@ -268,6 +272,7 @@ void projection_3dgut_backward_quantgrad(
     const int sh_value_bits,
     const int64_t sh_value_bounds_stride
 ) {
+    const int max_sh_degree = sh_only_degree(color, "projection_3dgut_backward_quantgrad");
     _projection_bwd_quantgrad_dispatch<Vanilla3DGUT>(
         num_splats, max_sh_degree, splats_world, viewmats, intrins,
         image_width, image_height, camera_model, distortion, dist_coeffs,

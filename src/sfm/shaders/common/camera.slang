@@ -30,9 +30,15 @@ interface ICameraModel : IDifferentiable {
     [Differentiable] RVec2 project(RVec3 p);
 };
 
+// theta^2 below which the rotation is Ceres' first-order p + aa x p: its
+// derivative -[p]x exists at aa = 0, the norm's does not. Host: kSmallAngle2 in CpuCamera.h.
+static const float kSmallAngle2 = 2.220446049250313e-16;
+
 [Differentiable]
 RVec3 angleAxisRotate(RVec3 axis, RVec3 p) {
-    Real theta = length3(axis);
+    Real t2 = dot3(axis, axis);
+    if (t2 <= Real(kSmallAngle2)) return p + cross3(axis, p);
+    Real theta = sqrt(t2);
     RVec3 a = axis * (Real(1.0) / (theta + Real(1e-15)));
     RVec2 sc = rsincos(theta);
     Real st = sc.x, ct = sc.y;
@@ -271,13 +277,9 @@ struct EquirectModel : ICameraModel {
     }
 };
 
-// Reprojection residual, generic in the camera model.
 [Differentiable]
-RVec2 reproject<M : ICameraModel>(
-    Real pose[6], Real intr[M.kNumIntr], RVec3 X, no_diff RVec2 obs
-) {
+RVec2 projectResidual<M : ICameraModel>(Real intr[M.kNumIntr], RVec3 p, no_diff RVec2 obs) {
     M cam = M.fromArray(intr);
-    RVec3 p = applyPose(pose, X);
     RVec2 r = cam.project(p) - obs;
     if (M.kPeriodicX) {
         Real half = Real(0.5) * intr[0];
@@ -285,4 +287,21 @@ RVec2 reproject<M : ICameraModel>(
         else if (r.x < -half) r.x = r.x + intr[0];
     }
     return r;
+}
+
+// Reprojection residual, generic in the camera model.
+[Differentiable]
+RVec2 reproject<M : ICameraModel>(
+    Real pose[6], Real intr[M.kNumIntr], RVec3 X, no_diff RVec2 obs
+) {
+    return projectResidual<M>(intr, applyPose(pose, X), obs);
+}
+
+// The same through a rig: `pose` is the frame's rig_from_world, `ext` the
+// member's cam_from_rig (sfm/ba/Problem.h).
+[Differentiable]
+RVec2 reprojectRig<M : ICameraModel>(
+    Real pose[6], Real ext[6], Real intr[M.kNumIntr], RVec3 X, no_diff RVec2 obs
+) {
+    return projectResidual<M>(intr, applyPose(ext, applyPose(pose, X)), obs);
 }

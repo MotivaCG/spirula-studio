@@ -21,14 +21,27 @@ void quantile_of_positive_finite_elements_internal(
     float* outputs_ptr
 );
 
-// Weighted sampling without replacement (Efraimidis-Spirakis). Returns a
-// pool-allocated int32 index buffer of length `num_sample`; the caller does
-// not own it (PoolSlot-backed).
+// Weighted sampling without replacement (Efraimidis-Spirakis) into a pool-owned
+// [num_sample] index buffer. Only the first `num_eligible` draws (positive
+// weight, admitted by the mask and the opacity floor) are real.
 int32_t* weighted_sample_without_replacement_internal(
     int64_t numel,
     float* weights_ptr,
     int64_t weights_numel,
     bool* masks_ptr,
     uint32_t num_sample,
-    uint32_t seed
+    uint32_t seed,
+    uint32_t* num_eligible = nullptr,
+    // Elements whose opacity logit is under floor_logit draw as zero weight.
+    const float* floor_opacities = nullptr,
+    float floor_logit = 0.0f,
+    // The oversize split channel: weight (oversize_accum + floor) * w^blend.
+    const float* oversize_accum = nullptr,
+    float oversize_blend = 0.0f
 );
+
+// The split floor as the logit the draw compares raw opacities against.
+inline float split_floor_logit(float opacity) {
+    opacity = fminf(opacity, 1.0f - 1e-6f);
+    return logf(opacity / (1.0f - opacity));
+}

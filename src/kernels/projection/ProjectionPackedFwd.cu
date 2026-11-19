@@ -115,7 +115,7 @@ inline std::tuple<
         if (camera_model == CameraModelType::M && distortion == CameraDistortionType::D) \
             projection_packed_mask_kernel_wrapper<SplatPrimitive, \
                 CameraModelType::M, CameraDistortionType::D> _LAUNCH_ARGS; else
-    SS_FOR_EACH_CAMERA_VARIANT(_DISPATCH)
+    SS_FOR_EACH_FORWARD_CAMERA_VARIANT(_DISPATCH)
         throw std::runtime_error("Unsupported camera model / distortion tier");
     #undef _DISPATCH
     CHECK_DEVICE_ERROR(cudaGetLastError());
@@ -156,7 +156,7 @@ inline std::tuple<
         if (camera_model == CameraModelType::M && distortion == CameraDistortionType::D) \
             projection_packed_fwd_kernel_wrapper<SplatPrimitive, \
                 CameraModelType::M, CameraDistortionType::D> _LAUNCH_ARGS; else
-    SS_FOR_EACH_CAMERA_VARIANT(_DISPATCH)
+    SS_FOR_EACH_FORWARD_CAMERA_VARIANT(_DISPATCH)
         throw std::runtime_error("Unsupported camera model / distortion tier");
     #undef _DISPATCH
     CHECK_DEVICE_ERROR(cudaGetLastError());
@@ -177,7 +177,7 @@ std::tuple<
     DeviceVector<float>, std::vector<DeviceTensorFloatND>
 > projection_3dgs_packed_forward(
     const int64_t num_splats,
-    const int max_sh_degree,
+    const ColorBasis color,
     const std::vector<DeviceTensorFloatND> &in_splats,
     TorchTensorView viewmats,
     TorchTensorView intrins,
@@ -193,6 +193,7 @@ std::tuple<
     const int sh_value_bits,
     const int64_t sh_bounds_stride
 ) {
+    const int max_sh_degree = sh_only_degree(color, "projection_3dgs_packed_forward");
     int sh_degree = Vanilla3DGS<0>::WorldBuffer(in_splats).sh_degree();
     sh_degree = min(sh_degree, max_sh_degree);
     uint32_t C = (uint32_t)std::get<2>(viewmats)[0];
@@ -222,7 +223,7 @@ std::tuple<
     DeviceVector<float>, std::vector<DeviceTensorFloatND>
 > projection_mip_packed_forward(
     const int64_t num_splats,
-    const int max_sh_degree,
+    const ColorBasis color,
     const std::vector<DeviceTensorFloatND> &in_splats,
     TorchTensorView viewmats,
     TorchTensorView intrins,
@@ -238,6 +239,7 @@ std::tuple<
     const int sh_value_bits,
     const int64_t sh_bounds_stride
 ) {
+    const int max_sh_degree = sh_only_degree(color, "projection_mip_packed_forward");
     int sh_degree = MipSplatting<0>::WorldBuffer(in_splats).sh_degree();
     sh_degree = min(sh_degree, max_sh_degree);
     uint32_t C = (uint32_t)std::get<2>(viewmats)[0];
@@ -268,7 +270,7 @@ std::tuple<
     DeviceVector<float>, std::vector<DeviceTensorFloatND>
 > projection_3dgut_packed_forward(
     const int64_t num_splats,
-    const int max_sh_degree,
+    const ColorBasis color,
     const std::vector<DeviceTensorFloatND> &in_splats,
     TorchTensorView viewmats,
     TorchTensorView intrins,
@@ -284,6 +286,7 @@ std::tuple<
     const int sh_value_bits,
     const int64_t sh_bounds_stride
 ) {
+    const int max_sh_degree = sh_only_degree(color, "projection_3dgut_packed_forward");
     int sh_degree = Vanilla3DGUT<0>::WorldBuffer(in_splats).sh_degree();
     sh_degree = min(sh_degree, max_sh_degree);
     uint32_t C = (uint32_t)std::get<2>(viewmats)[0];

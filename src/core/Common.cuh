@@ -97,6 +97,14 @@ static __device__ __forceinline__ bool ellipse_box_overlap_test(
     return fminf(mc, fminf(mx, my) - 1.0f) < 0.f;
 }
 
+// The sigma at which opac * Primitive3DGS::kernel_vis falls to ALPHA_THRESHOLD: the
+// raster cull radius, which the forward and the backward must compute identically.
+static __device__ __forceinline__ float kernel_reach(float opac, float kernel_cut) {
+    if (kernel_cut <= 0.f) return __logf(opac / ALPHA_THRESHOLD);
+    const float ec = __expf(-kernel_cut);
+    return -__logf(ec + (1.f - ec) * (ALPHA_THRESHOLD / opac));
+}
+
 #else  // #ifdef __CUDACC__
 
 template<typename T, size_t SIZE>
@@ -117,6 +125,7 @@ enum class CameraModelType {
     FISHEYE = 1,
     EQUISOLID = 2,
     EQUIRECTANGULAR = 3,
+    ORTHOGRAPHIC = 4,
 };
 
 // Lens distortion tier, orthogonal to CameraModelType and a COMPILE-TIME axis
@@ -194,6 +203,7 @@ inline CameraModelType cmt(const std::string &s) {
     return (s == "PINHOLE") ? CameraModelType::PINHOLE :
         (s == "FISHEYE") ? CameraModelType::FISHEYE :
         (s == "EQUISOLID") ? CameraModelType::EQUISOLID :
+        (s == "ORTHOGRAPHIC") ? CameraModelType::ORTHOGRAPHIC :
         (s == "EQUIRECTANGULAR") ? CameraModelType::EQUIRECTANGULAR :
         (CameraModelType)-1;
 }

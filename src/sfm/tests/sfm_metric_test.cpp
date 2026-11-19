@@ -91,6 +91,44 @@ int cmdMetricSelftest(int, char**) {
         check(fit.inliers == fit.n && fit.n == 24, what);
     }
 
+    // ---- T1a: separate barometric datums do not tip a full GPS fit --------
+    {
+        Sim3 T;
+        T.scale = 1.73;
+        T.R = rotFromAxisAngle({0, 0, 1}, 0.9);
+        T.t = {11.0, -4.0, 2.5};
+        MetricRef ref = makeRef(arcCentres(60), T);
+        const double raw[3] = {-1.5, 0.8, 2.5};
+        for (size_t i = 0; i < ref.targets.size(); i++) {
+            const int track = (int)(i % 3);
+            ref.tracks.push_back(track);
+            ref.targets[i].z += raw[track];
+        }
+        const double mean = (raw[0] + raw[1] + raw[2]) / 3.0;
+        const MetricFit fit = fitMetricGauge(ref, 0.0, MetricAxes::Full, 0.0,
+                                              MetricTrackOffsets::Vertical);
+        check(fit.ok, "T1a track altitude: fit");
+        check(std::fabs(fit.T.scale / T.scale - 1.0) < 1e-8, "T1a track altitude: scale");
+        check(chordal(fit.T.R, T.R) < 1e-8, "T1a track altitude: rotation");
+        check(fit.track_ids.size() == 3, "T1a track altitude: three corrections");
+        check(std::fabs(fit.trackVerticalOffset(0) - (raw[0] - mean)) < 1e-8 &&
+                  std::fabs(fit.trackVerticalOffset(1) - (raw[1] - mean)) < 1e-8 &&
+                  std::fabs(fit.trackVerticalOffset(2) - (raw[2] - mean)) < 1e-8,
+              "T1a track altitude: corrections recover relative datums");
+        check(fit.rms < 1e-8, "T1a track altitude: residual removed");
+
+        // Fixes stated at sea level: a mean would drag the height by ~1 m each.
+        for (int i : {0, 1, 2, 30, 31, 32}) ref.targets[(size_t)i].z = -T.t.z * 40.0;
+        const MetricFit sea = fitMetricGauge(ref, 0.0, MetricAxes::Full, 0.0,
+                                              MetricTrackOffsets::Vertical);
+        check(sea.ok && !sea.flat, "T1a track altitude: sea-level fixes, full fit");
+        check(std::fabs(sea.T.t.z - (T.t.z + mean)) < 1e-6, "T1a track altitude: height kept");
+        check(!sea.inlier_mask[0] && !sea.inlier_mask[31] && sea.inliers == 54,
+              "T1a track altitude: sea-level fixes rejected");
+        check(std::fabs(sea.trackVerticalOffset(2) - (raw[2] - mean)) < 1e-8,
+              "T1a track altitude: corrections unmoved");
+    }
+
     // ---- T1b: a left-handed reference, where the guard actually fires -----
     // Unguarded this fits to 3e-15 m with det(R) = -1, so no RMS gate can see
     // it. A coplanar fixture cannot test this: det(cov) is then round-off.
@@ -672,6 +710,15 @@ int cmdMetricSelftest(int, char**) {
         printf("  T6b: b - a = (%.4f, %.4f, %.4f) m\n", d.x, d.y, d.z);
         check(std::fabs(d.y - 215.99) < 0.05 && std::fabs(d.x) < 0.01,
               "T6b: 216 m due north, by the meridional radius not by a");
+        // d.jpg is at the three fixes' mean latitude and on their meridian, so
+        // the frame's origin is straight above it.
+        const double lat_d = 42.0 + 12.0 / 60.0 + 7.05 / 3600.0;
+        const double lon_d = -(83.0 + 40.0 / 60.0 + 17.86 / 3600.0);
+        check(ref.origin.ok && std::fabs(ref.origin.at.lat_deg - lat_d) < 1e-9 &&
+                  std::fabs(ref.origin.at.lon_deg - lon_d) < 1e-9 &&
+                  std::hypot(ref.targets[2].x, ref.targets[2].y) < 1e-6,
+              "T6b: the targets are east-north-up about the fixes' mean");
+        check(ref.origin.alt.empty(), "T6b: a fix with no altitude leaves the origin without one");
         fs::remove_all(dir);
     }
 
@@ -839,6 +886,99 @@ int cmdMetricSelftest(int, char**) {
         check(flat.ok && std::fabs(flat.T.scale / T.scale - 1.0) <= 1e-12,
               "T13: the horizontal fit takes it and recovers the scale");
         check(flat.inliers == 60, "T13: with every camera an inlier");
+    }
+
+    // ---- T14: a level fit about an up that tips the camera path ------------
+    // A straight level flight levelled about an up 88 deg off runs almost along
+    // it: the short level part inflates the scale, which the 3D distances refuse.
+    {
+        Sim3 T;
+        T.scale = 2.6;
+        T.R = rotFromAxisAngle({0, 0, 1}, 0.3);
+        T.t = {5.0, -2.0, 160.0};
+        std::vector<Vec3> c(60);
+        for (int i = 0; i < 60; i++) c[i] = {0.5 * i, 0.01 * std::sin(0.4 * i), 0.0};
+        const MetricRef ref = makeRef(c, T);
+        MetricRef tipped = ref;
+        const Mat3 tip = rotFromAxisAngle({0, 1, 0}, 88.0 * M_PI / 180.0);
+        for (Vec3& p : tipped.centres) p = mul(tip, p);
+        const MetricFit good = fitMetricGauge(ref, 5.0, MetricAxes::Horizontal);
+        const MetricFit bad = fitMetricGauge(tipped, 5.0, MetricAxes::Horizontal);
+        printf("  T14: scale %.4f / 3D %.4f (true up), %.4f / 3D %.4f (88 deg off), reason %d\n",
+               good.T.scale, good.scale_3d, bad.T.scale, bad.scale_3d, (int)bad.reason);
+        check(good.ok && std::fabs(good.scale_3d / T.scale - 1.0) < 1e-9,
+              "T14: levelled about the true up, the 3D scale agrees");
+        check(!bad.ok && bad.reason == MetricFail::Tilted && bad.T.scale > 20.0 * T.scale &&
+                  std::fabs(bad.scale_3d / T.scale - 1.0) < 1e-9,
+              "T14: about an up 88 deg off, the inflated level scale is refused as tilted");
+
+        // A real 30 deg climb passes, whether the reference follows it or has no altitude.
+        std::vector<Vec3> climb(60);
+        const double a = 30.0 * M_PI / 180.0;
+        for (int i = 0; i < 60; i++)
+            climb[i] = {0.5 * i * std::cos(a), 0.01 * std::sin(0.4 * i), 0.5 * i * std::sin(a)};
+        MetricRef up = makeRef(climb, T), sea = up;
+        for (Vec3& p : sea.targets) p.z = 0.0;
+        const MetricFit rise = fitMetricGauge(up, 5.0, MetricAxes::Horizontal);
+        const MetricFit noalt = fitMetricGauge(sea, 5.0, MetricAxes::Horizontal);
+        printf("  T14: 30 deg climb: scale over 3D %.4f (altitude), %.4f (none)\n",
+               rise.T.scale / rise.scale_3d, noalt.T.scale / noalt.scale_3d);
+        check(rise.ok && noalt.ok && std::fabs(rise.T.scale / T.scale - 1.0) <= 1e-9,
+              "T14: a climb the up describes truly is not refused, altitude or none");
+
+        // Five fixes stated at sea level: the vertical place is the others' median.
+        MetricRef few = ref;
+        for (int i = 0; i < 60; i += 12) few.targets[i].z = 0.0;
+        const MetricFit med = fitMetricGauge(few, 5.0, MetricAxes::Horizontal);
+        printf("  T14: five fixes at sea level: t.z %.6f against %.6f, altitude sigma %.2e m\n",
+               med.T.t.z, T.t.z, med.vertical_sigma);
+        check(med.ok && std::fabs(med.T.t.z - T.t.z) < 1e-9 && med.vertical_sigma < 1e-9,
+              "T14: a few fixes without altitude move neither the vertical place nor its sigma");
+    }
+
+    // ---- T15: a radius from the positions' own scatter (max_error 0) --------
+    // Phone metres get a radius near 3.37 sigma and RTK centimetres the 0.5 % floor, through a
+    // tenth of fixes 100 m off; noise as wide as the capture and repeated fixes are refused.
+    {
+        Sim3 T;
+        T.scale = 10.0;
+        T.R = rotFromAxisAngle({0.2, 0.5, -0.4}, 0.7);
+        T.t = {50.0, -20.0, 3.0};
+        const std::vector<Vec3> c = arcCentres(80);
+        std::mt19937 rng(7);
+        auto noisy = [&](double sigma, double outliers) {
+            MetricRef ref = makeRef(c, T);
+            std::normal_distribution<double> N(0.0, sigma);
+            for (size_t i = 0; i < ref.targets.size(); i++) {
+                ref.targets[i] = ref.targets[i] + Vec3{N(rng), N(rng), N(rng)};
+                if (i % 10 == 3 && outliers > 0) ref.targets[i].x += outliers;
+            }
+            return ref;
+        };
+        for (double sigma : {0.02, 3.0}) {
+            const MetricFit f = fitMetricGauge(noisy(sigma, 100.0), 0.0);
+            printf("  T15: sigma %.2f m: radius %.3f m (%.2f sigma), %d/%d inliers, scatter %.3f m\n",
+                   sigma, f.max_error, f.max_error / sigma, f.inliers, f.n, f.sigma);
+            const double floor = kMetricMinRadiusFrac * f.spread;
+            check(f.ok && f.max_error > std::max(2.5 * sigma, 0.99 * floor) &&
+                      f.max_error < std::max(4.5 * sigma, 1.01 * floor) && f.inliers >= 70 &&
+                      f.inliers <= 72 && std::fabs(f.sigma / sigma - 1.0) < 0.25,
+                  "T15: the radius follows the noise to its floor, through 10% outliers");
+            check(f.ok && std::fabs(f.T.scale / T.scale - 1.0) < 0.05,
+                  "T15: the scale through the fit's own radius");
+        }
+        const MetricFit wide = fitMetricGauge(noisy(30.0, 0.0), 0.0);
+        printf("  T15: noise as wide as the capture: ok %d, reason %d, spread %.1f m, radius %.1f m\n",
+               wide.ok, (int)wide.reason, wide.spread, wide.max_error);
+        check(!wide.ok && wide.reason == MetricFail::Spread, "T15: noise past the spread fits nothing");
+
+        MetricRef twice = makeRef(c, T);
+        for (size_t i = 0; i < twice.targets.size(); i++) twice.targets[i] = twice.targets[i % 2 ? 7 : 40];
+        const MetricFit rep = fitMetricGauge(twice, 0.0, MetricAxes::Horizontal);
+        check(!rep.ok && rep.reason == MetricFail::Distinct && rep.distinct == 2,
+              "T15: two fixes repeated forty times are two positions, too few to judge a radius");
+        check(fitMetricGauge(twice, 5.0, MetricAxes::Horizontal).reason != MetricFail::Distinct,
+              "T15: a fixed radius does not count distinct positions");
     }
 
     printf("%s\n", fails ? "FAIL" : "PASS");
