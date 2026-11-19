@@ -119,35 +119,6 @@ void densify_update_weight(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
 }
 
 // ---------------------------------------------------------------------------
-// densify_oversize_weight
-// ---------------------------------------------------------------------------
-
-struct DensifyOversizeWeightParams {  // 32 bytes: pushed directly
-    float* oversize_accum;  // [N]
-    float2* score;          // [N, 2], lane 0 = error score
-    float2* out;            // [N, 2], lane 0 = weight
-    float blend;
-    uint num_splats;
-    uint wgs_per_row;
-    uint _pad0;
-};
-
-[shader("compute")]
-[numthreads(256, 1, 1)]
-void densify_oversize_weight(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
-                             uniform DensifyOversizeWeightParams p) {
-    uint idx = (wg.y * p.wgs_per_row + wg.x) * 256 + tid;
-    if (idx >= p.num_splats) return;
-    const float kOversizeFloor = 1e-3f;
-    float s = max(p.score[idx].x, 0.0f);
-    float w = p.oversize_accum[idx] + kOversizeFloor;
-    if (p.blend > 0.0f)
-        w *= (p.blend == 1.0f) ? s : pow(s, p.blend);
-    p.out[idx] = float2(_dn_finitef(w) ? w : 0.0f, 0.0f);
-}
-
-
-// ---------------------------------------------------------------------------
 // densify_clip_scale
 // ---------------------------------------------------------------------------
 
@@ -232,6 +203,25 @@ void densify_splat_decay(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
 // MCMC / revised noise (canonical device code from ../densify.slang)
 // ---------------------------------------------------------------------------
 
+// Integer hash matching hash_uint3 in core/Common.cuh bit-exactly.
+[ForceInline]
+uint _dn_hash_u3(uint a, uint b, uint c) {
+    uint hash = a;
+    hash *= 0x01000193u;
+    hash = (hash << 16) | (hash >> 16);
+    hash ^= b;
+    hash *= 0x01000193u;
+    hash = (hash << 16) | (hash >> 16);
+    hash ^= c;
+    hash *= 0x01000193u;
+    hash ^= hash >> 15;
+    hash *= 0x85ebca6bu;
+    hash ^= hash >> 13;
+    hash *= 0xc2b2ae35u;
+    hash ^= hash >> 16;
+    return hash;
+}
+
 struct DensifyNoiseParams {  // 72 bytes: pushed directly
     float* means;       // [N, 3] updated in place
     float* log_scales;  // [N, 3]
@@ -244,6 +234,7 @@ struct DensifyNoiseParams {  // 72 bytes: pushed directly
     uint wgs_per_row;
     float peak_weight_scale;  // stored -> current peak weight
     uint has_peak_weight;
+    uint seed;
 };
 
 [shader("compute")]
@@ -259,7 +250,8 @@ void densify_mcmc_add_noise(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
     float4 quat = float4(p.quats[4 * idx], p.quats[4 * idx + 1],
                          p.quats[4 * idx + 2], p.quats[4 * idx + 3]);
     mcmc_add_noise_3dgs(p.scaler, mean, log_scale, quat,
-                        p.logit_opacs[idx]);
+                        p.logit_opacs[idx], uint4(_dn_hash_u3(p.seed ^ 0x9e3779b9u, idx, 0), _dn_hash_u3(p.seed ^ 0x9e3779b9u, idx, 1),
+                              _dn_hash_u3(p.seed ^ 0x9e3779b9u, idx, 2), _dn_hash_u3(p.seed ^ 0x9e3779b9u, idx, 3)));
     p.means[3 * idx] = mean.x;
     p.means[3 * idx + 1] = mean.y;
     p.means[3 * idx + 2] = mean.z;
@@ -281,7 +273,9 @@ void densify_revised_add_noise(uint3 wg: SV_GroupID,
     revised_add_noise_3dgs(p.scaler, p.radii[idx], mean, log_scale, quat,
                            p.logit_opacs[idx],
                            p.has_peak_weight != 0
-                               ? p.peak_weight[idx] * p.peak_weight_scale : 1.0f);
+                               ? p.peak_weight[idx] * p.peak_weight_scale : 1.0f,
+                           uint4(_dn_hash_u3(p.seed ^ 0x9e3779b9u, idx, 0), _dn_hash_u3(p.seed ^ 0x9e3779b9u, idx, 1),
+                              _dn_hash_u3(p.seed ^ 0x9e3779b9u, idx, 2), _dn_hash_u3(p.seed ^ 0x9e3779b9u, idx, 3)));
     p.means[3 * idx] = mean.x;
     p.means[3 * idx + 1] = mean.y;
     p.means[3 * idx + 2] = mean.z;
@@ -290,25 +284,6 @@ void densify_revised_add_noise(uint3 wg: SV_GroupID,
 // ---------------------------------------------------------------------------
 // Shared helpers for the relocation / MCMC kernels
 // ---------------------------------------------------------------------------
-
-// Integer hash matching hash_uint3 in core/Common.cuh bit-exactly.
-[ForceInline]
-uint _dn_hash_u3(uint a, uint b, uint c) {
-    uint hash = a;
-    hash *= 0x01000193u;
-    hash = (hash << 16) | (hash >> 16);
-    hash ^= b;
-    hash *= 0x01000193u;
-    hash = (hash << 16) | (hash >> 16);
-    hash ^= c;
-    hash *= 0x01000193u;
-    hash ^= hash >> 15;
-    hash *= 0x85ebca6bu;
-    hash ^= hash >> 13;
-    hash *= 0xc2b2ae35u;
-    hash ^= hash >> 16;
-    return hash;
-}
 
 // Spec axes shared by the relocate/MCMC kernels.
 //   kShOptimBits:  0 = fp32 SH Adam state, 8 / 4 = QuantizedAdamState bits
@@ -444,16 +419,22 @@ void _dn_mcmc_relocation(inout float opacity, inout float3 scale, int n_idx) {
 // ascending order bit-exactly for identical key bits.
 // ---------------------------------------------------------------------------
 
-struct EfraimidisParams {  // 52 bytes: pushed directly
+struct EfraimidisParams {  // 84 bytes: pushed directly
     float* weights;   // [numel * stride]
     int* mask;        // [numel] int32 0/1 (use_mask gates; fallback-backed)
     uint* out_keys;   // [numel] sortable key bits
     int* eligible;    // [1] += 1 per strictly negative key
+    float* floor_opacs;  // [numel] logits (use_floor gates; fallback-backed)
+    float* oversize;  // [numel] (use_oversize gates; fallback-backed)
     uint stride;
     uint seed;
     uint use_mask;
     uint numel;
     uint wgs_per_row;
+    float floor_logit;
+    uint use_floor;
+    float oversize_blend;
+    uint use_oversize;
 };
 
 [shader("compute")]
@@ -466,9 +447,21 @@ void densify_efraimidis_keys(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
 
     float u = float(_dn_hash_u3(p.seed, block_lin, tid)) * exp2(-32.0f);
     float w = p.weights[idx * p.stride];
+    // The oversize split channel's weight. The floor makes an all-zero
+    // accumulator degrade to a draw from the error score itself.
+    if (p.use_oversize != 0) {
+        const float kOversizeFloor = 1e-3f;
+        float s = max(w, 0.0f);
+        w = p.oversize[idx] + kOversizeFloor;
+        if (p.oversize_blend > 0.0f)
+            w *= (p.oversize_blend == 1.0f) ? s : pow(s, p.oversize_blend);
+        if (!_dn_finitef(w)) w = 0.0f;
+    }
     // larger w -> smaller (more negative) value
     w = w / log(max(1.0f - u, 1e-30f));
     if (p.use_mask != 0 && p.mask[idx] == 0) w = 0.0f;
+    // `!(>=)` so a NaN opacity fails the floor too.
+    if (p.use_floor != 0 && !(p.floor_opacs[idx] >= p.floor_logit)) w = 0.0f;
     // Strictly negative: a positive weight the mask admits. -0.0 is not one.
     if (w < 0.0f) {
         int unused;
@@ -500,11 +493,13 @@ struct RelocMaskParams {  // 104 bytes: pushed directly
     uint* visit_counters; // [N] (dead_after_steps != 0)
     float* max_weight;   // [N] (has_max_weight)
     float min_opacity;
+    float min_weight;
     uint num_splats;
     uint wgs_per_row;
     uint dead_after_steps;
     uint dead_by_opacity;
     uint has_max_weight;
+    uint pad0;
 };
 
 [shader("compute")]
@@ -526,7 +521,7 @@ void densify_reloc_mask(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
 
     bool is_low_opac =
         (p.dead_by_opacity != 0 && _dn_sigmoid(opac) <= p.min_opacity) ||
-        (p.has_max_weight != 0 && p.max_weight[idx] <= p.min_opacity);
+        (p.has_max_weight != 0 && p.max_weight[idx] <= p.min_weight);
     bool is_finite = _dn_finitef(dot(mean, mean) / dot(quat, quat) +
                                  dot(scale, dc) * opac);
     bool is_stale = p.dead_after_steps != 0u &&
@@ -586,6 +581,8 @@ struct RelocLasParams {
     int* bias_steps;     // [cap] (has_bias_steps)
     uint* visit_counters; // [cap] (has_visit)
     float* max_weight;   // [cap] (has_max_weight)
+    float4* projective_state;
+    float* projective_information;
     float split_opacity_k;
     uint cur_num_splats;
     uint num_new_splats;
@@ -600,6 +597,7 @@ struct RelocLasParams {
     uint wgs_per_row;
     uint has_visit;
     uint has_max_weight;
+    uint has_projective_state;
 };
 
 [shader("compute")]
@@ -645,6 +643,11 @@ void densify_relocate_las(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
                   max(_dn_sigmoid(opac), 1e-12f);
         p.max_weight[idx_src] = w;
         p.max_weight[idx_dst] = w;
+    }
+
+    if (p.has_projective_state != 0) {
+        p.projective_state[idx_dst] = p.projective_state[idx_src];
+        p.projective_information[idx_dst] = p.projective_information[idx_src];
     }
 
     // appearance - copy
@@ -1108,7 +1111,7 @@ void densify_mcmc_relocation(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
     if (p.has_bias_steps != 0) p.bias_steps[cur_idx] = 0;
 }
 
-struct McmcUpdateRelocParams {  // 72 bytes: pushed directly
+struct McmcUpdateRelocParams {  // 96 bytes: pushed directly
     int* index_map;      // [N]
     float* means;
     float* quats;
@@ -1116,6 +1119,9 @@ struct McmcUpdateRelocParams {  // 72 bytes: pushed directly
     float* opacs;
     float* features_dc;
     float* features_sh;  // (has_fp32_sh)
+    float4* projective_state;
+    float* projective_information;
+    uint has_projective, projective_pad;
     uint num_splats;
     uint num_sh;
     uint has_fp32_sh;
@@ -1133,6 +1139,11 @@ void densify_mcmc_update_reloc(uint3 wg: SV_GroupID,
     // only update on those relocated from
     uint id_src = uint(p.index_map[id_dst]);
     if (id_src == id_dst) return;
+
+    if (p.has_projective != 0) {
+        p.projective_state[id_dst] = p.projective_state[id_src];
+        p.projective_information[id_dst] = p.projective_information[id_src];
+    }
 
     [ForceUnroll]
     for (int i = 0; i < 3; i++) {
@@ -1220,6 +1231,9 @@ struct McmcUpdateAddParams {
     float4* nq_opacities_bounds;
     float4* nq_dc_bounds;
     int* bias_steps;  // (has_bias_steps)
+    float4* projective_state;
+    float* projective_information;
+    uint has_projective, projective_pad;
     uint num_splats;
     uint num_add;
     uint num_sh;
@@ -1243,6 +1257,10 @@ void densify_mcmc_update_add(uint3 wg: SV_GroupID, uint tid: SV_GroupThreadID,
     uint id_dst = idx + p.num_splats;
     uint id_src = uint(p.index_map[idx]);
 
+    if (p.has_projective != 0) {
+        p.projective_state[id_dst] = p.projective_state[id_src];
+        p.projective_information[id_dst] = p.projective_information[id_src];
+    }
     // copy components
     [ForceUnroll]
     for (int i = 0; i < 3; i++) {

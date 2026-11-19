@@ -1,6 +1,7 @@
 // Adapt.cpp -- see Adapt.h.
 
 #include "checkpoint/Adapt.h"
+#include "checkpoint/Resume.h"
 
 #include "core/CheckpointIO.h"
 #include "core/SphericalBeta.h"
@@ -69,9 +70,9 @@ Buffer from_u32(const std::vector<uint32_t>& v) {
 }
 
 std::map<std::string, Buffer> read_tar_npy(const fs::path& ckpt_dir) {
-    std::ifstream in((ckpt_dir / "state.tar").string(), std::ios::binary);
+    std::ifstream in(resolve_checkpoint(ckpt_dir).tar_path.string(), std::ios::binary);
     if (!in) throw std::runtime_error("cannot open " +
-                                      (ckpt_dir / "state.tar").string());
+                                      resolve_checkpoint(ckpt_dir).tar_path.string());
     std::map<std::string, Buffer> out;
     for (const auto& m : tar_index(in)) {
         if (m.name.size() < 4 ||
@@ -269,6 +270,8 @@ std::optional<SlotClass> classify(const std::string& name) {
     }
     if (name == "eng.radii")        { SlotClass c; c.ch = 1; return c; }
     if (name == "eng.accum_buffer") { SlotClass c; c.ch = 2; return c; }
+    if (name == "eng.projective_state")       { SlotClass c; c.ch = 4; return c; }
+    if (name == "eng.projective_information") { SlotClass c; c.ch = 1; return c; }
     if (name == "eng.bias_correction_steps") {
         SlotClass c; c.ch = 1; c.is_int = true; return c;
     }
@@ -484,6 +487,13 @@ const std::optional<std::array<int, 3>>& target_grid(const TargetLayout& t,
         "this run.");
 }
 
+// The checkpoint's calibration-warp table layout, as TargetLayout holds it.
+std::optional<std::array<int, 2>> calib_warp_layout(const JsonValue& state) {
+    const JsonValue* c = state.find("calib_warp");
+    if (!c || c->get_double("enabled", 0) == 0) return std::nullopt;
+    return std::array<int, 2>{(int)c->get_double("grid", 0), (int)c->get_double("D", 0)};
+}
+
 }  // namespace
 
 
@@ -507,15 +517,16 @@ bool needs_adapt(const JsonValue& state, const TargetLayout& t) {
     const JsonValue* p = state.find("ppisp");
     bool ck_ppisp = p && p->get_double("enabled", 0) != 0;
     if (ck_ppisp != t.ppisp) return true;
+    if (calib_warp_layout(state) != t.calib_warp) return true;
     return false;
 }
 
 
 bool adapt_checkpoint(const fs::path& ckpt_dir, const TargetLayout& t,
                       const fs::path& out_dir) {
-    std::ifstream sin((ckpt_dir / "state.tar").string(), std::ios::binary);
+    std::ifstream sin(resolve_checkpoint(ckpt_dir).tar_path.string(), std::ios::binary);
     if (!sin) throw std::runtime_error("cannot open " +
-                                       (ckpt_dir / "state.tar").string());
+                                       resolve_checkpoint(ckpt_dir).tar_path.string());
     std::string state_text;
     for (const auto& m : tar_index(sin))
         if (m.name == "state.json") { state_text = tar_read_member(sin, m); break; }
@@ -732,6 +743,16 @@ bool adapt_checkpoint(const fs::path& ckpt_dir, const TargetLayout& t,
             continue;
         }
 
+        // --- calibration warp: kept as is, or dropped to be fitted again ---
+        if (starts_with(base, "eng.calib_warp.")) {
+            const auto ck = calib_warp_layout(state);
+            if (!t.calib_warp || ck != t.calib_warp || !parts.plain) continue;
+            const int64_t row = (int64_t)(*ck)[0] * (*ck)[0] * (*ck)[1];
+            if ((int64_t)parts.plain->numel() != row * n_img) continue;
+            emit[base] = *parts.plain;
+            continue;
+        }
+
         // --- PPISP ---------------------------------------------------------
         if (starts_with(base, "eng.ppisp.")) {
             if (!t.ppisp || !parts.plain) continue;   // target dropped it
@@ -746,6 +767,11 @@ bool adapt_checkpoint(const fs::path& ckpt_dir, const TargetLayout& t,
         }
 
         // --- everything else (bg_sky, colour matrices): fixed size ---------
+        PoolSlot slot;
+        if (pool_slot_from_name(base, slot) &&
+            slot_category(slot) == VramCategory::Splat)
+            throw std::runtime_error("checkpoint adapt: no rule to resize "
+                                     "per-splat buffer '" + base + "'");
         if (parts.plain) emit[base] = *parts.plain;
         else if (parts.q && parts.qb) {
             emit[base + ".q"] = *parts.q;

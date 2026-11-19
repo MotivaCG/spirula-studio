@@ -97,6 +97,7 @@ HEADER_SOURCES = dict([
     _fam("kernels/loss", "PerSplatLoss", "PerSplatLoss.cu"),
     _fam("kernels/loss", "PerPixelLoss", "PerPixelLoss.cu"),
     _fam("kernels/loss", "FusedSSIM", "FusedSSIM.cu"),
+    _fam("kernels/loss", "PcaReg", "PcaReg.cu"),
     _fam("kernels/visualize", "Visualizer", "Visualizer.cu"),
     _fam("kernels/bilagrid", "BilagridUtils", "BilagridUtils.cu"),
 
@@ -111,6 +112,8 @@ HEADER_SOURCES = dict([
     _fam("kernels/raster", "RasterizationBwd", "RasterizationBwd.cu"),
     _fam("kernels/raster", "RasterizationEval3DFwd", "RasterizationEval3DFwd.cu"),
     _fam("kernels/raster", "RasterizationEval3DBwd", "RasterizationEval3DBwd.cu"),
+
+    _fam("kernels/optim", "ProjectiveDepth", "ProjectiveDepth.cu"),
 
     # Optimizer variants, split by function.
     _fam("kernels/optim", "Optimizer",
@@ -149,6 +152,7 @@ HEADER_SOURCES["kernels/pixelwise/PixelWise"] = [
     "kernels/pixelwise/GtDepthNormalWarp.cu", # GT depth/normal wide -> pinhole warps
     "kernels/ppisp/Ppisp.cu",                 # per-pixel image signal processing
 ]
+HEADER_SOURCES["kernels/pixelwise/CalibWarp"] = ["kernels/pixelwise/CalibWarp.cu"]
 
 
 def generate_headers():

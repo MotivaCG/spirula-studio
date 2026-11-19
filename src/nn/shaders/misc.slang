@@ -5,10 +5,11 @@
 
 #include "_common.slang"
 
-// Spec ids 0..2 (module-wide).
+// Spec ids 0..3 (module-wide).
 [SpecializationConstant] const int kInputF16 = 0;
 [SpecializationConstant] const int kAct      = 0;
 [SpecializationConstant] const int kAlignCorners = 0;
+[SpecializationConstant] const int kPadBorder = 0;   // grid_sample padding_mode='border'
 
 static const int WG = 256;
 
@@ -86,6 +87,38 @@ void gather_rows(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID,
     // should degrade, not take the process down.
     if (id >= p.vocab) id = 0u;
     store_at(p.out, i, load_at(p.table, id * p.cols + c, kInputF16 != 0));
+}
+
+// ---------------------------------------------------------------------------
+// Segment mean (sparse voxel pooling)
+// ---------------------------------------------------------------------------
+
+struct SegmentMeanParams {
+    float* out;      // [segments, C]
+    uint*  x;        // [n, C]
+    uint*  offsets;  // [segments + 1] i32 into `ids`
+    uint*  ids;      // i32 rows of `x`
+    uint   segments;
+    uint   C;
+    uint   n;
+    uint   groups_per_row;
+};
+
+[shader("compute")]
+[numthreads(WG, 1, 1)]
+void segment_mean(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID,
+                  uniform SegmentMeanParams p) {
+    uint i = fold_index(gid, tid, p.groups_per_row, uint(WG));
+    if (i >= p.segments * p.C) return;
+    uint s = i / p.C;
+    uint c = i % p.C;
+    uint b = p.offsets[s], e = p.offsets[s + 1u];
+    float sum = 0.0;
+    for (uint k = b; k < e; ++k) {
+        uint id = p.ids[k];
+        if (id < p.n) sum += load_at(p.x, id * p.C + c, kInputF16 != 0);
+    }
+    store_at(p.out, i, e > b ? sum / float(e - b) : 0.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -363,6 +396,10 @@ void grid_sample_points(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID,
     } else {
         sx = ((gx + 1.0f) * float(p.W) - 1.0f) * 0.5f;
         sy = ((gy + 1.0f) * float(p.H) - 1.0f) * 0.5f;
+    }
+    if (kPadBorder != 0) {   // torch clips the source coordinate, then samples
+        sx = clamp(sx, 0.0f, float(p.W) - 1.0f);
+        sy = clamp(sy, 0.0f, float(p.H) - 1.0f);
     }
     store_at(p.out, i, sample_bilinear_zero(p.x, kInputF16 != 0, int(p.H), int(p.W),
                                            int(p.C), int(c), sy, sx));

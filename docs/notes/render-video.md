@@ -170,6 +170,13 @@ The settings refit on letting go, as long as the keys are still the fit's.
 
 ## One frame
 
+Orthographic is available for photos, videos and frame sequences. Its FOV uses
+the same reference distance as the viewport; that distance is saved with the
+lens in project world units and interpolated with the zoom. Capturing a view
+preserves its framing, including when models have different normalizations or
+the whole project is scaled. Orthographic lenses have no distortion, and both
+the splat renderer and the mesh/point preview cull geometry behind the camera.
+
 `FrameRenderer` draws each model with the renderer the viewer already uses,
 at the output size:
 
@@ -238,7 +245,9 @@ it gives the dataset's own cameras, held while an operator runs, times the
 panel's slider. A click hits any drawn line or axis.
 The camera's own picture sits in a resizable corner, fills the view, or sits
 beside it: then the pane's controls run the whole width and the view and the
-picture share the row under them, a splitter between.
+picture share the row under them, a splitter between. In both full and split
+views, dragging on the picture turns the camera, right-drag slides, the wheel
+moves and Ctrl+wheel zooms.
 
 ## Transitions
 

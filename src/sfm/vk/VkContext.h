@@ -8,6 +8,7 @@
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -20,6 +21,7 @@
 #include "core/Env.h"
 #include "core/SourcePath.h"
 #include "core/VulkanDeviceSelection.h"
+#include "core/VulkanMemoryBudget.h"
 
 #include "sfm/core/Log.h"
 #include "i18n/catalog/Sfm.h"
@@ -135,6 +137,20 @@ struct Push {
     uint32_t u4 = 0, u5 = 0, u6 = 0, u7 = 0;
 };
 
+// Device memory every SfM context in this process holds, for a front end that
+// runs the module in its own process: no one outside the module sees its devices.
+// `others` is the device less this process's budget; 0 when the driver will not say.
+namespace sfm {
+struct DeviceMemoryTally {
+    std::atomic<uint64_t> bytes{0}, capacity{0}, others{0};
+    std::atomic<int64_t> refreshed_ms{0};
+    static DeviceMemoryTally& get() {
+        static DeviceMemoryTally t;
+        return t;
+    }
+};
+}  // namespace sfm
+
 struct GpuBuffer {
     VkBuffer buf = VK_NULL_HANDLE;
     VkDeviceMemory mem = VK_NULL_HANDLE;
@@ -223,6 +239,7 @@ public:
             vkDestroyBuffer(device_, a.first, nullptr);
             vkFreeMemory(device_, a.second, nullptr);
         }
+        tally(totalAllocated_, false);
         if (fence_ != VK_NULL_HANDLE) vkDestroyFence(device_, fence_, nullptr);
         if (cmdPool_ != VK_NULL_HANDLE) vkDestroyCommandPool(device_, cmdPool_, nullptr);
         vkDestroyDevice(device_, nullptr);
@@ -535,12 +552,13 @@ public:
         }
     }
 
-    GpuBuffer createBuffer(VkDeviceSize size) {
+    GpuBuffer createBuffer(VkDeviceSize size, VkBufferUsageFlags extra_usage = 0) {
         GpuBuffer b = createBufferRaw(size,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT | extra_usage,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         totalAllocated_ += size;
+        tally(size, true);
         return b;
     }
 
@@ -558,6 +576,7 @@ public:
                 break;
             }
         totalAllocated_ -= b.size;
+        tally(b.size, false);
         b = GpuBuffer{};
     }
 
@@ -837,6 +856,15 @@ public:
         }
     }
 
+    void dispatchIndirect(VkCommandBuffer cb, const std::string& name, const GpuBuffer& commands,
+                          VkDeviceSize offset, const Push& push) {
+        auto it = pipelines_.find(key(name));
+        if (it == pipelines_.end()) throw std::runtime_error("unknown pipeline " + name);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, it->second);
+        vkCmdPushConstants(cb, pipeLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Push), &push);
+        vkCmdDispatchIndirect(cb, commands.buf, offset);
+    }
+
     void barrier(VkCommandBuffer cb,
                  VkPipelineStageFlags src = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                  VkPipelineStageFlags dst = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT) {
@@ -846,6 +874,14 @@ public:
                            VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(cb, src | VK_PIPELINE_STAGE_TRANSFER_BIT,
                              dst | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
+
+    void indirectBarrier(VkCommandBuffer cb) {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     }
 
     void fillZero(VkCommandBuffer cb, const GpuBuffer& b) {
@@ -1103,6 +1139,25 @@ private:
         VK_CHECK(vkBindBufferMemory(device_, b.buf, b.mem, 0));
         allocations_.emplace_back(b.buf, b.mem);
         return b;
+    }
+
+    // DeviceMemoryTally's bytes follow every device-local buffer; capacity and
+    // others are read off the budget at most twice a second.
+    void tally(VkDeviceSize size, bool add) {
+        sfm::DeviceMemoryTally& t = sfm::DeviceMemoryTally::get();
+        if (add) t.bytes += size;
+        else t.bytes -= std::min<uint64_t>(size, t.bytes.load());
+        const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now - t.refreshed_ms.load() < 500 || phys_ == VK_NULL_HANDLE) return;
+        t.refreshed_ms = now;
+        uint64_t capacity = 0;
+        for (uint32_t i = 0; i < memProps_.memoryHeapCount; i++)
+            if (memProps_.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                capacity += memProps_.memoryHeaps[i].size;
+        const spirula::vkmemory::Budget b = spirula::vkmemory::queryBudget(phys_);
+        t.capacity = capacity;
+        t.others = b.budget_bytes && capacity > b.budget_bytes ? capacity - b.budget_bytes : 0;
     }
 
     VkInstance instance_ = VK_NULL_HANDLE;

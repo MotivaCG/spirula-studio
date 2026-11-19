@@ -104,6 +104,7 @@ endforeach()
 # watches, comma-separated defines. The matcher is built four times: with and
 # without the integer dot product, at 128- and 256-byte descriptors.
 foreach(stage sift:sift/sift.slang:sift:none
+              global_position:position/global_position.slang:position:none
               match:match/bruteforce.slang:match:none
               match_nodot:match/bruteforce.slang:match:-DNO_DOT4
               match_d256:match/bruteforce.slang:match:-DDESC_WORDS=64
@@ -134,17 +135,9 @@ list(LENGTH _sfm_blobs _sfm_nblobs)
 message(STATUS "SfM SPIR-V: ${_sfm_nblobs} blobs "
     "(reals: ${SS_SFM_REALS}; losses: ${SS_SFM_LOSSES})")
 
-# List file for the embed step (keeps the command line short).
-set(_sfm_listfile ${_sfm_spirv_dir}/blobs.txt)
-string(REPLACE ";" "\n" _sfm_listbody "${_sfm_blobs}")
-ss_write_if_different(${_sfm_listfile} "${_sfm_listbody}\n")
-
-add_custom_command(OUTPUT ${_sfm_embed_cpp}
-    COMMAND ${SS_SFM_SPIRV_TOOL} embed --sfm ${_sfm_embed_cpp}
-            --list ${_sfm_listfile}
-    DEPENDS ${SS_SFM_SPIRV_TOOL} ${_sfm_blobs} ${_sfm_listfile}
-    COMMENT "Embedding SfM SPIR-V (${_sfm_nblobs} blobs)"
-    VERBATIM)
+ss_embed_spirv(${_sfm_embed_cpp} ${_sfm_spirv_dir}/blobs.txt
+    "Embedding SfM SPIR-V (${_sfm_nblobs} blobs)"
+    BLOBS ${_sfm_blobs} FLAGS --sfm)
 
 # ---------------------------------------------------------------------------
 # Library
@@ -177,14 +170,20 @@ target_link_libraries(ss_sfm PUBLIC ss_vulkan Threads::Threads ss_i18n)
 # a machine that only wants SIFT. PUBLIC because sfm/feature/Extractor.h's
 # factory is compiled into whatever links this.
 if(SS_BUILD_SAM)
-    target_link_libraries(ss_sfm PUBLIC ss_aliked ss_loma)
-    target_compile_definitions(ss_sfm PUBLIC SS_HAVE_ALIKED=1 SS_HAVE_LOMA=1)
+    target_link_libraries(ss_sfm PUBLIC ss_aliked ss_loma ss_flexglue)
+    target_compile_definitions(ss_sfm PUBLIC SS_HAVE_ALIKED=1 SS_HAVE_LOMA=1
+                                             SS_HAVE_FLEXGLUE=1)
 else()
-    target_compile_definitions(ss_sfm PUBLIC SS_HAVE_ALIKED=0 SS_HAVE_LOMA=0)
+    target_compile_definitions(ss_sfm PUBLIC SS_HAVE_ALIKED=0 SS_HAVE_LOMA=0
+                                             SS_HAVE_FLEXGLUE=0)
 endif()
 target_compile_options(ss_sfm PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:${SPLAT_CXX_FLAGS}>
     $<$<COMPILE_LANGUAGE:C>:${SPLAT_C_FLAGS}>)
+if(MSVC)
+    # Pipeline.cpp exceeds COFF's section limit with the header-only mapper.
+    target_compile_options(ss_sfm PRIVATE /bigobj)
+endif()
 set_property(TARGET ss_sfm PROPERTY CXX_STANDARD 17)
 
 # Most of the pipeline is still header-only (the split into translation units is

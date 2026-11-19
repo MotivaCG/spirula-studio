@@ -7,6 +7,7 @@
 
 #include "data/DatasetParser.h"
 #include "data/SparseEdit.h"
+#include "data/SeedPointCount.h"
 
 #include <algorithm>
 #include <cmath>
@@ -286,6 +287,15 @@ int main() {
         for (int64_t i : all_cams) if (i != 2) c2.push_back(i);
         for (int64_t i : all_pts) if (i != 3 && i != 17) p2.push_back(i);
         compare(before, parse(dir), T2, c2, p2, tag + ", second save");
+        const auto copy = dir / "sparse/edit";
+        spirula::sparse_write_model(dir.string(), copy.string(), some, &T2, &base);
+        DatasetParserConfig seed_cfg;
+        seed_cfg.require_image_files = false;
+        seed_cfg.seed_pointcloud = "sparse/edit";
+        compare(before, parse_colmap_dataset(dir.string(), seed_cfg), T2, c2, p2,
+                tag + ", selected copy");
+        check(spirula::seed_point_count(copy) == (int64_t)p2.size(),
+              tag + ": selected copy reports its filtered point count");
     }
 
     {
@@ -304,6 +314,77 @@ int main() {
         spirula::sparse_write_filtered(dir.string(), keep_all, &T2, &base);
         compare(before, parse(dir), T2, all_cams, all_pts,
                 "Nerfstudio, second save");
+    }
+
+    {
+        // compute_normalized_transform with secondary methods
+        // 4 cameras arranged around (0, 0, 5) looking at it
+        std::vector<double> c2w(4 * 12, 0.0);
+        const double pos[4][3] = {{-2, 0, 0}, {2, 0, 0}, {0, -2, 0}, {0, 2, 0}};
+        const double target[3] = {0, 0, 5};
+        for (int i = 0; i < 4; i++) {
+            // Optical axis -Z points to target - pos
+            double dir[3] = {target[0] - pos[i][0], target[1] - pos[i][1], target[2] - pos[i][2]};
+            double len = std::sqrt(dir[0]*dir[0] + dir[1]*dir[1] + dir[2]*dir[2]);
+            for (int k = 0; k < 3; k++) dir[k] /= len;
+            // camera -Z = dir => camera Z = -dir
+            double z[3] = {-dir[0], -dir[1], -dir[2]};
+            double up_world[3] = {0, 1, 0};
+            if (std::abs(z[1]) > 0.9) up_world[0] = 1, up_world[1] = 0;
+            // x = up x z
+            double x[3] = {up_world[1]*z[2] - up_world[2]*z[1],
+                           up_world[2]*z[0] - up_world[0]*z[2],
+                           up_world[0]*z[1] - up_world[1]*z[0]};
+            double xl = std::sqrt(x[0]*x[0] + x[1]*x[1] + x[2]*x[2]);
+            for (int k = 0; k < 3; k++) x[k] /= xl;
+            // y = z x x
+            double y[3] = {z[1]*x[2] - z[2]*x[1],
+                           z[2]*x[0] - z[0]*x[2],
+                           z[0]*x[1] - z[1]*x[0]};
+            for (int r = 0; r < 3; r++) {
+                c2w[i*12 + r*4 + 0] = x[r];
+                c2w[i*12 + r*4 + 1] = y[r];
+                c2w[i*12 + r*4 + 2] = z[r];
+                c2w[i*12 + r*4 + 3] = pos[i][r];
+            }
+        }
+
+        double T[16], R[9];
+        // 1. None orientation, none center, no auto scale
+        double s = dsparse::compute_normalized_transform(c2w.data(), 4, T, R, nullptr,
+                                                        "none", "none", false);
+        check(std::abs(s - 1.0) < 1e-9, "none/none: scale_factor is 1.0 when auto_scale_poses is false");
+        bool r_ident = true;
+        for (int r = 0; r < 3; r++)
+            for (int c = 0; c < 3; c++)
+                if (std::abs(R[r*3 + c] - (r == c ? 1.0 : 0.0)) > 1e-9) r_ident = false;
+        check(r_ident, "none orientation produces identity rotation");
+        check(std::abs(T[3]) < 1e-9 && std::abs(T[7]) < 1e-9 && std::abs(T[11]) < 1e-9,
+              "none center leaves translation at zero");
+
+        // 2. PCA orientation
+        s = dsparse::compute_normalized_transform(c2w.data(), 4, T, R, nullptr,
+                                                 "pca", "poses", true);
+        check(s > 0.0, "pca orientation produces positive scale");
+        // Verify R is orthonormal with det = 1
+        double detR = R[0]*(R[4]*R[8] - R[5]*R[7]) - R[1]*(R[3]*R[8] - R[5]*R[6]) + R[2]*(R[3]*R[7] - R[4]*R[6]);
+        check(std::abs(detR - 1.0) < 1e-6, "pca rotation has determinant 1");
+
+        // 3. Vertical orientation
+        s = dsparse::compute_normalized_transform(c2w.data(), 4, T, R, nullptr,
+                                                 "vertical", "poses", true);
+        detR = R[0]*(R[4]*R[8] - R[5]*R[7]) - R[1]*(R[3]*R[8] - R[5]*R[6]) + R[2]*(R[3]*R[7] - R[4]*R[6]);
+        check(std::abs(detR - 1.0) < 1e-6, "vertical rotation has determinant 1");
+
+        // 4. Focus centering
+        s = dsparse::compute_normalized_transform(c2w.data(), 4, T, R, nullptr,
+                                                 "none", "focus", true);
+        // Translation in T: t_norm = s * (-R @ center) = -s * center (since R is I)
+        double foc[3] = {-T[3] / s, -T[7] / s, -T[11] / s};
+        check(std::abs(foc[0] - target[0]) < 1e-3 &&
+              std::abs(foc[1] - target[1]) < 1e-3 &&
+              std::abs(foc[2] - target[2]) < 1e-3,
+              "focus centering finds camera optical intersection");
     }
 
     fs::remove_all(root, ec);

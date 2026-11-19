@@ -19,6 +19,7 @@
 #include "app/gui/mask/MaskSession.h"
 #include "app/gui/mask/MaskSlideshow.h"
 #include "app/gui/mask/MaskWindow.h"
+#include "core/HardwareThreads.h"
 #include "core/ImageOrient.h"
 #include "core/MaskMargin.h"
 #include "core/SourcePath.h"
@@ -3115,6 +3116,79 @@ void test_session_flipped_polarity() {
           "the other convention over recorded corrections is refused");
 }
 
+void test_session_imported_mask_names() {
+    for (bool flipped : {false, true}) {
+        Fixture f = make_dataset(flipped ? "imported_names_flipped" : "imported_names",
+                                 64, 48, {"cam0/a", "cam0/b", "cam1/c"});
+        const std::vector<std::string> names = {"cam0/a.jpg.png", "cam0/b.jpg.mask.png", "c_mask.PNG"};
+        std::vector<std::vector<uint8_t>> original;
+        for (size_t i = 0; i < names.size(); i++) {
+            fs::rename(f.masks / (f.keys[i] + ".png"), f.masks / names[i]);
+            original.push_back(file_bytes(f.masks / names[i]));
+        }
+        mk::MaskSession s;
+        std::string err;
+        check(s.open(f.root.string(), f.images.string(), f.masks.string(), flipped, err),
+              "imported masks open: " + err);
+        settle(s);
+        wait_scanned(s);
+        for (size_t i = 0; i < names.size(); i++) {
+            s.go_to((int)i);
+            settle(s);
+            std::vector<uint8_t> expected = synth_mask(64, 48, (uint32_t)i);
+            if (flipped) mk::flip_polarity(expected.data(), expected.size());
+            check(s.doc() && s.doc()->composite() == expected && !s.health((int)i).missing_mask,
+                  "imported mask displayed and scanned: " + names[i]);
+        }
+        s.go_to(0);
+        settle(s);
+        keep_box(s);
+        s.save();
+        settle(s);
+        s.propagate(mk::PropagateScope::Next, 0, 0);
+        settle(s);
+        check(s.error().empty() && file_bytes(f.masks / names[1]) != original[1],
+              "propagation updates the imported target: " + s.error());
+        s.undo_propagate();
+        settle(s);
+        check(file_bytes(f.masks / names[1]) == original[1], "undo restores the imported target bytes");
+        s.close();
+        check(file_bytes(f.masks / names[0]) != original[0] &&
+                  file_bytes(f.layer / "cam0/a.base.png") == original[0] &&
+                  !fs::exists(f.masks / "cam0/a.png"),
+              "saving updates the original filename and preserves its base");
+
+        mk::LayerIndex idx;
+        check(idx.load(f.layer.string(), err) && idx.mask_paths.count("cam0/a") &&
+                  idx.mask_paths.at("cam0/a") == names[0],
+              "the original mask path survives an index reload");
+        const auto regenerated = synth_mask(64, 48, 99);
+        write_png_gray(f.masks / names[0], 64, 48, regenerated);
+        check(mk::recomposite_all(f.layer.string(), err) == 1,
+              "a regenerated imported mask receives its corrections: " + err);
+        check(mk::revert_all(f.layer.string(), err) == 1 &&
+                  stencil_pixels(f.masks / names[0]) == regenerated,
+              "revert all restores the imported mask without a session: " + err);
+        check(s.open(f.root.string(), f.images.string(), f.masks.string(), flipped, err),
+              "imported masks reopen: " + err);
+        settle(s);
+        keep_box(s);
+        s.save();
+        settle(s);
+        s.revert_every_frame();
+        settle(s);
+        keep_box(s);
+        s.save();
+        settle(s);
+        check(s.error().empty() && !fs::exists(f.masks / "cam0/a.png"),
+              "editing after revert all retains the imported path: " + s.error());
+        s.close();
+        for (size_t i = 0; i < names.size(); i++)
+            check(!fs::exists(f.masks / (f.keys[i] + ".png")),
+                  "no competing canonical mask created: " + names[i]);
+    }
+}
+
 // One layer folder, two mask folders: the second must not reinterpret the
 // first's bases.
 void test_session_other_mask_root_refused() {
@@ -4339,7 +4413,7 @@ void bench_8k(const char* dir) {
         const int depth = mk::slide_depth(mk::slide_picture_bytes(src_w, src_h, target), 100);
         mk::SlidePrefetch p;
         p.set_target(target);
-        const int threads = mk::slide_threads(src_w, src_h, std::thread::hardware_concurrency());
+        const int threads = mk::slide_threads(src_w, src_h, spirula::hardware_threads());
         p.start(frames, threads);
         gui::Picture pic;
         // The first kWarm takes fill an empty ring from cold. Timing them puts
@@ -5752,7 +5826,7 @@ void test_held_region_roundtrip() {
     const mk::AddRegion rebox = mk::expand_region(mk::hold_region(boxed));
     check(rebox.box.set && rebox.box.x0 == 2.0f && rebox.box.y0 == 3.0f &&
               rebox.box.x1 == 50.0f && rebox.box.y1 == 40.0f,
-          "held region: the model's box survives the hold, so a re-apply sizes from it too");
+          "held region: the model's box survives the hold");
     const mk::HeldRegion none = mk::hold_region(disc_region(64, 48, 20.0f, 30.0f, 0.0f));
     check(none.box.empty() && none.mask.empty(), "held region: nothing set holds nothing");
 }
@@ -6026,9 +6100,7 @@ void test_add_stencil_veto_beats_margin() {
           "veto margin: every vetoed pixel stays clear of the grown outline");
 }
 
-// The margin is sized from the model's box when it has one: a text detection's
-// regressed box is not its mask's extent, and the dataset screen uses the box.
-void test_add_stencil_box_sizes_margin() {
+void test_add_stencil_component_sizes_margin() {
     const int W = 96, H = 64;
     mk::AddRegion g = disc_region(W, H, 48.0f, 32.0f, 6.0f);
     const mk::Rect e = extent(g.mask, W, H);
@@ -6040,7 +6112,11 @@ void test_add_stencil_box_sizes_margin() {
     check(from_box > from_extent,
           "box margin: the fixture's box and the mask's extent give different radii");
     std::vector<uint8_t> hit((size_t)W * H, 0);
-    margin::accumulate(g.mask.data(), W, H, from_box, hit);
+    margin::accumulate(g.mask.data(), W, H, from_extent, hit);
+    g.mask[2 * W + 2] = 255;
+    for (int y = 1; y <= 3; ++y)
+        for (int x = 1; x <= 3; ++x)
+            if (std::abs(x - 2) + std::abs(y - 2) <= 1) hit[y * W + x] = 1;
     std::vector<mk::AddRegion> r{g};
     gui::Stencil st;
     mk::Rect b;
@@ -6048,7 +6124,7 @@ void test_add_stencil_box_sizes_margin() {
     check(mk::build_add_stencil(r, W, H, st, b, set, ratio), "box margin: builds");
     bool same = st.in.size() == hit.size();
     for (size_t i = 0; same && i < hit.size(); i++) same = (st.in[i] != 0) == (hit[i] != 0);
-    check(same, "box margin: the radius comes from the model's box, not the mask's extent");
+    check(same, "component margin: the model box does not override the component extent");
 }
 
 // A click on the object whose add is on top inherits that add's mode unless a
@@ -7372,7 +7448,7 @@ void test_slide_prefetch_keeps_buffers() {
     }
     const size_t one = mk::slide_picture_bytes(64, 48, 32);
     const int depth = 3;
-    const int threads = mk::slide_threads(64, 48, std::thread::hardware_concurrency());
+    const int threads = mk::slide_threads(64, 48, spirula::hardware_threads());
     mk::SlidePrefetch p;
     p.set_target(32);
     p.set_byte_budget_for_test((size_t)depth * one);
@@ -7832,7 +7908,7 @@ void test_session_slideshow_threads_from_largest_frame() {
     write_jpg_rgb(images / "cam1" / "c.jpg", 7680, 3840, big);
     std::error_code ec;
     fs::create_directories(masks, ec);
-    const unsigned hw = std::thread::hardware_concurrency();
+    const unsigned hw = spirula::hardware_threads();
     const int want = mk::slide_threads(7680, 3840, hw);
     check(want != mk::slide_threads(1920, 1080, hw),
           "mixed sizes: fixture: this machine budgets 8K and 1080p differently");
@@ -8757,6 +8833,7 @@ int main() {
     test_session_eraser();
     test_session_size_mismatch();
     test_session_flipped_polarity();
+    test_session_imported_mask_names();
     test_session_other_mask_root_refused();
     test_session_reencoded_mask_is_not_regenerated();
     test_session_corrupt_index_refuses();
@@ -8831,7 +8908,7 @@ int main() {
     test_session_sam_margin_after_prompt();
     test_veto_regions();
     test_add_stencil_veto_beats_margin();
-    test_add_stencil_box_sizes_margin();
+    test_add_stencil_component_sizes_margin();
     test_session_sam_click_mode();
     test_session_sam_redo_then_refine();
     test_session_sam_undo_then_refine();

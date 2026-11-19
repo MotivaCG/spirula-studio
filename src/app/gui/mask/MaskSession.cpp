@@ -6,6 +6,8 @@
 
 #include "app/FrameLook.h"
 #include "app/FrameMask.h"
+#include "core/HardwareThreads.h"
+#include "data/DatasetParser.h"
 #include "i18n/catalog/Dataset.h"
 #include "i18n/catalog/MaskEdit.h"
 
@@ -91,6 +93,8 @@ struct SharedIndex {
         std::lock_guard<std::mutex> lk(mu);
         x.mask_root = idx.mask_root;
         x.mask_flipped = idx.mask_flipped;
+        if (const auto path = idx.mask_paths.find(key); path != idx.mask_paths.end())
+            x.mask_paths[key] = path->second;
         const auto it = idx.frames.find(key);
         if (it != idx.frames.end()) x.frames[key] = it->second;
         return x;
@@ -165,7 +169,7 @@ bool MaskSession::open(const std::string& workspace, const std::string& image_di
         return false;
     }
     _frames.clear();
-    const auto groups = app::group_frames_by_camera(_image_root, _mask_root);
+    const auto groups = app::group_frames_by_camera(_image_root, {_mask_root});
     for (const auto& [camera, files] : groups)
         for (const std::string& f : files)
             _frames.push_back({f, frame_key(_image_root, f), camera});
@@ -193,6 +197,16 @@ bool MaskSession::open(const std::string& workspace, const std::string& image_di
     }
     idx.mask_root = _mask_root;
     idx.mask_flipped = mask_flipped;
+    for (const FrameRef& f : _frames) {
+        const std::string rel = fs::path(f.file).lexically_relative(_image_root).generic_string();
+        const std::string found = dsparse::find_aux_file(_mask_root, rel, "mask");
+        if (!found.empty()) {
+            const std::string path = fs::path(found).lexically_relative(_mask_root).generic_string();
+            if (path == f.key + ".png") idx.mask_paths.erase(f.key);
+            else idx.mask_paths[f.key] = path;
+        }
+    }
+    _mask_paths = idx.mask_paths;
     _mask_flipped = mask_flipped;
     _index = std::move(idx);
     _idx = -1;
@@ -273,6 +287,7 @@ void MaskSession::close() {
     _workspace.clear();
     _image_root.clear();
     _mask_root.clear();
+    _mask_paths.clear();
     _layer_root.clear();
     _mask_flipped = false;
     std::lock_guard<std::mutex> lk(_mu);
@@ -525,6 +540,7 @@ void MaskSession::revert_every_frame() {
         if (!_index.load(_layer_root, err)) _index = LayerIndex{};
         _index.mask_root = _mask_root;
         _index.mask_flipped = flipped;
+        _index.mask_paths = _mask_paths;
         set_corrected((int)_index.frames.size());
         refresh_health(reverted);
     });
@@ -612,7 +628,7 @@ void MaskSession::propagate(PropagateScope scope, int lo, int hi) {
     j->source_key = _doc->key();
     j->W = _doc->width();
     j->H = _doc->height();
-    j->threads = propagate_threads(j->W, j->H, std::thread::hardware_concurrency());
+    j->threads = propagate_threads(j->W, j->H, spirula::hardware_threads());
     j->base = _doc->base();
     j->drop = _doc->drop();
     j->keep = _doc->keep();
@@ -796,7 +812,7 @@ void MaskSession::undo_propagate() {
     }
     sam_forget_clicks(frames);
     const int threads = propagate_threads(_doc->width(), _doc->height(),
-                                          std::thread::hardware_concurrency());
+                                          spirula::hardware_threads());
     _prop_cancel = false;
     _prop_done = 0;
     _prop_total = (int)rec->targets.size();
@@ -947,7 +963,7 @@ void MaskSession::scan_main() {
         const std::string& key = _frames[(size_t)i].key;
         FrameHealth h;
         h.scanned = true;
-        h.missing_mask = !kept_fraction_of(_mask_root, key, _mask_flipped, cache, h.kept);
+        h.missing_mask = !kept_fraction_of(_mask_root, key, _mask_flipped, cache, h.kept, _mask_paths);
         if (_scan_hook) _scan_hook(i, true);
         {
             std::lock_guard<std::mutex> lk(_mu);
@@ -988,7 +1004,7 @@ void MaskSession::refresh_health(const std::vector<std::string>& keys) {
         if (it == at.end()) continue;
         FrameHealth h;
         h.scanned = true;
-        h.missing_mask = !kept_fraction_of(_mask_root, key, _mask_flipped, cache, h.kept);
+        h.missing_mask = !kept_fraction_of(_mask_root, key, _mask_flipped, cache, h.kept, _mask_paths);
         std::lock_guard<std::mutex> lk(_mu);
         if ((size_t)it->second < _health.size()) _health[(size_t)it->second] = h;
     }
@@ -998,7 +1014,7 @@ void MaskSession::note_health(int i, const std::string& key) {
     FrameHealth h;
     h.scanned = true;
     KeptCache none;   // the mask was just written, so no cached fraction fits
-    h.missing_mask = !kept_fraction_of(_mask_root, key, _mask_flipped, none, h.kept);
+    h.missing_mask = !kept_fraction_of(_mask_root, key, _mask_flipped, none, h.kept, _mask_paths);
     std::lock_guard<std::mutex> lk(_mu);
     if (i >= 0 && (size_t)i < _health.size()) _health[(size_t)i] = h;
 }
@@ -1663,7 +1679,7 @@ void MaskSession::start_slideshow() {
     _slide_index = _slide_pending = _idx;
     std::vector<SlideFrame> frames;
     for (const FrameRef& f : _frames)
-        frames.push_back({f.file, mask_file(_mask_root, f.key), _mask_flipped});
+        frames.push_back({f.file, mask_file(_mask_root, f.key, _mask_paths), _mask_flipped});
     // The largest frame sets the budget: one header per camera, whose frames share a size.
     int w = 0, h = 0;
     std::vector<std::string> cameras;
@@ -1676,7 +1692,7 @@ void MaskSession::start_slideshow() {
             h = fh;
         }
     }
-    _slide_threads = mask::slide_threads(w, h, std::thread::hardware_concurrency());
+    _slide_threads = mask::slide_threads(w, h, spirula::hardware_threads());
     const auto t0 = std::chrono::steady_clock::now();
     _slide.start(std::move(frames), _slide_threads);   // joins a halted playback's leftovers
     _slide_join_ms =

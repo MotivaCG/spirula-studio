@@ -1,7 +1,7 @@
 // Application entry: wires the WASM loader, WebGL renderer, camera controller,
 // and the UI panel together.
 
-import { initWasm, loadModel, sortSplats, freeSplatSh, reduceSh, splatHistogram, meshHistogram, meshEdgeCount, fitSphere, raycastMesh, dsFree, dsFitSphere, dsPickPoint } from './wasm.js';
+import { dsNavigation, initWasm, loadModel, sortSplats, freeSplatSh, reduceSh, splatHistogram, meshHistogram, meshEdgeCount, fitSphere, raycastMesh, dsFree, dsFitSphere, dsPickPoint } from './wasm.js';
 import { loadDatasetFiles, parseDatasetComponent } from './dataset.js';
 import { Renderer } from './renderer.js';
 import { Camera, Nav } from './camera.js';
@@ -70,7 +70,7 @@ async function boot() {
   }
   camera = new Camera();
   nav = new Nav(camera);
-  nav.onChange = () => { dirty = true; };
+  nav.onChange = () => { dirty = true; focusUntil = performance.now() + 450; };
   initSortWorker();
   wireInput();
   wireControls();
@@ -125,7 +125,15 @@ window.__viewer = {
   load: (files) => load(files),
   get model() { return model; },
   get opts() { return opts; },
-  setOpt: (k, v) => { opts[k] = v; dirty = true; },
+  setOpt: (k, v) => {
+    if (k === 'primitive') {
+      $('primitive').value = String(v);
+      syncPrimitive();
+      return;
+    }
+    opts[k] = v;
+    dirty = true;
+  },
   get nav() { return nav; },
   get camera() { return camera; },
   snapshot: () => { if (model && model.type==='splat') maybeSort(true); renderer.render(camera, opts); return renderer.snapshot(); },
@@ -140,6 +148,10 @@ window.__viewer = {
 // ---------------------------------------------------------------------------
 // Render loop
 // ---------------------------------------------------------------------------
+let focusUntil = 0;
+const focusMarker = document.createElement('div');
+focusMarker.style.cssText = 'position:fixed;pointer-events:none;width:12px;height:12px;border:2px solid #ffd250;border-radius:50%;box-shadow:0 0 0 2px #000a;transform:translate(-50%,-50%);display:none;z-index:5';
+document.body.appendChild(focusMarker);
 let lastT = performance.now(), frames = 0, fpsT = performance.now();
 function loop(now) {
   const dt = Math.min((now - lastT)/1000, 0.1); lastT = now;
@@ -150,6 +162,15 @@ function loop(now) {
     if (model && model.type === 'splat') maybeSort(false);
     renderer.render(camera, opts);
     dirty = false;
+  }
+  const focus = now < focusUntil && ['turntable','trackball'].includes(nav.mode)
+    ? projectWorld(camera.target) : null;
+  const rect = canvas.getBoundingClientRect();
+  const visible = focus && focus[0] >= 0 && focus[0] <= canvas.width && focus[1] >= 0 && focus[1] <= canvas.height;
+  focusMarker.style.display = visible ? 'block' : 'none';
+  if (visible) {
+    focusMarker.style.left = `${rect.left + focus[0]*rect.width/canvas.width}px`;
+    focusMarker.style.top = `${rect.bottom - focus[1]*rect.height/canvas.height}px`;
   }
   // fps
   frames++;
@@ -368,7 +389,8 @@ async function loadSingleModel(entries) {
     }
     freeSplatSh();   // SH lives on the GPU now; drop the WASM copy (+ quats)
     sortWorkerInitModel(data);
-    model = { type:'splat', count: data.count, shDegree: data.shDegree, sbLobes: data.sbLobes };
+    model = { type:'splat', count: data.count, shDegree: data.shDegree, sbLobes: data.sbLobes, mip: data.mip };
+    syncPrimitive();
     showSplatUI(data);
   } else {
     renderer.setMesh(res.data, res.image || null);
@@ -402,7 +424,6 @@ async function loadDataset(entries, token) {
     ? { ...parseDatasetComponent(token), components: dataset.components, selectedToken: token }
     : await loadDatasetFiles(entries);
 
-  const firstDataset = !model || model.type !== 'dataset';
   renderer.setDataset({ points: res.points, frustum: res.frustum });
   // Keep the wasm-side dataset resident so double-click point picking
   // (dsPickPoint) still works; it is freed when a non-dataset model loads.
@@ -421,9 +442,15 @@ async function loadDataset(entries, token) {
   model = { type:'dataset', numCameras: res.cameras.length, numPoints: res.points.count };
   opts.hoverCam = -1;
   showDatasetUI(res.summary);
+  const navHint = dsNavigation();
+  nav.mode = navHint ? 'trackball' : 'fly';
+  $('nav-mode').value = nav.mode;
+  opts.centerMode = res.cameras.length && navHint === 2 ? 3 : 2;
+  $('center-mode').value = String(opts.centerMode);
+  updateNavLegend();
   syncCenterMenu();
   const fit = dsFitSphere(opts.centerMode);
-  if (firstDataset || token) fitDataset(fit); else nav._sceneScale = 2.0*(fit[3]||1);
+  fitDataset(fit);
   histCache.clear(); updateHistParams();
   $('drop-hint').style.display = 'none';
   const label = (dataset.components.find(c=>c.token===dataset.token) || {}).label || 'dataset';
@@ -462,6 +489,13 @@ function showSplatUI(data) {
   $('st-sb').textContent = data.sbLobes || 0;
   $('sb-row').style.display = data.sbLobes > 0 ? '' : 'none';
 }
+
+function syncPrimitive() {
+  const mode = $('primitive').value;
+  opts.primitive = mode === 'auto' ? Number(model?.mip === true) : Number(mode);
+  dirty = true;
+}
+
 function showMeshUI(data) {
   $('sec-mesh').classList.remove('hidden');
   $('sec-splat').classList.add('hidden');
@@ -917,7 +951,7 @@ function wireControls() {
   bind('move-speed','input', e => { nav.speedExp = +e.target.value; $('v-speed').textContent = Math.pow(10,+e.target.value).toFixed(2)+'×'; });
   bind('btn-reset','click', () => { if (model) fitModel(); else nav.reset(); });
 
-  bind('primitive','change', e => { opts.primitive = +e.target.value; dirty=true; });
+  bind('primitive','change', syncPrimitive);
   bind('gamut','change', e => { opts.gamut = toColMajor(GAMUTS[e.target.value]); dirty=true; });
   bind('linear','change', e => { opts.isLinear = e.target.checked; dirty=true; });
   bind('transfer','change', e => { opts.transfer = +e.target.value; dirty=true; });

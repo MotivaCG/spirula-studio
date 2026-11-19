@@ -56,7 +56,7 @@ function readSplat() {
   const shRest = call('ssv_splat_sh_rest');
   const sbLobes = call('ssv_splat_sb_lobes');
   const data = {
-    count, shDegree, shRest, sbLobes,
+    count, shDegree, shRest, sbLobes, mip: Boolean(call('ssv_splat_mip')),
     posop: f32(call('ssv_splat_posop'), count*4),
     quat:  u16(call('ssv_splat_quat'), count*4),
     scale: u16(call('ssv_splat_scale'), count*4),
@@ -503,6 +503,7 @@ export function dsReadCameras() {
   const out = [];
   if (!n) return out;
   const names = Module.ccall('ssv_ds_image_names', 'string', [], []).split('\n');
+  const heldOut = new Set(new Int32Array(Module.HEAP32.buffer, call('ssv_ds_validation') >>> 0, call('ssv_ds_num_validation')));
   const models  = new Int32Array(Module.HEAP32.buffer, call('ssv_ds_cam_models') >>> 0, n);
   const intr    = f32(call('ssv_ds_cam_intrins') >>> 0, n*4);
   const distPtr = call('ssv_ds_cam_dist') >>> 0;
@@ -515,6 +516,7 @@ export function dsReadCameras() {
   for (let i = 0; i < n; i++) {
     out.push({
       model: models[i],
+      heldOut: heldOut.has(i),
       fx: intr[i*4], fy: intr[i*4+1], cx: intr[i*4+2], cy: intr[i*4+3],
       distType: dtypes ? dtypes[i] : 0,
       dist: dist ? Array.from(dist.subarray(i*DIST_PARAMS, (i+1)*DIST_PARAMS)) : new Array(DIST_PARAMS).fill(0),
@@ -550,3 +552,6 @@ export function dsPickPoint(ox, oy, oz, dx, dy, dz) {
   return { index: p[0]|0, t: p[1], perp: p[2] };
 }
 export function dsFree() { call('ssv_ds_free'); }
+
+// 0 fly, 1 orbit about the camera median, 2 orbit about the camera focus.
+export function dsNavigation() { return call('ssv_ds_navigation'); }

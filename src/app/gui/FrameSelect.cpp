@@ -1,9 +1,11 @@
 // FrameSelect.cpp -- see FrameSelect.h.
 
 #include "app/gui/FrameSelect.h"
+#include "core/BufferedFile.h"
 
 #include "app/FrameSharpness.h"
 #include "app/gui/PickSheet.h"
+#include "core/HardwareThreads.h"
 #include "core/ImageFile.h"
 #include "i18n/catalog/Log.h"
 
@@ -140,8 +142,16 @@ bool is_picture(const fs::path& p) {
 bool same_bytes(const fs::path& a, const fs::path& b) {
     std::ifstream fa(a, std::ios::binary), fb(b, std::ios::binary);
     if (!fa || !fb) return false;
-    return std::equal(std::istreambuf_iterator<char>(fa), std::istreambuf_iterator<char>(),
-                      std::istreambuf_iterator<char>(fb), std::istreambuf_iterator<char>());
+    thread_local std::vector<char> left(spirula::kFileBufferBytes), right(spirula::kFileBufferBytes);
+    for (;;) {
+        fa.read(left.data(), (std::streamsize)left.size());
+        fb.read(right.data(), (std::streamsize)right.size());
+        const auto n = fa.gcount();
+        if (n != fb.gcount() || !std::equal(left.begin(), left.begin() + n, right.begin())) return false;
+        if (fa.bad() || fb.bad()) return false;
+        if (fa.eof() || fb.eof()) return fa.eof() && fb.eof();
+        if (!fa || !fb) return false;
+    }
 }
 
 // ffmpeg's fps filter repeats a source frame to reach a rate above the
@@ -221,7 +231,7 @@ int select_sharpest_frames(const std::string& cand_dir,
     const Judge judge = !rule.on() && !options.judged ? Judge::No
                         : rule.max_blur > 0.0f        ? Judge::Blur
                                                       : Judge::Similar;
-    const unsigned n_threads = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned n_threads = std::max(1u, spirula::hardware_threads());
     if (group > 1 || options.adaptive) {
         auto last_log = std::chrono::steady_clock::now();
         for (size_t base = 0; base < files.size(); base += kChunk) {
@@ -389,7 +399,7 @@ int judge_image_folder(const std::string& dir, const FrameSelectOptions& options
     std::vector<std::string> paths;
     for (const fs::path& f : files) paths.push_back(f.string());
     std::vector<Analysis> got =
-        measure_all(paths, judge, std::thread::hardware_concurrency() / 2, options.scanning, cancel);
+        measure_all(paths, judge, spirula::hardware_threads() / 2, options.scanning, cancel);
     if (cancel.load()) return -1;
     std::vector<app::FramePick> measured;
     for (const Analysis& a : got) measured.push_back(a.pick);
@@ -439,7 +449,7 @@ int judge_image_sets(const std::string& dir, const std::vector<std::string>& fol
         for (const std::string& f : folders) paths.push_back((root / f / n).string());
     const std::function<void(int64_t, int64_t)> scanning = options.scanning;
     std::vector<Analysis> got = measure_all(
-        paths, judge, std::thread::hardware_concurrency() / 2,
+        paths, judge, spirula::hardware_threads() / 2,
         [&](int64_t done, int64_t) {
             if (scanning) scanning(done / (int64_t)lenses, (int64_t)names.size());
         },

@@ -29,6 +29,8 @@ struct GeometryRequest {
     // MoGe's ViT budget, which is what sets its cost. Per call rather than per
     // load, so changing it does not mean re-uploading the weights.
     int num_tokens = 3600;
+    // MoGe-3's refinement passes; every other model ignores it.
+    int refine_steps = 3;
 };
 
 struct GeometryPrediction {
@@ -102,6 +104,10 @@ private:
 
 // Every model id `--model` accepts, MoGe's first, for a usage message.
 std::string geometry_model_ids();
+
+// Resolve cached weights before starting isolated workers, without allocating a device.
+int geometry_model_preflight(const std::string& id_or_path, bool depth, bool normal,
+                             uint64_t& host_bytes);
 
 // What has to be fetched before load() can run, beyond the single files the
 // families fetch themselves. Only Marigold v2 has any: it is built from ~45 GB

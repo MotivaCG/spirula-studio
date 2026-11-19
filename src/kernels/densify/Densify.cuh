@@ -193,19 +193,11 @@ void densify_update_weight(
 );
 
 
-void densify_oversize_weight_tensor(
-    int64_t num_splats,
-    float blend,
-    DeviceVector<float> oversize_accum,
-    DeviceVector<float2> score,
-    DeviceVector<float2> out
-);
-
-
 int64_t relocate_splats_with_long_axis_split_tensor(
     int64_t cur_num_splats,
     float min_opacity,
     float split_opacity_k,
+    float min_split_opacity,  // splats under it are not split; 0 = off
     DeviceVector<float3> means, DeviceVector<float4> quats, DeviceVector<float3> scales, DeviceVector<float> opacs, DeviceVector<float3> features_dc, DeviceVector<float3> features_sh,
     DeviceVector<float3> g1_means, DeviceVector<float4> g1_quats, DeviceVector<float3> g1_scales, DeviceVector<float> g1_opacs, DeviceVector<float3> g1_features_dc, DeviceVector<float3> g1_features_sh,
     DeviceVector<float3> g2_means, DeviceVector<float4> g2_quats, DeviceVector<float3> g2_scales, DeviceVector<float> g2_opacs, DeviceVector<float3> g2_features_dc, DeviceVector<float3> g2_features_sh,
@@ -218,8 +210,9 @@ int64_t relocate_splats_with_long_axis_split_tensor(
     DeviceVector<uint32_t> visit_counters,
     uint32_t dead_after_steps,
     // Peak alpha * T per splat; when given it is a second dead test against
-    // min_opacity and is carried src -> dst. dead_by_opacity keeps the first.
+    // min_weight and is carried src -> dst. dead_by_opacity keeps the first.
     DeviceVector<float> max_weight,
+    float min_weight,
     bool dead_by_opacity,
     int sh_optim_bits,
     int num_sh,
@@ -238,16 +231,18 @@ int64_t relocate_splats_with_long_axis_split_tensor(
     // Non-SH Adam-state quant: when enabled, each relocated dst splat gets
     // its packed bytes set to codec-encoded zero against the current bound.
     NonShQuantState non_sh,
+    DeviceVector<float4> projective_state, DeviceVector<float> projective_information,
     uint32_t seed,
     int64_t max_relocate,
     int64_t* num_dead_out
 );
 
 
-void add_splats_with_long_axis_split_tensor(
+int64_t add_splats_with_long_axis_split_tensor(
     int64_t cur_num_splats,
     int64_t num_new_splats,
     float split_opacity_k,
+    float min_split_opacity,
     DeviceVector<float3> means, DeviceVector<float4> quats, DeviceVector<float3> scales, DeviceVector<float> opacs, DeviceVector<float3> features_dc, DeviceVector<float3> features_sh,
     DeviceVector<float3> g1_means, DeviceVector<float4> g1_quats, DeviceVector<float3> g1_scales, DeviceVector<float> g1_opacs, DeviceVector<float3> g1_features_dc, DeviceVector<float3> g1_features_sh,
     DeviceVector<float3> g2_means, DeviceVector<float4> g2_quats, DeviceVector<float3> g2_scales, DeviceVector<float> g2_opacs, DeviceVector<float3> g2_features_dc, DeviceVector<float3> g2_features_sh,
@@ -256,6 +251,10 @@ void add_splats_with_long_axis_split_tensor(
     // densify_accum_buffer. Separate so a transformed score can drive the
     // draw while the kernel still propagates the raw accumulator src -> dst.
     DeviceVector<float2> sample_weights,
+    // The oversize split channel's accumulator, [N]: the draw's weight is then
+    // (oversize_accum + floor) * weight^oversize_blend. Empty to skip.
+    DeviceVector<float> oversize_accum,
+    float oversize_blend,
     DeviceVector<int32_t> bias_correction_steps,
     DeviceVector<uint32_t> visit_counters,
     DeviceVector<float> max_weight,  // carried src -> dst; empty to skip
@@ -269,6 +268,7 @@ void add_splats_with_long_axis_split_tensor(
     bool sh_value_bounds_per_splat,
     int  num_sh_buffer,
     NonShQuantState non_sh,
+    DeviceVector<float4> projective_state, DeviceVector<float> projective_information,
     uint32_t seed
 );
 
@@ -290,6 +290,7 @@ void relocate_splats_mcmc_tensor(
     bool sh_value_bounds_per_splat,
     int  num_sh_buffer,
     NonShQuantState non_sh,
+    DeviceVector<float4> projective_state, DeviceVector<float> projective_information,
     uint32_t seed,
     DeviceVector<float> draw_weight   // [N] or empty: scales each live splat's draw
 );
@@ -313,6 +314,7 @@ void add_splats_mcmc_tensor(
     bool sh_value_bounds_per_splat,
     int  num_sh_buffer,
     NonShQuantState non_sh,
+    DeviceVector<float4> projective_state, DeviceVector<float> projective_information,
     uint32_t seed,
     DeviceVector<float> draw_weight   // [N] or empty: scales each live splat's draw
 );
@@ -333,7 +335,8 @@ void mcmc_add_noise_tensor(
     DeviceVector<float3> means,
     DeviceVector<float3> log_scales,
     DeviceVector<float4> quats,
-    DeviceVector<float> opacs
+    DeviceVector<float> opacs,
+    uint32_t seed
 );
 
 
@@ -346,7 +349,8 @@ void revised_add_noise_tensor(
     DeviceVector<float4> quats,
     DeviceVector<float> opacs,
     DeviceVector<float> peak_weight,
-    float peak_weight_scale
+    float peak_weight_scale,
+    uint32_t seed
 );
 
 

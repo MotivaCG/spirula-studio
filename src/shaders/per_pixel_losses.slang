@@ -394,8 +394,11 @@ float[LossIndex::length] per_pixel_losses_reduce(
     // remain comparable across runs.
     losses[LossIndex::RgbLoss] =
         raw_losses[RawLossIndex::RgbLoss] / max(raw_losses[RawLossIndex::DarknessWeightTotal], 1);
-    losses[LossIndex::RgbPSNR] = -10.0 * log10(
-        raw_losses[RawLossIndex::RgbL2] / max(raw_losses[RawLossIndex::MaskTotal], 1));
+    // Zero MSE reports +inf without differentiating log10(0).
+    losses[LossIndex::RgbPSNR] = raw_losses[RawLossIndex::RgbL2] > 0.0f
+        ? -10.0 * log10(raw_losses[RawLossIndex::RgbL2] /
+                        max(raw_losses[RawLossIndex::MaskTotal], 1))
+        : asfloat(0x7f800000u);
 
     // depth supervision loss - Pearson correlation
     losses[LossIndex::DepthSup] = (

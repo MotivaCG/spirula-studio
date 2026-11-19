@@ -1,6 +1,8 @@
 #include "data/DatasetParser.h"
 #include "data/SparseEdit.h"
+#include "data/SeedPointCount.h"
 #include "config/TrainConfigJson.h"
+#include "i18n/catalog/Data.h"
 
 #include <cmath>
 #include <chrono>
@@ -48,6 +50,39 @@ void write_ply(const fs::path& path, bool binary, int count = 2,
     }
 }
 
+// Past 2 GB without the disk or the time: everything after the vertex rows is a
+// trailing element of zeros, which resize_file leaves unwritten.
+void write_ply_past_2gb(const fs::path& path) {
+    const uint64_t filler = (uint64_t(1) << 31) + 4096;
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << "ply\nformat binary_little_endian 1.0\nelement vertex 1\n"
+               "property double x\nproperty double y\nproperty double z\n"
+               "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+               "element filler " << filler << "\nproperty uchar value\nend_header\n";
+        const double xyz[] = {1.5, 2.5, 3.5};
+        out.write(reinterpret_cast<const char*>(xyz), sizeof xyz);
+        out.write("\x0a\x14\x1e", 3);
+    }
+    fs::resize_file(path, fs::file_size(path) + filler);
+}
+
+void check_ply_past_2gb(const fs::path& path) {
+    try {
+        write_ply_past_2gb(path);
+        const auto big = read_ply_points(path.string());
+        check(big.num() == 1 && big.xyz[2] == 3.5 && big.rgb[2] == 30,
+              "a PLY past 2 GB reads");
+    } catch (const std::runtime_error& e) {
+        std::vector<std::string> got;
+        if (spirula::i18n::scan(spirula::i18n::msg::data::file_out_of_memory, e.what(), got))
+            std::printf("skip a PLY past 2 GB reads: %s\n", e.what());
+        else check(false, e.what());
+    }
+    std::error_code ec;
+    fs::remove(path, ec);
+}
+
 void write_colmap(const fs::path& root) {
     fs::create_directories(root / "sparse" / "0");
     std::ofstream(root / "sparse/0/cameras.txt") << "1 PINHOLE 640 480 500 500 320 240\n";
@@ -82,6 +117,38 @@ int main() {
         auto native = parse_colmap_dataset(root.string(), cfg);
         check(native.points.num() == 1 && native.points.xyz[0] == 1,
               "unset path retains native sparse points");
+        {
+            DatasetParserConfig model = cfg;
+            model.center_mode = "none";
+            spirula::SparseKeep keep;
+            keep.points.assign(1, 0);
+            spirula::sparse_write_model(root.string(), (root / "sparse/edit").string(), keep);
+            check(fs::exists(root / "sparse/edit/cameras.txt") && fs::exists(root / "sparse/edit/images.txt"),
+                  "a model copy beside sparse/0 carries the cameras");
+            rejects([&] { spirula::sparse_write_model(root.string(), (root / "sparse/edit").string(), keep); },
+                    "a model copy refuses a folder that holds one");
+            std::ofstream(root / "sparse/edit/points3D.txt") << "1 7 8 9 255 0 0 0\n2 4 5 6 0 255 0 0\n";
+            model.seed_pointcloud = "sparse/edit";
+            const auto edited = parse_colmap_dataset(root.string(), model);
+            check(edited.points.num() == 2 && edited.points.xyz[0] == 7 && edited.c2w == native.c2w,
+                  "an untransformed model copy preserves camera poses");
+            check(spirula::seed_point_count(root / "sparse/edit") == 2,
+                  "text model seeds report their point count");
+            fs::remove_all(root / "sparse/edit");
+            keep.points.assign(1, 1);
+            keep.drop_images.push_back("0.png");
+            spirula::Sim3 moved;
+            moved.t[0] = 10;
+            spirula::sparse_write_model(root.string(), (root / "sparse/edit").string(), keep, &moved);
+            const auto selected = parse_colmap_dataset(root.string(), model);
+            model.seed_pointcloud.clear();
+            model.recon_dir = "sparse/edit";
+            const auto direct = parse_colmap_dataset(root.string(), model);
+            check(selected.points.xyz == direct.points.xyz && selected.c2w == direct.c2w &&
+                  selected.num_cameras == 3 && selected.points.xyz[0] == 11,
+                  "a transformed model seed uses its saved cameras and camera deletions");
+            fs::remove_all(root / "sparse/edit");
+        }
         const double precise_xyz[] = {4000000.123456789, -3000000.987654321, 2000000.314159265};
         const uint8_t precise_rgb[] = {17, 129, 241};
         spirula::write_ply_points((root / "precise.ply").string(), precise_xyz, precise_rgb, 1, nullptr,
@@ -93,6 +160,7 @@ int main() {
         spirula::write_ply_points((root / "legacy.ply").string(), precise_xyz, precise_rgb, 1, nullptr);
         const auto legacy = read_ply_points((root / "legacy.ply").string());
         check(legacy.xyz[0] == (double)(float)precise_xyz[0], "shared PLY writer retains its default float format");
+        check_ply_past_2gb(root / "past_2gb.ply");
         for (bool binary : {false, true}) {
             write_ply(root / "lidar.ply", binary);
             cfg.seed_pointcloud = "lidar.ply";

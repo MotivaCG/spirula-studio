@@ -218,7 +218,8 @@ void TrainerSession::save_spacetime(int step) {
         char name[32];
         std::snprintf(name, sizeof name, "%03d", f);
         engine_spacetime_set_frame(f, true);
-        engine_save_checkpoint((out_dir / "frames" / name).string(), false, step, true);
+        engine_save_checkpoint((out_dir / "frames" / name).string(), false, step,
+                               cfg.background_export_height, "", false, true);
         if (_room_rows > 0)
             split_ply(out_dir / "frames" / name / "splat.ply", out_dir / "frames" / "room.ply", _room_rows);
         list << name << ' ' << _chunk_dirs[(size_t)f] << '\n';

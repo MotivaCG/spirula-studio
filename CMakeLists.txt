@@ -1,4 +1,10 @@
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
+if(POLICY CMP0156)
+    cmake_policy(SET CMP0156 NEW)
+endif()
+if(POLICY CMP0179)
+    cmake_policy(SET CMP0179 NEW)
+endif()
 project(spirula_studio LANGUAGES C CXX)  # CUDA enabled by the cuda backend module
 
 # The build (see build_develop.bash / build_develop.bat and docs/build.md).
@@ -53,6 +59,10 @@ endif()
 # Likewise for `spirula sam` and the GUI's built-in masking.
 if(SS_BUILD_SAM)
     include(SsNn)
+endif()
+
+if(COMMAND ss_shader_limits_test)
+    ss_shader_limits_test()
 endif()
 
 include(SsApps)

@@ -6,7 +6,7 @@
 #include "app/gui/ViewportPanel.h"
 #include "i18n/Message.h"
 #include "app/gui/edit/PointsDoc.h"
-#include "dense/Generation.h"
+#include "dense/Artifact.h"
 #include "app/gui/edit/WorldGrid.h"
 #include "i18n/catalog/Edit.h"
 #include "i18n/catalog/EditTransform.h"
@@ -54,9 +54,12 @@ void EditSession::open(std::unique_ptr<EditDoc> doc, ViewportPanel* panel) {
     _tab_force = true;
     _xform.cancel();
     _pick = Pick::None;
+    _dist_scale.set_active(false);
+    _dist_scale.reset();
     _moved_ever = false;
     _levelling_touched = false;
     _saved_over_source = false;
+    _trainer_saved_path.clear();
     _centres = Centres{};
     _attrs.clear();
     _attrs_layer = -1;
@@ -73,6 +76,7 @@ void EditSession::open(std::unique_ptr<EditDoc> doc, ViewportPanel* panel) {
     if (_doc) _doc->mark_geometry_dirty();
     _seen_placement = Sim3();
     _seen_head = 0;
+    marker_reload();
     push_placement();
 }
 
@@ -81,16 +85,25 @@ void EditSession::close() {
     if (_comp_worker.joinable()) _comp_worker.join();
     if (_save_worker.joinable()) _save_worker.join();
     if (_attr_worker.joinable()) _attr_worker.join();
+    if (_marker_worker.joinable()) _marker_worker.join();
     _cancel = false;
     _comp_busy = false;
     _save_busy = false;
     _attr_busy = false;
+    _marker_busy = false;
+    _markers.clear();
+    _markers_file.clear();
+    _marker_dataset = {};
+    _marker_status.clear();
+    _marker_status_err = false;
+    _marker_origin = _marker_xaxis = _marker_xyplane = -1;
     _attr_job_axis = -1;
     _comp = Components{};
     _pending.reset();
     _fly_block_key = 0;
     _xform.cancel();
     _pick = Pick::None;
+    _dist_scale.set_active(false);
     _train_after_save = false;
     _ask_train = false;
     if (_panel) {
@@ -137,7 +150,6 @@ bool EditSession::view(ViewProjection& out) const {
                         out.camera_model, out.eye);
     out.cx = 0.5f * (float)out.W;
     out.cy = 0.5f * (float)out.H;
-    out.ortho_back = _panel->ortho_pullback(false);
     return true;
 }
 
@@ -203,6 +215,21 @@ bool EditSession::on_viewport_input(const ViewportInput& in) {
     }
 
     if (_tool.id() == ToolId::Transform) {
+        if (_dist_scale.active()) {
+            spirula::Sim3 step;
+            bool should_scale = false;
+            ViewProjection vp;
+            if (view(vp)) {
+                const spirula::Sim3 to_saved = _doc->view_frame().inverse() * _doc->placement();
+                const bool consumed = _dist_scale.update(in, vp, *_doc, to_saved,
+                                                         saved_to_shared() * _dist_scale.preview_step(), step, should_scale);
+                if (should_scale) {
+                    place_saved(step, xmsg::op_scale_distance, /*carry=*/false);
+                }
+                if (consumed) return true;
+            }
+            return in.down || in.clicked;
+        }
         if (_pick != Pick::None) {
             if (in.hovered && in.clicked) pick_align(in.x, in.y);
             return in.down || in.clicked;
@@ -243,13 +270,23 @@ void EditSession::draw_viewport_overlay(const ViewportOverlay& v) {
     const ImVec2 origin(v.x, v.y);
     XformFrame f;
     const bool have = xform_frame(f);
+    if (have && _marker_show && _tab == 1) draw_marker_overlay(v, f.cam);
     if (have && v.grid && draws_world_grid()) {
         float target[3] = {0, 0, 0};
         if (_panel) _panel->nav_target(target);
         const double focus[3] = {target[0], target[1], target[2]};
         draw_world_grid(v.dl, origin, f.cam, saved_to_shared(), v.grid_cell, focus);
     }
-    if (have && _xform.active()) {
+    if (have && _dist_scale.active()) {
+        _dist_scale.draw_overlay(v.dl, v, f.cam,
+                                 saved_to_shared() * _dist_scale.preview_step());
+        spirula::Sim3 step;
+        bool should_scale = false;
+        _dist_scale.draw_viewport_toolbar(v, step, should_scale);
+        if (should_scale) {
+            place_saved(step, xmsg::op_scale_distance, /*carry=*/false);
+        }
+    } else if (have && _xform.active()) {
         _xform.draw_overlay(v.dl, origin, f);
         // Beside the pointer, where the eyes already are.
         const std::string text = _xform.readout(f);
@@ -602,6 +639,7 @@ void EditSession::poll() {
         _cancel = false;
     }
     if (!_save_busy.load() && _save_worker.joinable()) take_save_result();
+    if (!_marker_busy.load() && _marker_worker.joinable()) take_marker_result();
     if (busy()) {
         if (_panel) _panel->invalidate();
         return;
@@ -635,6 +673,23 @@ std::string EditSession::trainer_dataset() const {
 std::string EditSession::dense_dataset() const {
     if (!_doc || _doc->kind() != EditDoc::Kind::Points) return {};
     return spirula::dense::dense_dataset_of(_doc->source_path());
+}
+
+std::pair<std::string, std::string> EditSession::trainer_handoff(const std::string& saved) const {
+    namespace fs = std::filesystem;
+    const std::string dense = dense_dataset();
+    const std::string dataset = dense.empty() ? trainer_dataset() : dense;
+    std::error_code ec;
+    if (dense.empty() && fs::equivalent(saved, dataset, ec))
+        return {dataset, spirula::dense::kSparseSeed};
+    // A copy outside the dataset's own folders is a dataset of its own.
+    const bool beside = !dense.empty() ||
+        fs::equivalent(fs::path(saved).parent_path(), fs::path(dataset) / "sparse", ec);
+    if (!beside) return {saved, {}};
+    // Relative, as the trainer's list names it, and so a moved dataset keeps it.
+    const fs::path rel = fs::relative(saved, dataset, ec);
+    const bool inside = !ec && !rel.empty() && *rel.begin() != "..";
+    return {dataset, inside ? rel.generic_string() : saved};
 }
 
 int EditSession::folder_target() const {
@@ -674,7 +729,7 @@ void EditSession::ask_save_copy() {
             .string();
     if (stem.empty()) stem = "model";
     _pick_save(_save_target, target.ext, target.folder,
-               stem + "_edited" + target.ext);
+               stem + "_edited" + target.ext, _doc->copy_dir(_save_target));
 }
 
 // On a worker, because one linked mesh is several hundred-megabyte files and
@@ -708,6 +763,7 @@ void EditSession::take_save_result() {
     const bool to_trainer = _train_after_save;
     _train_after_save = false;
     if (_save_error.empty()) {
+        _trainer_saved_path = _save_path;
         if (_on_saved) _on_saved(_doc->source_path(), _save_path, _save_placement);
         _doc->mark_saved();
         if (_save_path == _doc->source_path() ||
@@ -716,10 +772,10 @@ void EditSession::take_save_result() {
         _status = spirula::i18n::format(msg::saved_to, {_save_path});
         _status_err = false;
         // Last: the owner is free to end this session in answer.
-        // A dense cloud is saved inside its dataset, which is what trains.
-        const std::string dense = dense_dataset();
-        if (to_trainer && _to_trainer)
-            _to_trainer(dense.empty() ? _save_path : dense, trainer_dataset());
+        if (to_trainer && _to_trainer) {
+            const auto [dataset, seed] = trainer_handoff(_save_path);
+            _to_trainer(dataset, trainer_dataset(), seed);
+        }
     } else {
         _status = spirula::i18n::format(msg::save_failed, {_save_error});
         _status_err = true;

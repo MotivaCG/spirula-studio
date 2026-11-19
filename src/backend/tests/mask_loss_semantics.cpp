@@ -67,7 +67,8 @@ Outcome run(const std::vector<uint8_t>& mask, bool zero_depth, float w_alpha,
             int64_t Hm = H, int64_t Wm = W, float w_ssim = 0.0f,
             const std::vector<float>* rgb_in = nullptr, float w_rgb = 1.0f,
             float sat = -1.0f, const std::vector<float>* ref_in = nullptr,
-            int loss = 0, int map_mode = (int)DensifyLossMapMode::None) {
+            int loss = 0, int map_mode = (int)DensifyLossMapMode::None,
+            float darkness_boost = 0.0f) {
     std::vector<float> rgb((size_t)3 * NP, 0.5f), ref((size_t)3 * NP, 0.25f);
     if (rgb_in) rgb = *rgb_in;
     for (size_t i = 0; i < ref.size(); i++)
@@ -84,6 +85,7 @@ Outcome run(const std::vector<uint8_t>& mask, bool zero_depth, float w_alpha,
     std::array<float, (int)LossWeightIndex::length> weights{};
     weights[(int)LossWeightIndex::RgbSupL1] = w_rgb;
     weights[(int)LossWeightIndex::AlphaSup] = w_alpha;
+    weights[(int)LossWeightIndex::DarknessBoost] = darkness_boost;
 
     std::vector<float> v_losses((size_t)LossIndex::length, 0.0f);
     v_losses[(int)LossIndex::RgbLoss] = 1.0f;
@@ -144,6 +146,45 @@ std::vector<float> ramp_image(uint32_t seed) {
 }  // namespace
 
 int main() {
+    {
+        std::vector<float> rgb(3 * NP), ref(3 * NP);
+        for (int64_t i = 0; i < NP; ++i) {
+            const bool dark = i % W < W / 2;
+            for (int c = 0; c < 3; ++c) {
+                rgb[3 * i + c] = dark ? 0.5f : 0.8f;
+                ref[3 * i + c] = dark ? 0.1f : 0.9f;
+            }
+        }
+        auto evaluate = [&](const std::vector<uint8_t>& mask, float boost) {
+            return run(mask, false, 0.0f, H, W, 0.0f, &rgb, 1.0f, -1.0f,
+                       &ref, 0, (int)DensifyLossMapMode::None, boost);
+        };
+        const Outcome plain = evaluate({}, 0.0f);
+        const Outcome boosted = evaluate({}, 2.0f);
+        check(std::fabs(plain.rgb_loss - 0.25f) < 1e-5f,
+              "darkness boost off: ordinary mean RGB loss");
+        check(std::fabs(boosted.rgb_loss - 0.31f) < 1e-5f,
+              "darkness boost: normalized weighted RGB loss");
+        check(std::fabs(std::fabs(boosted.v_render_rgb[0] /
+                                  boosted.v_render_rgb[3 * (W - 1)]) -
+                        2.8f / 1.2f) < 1e-4f,
+              "darkness boost: dark/bright gradient ratio matches weights");
+        const Outcome masked = evaluate(half_mask(), 2.0f);
+        check(std::fabs(masked.rgb_loss - 0.1f) < 1e-5f &&
+                  masked.v_render_rgb[0] == 0.0f,
+              "darkness boost: masked pixels affect neither mean nor gradient");
+        const Outcome empty = evaluate(std::vector<uint8_t>(NP, 0), 2.0f);
+        const Outcome empty_plain = evaluate(std::vector<uint8_t>(NP, 0), 0.0f);
+        check(empty.rgb_loss == 0.0f &&
+                  std::all_of(empty.v_render_rgb.begin(), empty.v_render_rgb.end(),
+                              [](float v) { return v == 0.0f; }),
+              "darkness boost: empty mask gives zero loss and gradients");
+        check(empty_plain.rgb_loss == 0.0f &&
+                  std::all_of(empty_plain.v_render_rgb.begin(), empty_plain.v_render_rgb.end(),
+                              [](float v) { return v == 0.0f; }),
+              "darkness boost off: empty mask gives zero loss and gradients");
+    }
+
     // Cut-out mode: masked-out pixels are trained toward empty, and whether a
     // GT depth map exists has nothing to do with it.
     Outcome cut = run(half_mask(), /*zero_depth=*/false, 1.0f);
@@ -389,7 +430,7 @@ int main() {
         check(std::fabs(map_sum / NP / w - ign.flip) <= 1e-4 * ign.flip,
               "flip: the reported mean is the mean of its map");
 
-        // An all-kept mask takes the coverage kernel's float16 path; it must
+        // An all-kept mask takes the coverage kernel's path; it must
         // land where the closed form does, border detectors included.
         Outcome open = run(std::vector<uint8_t>((size_t)NP, 1), false, 0.0f, H, W, w,
                            &rgb, 0.0f, -1.0f, &ref, kFl, (int)DensifyLossMapMode::Flip);

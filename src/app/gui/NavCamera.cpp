@@ -3,6 +3,11 @@
 
 #include "app/gui/NavCamera.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#include <Xinput.h>
+#endif
+
 #include <GLFW/glfw3.h>
 
 #include "imgui.h"
@@ -17,10 +22,27 @@ namespace {
 
 constexpr float kGamepadDeadzone = 0.1f;
 
-// One pad, triggers rescaled to the browser's [0,1]. GLFW leaves an axis the
-// mapping omits at 0 while a real trigger rests at -1, so rest is tracked per
-// pad: a device with one trigger mapped would otherwise roll the view forever.
 bool read_pad(int jid, GLFWgamepadstate& st, float& lt, float& rt) {
+#ifdef _WIN32
+    // GLFW's DirectInput enumeration can block in a HID driver before the first frame.
+    if (jid < 0 || jid >= XUSER_MAX_COUNT) return false;
+    XINPUT_STATE input{};
+    if (XInputGetState(static_cast<DWORD>(jid), &input) != ERROR_SUCCESS) return false;
+    const auto axis = [](SHORT value) {
+        return value / (value < 0 ? 32768.0f : 32767.0f);
+    };
+    st = {};
+    st.axes[GLFW_GAMEPAD_AXIS_LEFT_X] = axis(input.Gamepad.sThumbLX);
+    st.axes[GLFW_GAMEPAD_AXIS_LEFT_Y] = -axis(input.Gamepad.sThumbLY);
+    st.axes[GLFW_GAMEPAD_AXIS_RIGHT_X] = axis(input.Gamepad.sThumbRX);
+    st.axes[GLFW_GAMEPAD_AXIS_RIGHT_Y] = -axis(input.Gamepad.sThumbRY);
+    lt = input.Gamepad.bLeftTrigger / 255.0f;
+    rt = input.Gamepad.bRightTrigger / 255.0f;
+    return true;
+#else
+    // One pad, triggers rescaled to the browser's [0,1]. GLFW leaves an axis the
+    // mapping omits at 0 while a real trigger rests at -1, so rest is tracked per
+    // pad: a device with one trigger mapped would otherwise roll the view forever.
     static float rest[GLFW_JOYSTICK_LAST + 1][2];
     static bool seen[GLFW_JOYSTICK_LAST + 1];
     if (!glfwGetGamepadState(jid, &st)) {
@@ -39,6 +61,7 @@ bool read_pad(int jid, GLFWgamepadstate& st, float& lt, float& rt) {
     lt = 0.5f * (l - rest[jid][0]);
     rt = 0.5f * (r - rest[jid][1]);
     return true;
+#endif
 }
 
 // ---- v3 (viewer.html) -------------------------------------------------------

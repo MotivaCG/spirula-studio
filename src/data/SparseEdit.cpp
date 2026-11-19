@@ -1,5 +1,6 @@
 // SparseEdit.cpp -- see SparseEdit.h.
 
+#include "core/BufferedFile.h"
 #include "data/SparseEdit.h"
 
 #include "data/DatasetParser.h"
@@ -24,7 +25,7 @@ namespace spirula {
 namespace {
 
 std::string read_file(const fs::path& p) {
-    std::ifstream f(p, std::ios::binary);
+    BufferedInputFile f(p, std::ios::binary);
     if (!f) throw std::runtime_error("cannot read " + p.string());
     return std::string((std::istreambuf_iterator<char>(f)),
                        std::istreambuf_iterator<char>());
@@ -601,7 +602,7 @@ SparseStats read_sparse_stats(const std::string& dataset_dir) {
 
     // The text model: images.txt is two lines a record, points3D.txt one.
     {
-        std::ifstream f(fs::path(model) / "images.txt");
+        BufferedInputFile f(fs::path(model) / "images.txt");
         std::string line, obs;
         while (std::getline(f, line)) {
             if (line.empty() || line[0] == '#') continue;
@@ -633,7 +634,7 @@ SparseStats read_sparse_stats(const std::string& dataset_dir) {
             out.image_points.push_back(seen);
         }
     }
-    std::ifstream f(fs::path(model) / "points3D.txt");
+    BufferedInputFile f(fs::path(model) / "points3D.txt");
     std::string line;
     out.track_beg.push_back(0);
     while (std::getline(f, line)) {
@@ -856,6 +857,18 @@ std::vector<std::string> sparse_write_copy(const std::string& dataset_dir,
                                            const SparseKeep& keep,
                                            const Sim3* moved,
                                            SparseBaseline* loaded) {
+    std::error_code ec;
+    const fs::path sparse = fs::path(out_dir) / "sparse";
+    if (fs::exists(sparse, ec))
+        throw std::runtime_error(sparse.string() + " already exists");
+    return sparse_write_model(dataset_dir, (sparse / "0").string(), keep, moved, loaded);
+}
+
+std::vector<std::string> sparse_write_model(const std::string& dataset_dir,
+                                            const std::string& model_dir,
+                                            const SparseKeep& keep,
+                                            const Sim3* moved,
+                                            SparseBaseline* loaded) {
     SparseBaseline local;
     if (!loaded) loaded = &local;
     if (!loaded->loaded()) *loaded = load_baseline(dataset_dir);
@@ -863,10 +876,9 @@ std::vector<std::string> sparse_write_copy(const std::string& dataset_dir,
     if (base.format != SparseFormat::Colmap)
         throw std::runtime_error("only a COLMAP reconstruction can be saved as a copy");
     std::error_code ec;
-    const fs::path sparse = fs::path(out_dir) / "sparse";
-    if (fs::exists(sparse, ec))
-        throw std::runtime_error(sparse.string() + " already exists");
-    const fs::path model = sparse / "0";
+    const fs::path model(model_dir);
+    if (fs::exists(model, ec) && !fs::is_empty(model, ec))
+        throw std::runtime_error(model.string() + " already exists");
     fs::create_directories(model, ec);
     if (ec) throw std::runtime_error("cannot create " + model.string());
     const std::string ext = base.text ? ".txt" : ".bin";
@@ -885,7 +897,7 @@ std::vector<std::string> sparse_write_copy(const std::string& dataset_dir,
     }
     SparseBaseline b = base;
     b.model_dir = model.string();
-    std::vector<std::string> written = sparse_write_filtered(out_dir, keep, moved, &b);
+    std::vector<std::string> written = sparse_write_filtered(model_dir, keep, moved, &b);
     // Only what the edit changed was written; the rest is the model as found.
     if (!fs::exists(images, ec)) write_file(images, b.images);
     if (!b.frames.empty() && !fs::exists(frames, ec)) write_file(frames, b.frames);

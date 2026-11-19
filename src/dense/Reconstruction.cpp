@@ -1,5 +1,6 @@
 #include "dense/Reconstruction.h"
 
+#include "core/HardwareThreads.h"
 #include "data/SparseEdit.h"
 #include "data/Knn.h"
 #include "dense/ReferenceSampling.h"
@@ -94,9 +95,9 @@ struct Reconstruction::Impl {
     std::map<std::pair<uint32_t, int>, std::vector<Record>> pending;
     uint64_t pending_bytes = 0;
     fs::path preview_dir;
-    std::ofstream preview_stream;
+    BufferedOutputFile preview_stream;
     PreviewCheckpoint preview;
-    std::ofstream surface_output;
+    BufferedOutputFile surface_output;
     std::vector<bool> completed;
     std::vector<double> spacings;
     uint64_t run_records = 1, pending_limit = 1;
@@ -106,7 +107,7 @@ struct Reconstruction::Impl {
     bool two_image_rule = false, keep_tracks = false;
     std::unique_ptr<FreeSpaceGrid> free_space;
     uint64_t long_tracks = 0, kept_points = 0, observation_count = 0;
-    std::ofstream two_image_output, observation_output, range_output, error_output;
+    BufferedOutputFile two_image_output, observation_output, range_output, error_output;
     unsigned reference_workers = 1;
     uint64_t reference_budget = 1, published_references = 0;
     std::deque<std::future<ReferenceResult>> references;
@@ -122,7 +123,7 @@ struct Reconstruction::Impl {
         // Without the id, so the spacing sample, and with it the automatic voxel, match a run before ids.
         run_records = std::max<uint64_t>(1, config.image_cache_bytes / (8 * (sizeof(Surface) - sizeof(Surface::id))));
         pending_limit = std::max<uint64_t>(sizeof(Record), config.image_cache_bytes / 8);
-        const unsigned hardware = std::max(1u, std::thread::hardware_concurrency());
+        const unsigned hardware = std::max(1u, spirula::hardware_threads());
         const uint64_t requested = c.matching_space == "source" && c.samples_per_reference ?
             std::min<uint64_t>(c.samples_per_reference, (uint64_t)width * height) : (uint64_t)width * kRows;
         const uint64_t working_bytes = std::max<uint64_t>(sizeof(Record), requested * 128);
@@ -144,17 +145,17 @@ struct Reconstruction::Impl {
             stats.free_space_bytes = free_space->bytes();
         }
         if (two_image_rule) {
-            two_image_output.open(work / "two-image.bin", std::ios::binary | std::ios::trunc);
-            error_output.open(work / "long-track-errors.bin", std::ios::binary | std::ios::trunc);
+            two_image_output.open(work / "two-image.bin", std::ios::binary | std::ios::trunc, disk_io_buffer_bytes(config.image_cache_bytes));
+            error_output.open(work / "long-track-errors.bin", std::ios::binary | std::ios::trunc, disk_io_buffer_bytes(config.image_cache_bytes));
         }
         if (config.reprojection_check) {
-            observation_output.open(work / "observations.bin", std::ios::binary | std::ios::trunc);
-            range_output.open(work / "observation-ranges.bin", std::ios::binary | std::ios::trunc);
+            observation_output.open(work / "observations.bin", std::ios::binary | std::ios::trunc, disk_io_buffer_bytes(config.image_cache_bytes));
+            range_output.open(work / "observation-ranges.bin", std::ios::binary | std::ios::trunc, disk_io_buffer_bytes(config.image_cache_bytes));
         }
         if ((two_image_rule && (!two_image_output || !error_output)) ||
             (config.reprojection_check && (!observation_output || !range_output)))
             throw std::runtime_error("cannot write dense point observations");
-        surface_output.open(work / "surfaces.bin", std::ios::binary | std::ios::trunc);
+        surface_output.open(work / "surfaces.bin", std::ios::binary | std::ios::trunc, disk_io_buffer_bytes(config.image_cache_bytes));
         if (!surface_output) throw std::runtime_error("cannot write dense surfaces");
         open_preview("filtered");
     }
@@ -195,7 +196,7 @@ struct Reconstruction::Impl {
         preview.filtered = std::string(phase) == "filtered";
         std::error_code error;
         fs::create_directories(preview_dir, error);
-        preview_stream.open(preview_dir / preview.file, std::ios::binary | std::ios::trunc);
+        preview_stream.open(preview_dir / preview.file, std::ios::binary | std::ios::trunc, disk_io_buffer_bytes(config.image_cache_bytes));
         if (!preview_stream) preview.error = "cannot open dense point checkpoint";
     }
 
@@ -429,7 +430,7 @@ struct Reconstruction::Impl {
             };
             external_sort<Record>(source, ordered, budget / 2, compare, [&] { check(); });
         }
-        std::ifstream input(ordered,std::ios::binary);
+        BufferedInputFile input(ordered,std::ios::binary, disk_io_buffer_bytes(budget));
         Record record; DiskArray<Record> records(work / ("support-" + std::to_string(reference) + ".bin"), budget / 4);
         auto publish = [&] { if (!records.empty()) { check(); consume(records.front().pixel,records); records.clear(); } };
         while (read_disk_record(input,record)) {
@@ -444,7 +445,7 @@ struct Reconstruction::Impl {
         ReferenceResult result{work / ("reference-" + std::to_string(v) + ".bin"), work / ("reference-tracks-" + std::to_string(v) + ".bin")};
         const uint64_t requested = std::min<uint64_t>(config.samples_per_reference, (uint64_t)width * height);
         std::set<uint32_t> selected;
-        std::ifstream disk_selection;
+        BufferedInputFile disk_selection;
         uint32_t selection_pixel = 0; bool selection_available = false;
         if (config.matching_space == "source" && requested) {
             auto visit = [&](const std::function<void(uint32_t,float)>& add) {
@@ -461,7 +462,7 @@ struct Reconstruction::Impl {
             } else {
                 ExternalReferenceSampling sampling(work / ("sampling-" + std::to_string(v)),width,height,requested,seed,reference_budget / 2);
                 visit([&](auto pixel,auto score) { sampling.add(pixel,score); });
-                disk_selection.open(sampling.selected([&] { check(); }),std::ios::binary);
+                disk_selection.open(sampling.selected([&] { check(); }),std::ios::binary, disk_io_buffer_bytes(reference_budget));
                 if (!disk_selection) throw std::runtime_error("cannot read dense reference selection");
                 selection_available = read_disk_record(disk_selection,selection_pixel);
             }
@@ -495,7 +496,7 @@ struct Reconstruction::Impl {
             if (lo == accepted.size() || accepted[lo].pixel != pixel) return false;
             surface = accepted[lo].surface; return true;
         };
-        std::ofstream output(result.file,std::ios::binary | std::ios::trunc);
+        BufferedOutputFile output(result.file,std::ios::binary | std::ios::trunc, disk_io_buffer_bytes(reference_budget));
         for (auto entry : accepted) {
             check(); auto& p = entry.surface; Surface px, py;
             const auto pixel = entry.pixel;
@@ -511,7 +512,7 @@ struct Reconstruction::Impl {
         }
         output.flush(); if (!output) throw std::runtime_error("cannot write refined dense reference");
         if (keep_tracks) {
-            std::ofstream track_output(result.tracks,std::ios::binary | std::ios::trunc);
+            BufferedOutputFile track_output(result.tracks,std::ios::binary | std::ios::trunc, disk_io_buffer_bytes(reference_budget));
             for (const auto o : tracks) write_disk_record(track_output,o);
             track_output.flush(); if (!track_output) throw std::runtime_error("cannot write dense point tracks");
         }
@@ -532,8 +533,8 @@ struct Reconstruction::Impl {
         stats.reference_work_seconds += result.seconds;
         stats.imprecise += result.statistics.imprecise;
         {
-            std::ifstream input(result.file,std::ios::binary), track_input;
-            if (keep_tracks) track_input.open(result.tracks,std::ios::binary);
+            BufferedInputFile input(result.file,std::ios::binary, disk_io_buffer_bytes(config.image_cache_bytes)), track_input;
+            if (keep_tracks) track_input.open(result.tracks,std::ios::binary, disk_io_buffer_bytes(config.image_cache_bytes));
             if (!input || (keep_tracks && !track_input)) throw std::runtime_error("cannot read refined dense reference");
             RefinedSurface entry; std::vector<TrackObservation> track;
             while (read_disk_record(input,entry)) {
@@ -556,7 +557,7 @@ struct Reconstruction::Impl {
         fs::remove(result.file); if (keep_tracks) fs::remove(result.tracks); ++published_references;
     }
 
-    void read_track(std::ifstream& input, const RefinedSurface& entry, std::vector<TrackObservation>& track) {
+    void read_track(std::istream& input, const RefinedSurface& entry, std::vector<TrackObservation>& track) {
         track.resize(entry.track_count);
         for (auto& o : track)
             if (!read_disk_record(input,o) || o.view >= views.size()) throw std::runtime_error("truncated dense point track");
@@ -607,11 +608,11 @@ struct Reconstruction::Impl {
         two_image_output.flush(); if (!two_image_output) throw std::runtime_error("dense two-image point write failed");
         two_image_output.close();
         stats.two_image_bar = long_track_median();
-        std::ifstream input(work / "two-image.bin",std::ios::binary);
+        BufferedInputFile input(work / "two-image.bin",std::ios::binary, disk_io_buffer_bytes(config.image_cache_bytes));
         struct Candidate { RefinedSurface entry; std::vector<TrackObservation> track; std::vector<int64_t> sources; char verdict = 0; };
         std::vector<Candidate> block;
-        const unsigned workers = std::max(1u,std::min(config.cpu_workers ? (unsigned)config.cpu_workers : std::thread::hardware_concurrency(),
-                                                      std::max(1u,std::thread::hardware_concurrency())));
+        const unsigned workers = std::max(1u,std::min(config.cpu_workers ? (unsigned)config.cpu_workers : spirula::hardware_threads(),
+                                                      std::max(1u,spirula::hardware_threads())));
         auto judge = [&] {
             std::atomic<size_t> next{0};
             auto work_on = [&] {
@@ -699,12 +700,12 @@ struct Reconstruction::Impl {
         stats.fusion_workers = result.workers; stats.fusion_partitions = result.partitions;
         stats.fusion_boundary_candidates = result.boundary_candidates;
         const uint64_t records = drop_far_isolated(fused, dataset);
-        std::ofstream exported_ids;
-        if (config.reprojection_check) exported_ids.open(work / "exported-ids.bin", std::ios::binary | std::ios::trunc);
+        BufferedOutputFile exported_ids;
+        if (config.reprojection_check) exported_ids.open(work / "exported-ids.bin", std::ios::binary | std::ios::trunc, disk_io_buffer_bytes(config.image_cache_bytes));
         PointCloudWriter writer(ply, PlyCoordinates::Float64);
         reset_preview();
         if (!config.remove_outliers) {
-            std::ifstream input(fused,std::ios::binary); Surface p;
+            BufferedInputFile input(fused,std::ios::binary, disk_io_buffer_bytes(config.image_cache_bytes)); Surface p;
             uint64_t read = 0;
             while (read_disk_record(input,p)) {
                 check();
@@ -731,10 +732,10 @@ struct Reconstruction::Impl {
             if (required > config.image_cache_bytes)
                 throw std::runtime_error("dense exact outlier filtering requires " + std::to_string(required) +
                     " bytes; host cache budget is " + std::to_string(config.image_cache_bytes) + " bytes");
-            const unsigned hardware = std::max(1u, std::thread::hardware_concurrency());
+            const unsigned hardware = std::max(1u, spirula::hardware_threads());
             const unsigned workers = (unsigned)std::min<uint64_t>(std::min(config.cpu_workers ? (unsigned)config.cpu_workers : hardware, hardware),
                 std::min<uint64_t>((records + 255) / 256, std::max<uint64_t>(1,(config.image_cache_bytes - index_bytes) / std::max<uint64_t>(1,query_bytes))));
-            std::ifstream input(work / "fused.bin", std::ios::binary);
+            BufferedInputFile input(work / "fused.bin", std::ios::binary, disk_io_buffer_bytes(config.image_cache_bytes));
             std::vector<float> xyz;
             xyz.reserve((size_t)records * 3);
             sfm::Vec3 origin;
@@ -815,7 +816,7 @@ struct Reconstruction::Impl {
         const double reach = stats.far_filter.margin - stats.far_filter.radius;
         std::vector<sfm::Vec3> outer; std::vector<uint64_t> index;
         {
-            std::ifstream input(fused,std::ios::binary); Surface p; uint64_t i = 0;
+            BufferedInputFile input(fused,std::ios::binary, disk_io_buffer_bytes(config.image_cache_bytes)); Surface p; uint64_t i = 0;
             while (read_disk_record(input,p)) {
                 check();
                 if (box_excess(stats.far_filter,vector(p.point)) > reach) { outer.push_back(vector(p.point)); index.push_back(i); }
@@ -829,7 +830,7 @@ struct Reconstruction::Impl {
         std::sort(drop.begin(),drop.end());
         const auto kept_path = work / "fused-kept.bin";
         {
-            std::ifstream input(fused,std::ios::binary); std::ofstream output(kept_path,std::ios::binary | std::ios::trunc);
+            BufferedInputFile input(fused,std::ios::binary, disk_io_buffer_bytes(config.image_cache_bytes)); BufferedOutputFile output(kept_path,std::ios::binary | std::ios::trunc, disk_io_buffer_bytes(config.image_cache_bytes));
             Surface p; uint64_t i = 0; size_t next = 0;
             while (read_disk_record(input,p)) {
                 check();

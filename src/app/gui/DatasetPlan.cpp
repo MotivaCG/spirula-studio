@@ -92,6 +92,8 @@ bool masks_wanted(const PrepJob& job) {
     if (job.mask_enable) return true;
     for (const PrepInput& in : job.inputs)
         if (!in.mask_dir.empty() || !in.stencil.empty()) return true;
+    for (const auto& [scan, st] : job.scan_stencils)
+        if (!st.empty()) return true;
     return false;
 }
 
@@ -142,7 +144,8 @@ void add_lenses(StepFields& f, const PrepJob& p, const std::string& camera_model
     const std::vector<CameraGroup> rows = camera_groups(p.inputs);
     const std::vector<std::string> models =
         camera_group_models(p.inputs, rows, camera_model);
-    for (const PrepInput& in : p.inputs)
+    for (const PrepInput& in : p.inputs) {
+        if (!in.scan.empty()) continue;
         for (const std::string& leaf : leaf_folders(p, in)) {
             int best = -1;
             for (size_t r = 0; r < rows.size(); r++) {
@@ -165,17 +168,15 @@ void add_lenses(StepFields& f, const PrepJob& p, const std::string& camera_model
             add(f, "lens", scope_of(leaf), model);
             if (focal > 0) add(f, "focal", scope_of(leaf), num(focal));
         }
+    }
 }
 
 // The rigs build_rigs() will make, as their member folders and what is known
 // of them. A 360 file's views and a dual-fisheye file's lenses are only known
 // when one decode took them at one instant.
 void add_rigs(StepFields& f, const PrepJob& p) {
-    const bool builtin = backends().builtin_video && !p.force_external_decode;
     auto video_kind = [&](const PrepInput& in) -> std::string {
-        const bool lockstep = in.pano360.valid() ? p.pano.mode != app::Pano360Mode::Off
-                              : in.packed_lenses >= 2 ? true
-                                                      : builtin && p.sync_tracks;
+        const bool lockstep = video_capture(p, in, kStreamingFrameExtraction).lockstep;
         if (!lockstep) return "free";
         if (in.pano360.valid()) return "360";
         return is_dual_lens(in) ? "dual-fisheye" : "free";
@@ -219,13 +220,15 @@ void add_rigs(StepFields& f, const PrepJob& p) {
 
 void add_sequences(StepFields& f, const PrepJob& p) {
     for (const PrepInput& in : p.inputs)
-        for (const std::vector<std::string>& members : input_sequences(p, in))
+        for (const std::vector<std::string>& members :
+             in.scan.empty() ? input_sequences(p, in) : std::vector<std::vector<std::string>>{})
             add(f, "sequence", joined(members), "on");
 }
 
 // Only what is switched off, so a run from before the switches compares equal.
 void add_sensors(StepFields& f, const PrepJob& p) {
     for (const PrepInput& in : p.inputs) {
+        if (!in.scan.empty()) continue;
         if (!in.use_imu) add(f, in.is_video ? "imu" : "attitude", scope_of(in.subdir), "off");
         if (!in.use_gps) add(f, "gps", scope_of(in.subdir), "off");
     }
@@ -238,7 +241,8 @@ std::string image_dir_field(const PrepJob& p) {
 
 int effective_camera_mode(const PrepJob& p, int mode) {
     size_t folders = 0;
-    for (const PrepInput& in : p.inputs) folders += leaf_folders(p, in).size();
+    for (const PrepInput& in : p.inputs)
+        if (in.scan.empty()) folders += leaf_folders(p, in).size();
     return mode == 0 && folders > 1 ? 1 : mode;
 }
 
@@ -462,6 +466,14 @@ StepRecord legacy_frames(const std::string& workspace, const PrepJob& now) {
         return r;
     r.present = r.complete = true;
     r.fields = frames_fields(j);
+    r.fields.erase(std::remove_if(r.fields.begin(), r.fields.end(),
+                                  [](const StepField& f) {
+                                      return f.key == "frame_indices" || f.key == "source_inventory" ||
+                                             f.key == "source_content";
+                                  }),
+                   r.fields.end());
+    for (StepField& f : r.fields)
+        if (f.key == "decoder") f.value = j.force_external_decode ? "ffmpeg" : "builtin";
     return r;
 }
 
@@ -503,7 +515,10 @@ void apply_legacy_recon(const std::vector<std::string>& a, const std::string& im
         else if (flag == "--camera-mode") job.camera_mode = index_in(kSfmCameraMode, take(), 1);
         else if (flag == "--mapper") job.mapper = index_in(kSfmMapper, take(), 0);
         else if (flag == "--features") job.features = index_in(kSfmFeatures, take(), 0);
-        else if (flag == "--matcher") job.matcher = take() == "bruteforce" ? 0 : 1;
+        else if (flag == "--matcher") {
+            const std::string m = take();
+            job.matcher = m == "bruteforce" ? 0 : m == "flexglue" ? 2 : 1;
+        }
         else if (flag == "--pairs") job.pairs = index_in(kSfmPairs, take(), 0);
         else if (flag == "--overlap") job.overlap = (int)to_float(take());
         else if (flag == "--no-loop-closure") job.loop_closure = false;
@@ -651,6 +666,11 @@ StepFields frames_fields(const PrepJob& job) {
         if (input_in_dataset(job, in)) continue;
         const std::string scope = scope_of(in.subdir);
         add(f, "input", scope, norm_path(in.path));
+        add(f, "source_inventory", scope, frame_source_identity(job, in, false));
+        const size_t index = input_index(job, in);
+        if (index < job.source_content.size())
+            add(f, "source_content", scope, job.source_content[index]);
+        if (in.active_lens >= 0) add(f, "active_lens", scope, lens_dirs(job, in).front());
         if (!in.is_video) continue;
         video = true;
         const bool every = every_frame(job, in);
@@ -682,7 +702,8 @@ StepFields frames_fields(const PrepJob& job) {
         rule();
         return f;
     }
-    add(f, "decoder", "", job.force_external_decode ? "ffmpeg" : "builtin");
+    add(f, "decoder", "", job.force_external_decode ? "ffmpeg" : "auto");
+    add(f, "frame_indices", "", kStreamingFrameExtraction ? "source" : "candidates");
     add(f, "max_frames", "", num(job.max_frames));
     add(f, "auto_rotate", "", onoff(job.auto_rotate));
     if (rate) {
@@ -711,8 +732,12 @@ StepFields masks_fields(const PrepJob& job) {
         else if (!input_masks_in_dataset(job, in))
             add(f, "found_masks", scope, norm_path(in.mask_dir));
         if (!in.mask_dir.empty() && job.flip_found_masks) add(f, "flip_masks", scope, "on");
-        if (!in.stencil.empty()) add(f, "stencil", scope, stencil_digest(in.stencil));
+        if (!in.stencil.empty() && in.scan.empty())
+            add(f, "stencil", scope, stencil_digest(in.stencil));
     }
+    // Under the scan, which the plan knows before its photographs are inputs.
+    for (const auto& [scan, st] : job.scan_stencils)
+        if (!st.empty()) add(f, "scan_stencil", norm_path(scan), stencil_digest(st));
     if (!job.mask_enable) return f;
     const bool feature = !job.mask_feature_prompt.empty();
     if (!segment && !feature) return f;
@@ -778,6 +803,10 @@ StepFields model_fields(const SfmJob& job) {
     add_rigs(f, p);
     add_sequences(f, p);
     add_sensors(f, p);
+    // The scans' photographs are inputs only once the run has taken them out,
+    // so the plan before it names them by scan; how they go in is the scan's.
+    if (job.lidar.enabled() && job.lidar.scan_photos && !job.lidar.in_frame)
+        for (const std::string& c : job.lidar.with_photos) add(f, "scan_photos", norm_path(c), "on");
     add(f, "masks_for_features", "", onoff(masks_reach_features(p, job.mask_features)));
     add(f, "feature_only_masks", "",
         onoff(p.mask_enable && !p.mask_feature_prompt.empty()));
@@ -930,32 +959,7 @@ DatasetRecord read_plan_record(const std::string& workspace, const PrepJob& job)
 }
 
 std::vector<PrepCapture> recorded_captures(const std::string& workspace, const PrepJob& job) {
-    const StepRecord fr = read_plan_record(workspace, job).step(Step::Frames);
-    if (!fr.present || !fr.captures.empty()) return fr.captures;
-    // frames_fields back onto a job, as far as the stems depend on it.
-    PrepJob j = job;
-    j.inputs.clear();
-    for (const StepField& f : fr.fields)
-        if (f.key == "input" && is_video_path(f.value)) {
-            PrepInput in;
-            in.path = f.value;
-            in.is_video = true;
-            in.subdir = f.scope == "." ? "" : f.scope;
-            for (const StepField& r : fr.fields)
-                if (r.key == "fps" && r.scope == f.scope)
-                    in.fps = r.value == "every" ? kFpsEveryFrame : to_float(r.value);
-            j.inputs.push_back(std::move(in));
-        }
-    for (const StepField& f : fr.fields) {
-        if (f.key == "decoder") j.force_external_decode = f.value == "ffmpeg";
-        else if (f.key == "sharp_window") j.sharp_window = (int)to_float(f.value);
-        else if (f.key == "adaptive_fps") j.adaptive_fps = f.value == "on";
-        else if (f.key == "adaptive_range") j.adaptive_range = to_float(f.value);
-        else if (f.key == "sync_tracks") j.sync_tracks = f.value == "on";
-    }
-    std::vector<PrepCapture> out;
-    for (const PrepInput& in : j.inputs) out.push_back(video_capture(j, in));
-    return out;
+    return read_plan_record(workspace, job).step(Step::Frames).captures;
 }
 
 std::vector<PrepCapture> captures_behind(const PrepJob& job) {
@@ -997,9 +1001,15 @@ DatasetPlan plan_dataset(const PlanJob& job, const WorkspaceState& ws,
     } else if (req.redo_frames) {
         set(fr, Act::Redo, Why::Requested);
     } else if (!rf.present) {
-        set(fr, Act::Reuse, Why::Unrecorded);
+        set(fr, Act::Redo, Why::Unrecorded);
+        fr.can_keep = false;
+        fr.ask = true;
     } else {
-        compare(fr, rf, diff(rf.fields, frames_fields(job.prep)));
+        StepFields recorded = rf.fields;
+        if (job.prep.source_content.empty())
+            recorded.erase(std::remove_if(recorded.begin(), recorded.end(),
+                [](const StepField& f) { return f.key == "source_content"; }), recorded.end());
+        compare(fr, rf, diff(recorded, frames_fields(job.prep)));
         // A rule no looser than the one the frames were made with keeps only
         // frames the dataset already has, each with its camera. It is applied
         // to them where they lie, and nothing made from them is made again.
@@ -1021,6 +1031,33 @@ DatasetPlan plan_dataset(const PlanJob& job, const WorkspaceState& ws,
         if (fr.act == Act::Redo && rf.complete) {
             if (req.keep_built) set(fr, Act::Keep, Why::Settings);
             else fr.ask = true;
+        }
+    }
+
+    if (!fixed(Step::Frames) && ws.frames) {
+        for (const PrepInput& in : job.prep.inputs) {
+            if (!in.is_video) continue;
+            const bool recorded = std::any_of(
+                rf.captures.begin(), rf.captures.end(), [&](const PrepCapture& c) {
+                    return c.subdir == in.subdir && norm_path(c.path) == norm_path(in.path);
+                });
+            if (!recorded) {
+                set(fr, Act::Redo, req.redo_frames ? Why::Requested : Why::Unrecorded);
+                fr.can_keep = false;
+                fr.ask = !req.redo_frames;
+                break;
+            }
+        }
+    }
+    if (!fixed(Step::Frames) && ws.frames && !req.redo_frames) {
+        bool identity_changed = false;
+        for (const FieldChange& c : fr.changes)
+            identity_changed = identity_changed || c.key == "source_inventory" ||
+                               c.key == "source_content";
+        if (identity_changed) {
+            set(fr, Act::Redo, Why::Stale);
+            fr.can_keep = false;
+            fr.ask = true;
         }
     }
 
@@ -1233,6 +1270,7 @@ void restore_record_inputs(const DatasetRecord& rec, PrepJob& job,
                 rows[i].lut = rates.rows[i].lut;
                 rows[i].clip_start = rates.rows[i].clip_start;
                 rows[i].clip_end = rates.rows[i].clip_end;
+                rows[i].active_lens = rates.rows[i].active_lens;
             }
         if (same_rows(clicks)) job.mask_clicks = clicks.clicks;
         if (!rows.empty()) camera_model = rows[0].camera_model;
@@ -1376,7 +1414,8 @@ std::vector<std::string> plan_log_lines(Step step, const StepPlan& s,
                 return {L::plan_geometry_stale.get()};
             break;
         case Step::Dense:
-            return {spirula::i18n::msg::dense::title.get()};
+            if (makes(s.act)) return {spirula::i18n::msg::dense::title.get()};
+            break;
     }
     return {};
 }

@@ -8,6 +8,7 @@
 // ours to rewrite, so the edit lands beside it as a Nerfstudio dataset, which
 // parse_dataset reads first from then on.
 
+#include "core/BufferedFile.h"
 #include "core/Similarity.h"
 #include "data/DatasetParser.h"
 
@@ -67,6 +68,14 @@ std::vector<std::string> sparse_write_copy(const std::string& dataset_dir,
                                            const Sim3* moved = nullptr,
                                            SparseBaseline* base = nullptr);
 
+// The same edit written as one more model folder, `model_dir`, usually beside
+// the dataset's own in sparse/. Throws when `model_dir` already holds files.
+std::vector<std::string> sparse_write_model(const std::string& dataset_dir,
+                                            const std::string& model_dir,
+                                            const SparseKeep& keep,
+                                            const Sim3* moved = nullptr,
+                                            SparseBaseline* base = nullptr);
+
 // What a COLMAP model knows about its own quality and the parser does not
 // keep: who saw each point, and how well. Points are in the file's order --
 // ParsedDataset::points' -- and images are NAMED, as in SparseKeep.
@@ -93,7 +102,7 @@ public:
     void finish();
     uint64_t count() const { return count_; }
 private:
-    std::fstream file_;
+    BufferedOutputFile file_;
     std::string path_;
     PlyCoordinates coordinates_;
     std::streampos count_position_;

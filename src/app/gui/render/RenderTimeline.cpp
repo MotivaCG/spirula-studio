@@ -386,7 +386,7 @@ void RenderSession::draw_timeline() {
     ui::help_on_hover(msg::tl_track_help);
 }
 
-// The camera's own view, and in Through mode where it is flown from. What
+// The camera's own view, where it can be adjusted directly. What
 // moves is the key at the playhead, made there if there is none.
 void RenderSession::draw_preview_pane() {
     if (!_panel || !_have_project) return;
@@ -414,10 +414,14 @@ void RenderSession::draw_preview_pane() {
     dl->AddRect(a, b, IM_COL32(90, 220, 255, 160));
     const bool hovered = ImGui::IsItemHovered();
     const bool active = ImGui::IsItemActive();
+    // Through mode's caption already is the hint.
+    if (_preview_mode != PreviewMode::Through)
+        ui::help_on_hover(msg::pv_through_hint,
+                          {(long long)_project.output.width, (long long)_project.output.height});
     ImGui::SetCursorScreenPos(ImVec2(a.x, b.y + ImGui::GetStyle().ItemSpacing.y));
     ui::TextDisabled(_preview_mode == PreviewMode::Through ? msg::pv_through_hint : msg::pv_caption,
                      {(long long)_project.output.width, (long long)_project.output.height});
-    if (_preview_mode != PreviewMode::Through || _project.keys.empty()) return;
+    if (_project.keys.empty()) return;
 
     const ImGuiIO& io = ImGui::GetIO();
     const bool turn = active && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f) && !io.KeyShift;
@@ -495,7 +499,10 @@ void RenderSession::draw_preview_pane() {
             if (!key.own_lens) { key.lens = _project.lens_at(k); key.own_lens = true; }
             if (key.lens.projection != Projection::Equirect)
                 lens_set_fov(key.lens, std::clamp(lens_fov(key.lens) * std::exp(-wheel * 0.06), 5.0,
-                                                  key.lens.projection == Projection::Perspective ? 150.0 : 360.0));
+                                                  key.lens.projection == Projection::Perspective || key.lens.projection == Projection::Orthographic ? 150.0 : 360.0));
+        } else if (_project.lens_at(k).projection == Projection::Orthographic) {
+            if (!key.own_lens) { key.lens = _project.lens_at(k); key.own_lens = true; }
+            key.lens.ortho_distance = std::max(key.lens.ortho_distance * std::exp(-wheel * 0.08), 1e-12);
         } else {
             const double s = reach * 0.08 * wheel;
             for (int d = 0; d < 3; d++) key.pos[d] -= back[d] * s;

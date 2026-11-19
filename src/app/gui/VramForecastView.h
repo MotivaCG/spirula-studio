@@ -4,16 +4,17 @@
 // status strip's VRAM bar, and the card that bar shows on hover.
 
 #include "app/TrainForecast.h"
-#include "app/gui/Ui.h"
+#include "app/gui/ResourceForecastView.h"
+#include "app/gui/StepTimingView.h"
 
 namespace gui {
 
 // nullptr while the risk is unknown.
 const spirula::i18n::Msg* oom_risk_label(spirula::OomRisk r);
-ImVec4 oom_risk_color(spirula::OomRisk r);
 
 // Memory over the run with its projection, then this run's usage by category.
 // Call inside a tooltip.
-void vram_forecast_card(const spirula::VramForecast& v, int total_steps);
+void vram_forecast_card(const spirula::VramForecast& v, int total_steps,
+                        const SavingsContext& ctx);
 
 }  // namespace gui

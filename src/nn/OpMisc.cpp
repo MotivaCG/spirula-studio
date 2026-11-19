@@ -36,6 +36,11 @@ struct GatherParams {
     uint32_t n, cols, vocab, groups_per_row, _pad0;
 };
 
+struct SegmentMeanParams {
+    uint64_t out, x, offsets, ids;
+    uint32_t segments, C, n, groups_per_row;
+};
+
 struct StridedCopyParams {
     uint64_t out, x;
     uint32_t rows, cols, in_stride, out_stride, groups_per_row, _pad0;
@@ -248,6 +253,26 @@ void gather_rows(const Tensor& out, const Tensor& table, const Tensor& ids) {
     p.cols = (uint32_t)out.cols();
     p.vocab = (uint32_t)table.rows();
     vk::SpecList spec{(uint32_t)(table.dtype == DType::F16), 0u};
+    vk::Stream::get().dispatchFlat(entry, spec, out.numel(), 256, &p, sizeof(p),
+                                   &p.groups_per_row);
+}
+
+void segment_mean(const Tensor& out, const Tensor& x, const Tensor& offsets,
+                  const Tensor& ids) {
+    NN_CHECK(out.cols() == x.cols() && offsets.numel() == out.rows() + 1,
+             "segment_mean: %lld segments of %lld channels need %lld offsets, got %lld",
+             (long long)out.rows(), (long long)x.cols(), (long long)(out.rows() + 1),
+             (long long)offsets.numel());
+    const KernelName entry = span_entry("misc.segment_mean", {out, x});
+    SegmentMeanParams p{};
+    p.out = out.ptr;
+    p.x = x.ptr;
+    p.offsets = offsets.ptr;
+    p.ids = ids.ptr;
+    p.segments = (uint32_t)out.rows();
+    p.C = (uint32_t)out.cols();
+    p.n = (uint32_t)x.rows();
+    vk::SpecList spec{(uint32_t)(x.dtype == DType::F16), 0u};
     vk::Stream::get().dispatchFlat(entry, spec, out.numel(), 256, &p, sizeof(p),
                                    &p.groups_per_row);
 }
@@ -539,7 +564,7 @@ void avgpool(const Tensor& out, const Tensor& in, int kernel, int stride, int pa
 }
 
 void grid_sample_points(const Tensor& out, const Tensor& in, const Tensor& pos,
-                        bool align_corners) {
+                        bool align_corners, GridPad pad) {
     NN_CHECK(in.ndim == 3, "grid_sample_points expects an [H, W, C] map");
     NN_CHECK(pos.dtype == DType::F32 && pos.cols() == 2,
              "grid_sample_points: pos must be an f32 [N, 2] tensor");
@@ -558,7 +583,8 @@ void grid_sample_points(const Tensor& out, const Tensor& in, const Tensor& pos,
     p.W = (uint32_t)in.shape[1];
     p.C = (uint32_t)C;
     p.N = (uint32_t)N;
-    vk::SpecList spec{(uint32_t)(in.dtype == DType::F16), 0u, (uint32_t)align_corners};
+    vk::SpecList spec{(uint32_t)(in.dtype == DType::F16), 0u, (uint32_t)align_corners,
+                      (uint32_t)(pad == GridPad::Border)};
     vk::Stream::get().dispatchFlat(entry, spec, N * C, 256, &p, sizeof(p),
                                    &p.groups_per_row);
 }

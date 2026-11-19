@@ -130,10 +130,13 @@ SeedSplats TrainerSession::with_room(SeedSplats seed, const ColorResolution& col
 
 void split_ply(const fs::path& from, const fs::path& to, int64_t rows) {
     std::ifstream in(from, std::ios::binary);
-    std::string header, line;
+    std::string header, line, vertex;
     int64_t count = -1, columns = 0;
     while (std::getline(in, line)) {
-        if (line.rfind("element vertex ", 0) == 0) count = std::stoll(line.substr(15));
+        if (line.rfind("element vertex ", 0) == 0) {
+            count = std::stoll(line.substr(15));
+            vertex = line + "\n";  // as written: the engine zero-pads the count
+        }
         else if (line.rfind("property float ", 0) == 0) columns++;
         else if (line.rfind("property ", 0) == 0)
             throw std::runtime_error(from.string() + ": only float properties are split");
@@ -145,7 +148,6 @@ void split_ply(const fs::path& from, const fs::path& to, int64_t rows) {
     in.read(data.data(), (std::streamsize)data.size());
     if (!in) throw std::runtime_error(from.string() + ": truncated");
     in.close();
-    const std::string vertex = "element vertex " + std::to_string(count) + "\n";
     auto write = [&](const fs::path& path, int64_t first, int64_t n) {
         std::string h = header;
         h.replace(h.find(vertex), vertex.size(), "element vertex " + std::to_string(n) + "\n");
@@ -265,7 +267,8 @@ void TrainerSession::write_frame(int slot, int step) {
     std::snprintf(name, sizeof name, "%03d", frame);
     const int keep = engine_temporal_current();
     engine_temporal_select(slot);
-    engine_save_checkpoint((out_dir / "frames" / name).string(), false, step, true);
+    engine_save_checkpoint((out_dir / "frames" / name).string(), false, step,
+                           cfg.background_export_height, "", false, true);
     // The room is no frame's: the last frame written leaves it as the room's file.
     if (_room_rows > 0)
         split_ply(out_dir / "frames" / name / "splat.ply", out_dir / "frames" / "room.ply",

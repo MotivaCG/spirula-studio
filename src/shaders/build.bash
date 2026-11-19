@@ -20,10 +20,12 @@ shaders=(
     "shaders/per_splat_losses.slang:${out_dir}/per_splat_losses.cu"
     "shaders/pixel_wise.slang:${out_dir}/pixel_wise.cu"
     "shaders/ppisp.slang:${out_dir}/ppisp.cu"
+    "shaders/projective_depth.slang:${out_dir}/projective_depth.cu"
     "shaders/densify.slang:${out_dir}/densify.cu"
     "shaders/primitive_3dgs.slang:${out_dir}/primitive_3dgs.cu"
     "shaders/harmonics.slang:${out_dir}/harmonics.cu"
     "shaders/region.slang:${out_dir}/region.cu"
+    "shaders/pca_reg.slang:${out_dir}/pca_reg.cu"
 )
 
 # Files to rename from .cu -> .cuh after postprocessing
@@ -35,10 +37,12 @@ mv_targets=(
     "${out_dir}/per_splat_losses.cu"
     "${out_dir}/pixel_wise.cu"
     "${out_dir}/ppisp.cu"
+    "${out_dir}/projective_depth.cu"
     "${out_dir}/densify.cu"
     "${out_dir}/primitive_3dgs.cu"
     "${out_dir}/harmonics.cu"
     "${out_dir}/region.cu"
+    "${out_dir}/pca_reg.cu"
 )
 
 declare -a pids=()

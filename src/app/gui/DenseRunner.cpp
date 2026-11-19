@@ -61,13 +61,19 @@ bool run_dense_step(const DenseJob& job, const std::string& dataset, const std::
         perf = fs::absolute(root / "perf" / stamp);
         argv.insert(argv.end(), {"--perf-dir", perf.string()});
     }
-    std::string child_error;
+    std::string child_error, phase;
     const int code = run_process(argv, "", [&](const std::string& line) {
         std::vector<std::string> fields;
-        auto stage_label = [](const std::string& label) {
-            return label == D::prepare.get() || label == D::match.get() || label == D::refine.get() ||
-                   label == D::fuse.get() || label == D::load_model.get() || label == D::outliers.get() ||
-                   label == D::export_cloud.get();
+        // Each phase counts its own items, so each gets a bar of its own.
+        auto stage_label = [&](const std::string& label) {
+            const bool known = label == D::prepare.get() || label == D::match.get() || label == D::refine.get() ||
+                               label == D::fuse.get() || label == D::load_model.get() || label == D::outliers.get() ||
+                               label == D::export_cloud.get();
+            if (known && label != phase) {
+                if (!phase.empty()) progress.restart(Stage::Dense);
+                phase = label;
+            }
+            return known;
         };
         if (spirula::i18n::scan(D::error, line, fields)) {
             child_error = line;
@@ -90,8 +96,8 @@ bool run_dense_step(const DenseJob& job, const std::string& dataset, const std::
         return false;
     }
     try {
-        if (!spirula::dense::artifact_checksum_valid(spirula::dense::artifact_files(dataset))) {
-            error = spirula::i18n::format(D::error, {"cloud checksum mismatch"}); return false;
+        if (!spirula::dense::artifact_available(spirula::dense::artifact_files(dataset))) {
+            error = spirula::i18n::format(D::error, {"cloud file is missing or empty"}); return false;
         }
     } catch (const std::exception& e) { error = spirula::i18n::format(D::error, {e.what()}); return false; }
     progress.mark(Stage::Dense, StageStatus::Done);

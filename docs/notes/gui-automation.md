@@ -132,6 +132,35 @@ sharing an id.
 Display coordinates are not framebuffer pixels on a HiDPI screen; `/ui/state`
 reports both and the scale between them.
 
+## Sparse editor to trainer regression
+
+Open a COLMAP dataset in the trainer, then open its `images.bin` through
+"Open a Model or Reconstruction" and enter Edit. Delete some points and save
+over the reconstruction. Return Home and choose "Back to Trainer": the point
+count and preview must match the edited `points3D.bin`. Issue #249 left the
+trainer's cached preview showing the original points until the dataset was
+explicitly reopened.
+
+Repeat with a fresh dataset and only a quarter turn, keeping every point and
+camera. The trainer must reload the saved orientation and turn auto-level off
+even though its framing key's path and element counts are unchanged. Saving
+a copy elsewhere must leave the original dataset's trainer preview alone.
+
+## Imported masks and camera drawing
+
+For issue #338, open photos in `images/cam0/` and `images/cam1/`, with
+matching `masks/cam0/image.jpg.png` and `masks/cam1/image.jpg.png` files.
+**Correct Masks** must show the same masked pixels as the source preview;
+the existing files must not be counted as absent. Saving and reopening must
+keep the corrections on those filenames.
+
+Turn off **Use the masks found next to the photos**, enable **Remove fixed
+areas of the frame**, and choose **Draw...** on `cam1`. The panel must show
+`cam1` with **Separate areas for each camera** checked. Draw a box, save the
+set, and visit `cam0` with the frame slider: it must have no box. The saved
+set must contain only the `cam1` SVG with `data-camera="cam1"`. Reopening
+**Draw...** on either row must select that row's camera.
+
 ## As an MCP server
 
 `tools/gui_mcp.py` wraps the same endpoints as MCP tools over stdio, in the

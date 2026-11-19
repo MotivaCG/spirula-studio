@@ -2,8 +2,6 @@
 
 # Development build for Linux and macOS. Extra arguments are passed to CMake:
 #   ./build_develop.bash -DSS_BACKEND=vulkan -DSS_BUILD_GUI=OFF
-# SS_BUILD_DIR, when set, picks the tree instead of build_<backend>. See
-# build_presets/.
 
 # One tree per backend, so building one does not reconfigure the other. The
 # arguments are read, never consumed: your own -B still reaches CMake, and the
@@ -20,7 +18,8 @@ if [ "$(uname)" = "Darwin" ]; then
 else
     build_dir="build_$ss_backend"
 fi
-if [ -n "${SS_BUILD_DIR:-}" ]; then build_dir="$SS_BUILD_DIR"; fi
+SS_BUILD_DIR="${SS_BUILD_DIR:-$build_dir}"
+build_dir="$SS_BUILD_DIR"
 
 # Regenerate headers. Skipped when python3 is unavailable -- the generated
 # files are committed, so the build still works without it.
@@ -129,10 +128,10 @@ if [ "$(uname)" = "Darwin" ]; then
     esac
 fi
 
-cmake -G Ninja -B "$build_dir" "${ss_fatbin_args[@]}" "$@" || exit $?
+cmake -G Ninja -B "${SS_BUILD_DIR}" "${ss_fatbin_args[@]}" "$@" || exit $?
 
 # Repair the ninja dependency log.
-if [ -f "$build_dir/.ninja_deps" ]; then
+if [ -f "${SS_BUILD_DIR}/.ninja_deps" ]; then
     ss_deps_broken() {
         case "$1" in
             *"premature end of file"*|*"bad deps log signature"*|\
@@ -140,13 +139,13 @@ if [ -f "$build_dir/.ninja_deps" ]; then
         esac
         return 1
     }
-    if ss_deps_broken "$(cmake --build "$build_dir" -- -t recompact 2>&1)"; then
+    if ss_deps_broken "$(cmake --build "${SS_BUILD_DIR}" -- -t recompact 2>&1)"; then
         # The rewrite is what heals it, so a second pass is what confirms it.
-        if ss_deps_broken "$(cmake --build "$build_dir" -- -t recompact 2>&1)"; then
-            echo "$build_dir/.ninja_deps did not survive a recompact -- removing it"
-            rm -f "$build_dir/.ninja_deps"
+        if ss_deps_broken "$(cmake --build "${SS_BUILD_DIR}" -- -t recompact 2>&1)"; then
+            echo "${SS_BUILD_DIR}/.ninja_deps did not survive a recompact -- removing it"
+            rm -f "${SS_BUILD_DIR}/.ninja_deps"
         else
-            echo "repaired a corrupt $build_dir/.ninja_deps (this build recompiles everything once)"
+            echo "repaired a corrupt ${SS_BUILD_DIR}/.ninja_deps (this build recompiles everything once)"
         fi
     fi
 fi
@@ -174,7 +173,7 @@ echo "CPU cores     : ${CPU_CORES}"
 echo "Using jobs    : ${JOBS}"
 echo ""
 # Propagate the build's exit status.
-if ! cmake --build "$build_dir" --verbose -j"${JOBS}"; then
+if ! cmake --build "${SS_BUILD_DIR}" --verbose -j"${JOBS}"; then
     echo "BUILD FAILED" >&2
     exit 1
 fi

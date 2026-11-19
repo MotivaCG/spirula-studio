@@ -131,14 +131,14 @@ std::unique_ptr<ExifGpsPriors> makeExifGpsPriors(const SfmConfig& cfg, const std
                                                  const MatchesDatabase& db, const CameraSetup& cams,
                                                  bool verbose);
 
-// Calibrate `priors` against the gyro from pairs and their matches (a
-// sample's putative ones, or the database's verified ones), reporting per group.
-void calibrateSensorPriors(TelemetryPriors& priors, const std::vector<FeatureSet>& feats,
-                           const std::vector<std::pair<uint32_t, uint32_t>>& pairs,
-                           const std::vector<std::vector<FeatureMatch>>& matches,
-                           const std::vector<Camera>& cams, const TwoViewOptions& tvopt,
-                           int threads, bool verbose);
-void calibrateSensorPriorsFromDatabase(TelemetryPriors& priors, const MatchesDatabase& db,
+uint64_t sensorCalibrationFingerprint(const TelemetryPriors& priors,
+                                      const std::vector<FeatureSet>& feats,
+                                      const std::vector<Camera>& cams,
+                                      const TwoViewOptions& opt);
+
+// Replay saved calibration only for identical inputs, otherwise recalibrate
+// from verified matches, including databases without a calibration sample.
+void calibrateSensorPriorsFromDatabase(TelemetryPriors& priors, MatchesDatabase& db,
                                        const std::vector<FeatureSet>& feats,
                                        const std::vector<Camera>& cams,
                                        const TwoViewOptions& tvopt, int threads, bool verbose);
@@ -239,7 +239,7 @@ void resolveImageNames(std::vector<Reconstruction>& models, const std::string& i
 void recolorPoints(std::vector<Reconstruction>& models, const SfmConfig& cfg);
 void splitCamerasBySize(std::vector<Reconstruction>& models,
                         const std::vector<FeatureSet>& feats);
-void writeModels(const std::vector<Reconstruction>& models,
+void writeModels(std::vector<Reconstruction>& models,
                  const std::filesystem::path& dir, bool verbose,
                  const std::vector<ModelGauge>& gauge = {}, const RigTable* rigs = nullptr);
 void writeRigs(const std::filesystem::path& dir, const Reconstruction& m, const RigTable* rigs);
@@ -267,7 +267,7 @@ void warnIfMasksLookInverted(const ExtractStats& st);
 
 // Per-keypoint colours while the image is hot, then back to source pixels.
 void sampleFeatureColors(FeatureSet& fs, const GrayImage& img);
-void finishFeatures(FeatureSet& fs, const GrayImage& img);
+void finishFeatures(FeatureSet& fs, const GrayImage& img, bool colmap_corners = false);
 
 // An EXR or a TIFF with an ICC profile states its own colour space; adopt it
 // for any of `image-gamut` / `image-linear` that `seen` does not already name.

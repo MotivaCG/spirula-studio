@@ -31,7 +31,8 @@ __global__ void relocate_with_long_axis_split_kernel(
     float2*__restrict__ densify_accum_buffer,
     int32_t* __restrict__ bias_correction_steps,
     uint32_t* __restrict__ visit_counters,
-    float* __restrict__ max_weight
+    float* __restrict__ max_weight,
+    float4* __restrict__ projective_state, float* __restrict__ projective_information
 ) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_new_splats)
@@ -62,6 +63,11 @@ __global__ void relocate_with_long_axis_split_kernel(
         float w = max_weight[idx_src] * sigmoid(new_opac) / fmaxf(sigmoid(opac), 1e-12f);
         max_weight[idx_src] = w;
         max_weight[idx_dst] = w;
+    }
+
+    if (projective_state) {
+        projective_state[idx_dst] = projective_state[idx_src];
+        projective_information[idx_dst] = projective_information[idx_src];
     }
 
     // appearance - copy
@@ -184,6 +190,7 @@ __global__ void compute_relocation_mask_kernel(
     uint32_t dead_after_steps,
     bool dead_by_opacity,
     const float* __restrict__ max_weight,
+    float min_weight,
     bool* __restrict__ masks,
     int32_t* __restrict__ num_relocate,
     int32_t* __restrict__ relocate_indices
@@ -201,7 +208,7 @@ __global__ void compute_relocation_mask_kernel(
         float3 feature_dc = features_dc[idx];
 
         bool is_low_opac = (dead_by_opacity && sigmoid(opac) <= min_opacity)
-            || (max_weight != nullptr && max_weight[idx] <= min_opacity);
+            || (max_weight != nullptr && max_weight[idx] <= min_weight);
 
         bool is_finite = isfinite(
             dot(mean, mean) / dot(quat, quat) + dot(scale, feature_dc) * opac
@@ -231,6 +238,7 @@ int64_t relocate_splats_with_long_axis_split_tensor(
     int64_t cur_num_splats,
     float min_opacity,
     float split_opacity_k,
+    float min_split_opacity,  // splats under it are not split; 0 = off
     DeviceVector<float3> means, DeviceVector<float4> quats, DeviceVector<float3> scales, DeviceVector<float> opacs, DeviceVector<float3> features_dc, DeviceVector<float3> features_sh,
     DeviceVector<float3> g1_means, DeviceVector<float4> g1_quats, DeviceVector<float3> g1_scales, DeviceVector<float> g1_opacs, DeviceVector<float3> g1_features_dc, DeviceVector<float3> g1_features_sh,
     DeviceVector<float3> g2_means, DeviceVector<float4> g2_quats, DeviceVector<float3> g2_scales, DeviceVector<float> g2_opacs, DeviceVector<float3> g2_features_dc, DeviceVector<float3> g2_features_sh,
@@ -243,8 +251,9 @@ int64_t relocate_splats_with_long_axis_split_tensor(
     DeviceVector<uint32_t> visit_counters,
     uint32_t dead_after_steps,
     // Peak alpha * T per splat; when given it is a second dead test against
-    // min_opacity and is carried src -> dst. dead_by_opacity keeps the first.
+    // min_weight and is carried src -> dst. dead_by_opacity keeps the first.
     DeviceVector<float> max_weight,
+    float min_weight,
     bool dead_by_opacity,
     int sh_optim_bits,
     int num_sh,
@@ -263,6 +272,7 @@ int64_t relocate_splats_with_long_axis_split_tensor(
     // Non-SH Adam-state quant: when enabled, each relocated dst splat gets
     // its packed bytes set to codec-encoded zero against the current bound.
     NonShQuantState non_sh,
+    DeviceVector<float4> projective_state, DeviceVector<float> projective_information,
     uint32_t seed,
     int64_t max_relocate,
     int64_t* num_dead_out
@@ -296,6 +306,7 @@ int64_t relocate_splats_with_long_axis_split_tensor(
         dead_after_steps,
         dead_by_opacity,
         max_weight.data_ptr(),
+        min_weight,
         mask,
         num_relocate_ptr,
         dst_indices
@@ -313,9 +324,11 @@ int64_t relocate_splats_with_long_axis_split_tensor(
     DeviceVector<float2> weights = sample_weights.data_ptr()
         ? sample_weights : densify_accum_buffer;
     uint32_t num_eligible = 0;
+    const bool floor = min_split_opacity > 0.0f;
     int32_t* src_indices = weighted_sample_without_replacement_internal(
         cur_num_splats, (float*)weights.data_ptr(),
-        weights.size() * 2, mask, num_relocate, seed, &num_eligible);
+        weights.size() * 2, mask, num_relocate, seed, &num_eligible,
+        floor ? opacs.data_ptr() : nullptr, floor ? split_floor_logit(min_split_opacity) : 0.0f);
     // Past the live splats of positive weight the draw returns dead ones,
     // each also some pair's dst: the two writes race and the revival is lost.
     // The rest wait for the next step.
@@ -340,7 +353,7 @@ int64_t relocate_splats_with_long_axis_split_tensor(
                 non_sh, \
                 densify_accum_buffer.data_ptr(), \
                 bias_correction_steps_ptr, visit_counters.data_ptr(), \
-                max_weight.data_ptr())
+                max_weight.data_ptr(), projective_state.data_ptr(), projective_information.data_ptr())
         if      (sh_optim_bits == 32) _DENSIFY_LAS_LAUNCH(float3, nullptr, false);
         else if (sh_optim_bits == 8)  _DENSIFY_LAS_LAUNCH(short3, sh_quant_bounds.data_ptr(), sh_bounds_per_splat);
         else if (sh_optim_bits == 4)  _DENSIFY_LAS_LAUNCH(uchar3, sh_quant_bounds.data_ptr(), sh_bounds_per_splat);
@@ -354,11 +367,14 @@ int64_t relocate_splats_with_long_axis_split_tensor(
     return num_relocate;
 }
 
+// Returns how many were added: under `min_split_opacity` (0 = off) that is
+// at most the number of splats opaque enough to split.
 /*[AutoHeaderGeneratorExport]*/
-void add_splats_with_long_axis_split_tensor(
+int64_t add_splats_with_long_axis_split_tensor(
     int64_t cur_num_splats,
     int64_t num_new_splats,
     float split_opacity_k,
+    float min_split_opacity,
     DeviceVector<float3> means, DeviceVector<float4> quats, DeviceVector<float3> scales, DeviceVector<float> opacs, DeviceVector<float3> features_dc, DeviceVector<float3> features_sh,
     DeviceVector<float3> g1_means, DeviceVector<float4> g1_quats, DeviceVector<float3> g1_scales, DeviceVector<float> g1_opacs, DeviceVector<float3> g1_features_dc, DeviceVector<float3> g1_features_sh,
     DeviceVector<float3> g2_means, DeviceVector<float4> g2_quats, DeviceVector<float3> g2_scales, DeviceVector<float> g2_opacs, DeviceVector<float3> g2_features_dc, DeviceVector<float3> g2_features_sh,
@@ -367,6 +383,10 @@ void add_splats_with_long_axis_split_tensor(
     // densify_accum_buffer. Separate so a transformed score can drive the
     // draw while the kernel still propagates the raw accumulator src -> dst.
     DeviceVector<float2> sample_weights,
+    // The oversize split channel's accumulator, [N]: the draw's weight is then
+    // (oversize_accum + floor) * weight^oversize_blend. Empty to skip.
+    DeviceVector<float> oversize_accum,
+    float oversize_blend,
     DeviceVector<int32_t> bias_correction_steps,
     DeviceVector<uint32_t> visit_counters,
     DeviceVector<float> max_weight,  // carried src -> dst; empty to skip
@@ -380,10 +400,11 @@ void add_splats_with_long_axis_split_tensor(
     bool sh_value_bounds_per_splat,
     int  num_sh_buffer,
     NonShQuantState non_sh,
+    DeviceVector<float4> projective_state, DeviceVector<float> projective_information,
     uint32_t seed
 ) {
     if (num_new_splats == 0)
-        return;
+        return 0;
     int32_t* bias_correction_steps_ptr = bias_correction_steps.data_ptr();
     const size_t n4 = 4 * (size_t)cur_num_splats;
     pool_begin_phase(PoolPhase::Densify,
@@ -391,9 +412,18 @@ void add_splats_with_long_axis_split_tensor(
 
     DeviceVector<float2> weights = sample_weights.data_ptr()
         ? sample_weights : densify_accum_buffer;
+    const bool floor = min_split_opacity > 0.0f;
+    uint32_t num_eligible = 0;
     int32_t* split_indices = weighted_sample_without_replacement_internal(
         cur_num_splats, (float*)weights.data_ptr(),
-        weights.size() * 2, nullptr, num_new_splats, seed);
+        weights.size() * 2, nullptr, num_new_splats, seed,
+        floor ? &num_eligible : nullptr,
+        floor ? opacs.data_ptr() : nullptr, floor ? split_floor_logit(min_split_opacity) : 0.0f,
+        oversize_accum.data_ptr(), oversize_blend);
+    // Past the splats over the floor the draw returns ones under it.
+    if (floor) num_new_splats = std::min<int64_t>(num_new_splats, num_eligible);
+    if (num_new_splats == 0)
+        return 0;
 
     #define _DENSIFY_LAS_ADD_LAUNCH(T, bnd_ptr, bps) \
         relocate_with_long_axis_split_kernel<T><<<_LAUNCH_ARGS_1D(num_new_splats, 256)>>>( \
@@ -412,7 +442,7 @@ void add_splats_with_long_axis_split_tensor(
             non_sh, \
             densify_accum_buffer.data_ptr(), \
             bias_correction_steps_ptr, visit_counters.data_ptr(), \
-            max_weight.data_ptr())
+            max_weight.data_ptr(), projective_state.data_ptr(), projective_information.data_ptr())
     if      (sh_optim_bits == 32) _DENSIFY_LAS_ADD_LAUNCH(float3, nullptr, false);
     else if (sh_optim_bits == 8)  _DENSIFY_LAS_ADD_LAUNCH(short3, sh_quant_bounds.data_ptr(), sh_bounds_per_splat);
     else if (sh_optim_bits == 4)  _DENSIFY_LAS_ADD_LAUNCH(uchar3, sh_quant_bounds.data_ptr(), sh_bounds_per_splat);
@@ -423,6 +453,7 @@ void add_splats_with_long_axis_split_tensor(
         cur_num_splats, num_new_splats, split_indices, /*dst_indices=*/nullptr,
         sh_value_packed.data_ptr(), sh_value_bounds.data_ptr(),
         num_sh, num_sh_buffer, sh_value_bits, sh_value_bounds_per_splat);
+    return num_new_splats;
 }
 
 

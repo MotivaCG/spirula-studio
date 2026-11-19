@@ -11,12 +11,15 @@
 #include "app/FrameMotion.h"
 #include "app/WriterPool.h"
 #include "app/gui/Subprocess.h"
+#include "core/HardwareThreads.h"
 #include "i18n/catalog/Data.h"
 #include "i18n/catalog/Log.h"
 #include "nn/core/Log.h"
 #include "nn/Device.h"
 #include "nn/io/Image.h"
 #include "sam/Sam.h"
+#include "sfm/core/Exif.h"
+#include "sfm/core/Telemetry.h"
 
 #include <algorithm>
 #include <atomic>
@@ -25,6 +28,7 @@
 #include <functional>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -70,31 +74,23 @@ using app::WriterPool;
 
 struct Decoder {
     bool builtin = false;
+    std::unique_lock<std::mutex> video_lock;
     VideoFacts facts;                          // ffmpeg's probe, when not built-in
     std::vector<std::pair<int, int>> sizes;    // one per track
 };
 
-// The device must be frozen first: asking whether the built-in decoder works
-// creates it.
-bool pick_decoder(const FrameExtractJob& job, const FrameExtractSinks& sinks,
-                  Decoder& d, std::string& error) {
-    std::string why = "this build has no in-process video decoder"
-                      " (-DSS_ENABLE_PATENTED=OFF)";
-    if (job.decoder != FrameDecoder::Ffmpeg) {
-#ifdef SS_HAVE_VIDEO
-        why = video_decode_availability();
-        if (why.empty()) {
-            d.builtin = true;
-            d.sizes = video_track_sizes(job.input, error);
-            if (d.sizes.empty() && error.empty()) error = "no video track in " + job.input;
-            return !d.sizes.empty();
-        }
-#endif
-        if (job.decoder == FrameDecoder::Builtin) {
-            error = why;
-            return false;
-        }
-    }
+bool cancelled(const FrameExtractSinks& sinks, std::string& error) {
+    if (!sinks.cancel || !sinks.cancel->load()) return false;
+    error = "cancelled";
+    return true;
+}
+
+bool use_ffmpeg(const FrameExtractJob& job, const FrameExtractSinks& sinks,
+                Decoder& d, const std::string& why, std::string& error) {
+    // ffmpeg still uses the shared GPU stream for blur scoring and masking.
+    if (d.video_lock.owns_lock() && job.blur_reject <= 0 && job.mask.model.empty())
+        d.video_lock.unlock();
+    if (cancelled(sinks, error)) return false;
     if (!gui::command_exists(job.ffmpeg_exe)) {
         error = job.decoder == FrameDecoder::Ffmpeg
                     ? spirula::i18n::format(lmsg::err_ffmpeg_not_found, {job.ffmpeg_exe})
@@ -102,24 +98,82 @@ bool pick_decoder(const FrameExtractJob& job, const FrameExtractSinks& sinks,
                                             {why, job.ffmpeg_exe});
         return false;
     }
-#ifdef SS_HAVE_VIDEO
     if (job.decoder == FrameDecoder::Auto)
         log_line(sinks, spirula::i18n::format(lmsg::decode_fallback_ffmpeg, {why}));
-#endif
+    error.clear();
+    Decoder ff;
+    ff.video_lock = std::move(d.video_lock);
     static const std::atomic<bool> never{false};
-    ffmpeg_probe_video(job.ffmpeg_exe, job.input, d.facts,
+    ffmpeg_probe_video(job.ffmpeg_exe, job.input, ff.facts,
                        sinks.cancel ? *sinks.cancel : never);
-    d.sizes = d.facts.tracks;
-    if (d.sizes.empty()) error = "no video track in " + job.input;
-    return !d.sizes.empty();
+    if (cancelled(sinks, error)) return false;
+    ff.sizes = ff.facts.tracks;
+    if (ff.sizes.empty()) {
+        error = ff.facts.error.empty()
+                    ? "no video track in " + job.input
+                    : spirula::i18n::format(lmsg::err_ffmpeg_unrunnable,
+                                            {ff.facts.error});
+        return false;
+    }
+    d = std::move(ff);
+    return true;
+}
+
+// Freeze the requested device before availability() creates its context.
+bool pick_decoder(const FrameExtractJob& job, const FrameExtractSinks& sinks,
+                  Decoder& d, std::string& error) {
+    if (cancelled(sinks, error)) return false;
+    std::string why = "this build has no in-process video decoder"
+                      " (-DSS_ENABLE_PATENTED=OFF)";
+    bool uses_gpu = job.blur_reject > 0 || !job.mask.model.empty();
+#ifdef SS_HAVE_VIDEO
+    uses_gpu = uses_gpu || job.decoder != FrameDecoder::Ffmpeg;
+#endif
+    if (uses_gpu) {
+        static std::mutex video_mutex;
+        d.video_lock = std::unique_lock<std::mutex>(video_mutex);
+        if (cancelled(sinks, error)) return false;
+    }
+    if (job.decoder != FrameDecoder::Ffmpeg) {
+#ifdef SS_HAVE_VIDEO
+        why = video_decode_availability();
+        if (cancelled(sinks, error)) return false;
+        if (why.empty()) {
+            d.sizes = video_track_sizes(job.input, why);
+            if (cancelled(sinks, error)) return false;
+            if (!d.sizes.empty()) {
+                d.builtin = true;
+                return true;
+            }
+            if (why.empty()) why = "no video track in " + job.input;
+        }
+#endif
+        if (job.decoder == FrameDecoder::Builtin) {
+            error = why;
+            return false;
+        }
+    }
+    return use_ffmpeg(job, sinks, d, why, error);
 }
 
 bool measure_motion(const FrameExtractJob& job, const FrameExtractSinks& sinks,
-                    const Decoder& d, int track, int tracks, MotionPlanInput& out,
+                    Decoder& d, int track, int tracks, MotionPlanInput& out,
                     FrameExtractStats& t, std::string& error) {
+    if (cancelled(sinks, error)) return false;
+    if (track < 0 || track >= (int)d.sizes.size()) {
+        error = "no video track " + std::to_string(track) + " in " + job.input;
+        return false;
+    }
 #ifdef SS_HAVE_VIDEO
-    if (d.builtin)
-        return measure_motion_vulkan(job, sinks, track, tracks, out, t, error);
+    if (d.builtin) {
+        bool startup_failed = false;
+        if (measure_motion_vulkan(job, sinks, track, tracks, out, t, error,
+                                  startup_failed))
+            return true;
+        if (!startup_failed || job.decoder != FrameDecoder::Auto) return false;
+        const std::string why = error;
+        if (!use_ffmpeg(job, sinks, d, why, error)) return false;
+    }
 #endif
     return measure_motion_ffmpeg(job, sinks, d.facts, track, tracks, out, t, error);
 }
@@ -128,11 +182,50 @@ bool measure_motion(const FrameExtractJob& job, const FrameExtractSinks& sinks,
 using Decode = std::function<bool(const std::vector<int>& tracks, bool convert,
                                   const InstantSink& on_frame)>;
 
+// The exposure the camera logged for a source frame, as the EXIF block its
+// JPEG carries for --ppisp-exposure-from-exif. Timed index / fps on the
+// telemetry's clock, as SfM times the same frame (sfm/core/Manifest.h).
+class FrameExposure {
+public:
+    explicit FrameExposure(const std::string& video) {
+#ifdef SS_TOOL_SFM
+        sfm::Telemetry t;
+        std::string err;
+        if (!sfm::telemetry_read(video, t, err) || !(t.video_fps > 0)) return;
+        fps_ = t.video_fps;
+        exp_ = std::move(t.exposure);
+        std::stable_sort(exp_.begin(), exp_.end(),
+                         [](const sfm::TelemetryExposure& a,
+                            const sfm::TelemetryExposure& b) { return a.t < b.t; });
+#else
+        (void)video;
+#endif
+    }
+    bool empty() const { return exp_.empty(); }
+    std::vector<uint8_t> exif(int64_t index) const {
+        if (exp_.empty()) return {};
+        const double t = (double)index / fps_;
+        auto it = std::lower_bound(exp_.begin(), exp_.end(), t,
+                                   [](const sfm::TelemetryExposure& e, double v) {
+                                       return e.t < v;
+                                   });
+        if (it == exp_.end() || (it != exp_.begin() && t - (it - 1)->t < it->t - t)) --it;
+        if (std::fabs(it->t - t) > 0.5) return {};
+        return sfm::exifExposureSegment(it->shutter, it->fnum, it->iso);
+    }
+
+private:
+    std::vector<sfm::TelemetryExposure> exp_;
+    double fps_ = 0;
+};
+
 }  // namespace
 
 bool scan_motion(const FrameExtractJob& job, const FrameExtractSinks& sinks,
                  MotionPlanInput& out, FrameExtractStats& stats,
                  std::string& error) {
+    error.clear();
+    if (cancelled(sinks, error)) return false;
     if (!sam::freeze_device(job.device, error)) return false;
     Decoder d;
     if (!pick_decoder(job, sinks, d, error)) return false;
@@ -151,7 +244,8 @@ namespace {
 // One track into one folder, masked on the way when there is a masker.
 bool extract_track(const FrameExtractJob& o, const FrameExtractSinks& sinks,
                    const Decode& decode, int track, const fs::path& image_dir,
-                   const fs::path& mask_dir, sam::Masker* masker, WriterPool& pool,
+                   const fs::path& mask_dir, sam::Masker* masker,
+                   const FrameExposure& exposure, WriterPool& pool,
                    FrameExtractStats& t) {
     fs::create_directories(image_dir);
     if (masker) fs::create_directories(mask_dir);
@@ -187,6 +281,7 @@ bool extract_track(const FrameExtractJob& o, const FrameExtractSinks& sinks,
         if (sinks.preview && image.channels == 3)
             sinks.preview(image.data.data(), image.width, image.height, job.path);
         job.quality = o.quality;
+        job.exif = exposure.exif(index);
         job.image = std::move(image);
         const double t0 = nn::now_ms();
         pool.submit(std::move(job));
@@ -200,7 +295,8 @@ bool extract_track(const FrameExtractJob& o, const FrameExtractSinks& sinks,
 // A 360 file's tracks, laid out as one canvas and resampled into every view.
 bool extract_pair(const FrameExtractJob& o, const FrameExtractSinks& sinks,
                   const Decode& decode, const Decoder& d, const fs::path& image_dir,
-                  WriterPool& pool, FrameExtractStats& t, std::string& error) {
+                  const FrameExposure& exposure, WriterPool& pool,
+                  FrameExtractStats& t, std::string& error) {
     const std::vector<int> want = pano360_needs_track1(o.eac)
                                       ? std::vector<int>{0, 1}
                                       : std::vector<int>{0};
@@ -233,6 +329,7 @@ bool extract_pair(const FrameExtractJob& o, const FrameExtractSinks& sinks,
         t.convert += nn::now_ms() - t0;
         char stem[64];
         std::snprintf(stem, sizeof(stem), "%05lld", (long long)index);
+        const std::vector<uint8_t> exif = exposure.exif(index);
         for (size_t i = 0; i < o.views.size(); i++) {
             t0 = nn::now_ms();
             WriteJob job;
@@ -246,6 +343,7 @@ bool extract_pair(const FrameExtractJob& o, const FrameExtractSinks& sinks,
             job.path = (image_dir / o.views[i].dir /
                         (std::string(stem) + (jpeg ? ".jpg" : ".png"))).string();
             job.quality = o.quality;
+            job.exif = exif;
             if (sinks.preview)
                 sinks.preview(job.image.data.data(), job.image.width, job.image.height,
                               job.path);
@@ -265,7 +363,8 @@ bool extract_pair(const FrameExtractJob& o, const FrameExtractSinks& sinks,
 // track: the rig the frames of one stem form is then a rig in fact.
 bool extract_synced(const FrameExtractJob& o, const FrameExtractSinks& sinks,
                     const Decode& decode, const std::vector<int>& tracks,
-                    const fs::path& base, WriterPool& pool, FrameExtractStats& t) {
+                    const fs::path& base, const FrameExposure& exposure,
+                    WriterPool& pool, FrameExtractStats& t) {
     std::vector<fs::path> dirs;
     for (size_t k = 0; k < tracks.size(); k++) {
         dirs.push_back(base / ("cam" + std::to_string(k)));
@@ -276,12 +375,14 @@ bool extract_synced(const FrameExtractJob& o, const FrameExtractSinks& sinks,
     auto on_frame = [&](std::vector<nn::Image>& imgs, int64_t index, std::string&) {
         char stem[64];
         std::snprintf(stem, sizeof(stem), "%05lld", (long long)index);
+        const std::vector<uint8_t> exif = exposure.exif(index);
         for (size_t k = 0; k < imgs.size(); k++) {
             WriteJob job;
             job.path = (dirs[k] / (std::string(stem) + (jpeg ? ".jpg" : ".png"))).string();
             if (sinks.preview && imgs[k].channels == 3)
                 sinks.preview(imgs[k].data.data(), imgs[k].width, imgs[k].height, job.path);
             job.quality = o.quality;
+            job.exif = exif;
             job.image = std::move(imgs[k]);
             const double t0 = nn::now_ms();
             pool.submit(std::move(job));
@@ -301,6 +402,8 @@ bool extract_synced(const FrameExtractJob& o, const FrameExtractSinks& sinks,
 
 bool extract_frames(const FrameExtractJob& job_in, const FrameExtractSinks& sinks_in,
                     FrameExtractStats& stats, std::string& error) {
+    error.clear();
+    if (cancelled(sinks_in, error)) return false;
     FrameExtractJob job = job_in;
     FrameExtractSinks sinks = sinks_in;
     if (job.skip < 1) job.skip = 1;
@@ -367,6 +470,7 @@ bool extract_frames(const FrameExtractJob& job_in, const FrameExtractSinks& sink
     }
     stats.tracks = (int)tracks.size();
 
+    const int ffmpeg_rotate = job.rotate;
 #ifdef SS_HAVE_VIDEO
     // ffmpeg turns the picture by the container's matrix itself.
     if (dec.builtin) {
@@ -389,9 +493,12 @@ bool extract_frames(const FrameExtractJob& job_in, const FrameExtractSinks& sink
         if (!masker->init(job.mask, error)) return false;
     }
 
+    const FrameExposure exposure(job.input);
+    if (!exposure.empty()) log_line(sinks, lmsg::video_exposure_exif.get());
+
     stats.encoder_threads =
         job.threads > 0 ? job.threads
-                        : std::max(1, (int)std::thread::hardware_concurrency() - 1);
+                        : std::max(1, (int)spirula::hardware_threads() - 1);
     WriterPool pool(stats.encoder_threads);
 
     const fs::path base(job.image_dir);
@@ -401,23 +508,20 @@ bool extract_frames(const FrameExtractJob& job_in, const FrameExtractSinks& sink
     const double t_start = nn::now_ms();
     bool ok = true;
     const bool synced = !pano && job.sync_tracks && tracks.size() > 1;
-    // A frame left out goes to skipped_dir through the same pool, in the same
-    // colours a kept one has. ffmpeg's are mapped here: its kept frames get
-    // the LUT on the way to the sink, which a frame left out never reaches.
+    // Rejected frames arrive in the same colours as kept frames.
     if (!job.skipped_dir.empty() && !pano && tracks.size() == 1) {
         fs::create_directories(job.skipped_dir);
         const bool jpeg = job.quality >= 0 && job.quality <= 100;
-        const bool map = lut && !dec.builtin;
-        sinks.judged = [&, jpeg, map](const FramePick& p, const nn::Image& im) {
+        sinks.judged = [&, jpeg](const FramePick& p, const nn::Image& im) {
             if (p.verdict != PickVerdict::Kept) {
                 char stem[64];
                 std::snprintf(stem, sizeof(stem), "%05lld", (long long)p.index);
                 WriteJob w;
                 w.image = im;
-                if (map) apply_cube_lut(*lut, w.image.data.data(), w.image.data.size() / 3);
                 w.path = (fs::path(job.skipped_dir) /
                           (std::string(stem) + (jpeg ? ".jpg" : ".png"))).string();
                 w.quality = job.quality;
+                w.exif = exposure.exif(p.index);
                 pool.submit(std::move(w));
             }
             if (sinks_in.judged) sinks_in.judged(p, im);
@@ -432,6 +536,7 @@ bool extract_frames(const FrameExtractJob& job_in, const FrameExtractSinks& sink
         if (!measure_motion(job, sinks, dec, tracks[0], (int)tracks.size(), mi, stats,
                             error))
             return false;
+        if (!dec.builtin) job.rotate = ffmpeg_rotate;
         std::vector<std::vector<int64_t>> got =
             plan_by_motion({mi}, job.adaptive_range);
         if (!got.empty()) plan = std::move(got[0]);
@@ -442,29 +547,36 @@ bool extract_frames(const FrameExtractJob& job_in, const FrameExtractSinks& sink
         report_plan(sinks, plan, mi.frames, mi.fps);
     }
 
+#ifdef SS_HAVE_VIDEO
+    bool first_decode = true;
+#endif
     const Decode decode = [&](const std::vector<int>& tr, bool convert,
                               const InstantSink& on_frame) {
+        if (cancelled(sinks, error)) return false;
 #ifdef SS_HAVE_VIDEO
-        // Mapped by the GPU conversion, before the 8-bit rounding.
-        if (dec.builtin)
-            return decode_lockstep_vulkan(job, sinks, tr, convert, plan, stats, error,
-                                          on_frame);
+        if (dec.builtin) {
+            const bool may_retry = first_decode;
+            first_decode = false;
+            bool startup_failed = false;
+            if (decode_lockstep_vulkan(job, sinks, tr, convert, plan, stats, error,
+                                       on_frame, startup_failed))
+                return true;
+            // Earlier tracks may already have written images or changed a masker.
+            if (!may_retry || !startup_failed || job.decoder != FrameDecoder::Auto)
+                return false;
+            const std::string why = error;
+            if (!use_ffmpeg(job, sinks, dec, why, error)) return false;
+            job.rotate = ffmpeg_rotate;
+        }
 #endif
-        // ffmpeg hands over 8-bit RGB that the window is scored on, so the LUT
-        // goes on the instants kept, where it cannot move the choice.
-        const InstantSink mapped = [&](std::vector<nn::Image>& imgs, int64_t index,
-                                       std::string& err) {
-            for (nn::Image& im : imgs) apply_cube_lut(*lut, im.data.data(), im.data.size() / 3);
-            return on_frame(imgs, index, err);
-        };
         return decode_lockstep_ffmpeg(job, sinks, dec.facts, tr, convert, plan, stats,
-                                      error, lut ? mapped : on_frame);
+                                      error, on_frame);
     };
     if (pano) {
         stats.tracks = 2;
-        ok = extract_pair(job, sinks, decode, dec, base, pool, stats, error);
+        ok = extract_pair(job, sinks, decode, dec, base, exposure, pool, stats, error);
     } else if (synced) {
-        ok = extract_synced(job, sinks, decode, tracks, base, pool, stats);
+        ok = extract_synced(job, sinks, decode, tracks, base, exposure, pool, stats);
     }
     for (size_t ti = 0; ti < tracks.size() && ok && !pano && !synced; ++ti) {
         // A multi-track file (an Insta360 .insv carries two fisheye streams)
@@ -477,7 +589,7 @@ bool extract_frames(const FrameExtractJob& job_in, const FrameExtractSinks& sink
             log_line(sinks, "track " + std::to_string(tracks[ti]) + " -> " +
                                 image_dir.string());
         ok = extract_track(job, sinks, decode, tracks[ti], image_dir, mask_dir,
-                           masker.get(), pool, stats);
+                           masker.get(), exposure, pool, stats);
     }
 
     const double t_drain = nn::now_ms();

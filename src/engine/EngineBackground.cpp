@@ -199,7 +199,7 @@ void engine_set_background_step_params(uint32_t seed, float randomize_weight,
     bg.cur_randomize_weight = randomize_weight;
     bg.cur_num_loss_scales      = num_loss_scales;
     bg.cur_loss_scale_min_pixels = loss_scale_min_pixels;
-    if (sh_degree >= 0) bg.cur_sh_degree = sh_degree;
+    if (sh_degree >= 0) bg.cur_sh_degree = std::clamp(sh_degree, 0, bg.sh_degree);
 }
 
 
@@ -211,6 +211,7 @@ void engine_set_background_step_params(uint32_t seed, float randomize_weight,
 void _engine_background_forward() {
     auto& bg = engine().background;
     if (!bg.enabled || bg.mode == EngineBackground::Mode::None) return;
+    StepTimingScope timing(StepPart::Background, StepScale::Pixels);
 
     int C_batch = (int)engine().camera.num;
     int H       = engine().camera.height;
@@ -304,7 +305,7 @@ void _engine_background_chain_params(AppearanceChainParams& p) {
         BgShViews vs = _engine_bg_sh_views(C_batch);
         render_background_sh_forward(
             W, H, engine().camera.model_str, engine().camera.distortion_str,
-            bg.sh_degree, vs.viewmats, vs.intrins, vs.dist_coeffs,
+            bg.cur_sh_degree, vs.viewmats, vs.intrins, vs.dist_coeffs,
             vs.sh_coeffs, _dt3d_tv(bg.fwd_background));
         p.bg = AppearanceBg::Image;
         p.bg_image = (const float*)bg.fwd_background.data_ptr();
@@ -334,7 +335,7 @@ void _engine_background_sh_backward(const float* v_background) {
     BgShViews vs = _engine_bg_sh_views(C_batch);
     render_background_sh_backward(
         W, H, engine().camera.model_str, engine().camera.distortion_str,
-        bg.sh_degree, vs.viewmats, vs.intrins, vs.dist_coeffs, vs.sh_coeffs,
+        bg.cur_sh_degree, vs.viewmats, vs.intrins, vs.dist_coeffs, vs.sh_coeffs,
         _dt3d_tv(bg.fwd_background),
         TorchTensorView((uint64_t)v_background, 4,
                         {(int64_t)C_batch, (int64_t)H, (int64_t)W, 3LL}),
@@ -459,6 +460,7 @@ void _engine_background_backward_hook(
 void engine_background_optim_step(int step, const BackgroundStepConfig& cfg) {
     auto& bg = engine().background;
     if (!bg.enabled) return;
+    StepTimingScope timing(StepPart::Background, StepScale::Fixed);
     if (bg.mode != EngineBackground::Mode::Sh) return;
 
     _ensure_bg_sh_optim_state();
@@ -563,4 +565,13 @@ int engine_copy_background_to_host(TorchTensorView out_image) {
         0.5f, (colorspace::Transfer)bg.splat_transfer, bg.splat_is_linear);
     for (int64_t i = 0; i < n; ++i) h[i] = fill;
     return 1;
+}
+
+
+bool engine_has_background_sh(int* out_degree) {
+    if (engine().background.enabled && engine().background.mode == EngineBackground::Mode::Sh) {
+        if (out_degree) *out_degree = engine().background.sh_degree;
+        return true;
+    }
+    return false;
 }

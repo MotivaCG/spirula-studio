@@ -166,9 +166,16 @@ dropped for now and noted as a limitation).
   applied with profiling, not by default.
 - `Event` = {timeline value at record, optional timestamp-query slot}.
   `event_elapsed_ms` reads the two timestamps × `timestampPeriod`.
+- Step breakdown: while `dispatch_timing_arm()` is in force, every
+  dispatch, fill and copy is bracketed by its own pair of timestamps in a
+  separate query pool, tagged with the recording thread's scope
+  (docs/notes/step-timing.md).
 - Errors: sticky `VkResult` + message; `last_error()` returns-and-clears
-  (cudaGetLastError semantics). Nothing is compiled out: failures always
-  set the sticky error, and allocation failures return nullptr.
+  (cudaGetLastError semantics). Allocation failures return nullptr.
+  A no-progress timeout is fatal: it prints the configured stall limit and
+  exits with failure without running destructors or exit handlers. A timeout
+  does not cancel queued work; driver teardown can otherwise wait forever.
+  `vk_stall_exit_test` checks this with an unsignaled queue semaphore.
 
 ## Kernel ABI
 
@@ -254,6 +261,8 @@ custom command per blob so the build's `-j` bounds how many run at once
 (each blob is a normal Ninja edge, printed `[n/m] SPIR-V <name>`, and only
 stale blobs recompile). The same tool then `embed`s the blobs into one
 generated TU (byte arrays + name registry), so binaries are self-contained.
+The embed also fails on an entry with no row in `engine/StepTimingTable.h`,
+the step-time breakdown's table, and on a row that names no entry.
 CMake locates slangc in PATH / `-DSS_SLANGC=`, checks
 `slangc -v` against the pinned `SS_SLANG_VERSION`, and on miss or
 mismatch downloads + extracts the pinned GitHub release into the build tree
@@ -459,7 +468,10 @@ Vulkan.
 - `kernels/IntersectTile.cpp` + `backend/vulkan/shaders/intersect_tile.slang`:
   `do_intersect_tile_generic` = count -> `backend::inclusive_sum<int32>` ->
   4-byte n_isects readback -> key write -> `backend::sort_pairs<int64,int32>`
-  (begin 0, end 32 + tile bits, exactly the CUB call) -> offset kernel.
+  (begin 0, end 32 + tile bits, exactly the CUB call) -> offset kernel, per
+  band of tile rows when the pairs are many (docs/notes/vram-splat-x-img.md,
+  "Sorting in bands"). The sort starts in the payload buffer that leaves its
+  result in the caller's list: one swap per 8 key bits.
   Ellipse-vs-AABB mode is a runtime null-check on proj_conic (the CUDA
   template bool only folds that check).
 - `kernels/RasterizeFwd.cpp` + `backend/vulkan/shaders/rasterize_fwd.slang`: closely
@@ -595,17 +607,27 @@ the engine level.
   barrier), ballot compaction -> WavePrefixCountBits + per-wave totals in
   groupshared, float atomicAdd/atomicMax -> atomic_add_f32 CAS loop /
   atomic_max_f32 signed-int-max trick (atomic_float.slang) with CUDA's
-  isfinite filter. Six spec-constant axes (camera, dist, median,
-  accum-weight, viewmat-grad, packed). The 2D fragment vjp math is ported
+  isfinite filter. Seven spec-constant axes (camera, dist, median,
+  accum-weight, viewmat-grad, packed, max-weight). The 2D fragment vjp math is ported
   inline; 3DGUT goes through the evaluate_{alpha,color}_3dgs_vjp +
   compute_3dgut_iscl_rot_vjp slang exports. `raster_bwd_parity` builds real
-  forward state through the ported projection/intersect/raster-fwd chain,
-  then compares 285k gradient floats over 5 configs: NVIDIA 1 violation
-  (0.0004%); Intel/llvmpipe ~0.05% — verified to be inherited upstream
-  near-tie blend-order flips, not a port defect, by comparing those devices
-  against an NVIDIA-Vulkan dump of the SAME shader (identical diffs).
-  Note: Primitive.cuh zeros_pool had a leftover raw cudaMemset (host code)
-  -> backend::memset_sync (both backends re-verified).
+  forward state through projection/intersect/raster-forward, then compares
+  1.06 million gradient floats across 18 configurations, including absent
+  depth gradients, distortion, median depth, packed rows, camera gradients,
+  cutoff kernels and maximum weights. Tolerance caps account for atomic
+  accumulation order and upstream near-tie blend-order differences.
+  `rasterize_bwd_nodepth.slang` compiles the shared raster body with
+  `SS_RASTER_NODEPTH`, specializing away the depth VJP when render-depth gradients,
+  distortion and median depth are all absent. Selection uses those bindings,
+  with no footprint or tile-list heuristic. Both entries keep the same
+  compositing order and buffers. The existing 2D and full 3DGUT modules
+  remain byte-identical, including their atomic and int64 variants.
+  RTX 5070, three interleaved pairs with 100 ms warmup per stage: the
+  depth-free entry reduces backward time 5.3–21.3% across tiny, large,
+  mixed, heavy-tail, clustered and transparent splats at 1237x822.
+  A 2M-splat mixed case takes 2.085 ms against 2.495 ms (16.4% less).
+  The same trained bicycle model and fixed full-resolution camera allocate
+  1,735,471,680 bytes with either build (1585.97 MiB pool plus scratch).
 - **Projection backward family (phase 5, fourth slice)**: three kernels over
   shared machinery in `proj_bwd_common.slang` (splat/camera loaders, the
   per-intersection projection VJP wrappers over the primitive_3dgs.slang
@@ -615,7 +637,8 @@ the engine level.
   address locals and the CUDA `_vjp_atomic` variant needs float
   InterlockedAdd, so the VJP accumulates into an `inout float3[24]` and
   callers either keep it in registers or scatter with atomic_add_f32; source
-  coefficients decode once via fp32 or the word-based q8/q16 codec).
+  coefficients are read on demand through the fp32 or word-based q8/q16
+  reader, without retaining a decoded row).
   - `kernels/ProjectionBwd.cpp` + `projection_bwd.slang`
     (projection_{3dgs,mip,3dgut}_backward): one thread per intersection,
     spec axes camera/degree/antialiased/value-bits/packed/viewmat-grad;
@@ -662,7 +685,7 @@ the engine level.
   (densify_clip_scale, MCMC/revised noise, long-axis-split relocate/add,
   MCMC relocate/add) over `backend/vulkan/shaders/densify.slang`, which includes the
   canonical `shaders/densify.slang` device code (long_axis_split_3dgs, the
-  randn3 noise kernels) and mirrors the McmcRelocation.cu-only mcmc_relocation
+  Gaussian noise kernels) and mirrors the McmcRelocation.cu-only mcmc_relocation
   math; `kernels/Optimizer.cpp` gains the adamtr trust-region color
   variants (`backend/vulkan/shaders/optim_color.slang`) and the fused 3DGS geometry
   step (`backend/vulkan/shaders/optim_geometry.slang`, sharing the FPBO helpers
@@ -707,6 +730,26 @@ the engine level.
     loose floats + 2.8M codes; 10 configs over sh_optim_bits 32/8/4 x
     sh_value_bits 32/16/8 x bounds layouts x non-SH quant x degree
     warmup). All three devices pass; validation clean.
+- **Local covariance regularization**: `kernels/PcaReg.cpp` uses the shared
+  Slang PCA math for centers, opacity-weighted centers, or Gaussian mixtures.
+  It supports PCAsplat eigenspectrum/normal/surfel losses, an effective-rank
+  upper bound, and transmittance along the PCA normal. Specialization IDs are
+  covariance mode 0, enabled-term mask 1, search mode 2; capacities and scale
+  modes have separate entries. `pca_reg_parity` checks double-precision values,
+  finite differences, neighbor search and degenerate inputs. `pca_reg_step`
+  checks optimizer integration, including opacity updates without false camera
+  visits. See [the math and tuning notes](../../../docs/notes/pca-reg.md).
+- **Projective depth**: `kernels/ProjectiveDepth.cpp` and
+  `backend/vulkan/shaders/projective_depth.slang` observe existing raster
+  gradients to update each splat's anchor and geometric information. FPBO and
+  the separate geometry optimizer share `shaders/projective_depth.slang` with
+  CUDA. Densification inherits the added state; full checkpoints preserve it.
+  `projective_depth_test`, `fpbo_parity`, `fpbo_split_parity`,
+  `densify_parity`, `projective_resume`, and `projective_camera_batches` cover
+  both backends, including coincident faces and accumulated passes. Exploration
+  keys hash `(step, splat index, component)` as integers; `noise_moments`
+  checks the shared Box–Muller transform and cross-step independence.
+  See [projective depth optimization](../../../docs/notes/projective-depth.md).
 - **Bilagrid/PPISP color pipeline (phase 5, sixth slice)**:
   `kernels/Bilagrid.cpp` implements the full kernels/bilagrid/BilagridBindings.h raw
   launcher family (affine / PPISP / log-linear / depth / normal samplers:
@@ -741,9 +784,25 @@ the engine level.
     need workgroup X to be a multiple of the pinned width (VUID-02757;
     same reason the TV/channel-mean 4x4x4 blocks and the single-thread
     reg-loss finals are 64-/32-wide with logical decode / a tid-0 guard).
-    The warp-shuffle block reduce becomes a groupshared tree
-    (`bg_block_add_64`); CUDA's fast/slow writeback three-path split is
-    preserved.
+    `bg_block_add_64` folds across subgroups in shared memory, then finishes
+    with subgroup reads in the shared tree's original addition order.
+    PPISP gathers two neighboring intensity planes per workgroup, sharing
+    each pixel's transform VJP across both planes. The four-plane preload
+    and `ceil(L/2)` host dispatch cover odd and single-layer grids too.
+    Its RGB backward caches the eight corners for the intensity derivative,
+    avoiding a second read/decode. No image-sized scratch is added.
+    RTX 5070, `image_loss_bench bilagrid 4946 3286 40`: 26.184 against
+    35.788 ms, medians of three interleaved pairs (26.8% less time), with
+    identical Vulkan allocation peaks on fixed inputs.
+  - Standalone PPISP and the appearance chain unroll parameter reduction
+    over the fixed maximum layout. `ppisp_reduce.slang` finishes the shared
+    binary tree with subgroup reads in the original addition order, using
+    the same shared scratch. RTX 5070, 1237x822, medians of three interleaved
+    pairs: standalone PPISP takes 0.180–0.440 ms against 0.321–0.704 ms;
+    the appearance chain takes 0.216–0.988 ms against 0.321–1.459 ms,
+    across 9-, 24-, 36- and 39-parameter layouts. The default 9-parameter
+    chain at 4946x3286 takes 3.471 ms against 5.173 ms. Affine-only and
+    grid-only samplers retain their existing implementations.
   - **Fused TV-Adam/AdaGrad**: one 256-cell codec block per workgroup;
     Adam moments through QuantizedAdamState<4|8>, the AdaGrad accumulator
     through a new QuantizedTensorLog<4|8> port in optim_quant.slang
@@ -769,21 +828,22 @@ the engine level.
     scatter utils) and `ppisp_parity` (63K tight + 0.9K loose; 3 param
     types x cam_indices on/off + reg fwd/bwd with synthetic deterministic
     bwd inputs). All three devices pass; validation clean.
-  - **PLANNED — backward-implementation selection**: the grid-gradient
-    backward ships only as `*_bwd_v1_grid` (thread-per-cell *gather*), which
-    profiling flags as a consistent top cost on every device (NVIDIA, amdvlk,
-    RADV, Intel, llvmpipe). The plan is to add a thread-per-pixel *scatter*
-    `*_bwd_v2` alternative (the disabled `#if 0` CUDA
-    `BilagridUniformSampleBwdV2_kernel.cuh` revived + a new Slang port) and
-    pick between v1/v2 at runtime with a small **online contextual** selector
-    keyed on `(family, resolution, grid shape)` — reusing vksplat's
-    Gaussian-Thompson-sampling stats but making them per-key, so it needs no
-    offline calibration pass (unlike fused-bilagrid) and does not average over
-    resolutions (unlike vksplat's context-free bandit). When porting v2, the
-    `needs_image_grad` axis is a Slang spec-constant (false for depth/normal,
-    which skip the image-grad scatter — the v2 analogue of the existing
-    `v_in == nullptr` skip), and the grid-fold tail rule + null-`v_in` guard
-    above apply unchanged.
+  - **Backward-implementation selection**: `BilagridBwdSelector.h` keeps
+    contextual online statistics per family, resolution and grid shape.
+    Shipping arms explore v1 target tile sizes 2, 3, 4, 5, 6 and 8.
+    The v2 pixel-scatter kernels are available through `SS_BILAGRID_BWD`
+    but remain opt-in because their atomic contention measured slower.
+    Depth/normal v2 specializes away discarded input gradients; RGB PPISP
+    v2 retains its image-gradient pass.
+  - **Uniform PPISP backward, Vulkan only**: wherever a 16x16 pixel tile
+    spans at most two cells per axis and L <= 8, every v1 arm runs
+    `bilagrid_ppisp_bwd_tile` instead. v1's grid kernel repeats each
+    pixel's PPISP backward for the ~4 grid nodes that gather it; the tile
+    kernel runs it once per pixel, stages the 9 parameter gradients in
+    groupshared, and sums one (cell, level) row per thread over 32-pixel
+    chunks. Garden at 2594x1681, 2.5M splats: grid + rgb 4.65 ms ->
+    1.31 ms a step. Reducing per subgroup instead cost more than v1 did:
+    a tile's pixels spread over most of the levels.
 - **Multi-scale per-pixel loss stack (phase 5, seventh slice)**:
   `kernels/PerPixelLoss.cpp` mirrors `compute_multi_scale_per_pixel_losses`
   (PerPixelLoss.cu) end to end — pyramid construction, per-scale grad
@@ -815,6 +875,12 @@ the engine level.
     The `ssim_bt_*` entries are blur-tolerant SSIM: a blur pass, the fused
     kernel on SSIM's tile (30 KB at 16, 47.7 KB at 24), and the blur's
     adjoint (`docs/notes/ssim-blur-tolerance.md`).
+    Its 24x24 backward tile uses 512 threads when the device's workgroup
+    and pinned-subgroup limits permit it, reducing live window state per
+    thread. The 256-thread variant remains the portable fallback;
+    `SS_VK_SSIM_THREADS=256|512` overrides selection for comparisons.
+    Both use the same shared allocation; scalar reduction reuses the dead
+    moment buffer rather than enlarging the loss-map buffer.
   - `canny.slang` (canny rgb/scalar + BT.601 residual luma + Tukey
     biweight) with globally-clamped loads -> per-pixel deterministic, so
     even the RobustEdgeAware densification map compares tight.

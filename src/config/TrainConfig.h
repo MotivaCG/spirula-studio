@@ -1,44 +1,10 @@
 #pragma once
 
-// The training config: every flag `spirula train` accepts, in one table.
-//
-// This file is the single source of truth for the flag's BEHAVIOUR. Adding a
-// row to SS_CONFIG_FIELDS makes the field appear in the CLI parser, in
-// `--help`, in the GUI's "All Options" editor, in the run's config.json and
-// in TrainerCore. The struct is expanded from the same table, so a field
-// cannot exist in one and not the other.
-//
-// The one thing a row does NOT carry is what the flag is CALLED and what it
-// does in words: that is translated, so it lives in
-// i18n/catalog/TrainFields.h, one `SS_MSG(<member>, ...)` name and one
-// `SS_MSG(<member>_help, ...)` sentence per row. `--help` and the GUI tooltip
-// both read those, and a row with no entry there is a compile error naming
-// the flag. This header must not include that catalog -- it is included
-// nearly everywhere and should not drag the translations behind it; the
-// consumers that draw text include both and paste the two together.
-//
-// Row: X(type, member, default, section, tier, choices)
-//
-//   type     one of the scalar types below, or TrainVec3i / TrainVec3f.
-//            std::array<T, N> cannot appear here: its comma would split the
-//            macro argument.
-//   member   the struct member AND, stringified, the CLI flag. The parser
-//            treats '-' and '_' alike, so --sh-degree sets sh_degree.
-//   default  a constant expression. Vector defaults go through train_v3i() /
-//            train_v3f() for the same comma reason.
-//   section  the heading the flag is listed under, one of kTrainSections.
-//            Rows must stay contiguous per section: --help and the GUI stream
-//            headings as they walk the table rather than sorting first.
-//            Purely presentational -- config.json is flat, so a flag can be
-//            moved to a different heading without breaking anything on disk.
-//   tier     how much of a specialist the flag is for, one of kTrainTiers:
-//            "basic"    the ~20 flags a first run needs. `--help` and the
-//                       GUI's default view show these and nothing else.
-//            "advanced" reached for often enough to be worth browsing.
-//            "expert"   warmups, schedules and regularizer internals.
-//            "stub"     parsed but not implemented; hidden unless asked for.
-//   choices  '|'-separated list for string fields; "" is free-form; "none"
-//            means the empty string is allowed and displays as `none`.
+// SS_CONFIG_FIELDS drives the CLI, GUI, config.json and preset fields.
+// Labels and help live in i18n/catalog/TrainFields.h; section and tier are
+// display metadata and never reach disk. Rows must stay contiguous per section.
+// Row: X(type, member, default, section, tier, choices).
+// Vector types use aliases so their commas cannot split macro arguments.
 
 #include <algorithm>
 #include <array>
@@ -74,7 +40,7 @@ inline int train_section_index(const char* section) {
 
 // Least specialist first, so "show me everything up to advanced" is a <=.
 inline constexpr const char* kTrainTiers[] = {
-    "basic", "advanced", "expert", "stub",
+    "basic", "advanced", "expert",
 };
 inline constexpr int kTrainNumTiers =
     (int)(sizeof(kTrainTiers) / sizeof(kTrainTiers[0]));
@@ -117,6 +83,22 @@ inline bool train_choices_free_form(const char* choices) {
 }
 
 
+inline bool train_choice_valid(const std::string& value, const char* choices) {
+    if (train_choices_free_form(choices)) return true;
+    const std::string options = choices;
+    const std::string want = value.empty() ? "none" : value;
+    size_t pos = 0;
+    while (pos <= options.size()) {
+        const size_t bar = options.find('|', pos);
+        if (options.substr(pos, bar == std::string::npos ? std::string::npos : bar - pos) == want)
+            return true;
+        if (bar == std::string::npos) break;
+        pos = bar + 1;
+    }
+    return false;
+}
+
+
 // ===========================================================================
 // The field table
 // ===========================================================================
@@ -137,14 +119,17 @@ inline bool train_choices_free_form(const char* choices) {
     X(float, steps_scaler, 1.0f, "run", "basic", "")                         \
     X(int, steps_per_save, 2000, "run", "advanced", "")                      \
     X(bool, save_only_latest_checkpoint, true, "run", "advanced", "")        \
+    X(bool, export_y_up, false, "run", "basic", "")                          \
     X(bool, save_full_checkpoint, false, "run", "advanced", "")              \
     X(bool, save_eval_images, false, "run", "advanced", "")                  \
     X(bool, eval_lpips, true, "run", "advanced", "")                         \
+    X(std::optional<bool>, eval_align, std::nullopt, "run", "advanced", "")  \
     X(std::string, lpips_checkpoints, "", "run", "advanced", "<folder>")     \
     X(bool, log_performance, false, "run", "advanced", "")                   \
     X(int, viewer_port, 7007, "run", "advanced", "")                         \
     X(bool, disable_viewer, false, "run", "advanced", "")                    \
     X(bool, keep_viewer_alive, true, "run", "advanced", "")                  \
+    X(std::string, finish_command, "", "run", "basic", "none")               \
                                                                              \
     /* ==== dataset -- which files are read, and which images are held out ==== */ \
     X(std::string, data_format, "", "dataset", "basic", "colmap|nerfstudio|metashape|none") \
@@ -173,8 +158,11 @@ inline bool train_choices_free_form(const char* choices) {
     X(float, roi_outside_opacity_decay, 1.0f, "dataset", "advanced", "")     \
     X(int, roi_splat_samples, 4, "dataset", "advanced", "")                  \
     X(bool, roi_mask_pixels, true, "dataset", "advanced", "")                \
+    X(int, sampling_seed, 0, "dataset", "expert", "")                         \
+    X(int, max_resolution, 0, "dataset", "basic", "")                         \
     X(float, train_resolution_divisor, 0.0f, "dataset", "basic", "")         \
     X(std::string, downscale_rounding_mode, "floor", "dataset", "advanced", "floor|ceil|round") \
+    X(bool, cache_downscaled_images, true, "dataset", "advanced", "")        \
     X(bool, progressive_resolution, false, "dataset", "basic", "")           \
     X(int, progressive_resolution_start, 4, "dataset", "advanced", "")       \
     X(float, progressive_resolution_full_at, 0.3f, "dataset", "advanced", "") \
@@ -189,7 +177,6 @@ inline bool train_choices_free_form(const char* choices) {
     X(bool, warp_spherical_to_pinhole, true, "dataset", "advanced", "")      \
     X(std::string, warp_face_fit, "uniform", "dataset", "advanced", "uniform|per-face") \
     X(bool, warp_back_face, false, "dataset", "expert", "")                  \
-    X(bool, deblur_training_images, false, "dataset", "stub", "")            \
                                                                              \
     /* ==== scene -- how the capture is placed, oriented and scaled ==== */  \
     X(std::string, exif_orientation, "orient", "scene", "advanced", "none|orient|apply") \
@@ -200,7 +187,6 @@ inline bool train_choices_free_form(const char* choices) {
     X(std::string, scene_center, "auto", "scene", "basic", "auto|none|point-median|camera-median|camera-focus|point-mean|camera-mean") \
     X(float, scene_center_threshold, 20.0f, "scene", "expert", "")           \
     X(std::optional<float>, relative_scale, std::nullopt, "scene", "expert", "") \
-    X(std::string, train_frame, "points", "scene", "expert", "normalized|camera|points") \
                                                                              \
     /* ==== splats -- what a splat is and how the splats start out ==== */   \
     X(std::string, primitive, "3dgs", "splats", "basic", "3dgs|mip|3dgut")   \
@@ -210,6 +196,7 @@ inline bool train_choices_free_form(const char* choices) {
     X(std::string, background_mode, "color", "splats", "basic", "color|noise|pseudorandom|random|sh") \
     X(TrainVec3f, background_color, train_v3f(0.0f, 0.0f, 0.0f), "splats", "basic", "") \
     X(int, background_sh_degree, 4, "splats", "basic", "")                   \
+    X(int, background_export_height, 512, "splats", "basic", "")          \
     X(int, background_noise_warmup, 2000, "splats", "expert", "")            \
     X(float, background_noise_pre_warmup, 0.25f, "splats", "expert", "")     \
     X(bool, export_keep_all_splats, false, "splats", "advanced", "")         \
@@ -258,7 +245,6 @@ inline bool train_choices_free_form(const char* choices) {
     X(std::string, random_init_center, "camera-median", "splats", "expert", "camera-median|camera-focus|camera-mean|origin") \
     X(std::string, random_init_spread, "median", "splats", "expert", "median|mean") \
     X(float, random_init_std, 1.0f, "splats", "expert", "")                  \
-    X(bool, use_camera_optimizer, false, "splats", "stub", "")               \
                                                                              \
     /* ==== detail -- how many splats there are and where they go ==== */    \
     X(std::string, quality, "medium", "detail", "basic", "low|medium|high|ultra") \
@@ -268,13 +254,15 @@ inline bool train_choices_free_form(const char* choices) {
     X(float, growth_factor, 1.05f, "detail", "advanced", "")                 \
     X(float, min_opacity, 0.005f, "detail", "advanced", "")                  \
     X(std::string, dead_criterion, "either", "detail", "advanced", "opacity|max_weight|either") \
+    X(float, min_weight, 0.05f, "detail", "advanced", "")                    \
+    X(float, max_dead_fraction, 0.02f, "detail", "expert", "")               \
     X(int, refine_every, 100, "detail", "advanced", "")                      \
     X(int, refine_start_iter, 500, "detail", "expert", "")                   \
     X(int, refine_stop_num_iter, 2500, "detail", "advanced", "")             \
     X(int, refine_stop_iter, 14000, "detail", "advanced", "")                \
     X(float, noise_lr, 160.0f, "detail", "expert", "")                        \
     X(float, noise_lr_final, 1.6f, "detail", "expert", "")                   \
-    X(bool, noise_gate_peak_weight, true, "detail", "expert", "")            \
+    X(bool, noise_gate_peak_weight, false, "detail", "expert", "")           \
     X(bool, use_revised_densification, true, "detail", "expert", "")         \
     X(std::string, densify_score_mode, "mean", "detail", "basic", "mean|max|median|geom") \
     X(float, densify_score_blend_world_grad, 0.0f, "detail", "advanced", "") \
@@ -294,6 +282,7 @@ inline bool train_choices_free_form(const char* choices) {
     X(bool, use_long_axis_split, true, "detail", "expert", "")               \
     X(TrainVec3f, long_axis_split_opacity_k, train_v3f(0.5f, 0.55f, 15000.0f), "detail", "basic", "") \
     X(float, max_split_fraction, 0.1f, "detail", "advanced", "")             \
+    X(float, densify_min_split_opacity, 0.05f, "detail", "advanced", "")     \
     X(bool, split_weight_by_renders, false, "detail", "advanced", "")        \
     X(float, dead_after_epochs, 2.0f, "detail", "advanced", "")              \
     X(float, max_screen_size, 0.3f, "detail", "basic", "")                   \
@@ -321,7 +310,7 @@ inline bool train_choices_free_form(const char* choices) {
     X(float, view_deficit_max_ratio, 8.0f, "loss", "advanced", "")           \
                                                                              \
     /* ==== geometry -- how crisp the surfaces come out, and depth/normal guidance ==== */ \
-    X(std::string, floater_suppression, "off", "geometry", "basic", "off|mild|strong") \
+    X(std::string, floater_suppression, "off", "geometry", "basic", "off|mild|moderate|strong") \
     X(float, depth_distortion_reg, 0.0f, "geometry", "basic", "")            \
     X(float, normal_distortion_reg, 0.0f, "geometry", "basic", "")           \
     X(float, rgb_distortion_reg, 0.0f, "geometry", "basic", "")              \
@@ -340,6 +329,21 @@ inline bool train_choices_free_form(const char* choices) {
     X(float, median_normal_supervision_weight, 0.0f, "geometry", "expert", "") \
     X(float, median_render_normal_reg_weight, 0.0f, "geometry", "expert", "")\
     X(int, median_warmup, 6000, "geometry", "expert", "")                    \
+    X(int, pca_reg_neighbors, 0, "geometry", "advanced", "")                 \
+    X(std::string, pca_reg_knn, "morton-best", "geometry", "advanced", "exact|exact-cached|morton|morton-cached|morton-best|morton-best-cached") \
+    X(int, pca_reg_window, 0, "geometry", "expert", "")                      \
+    X(int, pca_reg_refresh_every, 0, "geometry", "expert", "")               \
+    X(int, pca_reg_start_iter, 7000, "geometry", "advanced", "")             \
+    X(float, pca_reg_weight, 0.1f, "geometry", "advanced", "")               \
+    X(std::optional<float>, pca_reg_weight_final, 1.0f, "geometry", "advanced", "") \
+    X(std::string, pca_reg_schedule, "linear", "geometry", "expert", "linear|exponential|cosine") \
+    X(float, pca_reg_tangent_weight, 0.001f, "geometry", "advanced", "")     \
+    X(float, pca_reg_normal_weight, 0.1f, "geometry", "advanced", "")        \
+    X(float, pca_reg_surfel_weight, 0.0f, "geometry", "expert", "")        \
+    X(float, pca_reg_erank_weight, 0.01f, "geometry", "advanced", "")        \
+    X(float, pca_reg_transparency_weight, 0.0f, "geometry", "expert", "")  \
+    X(std::string, pca_reg_covariance, "centers", "geometry", "expert", "centers|opacity-centers|gaussian-mixture") \
+    X(bool, pca_reg_scale_agnostic, true, "geometry", "expert", "")       \
                                                                              \
     /* ==== shape -- keeping individual splats compact and well behaved ==== */ \
     X(float, opacity_reg, 0.01f, "shape", "basic", "")                      \
@@ -399,6 +403,13 @@ inline bool train_choices_free_form(const char* choices) {
     X(std::optional<float>, ppisp_lr_final, 2e-05f, "correction", "advanced", "") \
     X(int, ppisp_lr_warmup, 500, "correction", "advanced", "")               \
     X(std::string, ppisp_from, "", "correction", "advanced", "none")        \
+    X(std::string, calib_correction, "basic", "correction", "basic", "off|basic|accurate") \
+    X(bool, use_calib_warp, true, "correction", "basic", "")                 \
+    X(int, calib_warp_grid, 9, "correction", "advanced", "")                 \
+    X(bool, calib_warp_parallax, false, "correction", "basic", "")           \
+    X(int, calib_warp_start_iter, 1000, "correction", "expert", "")          \
+    X(float, calib_warp_step, 0.5f, "correction", "expert", "")              \
+    X(float, calib_warp_smooth, 0.05f, "correction", "expert", "")           \
                                                                              \
     /* ==== colorspace -- linear vs display encoding, and which gamut ==== */\
     X(std::optional<bool>, image_color_is_linear, std::nullopt, "colorspace", "basic", "") \
@@ -412,7 +423,7 @@ inline bool train_choices_free_form(const char* choices) {
     X(std::string, point_color_gamut, "", "colorspace", "basic", "Rec.709|ACES2065-1|ACEScg|Rec.2020|AdobeRGB|DCI-P3|none") \
                                                                              \
     /* ==== perf -- speed and memory; none of these change the result ==== */\
-    X(std::string, cache_images, "disk", "perf", "basic", "cpu|gpu|disk")    \
+    X(std::string, cache_images, "disk", "perf", "basic", "cpu|disk")        \
     X(int, max_batch_per_epoch, 800, "perf", "basic", "")                    \
     X(float, min_renders_per_refine, 0.0f, "perf", "basic", "")              \
     X(float, render_quantile, 0.1f, "perf", "advanced", "")                  \
@@ -423,10 +434,10 @@ inline bool train_choices_free_form(const char* choices) {
     X(int, quantization_level, 1, "perf", "advanced", "")                    \
     X(int, bin_tile_size, 0, "perf", "expert", "")                           \
     X(bool, preallocate_splat_tensors, true, "perf", "expert", "")           \
-    X(std::string, optimizer_offload, "", "perf", "stub", "sh|all|none")     \
-    X(bool, use_bvh, false, "perf", "stub", "")                              \
                                                                              \
     /* ==== rates -- how fast each splat parameter is allowed to change ==== */ \
+    X(float, projective_depth_lr, 0.01f, "rates", "advanced", "")          \
+    X(std::optional<float>, projective_depth_lr_final, 0.0001f, "rates", "advanced", "") \
     X(float, means_lr, 0.000256f, "rates", "basic", "")                      \
     X(std::optional<float>, means_lr_final, 3.2e-06f, "rates", "basic", "")  \
     X(float, scales_lr, 0.02f, "rates", "basic", "")                         \
@@ -466,9 +477,9 @@ struct TrainConfig {
 #define SS_DATASET_PARSE_FIELDS(X) \
     X(data) X(data_format) X(colmap_recon_dir) X(seed_pointcloud) X(image_dir) X(mask_dir) \
     X(depth_dir) X(normal_dir) X(metashape_xml) X(metashape_ply) \
-    X(metashape_psx) X(train_resolution_divisor) X(downscale_rounding_mode) \
+    X(metashape_psx) X(train_resolution_divisor) X(max_resolution) X(downscale_rounding_mode) \
     X(exif_orientation) X(orientation_method) X(center_method) X(auto_scale_poses) \
-    X(outlier_threshold) X(scene_center) X(scene_center_threshold) X(train_frame) X(eval_mode) \
+    X(outlier_threshold) X(scene_center) X(scene_center_threshold) X(eval_mode) \
     X(train_split_fraction) \
     X(eval_interval) X(depth_unit_scale_factor) X(validation_fraction) \
     X(warp_to_pinhole) X(warp_spherical_to_pinhole) X(warp_face_fit) \
@@ -504,7 +515,6 @@ inline constexpr TrainPresetInfo kTrainPresets[] = {
     // {"academic-baseline"},  // hidden by default, uncomment to enable
 };
 
-// Returns false for an unknown preset name.
 inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
     if (name == "3dgs") {
         return true;
@@ -523,7 +533,7 @@ inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
         c.load_depths = true;
         c.load_normals = true;
         c.mask_boundary_offset = -0.005f;
-        // c.floater_suppression= "strong";
+        c.floater_suppression = "strong";
         // c.distraction_robustness = "strong";
         c.sh_degree_warmup_every = 0;
         c.long_axis_split_opacity_k = {0.5f, 0.55f, 30000.0f};
@@ -563,12 +573,14 @@ inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
         // c.features_dc_lr = 0.0015f;
         c.features_sh_lr = 0.0001f;
         c.ssim_lambda = 0.1f;
+        c.min_weight = 0.005f;
         return true;
     }
     if (name == "synthetic") {
         // c.min_init_fraction = 0.02f;
         c.use_bilateral_grid = false;
         c.use_ppisp = false;
+        c.calib_correction = "off";
         c.use_bilateral_grid_for_geometry = false;
         c.long_axis_split_opacity_k = {0.5f, 0.55f, 25000.0f};
         return true;
@@ -577,10 +589,11 @@ inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
         c.primitive = "mip";
         c.sh_degree = 0;
         c.dc_reg = 10.0f;
-        c.sh_reg = 10.0f;
+        // c.sh_reg = 10.0f;
         c.overexposure_reg = 10.0f;
         c.background_mode = "noise";
-        c.depth_distortion_reg = 0.01f;
+        // c.depth_distortion_reg = 0.01f;
+        c.floater_suppression = "strong";
         c.normal_distortion_reg = 0.01f;
         c.mean_median_depth_weight = 0.01f;
         c.median_depth_normal_reg_weight = 0.01f;
@@ -604,6 +617,7 @@ inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
         c.use_bilateral_grid = false;
         c.use_bilateral_grid_for_geometry = false;
         c.use_ppisp = false;
+        c.calib_correction = "off";
         c.use_revised_densification = false;
         c.reg_rendered_only = false;
         c.dead_after_epochs = 0.0f;
@@ -633,6 +647,7 @@ inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
         c.scale_reg = 0.01f;
         c.max_steps = 30000;
         c.use_scale_agnostic_mean = false;
+        c.projective_depth_lr = 0.0f;
         c.use_per_splat_bias_correction = false;
         c.means_lr = 0.00016f;
         c.means_lr_final = 1.6e-06f;
@@ -730,6 +745,16 @@ inline void train_resolve_macros(TrainConfig& c,
         }
     }
 
+    // `basic` is the defaults below it; `accurate` adds the depth-dependent term.
+    restore("calib_correction", "use_calib_warp", &TrainConfig::use_calib_warp);
+    restore("calib_correction", "calib_warp_parallax", &TrainConfig::calib_warp_parallax);
+    restore("calib_correction", "calib_warp_grid", &TrainConfig::calib_warp_grid);
+    if (c.calib_correction != "basic" || explicit_flags.count("calib_correction")) {
+        put("use_calib_warp", c.use_calib_warp, c.calib_correction != "off");
+        put("calib_warp_parallax", c.calib_warp_parallax, c.calib_correction == "accurate");
+        put("calib_warp_grid", c.calib_warp_grid, c.calib_correction == "accurate" ? 15 : 9);
+    }
+
     // Lobes take the place of the SH bands unless both are asked for. A
     // resumed run keeps its checkpoint's bands: --sb-lobes there adds lobes.
     if (c.sb_lobes > 0 && c.resume.empty()) put("sh_degree", c.sh_degree, 0);
@@ -746,15 +771,22 @@ inline void train_resolve_macros(TrainConfig& c,
             &TrainConfig::max_screen_size);
     restore("floater_suppression", "max_screen_size_clip_hardness",
             &TrainConfig::max_screen_size_clip_hardness);
+    restore("floater_suppression", "pca_reg_neighbors",
+            &TrainConfig::pca_reg_neighbors);
     if (c.floater_suppression != "off") {
+        const bool moderate = c.floater_suppression == "moderate";
         const bool strong = c.floater_suppression == "strong";
         put("depth_distortion_reg", c.depth_distortion_reg,
-            strong ? 0.03f : 0.01f);
+            strong ? 0.1f : moderate ? 0.03f : 0.01f);
         put("rgb_distortion_reg", c.rgb_distortion_reg,
-            strong ? 0.05f : 0.01f);
-        put("sh_reg", c.sh_reg, strong ? 0.1f : 0.067f);  // above the 0.04 default
-        put("max_screen_size", c.max_screen_size, strong ? 0.1f : 0.2f);
-        put("max_screen_size_clip_hardness", c.max_screen_size_clip_hardness, strong ? 1.1f : 1.25f);
+            strong ? 0.1f : moderate ? 0.05f : 0.01f);
+        put("sh_reg", c.sh_reg, strong ? 0.15f : moderate ? 0.1f : 0.067f);  // above the 0.04 default
+        put("max_screen_size", c.max_screen_size, strong || moderate ? 0.1f : 0.2f);
+        put("max_screen_size_clip_hardness", c.max_screen_size_clip_hardness, strong || moderate ? 1.1f : 1.25f);
+    }
+    if (c.floater_suppression == "strong") {
+        put("pca_reg_neighbors", c.pca_reg_neighbors, 31);
+        put("pca_reg_start_iter", c.pca_reg_start_iter, 4500);
     }
 }
 
@@ -792,6 +824,8 @@ inline void train_apply_steps_scaler(TrainConfig& c) {
     c.bilagrid_depth_lr_warmup  = sc(c.bilagrid_depth_lr_warmup);
     c.bilagrid_normal_lr_warmup = sc(c.bilagrid_normal_lr_warmup);
     c.ppisp_lr_warmup           = sc(c.ppisp_lr_warmup);
+    c.calib_warp_start_iter     = sc(c.calib_warp_start_iter);
+    c.pca_reg_start_iter        = sc(c.pca_reg_start_iter);
     if (c.max_steps)
         c.max_steps = sc(*c.max_steps);
     // The field packs (start value, end value, steps to move between them),

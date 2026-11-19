@@ -1,18 +1,7 @@
 #pragma once
 
-// ViewportPanel -- the native 3D viewport, with two backends behind the
-// browser-identical NavCamera navigation (see NavCamera.h: four modes,
-// mouse / keyboard / touch-via-OS-pointer / gamepad input):
-//
-//   Preview: pure-GL sparse point cloud + camera frusta (PreviewRenderer),
-//            shown as soon as a dataset is parsed, before training.
-//   Engine:  the shared RenderWorker (same latest-wins engine render path
-//            as the web viewer) once training has set up the engine; all
-//            web-viewer camera models (pinhole / fisheye-equidistant /
-//            fisheye-equisolid / equirectangular) with per-model FOV.
-//
-// GUI thread only. attach*() after the corresponding phase; detach() BEFORE
-// the session it renders from is destroyed.
+// Native viewport over GL previews or RenderWorker engine renders, with NavCamera navigation.
+// GUI thread only; detach before destroying the rendered session.
 
 #include "app/webviewer/RenderWorker.h"
 #include "core/ColorSpace.h"
@@ -22,6 +11,7 @@
 #include "app/gui/PreviewRenderer.h"
 #include "app/gui/ViewportInput.h"
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -94,6 +84,8 @@ public:
             apply_color_space,
         std::function<void()> on_primitive_changed);
     void detach();
+    // A saved placement can change the frame without changing element counts.
+    void invalidate_framing() { _framed_key.clear(); }
     bool attached() const { return _mode == Mode::Engine; }
 
     // Hide the controls the view link makes shared -- navigation, camera
@@ -122,13 +114,19 @@ public:
                      int& camera_model, float eye[3]) const;
     // Where the last draw put the image on screen, in ImGui coordinates.
     void image_rect(float& x, float& y, float& w, float& h) const;
+    struct WipeSource {
+        const ViewportPanel* panel;
+        std::string name;
+    };
+    // Sources include this panel first. Four sources use X/Y splits;
+    // otherwise splits are ordered fractions across the image.
+    void set_wipe(std::vector<WipeSource> sources = {}, std::vector<float>* splits = nullptr);
+    void render_only(const ImVec2& avail);
+    void last_avail(float& w, float& h) const { w = _last_avail_w; h = _last_avail_h; }
     // The same pose in the SHARED frame the camera navigates, which is where
     // a placement is dragged: the model moves through it, the grid does not.
     void nav_camera(int W, int H, float w2c[12], float& fx, float& fy,
                     int& camera_model, float eye[3]) const;
-    // How far the orthographic emulation pulled the render camera back along
-    // its axis, in the frame view_camera / nav_camera report; 0 in perspective.
-    float ortho_pullback(bool shared) const;
     // The orbit pivot, shared frame: what the view is looking at.
     void nav_target(float out[3]) const {
         for (int i = 0; i < 3; i++) out[i] = _cam.target[i];
@@ -279,6 +277,11 @@ private:
     void set_centers(const dsparse::CenterTable* centers, bool has_cameras);
     // The chosen centre in the shared frame; the origin when none is known.
     void center_shared(float out[3]) const;
+    // Make the chosen centre the pivot and the home pose's centre, keeping the view.
+    void pivot_on_center();
+    // The capture's navigation mode and centre (data/NavigationHint.h), each
+    // until the user picks one; `first` re-arms both for a new dataset.
+    void follow_navigation_hint(const ParsedDataset& ds, bool first);
     // The mode the menu shows: the point statistic a camera one fell back to
     // when there are no cameras.
     int effective_center_mode() const;
@@ -320,13 +323,25 @@ private:
     void draw_controls(bool engine);
     void handle_input(float item_h);         // mouse/keys/gamepad on last item
     void draw_engine(bool training, const ImVec2& avail, int step);
+    void pump_engine(bool training, const ImVec2& avail, int step);
+    unsigned pump_preview(const ImVec2& avail, int& W, int& H);
     void draw_preview(const ImVec2& avail);
+    void draw_wipe(const ImVec2& tl, const ImVec2& size) const;
+    bool wipe_input(const ImVec2& tl, const ImVec2& size);
+    std::vector<WipeSource> _wipe_sources;
+    std::vector<float>* _wipe_splits = nullptr;
+    int _wipe_drag = -1;
+    float _last_avail_w = 0.0f, _last_avail_h = 0.0f;
+    unsigned _preview_tex = 0;
 
     Mode _mode = Mode::None;
     RenderWorker _worker;
     PreviewRenderer _preview;
+    std::array<float, 16> _preview_frame{};   // ParsedDataset::train_to_normalized
 
     // Browser-identical camera + navigation.
+    double _focus_until = 0;
+    NavCamera _focus_pose;
     NavCamera _cam;
     NavCamera _home;                 // pose restored by Reset view
     float _home_dist = 3.0f;         // scene radius (near/far for preview)
@@ -345,7 +360,8 @@ private:
 
     // Camera model + per-model FOV memory (browser _fovMemory equivalent).
     int _cam_model = 0;              // index into kViewerCameraModels
-    float _fov_deg[4] = {90, 180, 180, 0};
+    float _fov_deg[5] = {90, 180, 180, 0, 90};
+    int _previous_cam_model = 0;
 
     // Whether there are training cameras behind what is being rendered. A
     // splat file has none, so the frustum controls are hidden rather than
@@ -371,6 +387,8 @@ private:
     // What the view orbits about and Reset view frames (dsparse::CenterMode),
     // a point per mode in the model frame. Moves only the camera.
     int _center_mode = (int)dsparse::CenterMode::CameraMedian;
+    bool _auto_nav_mode = true;
+    bool _auto_center = true;
     dsparse::CenterTable _centers{};
     bool _centers_known = false;
     bool _center_has_cameras = false;
@@ -387,12 +405,9 @@ private:
     void draw_overlays();
     void animate_view(double now);
     bool external_grid() const;
-    // Camera-to-world in the shared frame, pulled back when orthographic.
+    // Camera-to-world in the shared frame.
     void render_c2w(float out[12]) const;
-    float ortho_back() const;
 
-    // Orthographic is a pinhole a long way off with a long lens: every
-    // renderer, primitive and selection test then works unchanged.
     bool _ortho = false;
     bool _ortho_auto = false;        // entered by an axis click: orbit leaves it
     // A view change in flight (axis snap): rotation slerped, pivot distance kept.

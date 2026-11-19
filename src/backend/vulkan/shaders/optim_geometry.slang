@@ -9,6 +9,7 @@
 //
 // Barriers only exist in the kNonShQuant reduces, which every thread
 // reaches (`inside` masks work, never control flow around a reduce).
+#include "shaders/projective_depth.slang"
 #define CudaDeviceExport ForceInline
 #include "shaders/per_splat_losses.slang"
 #include "shaders/pixel_wise.slang"
@@ -61,6 +62,7 @@ struct OptimGeoParams {
     float* densify_score;  // optional output (has_densify_score)
     int* steps;            // per-splat steps (has_steps)
     uint* visit_counters;  // per-splat render counters (has_visit)
+    float* auxiliary_opacities;
     // block-wise 16-bit quantized gradients (kGqMask; bound per 256 splats)
     uint* gq_means_packed;
     float2* gq_means_bounds;
@@ -84,6 +86,13 @@ struct OptimGeoParams {
     float4* nq_opacities_bounds;
     float4* nq_dc_bounds;
     // learning rates + regularizer weights (already divided by N host-side)
+    float4* depth_states;
+    float* depth_information;
+    float4* depth_centers;
+    int* depth_cameras;
+    float* depth_angular_bound;
+    float depth_lr, depth_angular_lr;
+    uint has_depth, depth_photo, depth_relative, depth_has_bound;
     float lr_means;
     float lr_quats;
     float lr_scales;
@@ -109,7 +118,7 @@ struct OptimGeoParams {
     uint32_t wgs_per_row;
     uint32_t has_visit;
     uint32_t skip_unrendered_reg;
-    uint32_t _pad0;
+    uint32_t has_auxiliary_opacities;
 };
 
 // Data gradient for a PRIMS-wide attribute: decode from the 16-bit
@@ -217,6 +226,8 @@ void fused_optim_3dgs_geometry(uint3 wg: SV_GroupID,
         v_quat += p.grad_scale * float4(gd_quat[0], gd_quat[1], gd_quat[2],
                                         gd_quat[3]);
         v_opac += p.grad_scale * gd_opac[0];
+        if (p.has_auxiliary_opacities != 0)
+            v_opac += p.grad_scale * p.auxiliary_opacities[gid];
         if (kZeroGrad != 0) {
             if ((kGqMask & 4) == 0) {
                 p.v_scales[3 * gid] = 0.0f;
@@ -348,6 +359,22 @@ void fused_optim_3dgs_geometry(uint3 wg: SV_GroupID,
                 p.v_means[3 * gid + 1] = 0.0f;
                 p.v_means[3 * gid + 2] = 0.0f;
             }
+            float4 projective_state = float4(0);
+            float3 projective_anchor = float3(0), projective_camera = float3(0);
+            float projective_gradient = 0;
+            float3 data_scale_gradient = p.grad_scale*float3(gd_scale[0],gd_scale[1],gd_scale[2]);
+            bool projective_active = p.has_depth != 0 && p.radii[gid] > 0
+                && dot(v_mean,v_mean)+dot(data_scale_gradient,data_scale_gradient) > 0;
+            if (projective_active) {
+                projective_state = p.depth_states[gid];
+                projective_active = projective_state.x > 0;
+                if (projective_active) {
+                    projective_anchor = p.depth_centers[max(int(projective_state.x),1)-1].xyz;
+                    projective_camera = p.depth_centers[p.depth_cameras[0]].xyz;
+                    projective_gradient = projective_depth_gradient(projective_anchor,projective_camera,
+                        mean,v_mean,data_scale_gradient,p.depth_photo != 0);
+                }
+            }
             // densification score: ||dL/dmean_world|| * max post-exp world
             // scale (pre-update log scales).
             if (p.has_densify_score != 0) {
@@ -406,6 +433,17 @@ void fused_optim_3dgs_geometry(uint3 wg: SV_GroupID,
                     p.g2_means[3 * gid + i] = g2[i];
                 }
             }
+            if (projective_active) {
+                float3 updated_mean = new_mean;
+                float3 updated_scale = float3(p.scales[3*gid],p.scales[3*gid+1],p.scales[3*gid+2]);
+                projective_depth_update(projective_anchor,projective_camera,p.depth_lr,p.depth_angular_lr,
+                    p.depth_photo != 0,p.depth_relative != 0,projective_gradient,p.depth_information[gid],
+                    projective_state,updated_mean,updated_scale,p.depth_has_bound != 0 ? p.depth_angular_bound[gid] : -1.f);
+                p.means[3*gid] = updated_mean.x; p.means[3*gid+1] = updated_mean.y; p.means[3*gid+2] = updated_mean.z;
+                p.scales[3*gid] = updated_scale.x; p.scales[3*gid+1] = updated_scale.y; p.scales[3*gid+2] = updated_scale.z;
+                p.depth_states[gid] = projective_state;
+            }
+
         }
 
         // update features_dc (only under kNonShQuant; the fp32 path keeps

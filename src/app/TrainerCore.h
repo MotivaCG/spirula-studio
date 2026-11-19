@@ -1,22 +1,8 @@
 #pragma once
 
-// TrainerCore -- the engine-side training session shared by the standalone
-// CLI (app/cli/main.cpp) and the native GUI (app/gui/). This is the single
-// training driver. It began as a port of a Python trainer that no longer
-// exists; the per-step logic lives in build_step_config() and nowhere else,
-// so there is nothing left to keep in sync.
-//
-// TrainerSession splits the run into phases so front-ends can interleave
-// their own UI between them:
-//   check_config()  -> throws for unported features, logs warnings
-//   load_dataset()  -> parse + post-split bake (no GPU work)
-//   setup_engine()  -> output dir, seeding, engine + DataManager init
-//   train()         -> the step loop; pause / stop / render-fairness via
-//                      the public atomics, per-step callback for progress
-//
+// Training session shared by the CLI and GUI.
 // The engine is a process-global singleton: one live session at a time.
-// setup_engine() calls engine_reset(), so a fresh session can follow a
-// finished one in the same process (the GUI's "train again" path).
+// setup_engine() resets it before starting another run.
 
 #include "app/SystemRecorder.h"
 #include "app/TrainPerfLog.h"
@@ -34,6 +20,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <deque>
 #include <filesystem>
 #include <functional>
@@ -113,7 +100,8 @@ struct SeedSplats {
 };
 
 SeedSplats seed_splats(const ColmapPoints3D& pts, const TrainConfig& cfg,
-                       const ColorResolution& color);
+                       const ColorResolution& color,
+                       const PostSplitCameras* post = nullptr);
 
 // A warm start from a trained 3DGS PLY (--init-ply): the file supplies every
 // parameter, and only the layout is re-fitted to this run (cap_max, sh_degree,
@@ -129,7 +117,9 @@ void split_ply(const std::filesystem::path& from, const std::filesystem::path& t
 // the warm start covers what the source model has and the point cloud covers
 // what it does not. Adds nothing once `s` already fills cap_max.
 void append_point_seeds(SeedSplats& s, const ColmapPoints3D& pts,
-                        const TrainConfig& cfg, const ColorResolution& color);
+                        const TrainConfig& cfg, const ColorResolution& color,
+                        const PostSplitCameras* post = nullptr);
+
 
 
 // ===========================================================================
@@ -167,11 +157,8 @@ void save_config_json(const TrainConfig& c, const std::filesystem::path& out_dir
 void save_scene_transform_json(const ParsedDataset& ds, const TrainConfig& c,
                                const std::filesystem::path& out_dir);
 
-// "" when this config is runnable, else the sentence naming the flag that is
-// not implemented -- exactly what TrainerSession::check_config() throws. A
-// front-end that wants to report the problem instead of catching it (the
-// GUI's batch pre-flight) asks this first.
-std::string train_config_unsupported(const TrainConfig& c);
+// Shared validation for CLI training and GUI preflight; empty means valid.
+std::string train_config_error(const TrainConfig& c);
 
 
 // ===========================================================================
@@ -325,9 +312,6 @@ public:
     // caller must hold engine_mutex.
     std::map<std::string, float> train_step(int step);
 
-    // SMN opacity boost: on the two steps that mark 40% and 85% of the run,
-    // multiplies every splat's opacity by cfg.opacity_boost. Called by
-    // train_step(), so a front-end with its own loop gets it as well.
     void maybe_boost_opacity(int step);
 
     void save_checkpoint(int step, bool full);
@@ -336,6 +320,7 @@ public:
     // hooks are installed, and cc_ variants on the colour-corrected render.
     // Replaces the engine's DataManager, so it must run AFTER training.
     void eval(const std::function<void(const EvalProgress&)>& on_progress = {});
+
 
     // The seeds setup_engine() hands the engine, from the point cloud and/or
     // cfg.init_ply.
@@ -354,6 +339,9 @@ public:
     double eta_seconds() const;
     // The run's ETA and VRAM forecast, fed by train().
     const TrainForecast& forecast() const { return _forecast; }
+    // Where the time goes: per step over the last window, or this whole run
+    // with the steps still to come forecast.
+    TimeBreakdown time_breakdown(bool whole_run) const;
 
     // The /progress response body.
     std::string progress_json();
@@ -367,6 +355,7 @@ public:
 private:
     // ds.points drawn at random when --random-init asks for it.
     void seed_at_random();
+    void set_downscale_cache(DataManagerConfig& dm) const;
     void set_alpha_config(DataManagerConfig& dm,
                           const std::vector<uint8_t>& alpha) const;
 
@@ -450,11 +439,14 @@ private:
     TrainForecast _forecast;
     int _batches_per_epoch = 1;
     int _resolution_divisor = 0;   // of the last step; 0 before the first
+    std::vector<std::pair<int, int>> _resolution_stages;   // (first step, divisor)
     TrainPerfLog _perf;            // log_performance, SS_TRAIN_PERF
     std::filesystem::path _perf_dir;   // this session's, under <run>/perf; empty without log_performance
     SystemRecorder _system;        // log_performance: setup_engine() to the end of train()
     std::atomic<int64_t> _live_splats{0};
     OomRisk _warned_risk = OomRisk::Low;
+    size_t _sh_bytes = 0;          // observe_memory's, refreshed once a window
+    std::unique_ptr<std::FILE, int (*)(std::FILE*)> _forecast_dump{nullptr, std::fclose};
 };
 
 }  // namespace spirula

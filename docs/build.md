@@ -16,6 +16,12 @@ compiling its own copy.
 
 Always build through the dev scripts.
 
+`spirula --licenses` prints the embedded AprilTag BSD-2-Clause license and
+the OpenCV Apache-2.0 license for its ArUco tables, including their copyright
+notices. These texts travel with the executable on both backends, including
+headless builds. `tools/gen_license_texts.py` reads the vendored license files
+directly; regenerate its committed output when those files change.
+
 ## CMake layout
 
 `CMakeLists.txt` is just the running order; the logic lives in `cmake/`:
@@ -25,7 +31,7 @@ Always build through the dev scripts.
 | `SsOptions.cmake` | options (`SS_BUILD_GUI`, `SS_DEBUG_SYMBOLS`, …), backend selection, tree paths (`SS_ROOT`, `SS_CSRC`, …) |
 | `SsSources.cmake` | `ss_collect_sources()` — expands `sources.txt` with `CONFIGURE_DEPENDS` |
 | `SsBackendCuda.cmake` | Torch probe, CUDA arch detection, flags, the `csrc` library, CUDA-side parity tools |
-| `SsBackendVulkan.cmake` | portable engine object lib, slangc + SPIR-V embed, `ss_backend_vulkan`, the Vulkan-side tests |
+| `SsBackendVulkan.cmake` | portable engine static library, slangc + SPIR-V embed, `ss_backend_vulkan`, the Vulkan-side tests |
 | `SsSlang.cmake` | `ss_find_slangc()` — pinned version, PATH lookup, fetch on miss |
 | `SsEmbed.cmake` | `ss_embed_file()` — bake a file into a byte-array header |
 | `SsApps.cmake` | the `spirula` executable — every tool the build has, in one binary (backend-agnostic) |
@@ -101,9 +107,10 @@ starts with no focal-length prior.
 
 Turning it on buys in-process GPU decoding and encoding: roughly 15× faster
 frame extraction (a 127-second 1080p30 clip in ten seconds rather than
-minutes), `spirula encode` for the render mode's videos, and no ffmpeg to
-install. A device without a video queue -- MoltenVK on every Mac -- decodes
-with ffmpeg even then.
+minutes), `spirula encode` for the render mode's videos, and no FFmpeg
+dependency for inputs supported by the device. Devices without a video queue
+(including MoltenVK on macOS) and unsupported codec profiles still decode
+with external FFmpeg.
 Nothing else in the build changes.
 
 If you distribute binaries, decide for your jurisdiction and your users before
@@ -268,6 +275,20 @@ of refusing to start. Nothing BELOW 7.5 runs: JIT only goes forward, so a
 Pascal target has to be named. Override with `SS_CUDA_ARCHS="6.1 7.5 8.6"`.
 Off by default: seven architectures is seven compilations of every kernel.
 
+On Windows, build just the application with a bounded job count:
+
+```bat
+set SS_CUDA_FATBIN=1
+set SS_BUILD_TARGET=spirula
+set SS_BUILD_JOBS=8
+build_develop.bat -DSS_BACKEND=cuda -DSS_BUILD_GUI=ON -DCMAKE_CUDA_FLAGS=--compress-mode=size
+```
+
+`SS_VS_ROOT` selects a Visual Studio installation; `SS_MSVC_TOOLSET` pins the
+version passed to `vcvars64`, such as `14.38` for CUDA 12.8. The architecture
+override is stored in the build tree, so later incremental builds retain it.
+Verify the resulting executable with `cuobjdump --list-elf` and `--list-ptx`.
+
 **Linux.** `build_develop.bash` points CMake at CUDA `SS_CUDA_VERSION` (12.8),
 falling back to the newest `/usr/local/cuda-*`, unless the command line names a
 `-DCMAKE_CUDA_COMPILER`. The distro's `nvidia-cuda-toolkit` package installs an
@@ -303,6 +324,15 @@ from the built `spirula` plus an icon resampled from `assets/icon.png` — via
 Xcode.
 
 ### Windows: the Visual C++ runtime
+
+For a CUDA build, copy `spirula.exe` together with the toolkit's
+`cudart64_12.dll`. The destination needs a compatible NVIDIA driver; it does
+not need the full CUDA toolkit. Test and benchmark executables are not runtime
+dependencies. Fonts and the web viewer are embedded in the default build.
+
+Windows gamepad navigation uses XInput-compatible controllers. It avoids
+GLFW's DirectInput enumeration, which can hang the UI in a HID driver's
+product-string query. Other platforms use GLFW gamepad mappings.
 
 The Windows binary links the CRT dynamically, so the machine it lands on needs
 the Microsoft Visual C++ Redistributable (`MSVCP140.dll`, `VCRUNTIME140*.dll`,

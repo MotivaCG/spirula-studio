@@ -3,11 +3,14 @@
 
 #include "app/gui/render/RenderSession.h"
 
+#include "app/gui/ProgressView.h"
+
 #include "app/gui/Subprocess.h"
 #include "app/gui/Ui.h"
 #include "app/gui/ViewportPanel.h"
 #include "data/DatasetParser.h"
 #include "i18n/catalog/EditTransform.h"
+#include "i18n/catalog/Gui.h"
 #include "i18n/catalog/Render.h"
 
 #include "imgui.h"
@@ -44,7 +47,7 @@ constexpr int kNumResolutions = (int)(sizeof kResolutions / sizeof kResolutions[
 
 const Msg* const kProjections[kNumProjections] = {
     &msg::proj_perspective, &msg::proj_fisheye, &msg::proj_equisolid,
-    &msg::proj_equirect};
+    &msg::proj_equirect, &spirula::i18n::msg::gui::view_orthographic};
 const Msg* const kTransitions[kNumTransitions] = {
     &msg::tr_cut, &msg::tr_crossfade, &msg::tr_dip, &msg::tr_wipe, &msg::tr_iris, &msg::tr_zoom,
     &msg::tr_sweep, &msg::tr_grow, &msg::tr_dust, &msg::tr_spiral, &msg::tr_scatter,
@@ -644,9 +647,21 @@ void RenderSession::draw_lens_section(float full) {
 
     int proj = (int)l.projection;
     ImGui::SetNextItemWidth(w);
-    if (combo_msgs("##proj", &proj, kProjections, kNumProjections)) {
+    bool changed = false;
+    if (ui::BeginComboRaw("##proj", kProjections[proj]->get())) {
+        for (int i : {4, 0, 1, 2, 3})
+            if (ui::Selectable(*kProjections[i], proj == i) && proj != i) { proj = i; changed = true; }
+        ImGui::EndCombo();
+    }
+    if (changed) {
         const double fov = lens_fov(l);
         l.projection = (Projection)proj;
+        if (l.projection == Projection::Orthographic) {
+            const double distance = std::hypot(k.pos[0]-k.target[0], k.pos[1]-k.target[1], k.pos[2]-k.target[2]);
+            l.ortho_distance = distance > 1e-6 / _w2s.s ? distance : 1.0 / _w2s.s;
+            l.tier = 0;
+            for (float& d : l.dist) d = 0.0f;
+        }
         if (l.projection == Projection::Equirect) {
             l.tier = 0;
             for (float& d : l.dist) d = 0.0f;
@@ -655,8 +670,8 @@ void RenderSession::draw_lens_section(float full) {
                 _project.output.height = std::max(16, _project.output.width / 2);
             }
         } else {
-            lens_set_fov(l, l.projection == Projection::Perspective ? std::min(fov, 120.0)
-                                                                    : std::max(fov, 120.0));
+            const bool linear = l.projection == Projection::Perspective || l.projection == Projection::Orthographic;
+            lens_set_fov(l, linear ? std::min(fov, 120.0) : std::max(fov, 120.0));
         }
         project_changed();
     }
@@ -720,7 +735,7 @@ void RenderSession::draw_lens_section(float full) {
 
     if (l.projection != Projection::Equirect) {
         float fov = (float)lens_fov(l);
-        const float lo = 5.0f, hi = l.projection == Projection::Perspective ? 150.0f : 360.0f;
+        const float lo = 5.0f, hi = l.projection == Projection::Perspective || l.projection == Projection::Orthographic ? 150.0f : 360.0f;
         ImGui::SetNextItemWidth(w);
         if (ui::SliderFloatRaw("##fov", &fov, lo, hi, "%.1f\xc2\xb0")) {
             lens_set_fov(l, fov);
@@ -740,6 +755,7 @@ void RenderSession::draw_lens_section(float full) {
             ui::Text(msg::lens_mm);
             ui::help_on_hover(msg::lens_mm_help);
         }
+        if (l.projection == Projection::Orthographic) return;
         // k1 alone covers most of what a lens does; the rest is Advanced.
         float k1 = l.tier ? l.dist[0] : 0.0f;
         ImGui::SetNextItemWidth(w);
@@ -1568,9 +1584,12 @@ void RenderSession::draw_output_section(float full) {
         if (o.kind != OutputKind::Photo)
             ui::TextDisabled(msg::out_summary, {seconds(T), (long long)frame_count()});
     } else {
-        const float frac = _job.frames > 0 ? (float)_job.frame / (float)_job.frames : 0.0f;
-        ui::ProgressBar(frac, ImVec2(full, 0), msg::render_progress,
+        const double now = progress_now();
+        if (!_job_clock.started() || _job.frame == 0) _job_clock.start(now);
+        if (_job.frames > 0) _job_clock.work(now, (double)_job.frame / (double)_job.frames);
+        ui::ProgressBar(_job_clock.fraction(), ImVec2(full, 0), msg::render_progress,
                         {(long long)_job.frame, (long long)_job.frames});
+        progress_time_line(_job_clock);
         if (ui::Button(msg::render_cancel, ImVec2(full, 0))) cancel_export();
     }
 }

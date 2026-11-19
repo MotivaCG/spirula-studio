@@ -98,9 +98,9 @@ int main(int argc, char** argv) {
         return lo + (hi - lo) * (float)(rng() & 0xffffff) / 16777215.0f;
     };
 
-    static constexpr int64_t N = 3000;   // splats
+    static constexpr int64_t N = 3001;   // splats
     static constexpr int64_t S = 3;      // stride
-    static constexpr int64_t NUMEL = N * S;  // 9000 -> 36 blocks, partial tail
+    static constexpr int64_t NUMEL = N * S;  // 9003 cells: partial word and block
 
     std::vector<float> acc;        // float outputs
     std::vector<int32_t> codes;    // quantized-cell codes (tol +-1)
@@ -244,10 +244,16 @@ int main(int argc, char** argv) {
         float* d_ob = upload(obounds);
         uint8_t* d_val = upload(val_packed);
         float* d_vb = upload(vbounds);
+        DeviceVector<int32_t> qq_steps;
+        if (gq) {
+            std::vector<int32_t> steps(N);
+            for (int64_t i = 0; i < N; ++i) steps[i] = 1 + (int32_t)(i % 37);
+            qq_steps = DeviceVector<int32_t>(ttv(upload(steps), {N, 1}));
+        }
         fused_adam_step_quantized_value(
             N, NUMEL, ttv(d_grad, {N, S, 1}), d_gq, (const float2*)d_gb, d_opt,
             (float4*)d_ob, d_val, (float2*)d_vb, 1e-2f, 9,
-            DeviceVector<int32_t>{}, 0.f, 0.f, obits, vbits,
+            qq_steps, 0.f, 0.f, obits, vbits,
             vbits == 16 ? ct : ColorTrustState{}, SbOptimCells{}, 1.f, !gq);
         backend::device_synchronize();
         readback_f(acc, d_ob, n_blocks * 4);
@@ -368,26 +374,6 @@ int main(int argc, char** argv) {
             readback_f(acc, d_lacc, N * 2);
             readback_f(acc, d_over, N);
             readback_f(acc, d_stats, 2);
-        }
-
-        // ---- densify_oversize_weight ----
-        {
-            std::vector<float> over(N), sc(N * 2);
-            for (int64_t i = 0; i < N; i++) {
-                over[i] = (i % 3 == 0) ? 0.f : uf(0.f, 4.f);
-                sc[2 * i] = (i % 7 == 0) ? 0.f : uf(0.f, 5.f);
-                sc[2 * i + 1] = uf(0.f, 3.f);
-            }
-            float* d_over = upload(over);
-            float* d_sc = upload(sc);
-            float* d_out = upload(std::vector<float>(N * 2, 0.f));
-            for (float blend : {0.0f, 0.5f, 1.0f}) {
-                densify_oversize_weight_tensor(N, blend, dv_f(d_over, N),
-                                               dv_f2(d_sc, N),
-                                               dv_f2(d_out, N));
-                backend::device_synchronize();
-                readback_f(acc, d_out, N * 2);
-            }
         }
 
         // ---- densify_clip_score ----

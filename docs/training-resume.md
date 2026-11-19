@@ -9,10 +9,10 @@ all carry on from where they stopped.
 
 1. While training, press **Stop** and choose **Stop and Save**. The current
    step finishes and a checkpoint is written into the run's output folder, for
-   example `outputs/<run>/step-000012000.ckpt/`, next to its `config.json`.
+   example `outputs/<run>/<run>.tar`, next to its `config.json`.
 2. Later, choose **File > Resume Training...** or **Resume Training...** on the
    Home screen, and pick that run folder. You can also pick a specific
-   `step-*.ckpt` folder inside it.
+   retained `<run>_step-*.tar` file (legacy `step-*.ckpt` folders also work).
 3. The run's dataset opens on the training screen with the run's own settings,
    and the seed line reads that the Gaussians come from the checkpoint. Press
    **Start** to continue from the saved step toward the run's original step
@@ -29,6 +29,20 @@ are adapted on load, as with `--resume`; a lobe the checkpoint lacks starts
 fresh.
 
 ## What a save contains
+
+`<run>.ply` contains filtered, dequantized splats for viewing and export;
+`<run>.tar` contains the native training state. Both sit beside `config.json`.
+With `save_only_latest_checkpoint=false`, both names gain `_step-000012000`
+for that step. There is one PLY per checkpoint, without links or copies.
+
+The PLY writer stages bounded chunks from the GPU, filters and packs rows on
+the CPU, and overlaps disk writes with the next chunk. Y-up conversion is
+part of packing; Spirula reverses it during PLY decoding. TAR saving and
+loading use two reusable 16 MiB staging buffers to overlap device transfers
+with disk I/O. Neither save path stages the whole model in system RAM.
+Files keep a `.tmp` suffix until all checkpoint streams close successfully,
+then replace their final names. These are buffered writes; timings depend on
+the OS cache and competing disk activity.
 
 A checkpoint written **when a run is stopped before its last step** always
 holds everything needed to continue: the world parameters, optimizer state and
@@ -54,13 +68,15 @@ checkpoints entirely, including the one on stop.
 
 ```text
 spirula train --resume outputs/<run>
-spirula train --resume outputs/<run>/step-000012000.ckpt
+spirula train --resume outputs/<run>/<run>_step-000012000.tar
 ```
 
 The first form picks the latest checkpoint in the run. Settings come from the
 run's `config.json`; any flag given explicitly on the command line overrides
-them, and `--preset` re-applies a preset's overrides. The GUI uses the same
-code path (`ckpt::build_resume_config`, `src/checkpoint/Resume.h`).
+them, and `--preset` re-applies a preset's overrides. `--finish-command` is the
+exception: it is never read back, so a resume runs one only if it is given one
+again. The GUI uses the same code path (`ckpt::build_resume_config`,
+`src/checkpoint/Resume.h`).
 
 Ctrl-C during `spirula train` works like **Stop and Save**: the current step
 finishes, a resumable checkpoint is written and the command prints the line

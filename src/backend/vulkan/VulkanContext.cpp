@@ -92,6 +92,7 @@ struct DeviceProbe {
     // VK_EXT_subgroup_size_control can pin compute pipelines within [min, max].
     bool subgroup_control = false;
     uint32_t min_subgroup = 0, max_subgroup = 0;
+    uint32_t max_workgroup_subgroups = 0;
 };
 
 DeviceProbe probe_device(VkPhysicalDevice pd) {
@@ -139,6 +140,7 @@ DeviceProbe probe_device(VkPhysicalDevice pd) {
                                (sp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT);
         out.min_subgroup = sp.minSubgroupSize;
         out.max_subgroup = sp.maxSubgroupSize;
+        out.max_workgroup_subgroups = sp.maxComputeWorkgroupSubgroups;
     }
     // 64 is the widest the kernels are tested at (AMD GCN has nothing narrower).
     const uint32_t narrowest =
@@ -478,6 +480,8 @@ void Context::init() {
     _caps.max_push_constants = probe.props.limits.maxPushConstantsSize;
     _caps.max_workgroup_invocations =
         probe.props.limits.maxComputeWorkGroupInvocations;
+    _caps.max_workgroup_size_x = probe.props.limits.maxComputeWorkGroupSize[0];
+    _caps.max_workgroup_subgroups = probe.max_workgroup_subgroups;
     _caps.max_shared_memory = probe.props.limits.maxComputeSharedMemorySize;
     _caps.non_coherent_atom_size = probe.props.limits.nonCoherentAtomSize;
     _caps.float32_atomic_add = probe.atomic_float;
@@ -741,10 +745,14 @@ bool Context::wait(uint64_t value) {
             return false;
         }
         if (watch.stalled(current)) {
-            set_error("the GPU stopped responding: no work finished for a minute (the driver may have "
-                      "reset it, often after running out of GPU memory; SS_GPU_STALL_SECONDS sets the wait)",
-                      VK_ERROR_DEVICE_LOST);
-            return false;
+            // A timeout does not stop queued work. Driver teardown can wait on
+            // it forever, so neither stack unwinding nor atexit is safe here.
+            std::fprintf(stderr,
+                "Vulkan backend: the GPU stopped responding: no work finished for %.3g seconds "
+                "(SS_GPU_STALL_SECONDS); terminating without driver teardown\n",
+                watch.limit_seconds());
+            std::fflush(stderr);
+            std::_Exit(EXIT_FAILURE);
         }
     }
 }

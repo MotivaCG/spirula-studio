@@ -5,9 +5,11 @@
 #include "i18n/catalog/Gui.h"
 
 #include <algorithm>
+#include <utility>
 #include <cmath>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 namespace gui {
 
@@ -17,10 +19,7 @@ using spirula::VramForecast;
 
 namespace {
 
-// The status strip's own pressure colours (GuiApp.cpp).
-const ImVec4 kOk(0.35f, 0.85f, 0.45f, 1.0f);
-const ImVec4 kWarn(0.95f, 0.75f, 0.30f, 1.0f);
-const ImVec4 kErr(1.0f, 0.42f, 0.42f, 1.0f);
+// The memory strip's colour for other programs (ResourceForecastView.cpp).
 const ImVec4 kOthers(0.55f, 0.55f, 0.60f, 1.0f);
 
 constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
@@ -36,136 +35,6 @@ ImU32 with_alpha(ImVec4 c, float a) {
     return ImGui::GetColorU32(c);
 }
 
-void dashed_line(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float thick) {
-    const float dx = b.x - a.x, dy = b.y - a.y;
-    const float len = std::sqrt(dx * dx + dy * dy);
-    const float dash = px(4.0f);
-    for (float t = 0.0f; t < len; t += 2.0f * dash) {
-        const float t1 = std::min(len, t + dash);
-        dl->AddLine(ImVec2(a.x + dx * t / len, a.y + dy * t / len),
-                    ImVec2(a.x + dx * t1 / len, a.y + dy * t1 / len), col, thick);
-    }
-}
-
-void swatch(ImU32 col) {
-    const float h = ImGui::GetTextLineHeight();
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-    ImGui::GetWindowDrawList()->AddRectFilled(
-        ImVec2(p.x, p.y + h * 0.25f), ImVec2(p.x + h * 0.5f, p.y + h * 0.75f), col);
-    ImGui::Dummy(ImVec2(h * 0.5f, h));
-    ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
-}
-
-// A gridline spacing of 10^k, 2*10^k or 5*10^k GiB that draws at most five.
-double tick_step(double max_gib) {
-    double step = std::pow(10.0, std::floor(std::log10(std::max(max_gib, 1e-3))));
-    for (double m : {1.0, 2.0, 5.0, 10.0})
-        if (max_gib / (step * m) <= 5.0) return step * m;
-    return step * 10.0;
-}
-
-void chart(const VramForecast& v, int total_steps) {
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    const ImGuiStyle& st = ImGui::GetStyle();
-    const float line = ImGui::GetTextLineHeight();
-    const float W = px(460.0f), H = px(170.0f);
-    const ImVec2 p0 = ImGui::GetCursorScreenPos();
-    ImGui::Dummy(ImVec2(W, H + line + st.ItemInnerSpacing.y));
-
-    double y_max = v.total_bytes;
-    for (const auto& s : v.history) y_max = std::max(y_max, s.ours + s.others);
-    for (const auto& b : v.projection)
-        y_max = std::max(y_max, v.others_bytes + b.mean + 2.0 * b.sigma);
-    y_max = std::max(y_max * 1.05, 1.0);
-    const double T = std::max(1, total_steps);
-
-    const float label_w = ImGui::CalcTextSize("00.0").x + st.ItemInnerSpacing.x;
-    const ImVec2 r0(p0.x + label_w, p0.y);
-    const ImVec2 r1(p0.x + W, p0.y + H);
-    auto X = [&](double step) {
-        return r0.x + (r1.x - r0.x) * (float)std::min(1.0, std::max(0.0, step / T));
-    };
-    auto Y = [&](double bytes) {
-        return r1.y - (r1.y - r0.y) * (float)std::min(1.0, std::max(0.0, bytes / y_max));
-    };
-
-    dl->AddRectFilled(r0, r1, ImGui::GetColorU32(ImGuiCol_FrameBg));
-    const ImU32 grid = ImGui::GetColorU32(ImGuiCol_Border);
-    const ImU32 text_dim = ImGui::GetColorU32(ImGuiCol_TextDisabled);
-    const double tick = tick_step(y_max / kGiB);
-    for (double g = 0.0; g * kGiB <= y_max; g += tick) {
-        const float y = Y(g * kGiB);
-        dl->AddLine(ImVec2(r0.x, y), ImVec2(r1.x, y), grid);
-        char s[16];
-        std::snprintf(s, sizeof s, tick < 1.0 ? "%.1f" : "%.0f", g);
-        const ImVec2 sz = ImGui::CalcTextSize(s);
-        dl->AddText(ImVec2(r0.x - sz.x - st.ItemInnerSpacing.x, y - sz.y * 0.5f),
-                    text_dim, s);
-    }
-
-    // Other programs at the bottom, this run stacked on top: the gap to the
-    // capacity line is what the run has left.
-    const ImU32 others_fill = with_alpha(kOthers, 0.35f);
-    for (size_t i = 1; i < v.history.size(); ++i) {
-        const auto& a = v.history[i - 1];
-        const auto& b = v.history[i];
-        dl->AddQuadFilled(ImVec2(X(a.step), Y(0)), ImVec2(X(a.step), Y(a.others)),
-                          ImVec2(X(b.step), Y(b.others)), ImVec2(X(b.step), Y(0)),
-                          others_fill);
-    }
-    const double last_step = v.history.empty() ? 0.0 : v.history.back().step;
-    if (!v.projection.empty())
-        dl->AddRectFilled(ImVec2(X(last_step), Y(v.others_bytes)), ImVec2(r1.x, Y(0)),
-                          others_fill);
-
-    const ImVec4 run = ImGui::GetStyleColorVec4(ImGuiCol_PlotLines);
-    for (size_t i = 1; i < v.projection.size(); ++i) {
-        const auto& a = v.projection[i - 1];
-        const auto& b = v.projection[i];
-        const double o = v.others_bytes;
-        dl->AddQuadFilled(ImVec2(X(a.step), Y(o + a.mean + 2.0 * a.sigma)),
-                          ImVec2(X(b.step), Y(o + b.mean + 2.0 * b.sigma)),
-                          ImVec2(X(b.step), Y(o + b.mean - 2.0 * b.sigma)),
-                          ImVec2(X(a.step), Y(o + a.mean - 2.0 * a.sigma)),
-                          with_alpha(run, 0.22f));
-        dashed_line(dl, ImVec2(X(a.step), Y(o + a.mean)),
-                    ImVec2(X(b.step), Y(o + b.mean)), with_alpha(run, 0.9f), px(1.5f));
-    }
-    for (size_t i = 1; i < v.history.size(); ++i) {
-        const auto& a = v.history[i - 1];
-        const auto& b = v.history[i];
-        dl->AddLine(ImVec2(X(a.step), Y(a.ours + a.others)),
-                    ImVec2(X(b.step), Y(b.ours + b.others)),
-                    ImGui::GetColorU32(run), px(2.0f));
-    }
-    if (!v.history.empty())
-        dl->AddLine(ImVec2(X(last_step), r0.y), ImVec2(X(last_step), r1.y), grid);
-    // Windows charges VRAM to commit: with little left, that is the ceiling.
-    const double cap = v.commit_limited ? v.others_bytes + v.limit_bytes : v.total_bytes;
-    if (cap > 0.0)
-        dl->AddLine(ImVec2(r0.x, Y(cap)), ImVec2(r1.x, Y(cap)),
-                    ImGui::GetColorU32(kErr), px(1.5f));
-    dl->AddRect(r0, r1, grid);
-
-    char s[32];
-    dl->AddText(ImVec2(r0.x, r1.y + st.ItemInnerSpacing.y), text_dim, "0");
-    std::snprintf(s, sizeof s, "%d", total_steps);
-    dl->AddText(ImVec2(r1.x - ImGui::CalcTextSize(s).x, r1.y + st.ItemInnerSpacing.y),
-                text_dim, s);
-
-    swatch(ImGui::GetColorU32(run));
-    ui::TextDisabled(msg::vram_legend_run);
-    ImGui::SameLine();
-    swatch(with_alpha(run, 0.35f));
-    ui::TextDisabled(msg::vram_legend_projected);
-    ImGui::SameLine();
-    swatch(others_fill);
-    ui::TextDisabled(msg::vram_legend_others);
-    ImGui::SameLine();
-    swatch(ImGui::GetColorU32(kErr));
-    ui::TextDisabled(msg::vram_legend_capacity);
-}
-
 void breakdown(const VramForecast& v) {
     struct Row { const spirula::i18n::Msg* label; double now; double peak; ImVec4 color; };
     const ImVec4 bar = ImGui::GetStyleColorVec4(ImGuiCol_PlotHistogram);
@@ -174,14 +43,14 @@ void breakdown(const VramForecast& v) {
     const double sxi_peak = std::max(sxi, v.grow_peak_mean - v.scratch);
     const Row rows[] = {
         {&msg::vram_cat_splat, cat(VramCategory::Splat), 0.0, bar},
-        {&msg::vram_cat_splat_x_img, sxi, v.valid ? sxi_peak : 0.0, bar},
+        {&msg::vram_cat_splat_x_img, sxi, v.projected ? sxi_peak : 0.0, bar},
         {&msg::vram_cat_image, cat(VramCategory::Image), 0.0, bar},
         {&msg::vram_cat_appearance, cat(VramCategory::Appearance), 0.0, bar},
         {&msg::vram_cat_viewer, cat(VramCategory::Viewer), 0.0, bar},
         {&msg::vram_cat_other, cat(VramCategory::Other), 0.0, bar},
         {&msg::vram_cat_scratch, v.scratch, 0.0, bar},
         {&msg::vram_cat_unpooled, v.unpooled, 0.0, bar},
-        {&msg::vram_legend_others, v.others_bytes, 0.0, kOthers},
+        {&msg::vram_legend_others, v.others, 0.0, kOthers},
     };
     const double shown = 1024.0 * 1024.0;   // below 1 MiB a row is noise
     double scale = 1.0;
@@ -202,8 +71,10 @@ void breakdown(const VramForecast& v) {
         ui::Text(*r.label);
         ImGui::SameLine(label_w + st.ItemSpacing.x * 2.0f);
         const ImVec2 p = ImGui::GetCursorScreenPos();
+        // Growth too small to print is not shown as growth.
+        const bool grows = r.peak > r.now && gib(r.peak) != gib(r.now);
         const float w_now = bar_w * (float)(r.now / scale);
-        const float w_peak = bar_w * (float)(r.peak / scale);
+        const float w_peak = grows ? bar_w * (float)(r.peak / scale) : 0.0f;
         dl->AddRectFilled(p, ImVec2(p.x + bar_w, p.y + h),
                           ImGui::GetColorU32(ImGuiCol_FrameBg));
         if (w_peak > w_now) {
@@ -214,12 +85,59 @@ void breakdown(const VramForecast& v) {
         dl->AddRectFilled(p, ImVec2(p.x + w_now, p.y + h), ImGui::GetColorU32(r.color));
         ImGui::Dummy(ImVec2(bar_w, h));
         ImGui::SameLine();
-        if (r.peak > r.now)
+        if (grows)
             ui::TextRaw(gib(r.now) + " -> " + gib(r.peak));
         else
             ui::TextRaw(gib(r.now));
     }
     if (faded) ui::TextDisabled(msg::vram_breakdown_growth);
+}
+
+// What a basic setting takes off the peak: Splat is sized for cap_max, Image
+// and the arena's per-pixel slices follow the pixels, the rest of splat x img
+// both, and the 360-camera preset's five views are five appearance grids.
+void savings(const VramForecast& v, const SavingsContext& ctx) {
+    if (!v.projected || v.peak_mean <= 0.0) return;
+    const auto cat = [&](VramCategory c) { return v.category[(int)c]; };
+    const double sxi_all = std::max(cat(VramCategory::SplatXImg), v.grow_peak_mean - v.scratch);
+    const double sxi_px = std::min(sxi_all, v.grow_peak_pixels);
+    const double sxi = sxi_all - sxi_px;
+    const std::string basic = msg::section_basic_options.get();
+    struct Tip { double saved; std::string text; };
+    std::vector<Tip> tips;
+    const auto add = [&](double saved, const spirula::i18n::Msg& m, const std::string& a,
+                         const std::string& c, const std::string& d = {}) {
+        tips.push_back({saved, ui::format(m, {gib(saved), a, c, d})});
+    };
+    add((cat(VramCategory::Image) + sxi_px) * 0.75 +
+            sxi * (1.0 - std::pow(0.25, spirula::kSplatXImgVramExp)),
+        msg::vram_tip_halve, msg::opt_resolution.get(), basic);
+    add(cat(VramCategory::Splat) * 0.5 + sxi * (1.0 - std::pow(0.5, v.growth_power)),
+        msg::vram_tip_halve, msg::opt_max_splats.get(), basic);
+    if (ctx.sh_degree > 0 && v.sh_bytes > 0.0) {
+        // SH rows hold (d + 1)^2 - 1 coefficients; measured 3 -> 2 -> 1 -> 0
+        // freed 84 / 53 / 38 MiB of 176 at 1M splats, within 7% of this.
+        const auto coeffs = [](int d) { return (double)((d + 1) * (d + 1) - 1); };
+        const int d = ctx.sh_degree;
+        add(v.sh_bytes * (1.0 - coeffs(d - 1) / coeffs(d)), msg::vram_tip_set,
+            msg::opt_sh_degree.get(), std::to_string(d - 1), basic);
+    }
+    if (ctx.frames_split && ctx.preset_360)
+        add(cat(VramCategory::Appearance) * (1.0 - ctx.images_kept), msg::vram_tip_preset, msg::section_preset.get(),
+            ctx.preset_360_label, ctx.preset_general_label);
+    std::stable_sort(tips.begin(), tips.end(),
+                     [](const Tip& a, const Tip& c) { return a.saved > c.saved; });
+    bool titled = false;
+    for (const Tip& t : tips) {
+        if (t.saved < 0.05 * v.peak_mean) continue;
+        if (!titled) {
+            ImGui::Spacing();
+            ui::Text(msg::vram_tips_title);
+            titled = true;
+        }
+        ImGui::Bullet();
+        ui::TextWrappedRaw(t.text);
+    }
 }
 
 }  // namespace
@@ -233,26 +151,23 @@ const spirula::i18n::Msg* oom_risk_label(OomRisk r) {
     }
 }
 
-ImVec4 oom_risk_color(OomRisk r) {
-    return r == OomRisk::High ? kErr : r == OomRisk::Medium ? kWarn : kOk;
-}
-
-void vram_forecast_card(const VramForecast& v, int total_steps) {
+void vram_forecast_card(const VramForecast& v, int total_steps, const SavingsContext& ctx) {
     ui::Text(msg::vram_chart_title);
-    chart(v, total_steps);
-    if (v.valid && !v.projection.empty() && v.total_bytes > 0.0) {
+    forecast_chart(v, std::max(1, total_steps), std::to_string(total_steps));
+    forecast_legend(msg::vram_legend_run);
+    if (v.projected && !v.projection.empty() && v.capacity > 0.0) {
         char pct[16];
         std::snprintf(pct, sizeof pct, "%.0f", v.p_oom * 100.0);
         ui::TextColoredWrapped(oom_risk_color(v.risk), msg::vram_chart_peak,
                                {gib(v.peak_mean), gib(v.peak_sigma),
-                                gib(v.limit_bytes), std::string(pct)});
-        if (v.provisional) ui::TextDisabledWrapped(msg::vram_chart_provisional);
-    } else if (!v.valid) {
+                                gib(v.limit), std::string(pct)});
+    } else if (!v.projected) {
         ui::TextDisabledWrapped(msg::vram_chart_waiting);
     }
     ImGui::Spacing();
     ui::Text(msg::vram_breakdown_title);
     breakdown(v);
+    savings(v, ctx);
 }
 
 }  // namespace gui

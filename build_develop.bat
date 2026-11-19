@@ -17,7 +17,6 @@ rem ---------------------------------------------------------------------------
 set "BACKENDSEL=cuda"
 echo %* | findstr /i /c:"BACKEND=vulkan" >nul && set "BACKENDSEL=vulkan"
 set "BUILDDIR=build_%BACKENDSEL%"
-if defined SS_BUILD_DIR set "BUILDDIR=%SS_BUILD_DIR%"
 
 rem ---------------------------------------------------------------------------
 rem Codegen (optional -- the generated files are committed)
@@ -53,8 +52,11 @@ set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 set "VSROOT="
 if exist "%VSWHERE%" for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSROOT=%%i"
 if not defined VSROOT set "VSROOT=%ProgramFiles%\Microsoft Visual Studio\2022\Community"
+if defined SS_VS_ROOT set "VSROOT=%SS_VS_ROOT%"
+set "VCVARSARGS="
+if defined SS_MSVC_TOOLSET set "VCVARSARGS=-vcvars_ver=%SS_MSVC_TOOLSET%"
 if exist "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat" (
-    call "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat" >nul
+    call "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat" %VCVARSARGS% >nul
     goto :have_cl
 )
 where cl >nul 2>&1 && goto :have_cl
@@ -77,8 +79,8 @@ rem this machine, plus PTX so anything newer JITs rather than refusing to start.
 rem Needs CUDA 12.8 (sm_120); costs build time, which is why it is opt-in.
 rem ---------------------------------------------------------------------------
 set "FATBINARG="
+if not defined SS_CUDA_ARCHS set "SS_CUDA_ARCHS=7.5 8.0 8.6 8.9 9.0 10.0 12.0"
 if not "%SS_CUDA_FATBIN%"=="" if not "%SS_CUDA_FATBIN%"=="0" (
-    if not defined SS_CUDA_ARCHS set "SS_CUDA_ARCHS=7.5 8.0 8.6 8.9 9.0 10.0 12.0"
     set FATBINARG=-DSS_CUDA_EMBED_PTX=ON -DTORCH_CUDA_ARCH_LIST="%SS_CUDA_ARCHS%"
 )
 
@@ -89,8 +91,8 @@ rem MSVC in use); pass a trailing -DCMAKE_CUDA_COMPILER=... to pick another.
 rem A Vulkan build never enables the CUDA language, so passing the compiler
 rem there only earns a "manually-specified variables were not used" warning.
 rem ---------------------------------------------------------------------------
+echo %* | findstr /i /c:"BACKEND=vulkan" >nul && goto :no_cuda
 if not defined SS_CUDA_VERSION set "SS_CUDA_VERSION=12.8"
-if /i "%BACKENDSEL%"=="vulkan" goto :no_cuda
 set "_CUDA_ROOT="
 set "_CUDA_WANT=%ProgramFiles%\NVIDIA GPU Computing Toolkit\CUDA\v%SS_CUDA_VERSION%"
 if exist "%_CUDA_WANT%\bin\nvcc.exe" set "_CUDA_ROOT=%_CUDA_WANT%"
@@ -110,7 +112,9 @@ set "CUDAARG="
 rem ---------------------------------------------------------------------------
 rem Configure + build (RAM-aware job count, mirrors build_develop.bash)
 rem ---------------------------------------------------------------------------
-cmake -G Ninja -B "%BUILDDIR%" -DCMAKE_BUILD_TYPE=Release %CUDAARG% %FATBINARG% %*
+if not defined SS_BUILD_DIR set "SS_BUILD_DIR=%BUILDDIR%"
+set "BUILDDIR=%SS_BUILD_DIR%"
+cmake -G Ninja -B "%SS_BUILD_DIR%" -DCMAKE_BUILD_TYPE=Release %CUDAARG% %FATBINARG% %*
 if %ERRORLEVEL% neq 0 exit /b 1
 
 rem ---------------------------------------------------------------------------
@@ -119,18 +123,18 @@ rem a record with a mismatched node index survives ninja's own recovery, and
 rem from then on every build discards its header dependencies and the next one
 rem recompiles every object. `-t recompact` rewrites the log and drops it.
 rem ---------------------------------------------------------------------------
-if not exist "%BUILDDIR%\.ninja_deps" goto :deps_done
-cmake --build "%BUILDDIR%" -- -t recompact >"%TEMP%\ss_ninja_deps.log" 2>&1
+if not exist "%SS_BUILD_DIR%\.ninja_deps" goto :deps_done
+cmake --build "%SS_BUILD_DIR%" -- -t recompact >"%TEMP%\ss_ninja_deps.log" 2>&1
 findstr /c:"premature end of file" /c:"bad deps log" "%TEMP%\ss_ninja_deps.log" >nul
 if errorlevel 1 goto :deps_checked
 rem The rewrite is what heals it, so a second pass is what confirms it.
-cmake --build "%BUILDDIR%" -- -t recompact >"%TEMP%\ss_ninja_deps.log" 2>&1
+cmake --build "%SS_BUILD_DIR%" -- -t recompact >"%TEMP%\ss_ninja_deps.log" 2>&1
 findstr /c:"premature end of file" /c:"bad deps log" "%TEMP%\ss_ninja_deps.log" >nul
 if errorlevel 1 (
-    echo repaired a corrupt %BUILDDIR%\.ninja_deps ^(this build recompiles everything once^)
+    echo repaired a corrupt %SS_BUILD_DIR%\.ninja_deps ^(this build recompiles everything once^)
 ) else (
-    echo %BUILDDIR%\.ninja_deps did not survive a recompact -- removing it
-    del /q "%BUILDDIR%\.ninja_deps"
+    echo %SS_BUILD_DIR%\.ninja_deps did not survive a recompact -- removing it
+    del /q "%SS_BUILD_DIR%\.ninja_deps"
 )
 :deps_checked
 del /q "%TEMP%\ss_ninja_deps.log" >nul 2>&1
@@ -142,6 +146,7 @@ set AVAILABLE_MB=0
 for /f %%m in ('powershell -NoProfile -Command "[int]((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory/1024)"') do set AVAILABLE_MB=%%m
 set /a JOBS=AVAILABLE_MB/JOB_RAM_MB
 if %JOBS% gtr %NUMBER_OF_PROCESSORS% set JOBS=%NUMBER_OF_PROCESSORS%
+if defined SS_BUILD_JOBS if %JOBS% gtr %SS_BUILD_JOBS% set "JOBS=%SS_BUILD_JOBS%"
 if %JOBS% lss 1 set JOBS=1
 echo Build dir     : %BUILDDIR%
 echo Available RAM : %AVAILABLE_MB% MB
@@ -151,8 +156,9 @@ echo.
 
 rem `if errorlevel 1` is a >= test on a SIGNED value, so it reads a negative
 rem exit code as success -- a failed link returning -1 printed "Build complete".
-cmake --build "%BUILDDIR%" -j %JOBS%
+if not defined SS_BUILD_TARGET set "SS_BUILD_TARGET=all"
+cmake --build "%SS_BUILD_DIR%" --target "%SS_BUILD_TARGET%" -j %JOBS%
 if %ERRORLEVEL% neq 0 exit /b 1
 
 echo.
-echo Build complete: %BUILDDIR%\spirula.exe
+echo Build complete: %SS_BUILD_DIR%\spirula.exe

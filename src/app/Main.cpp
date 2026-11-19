@@ -10,13 +10,17 @@
 #include "app/AppPaths.h"
 #include "app/CrashLog.h"
 #include "app/Tools.h"
+#include "checkpoint/BackgroundExport.h"
+#include "core/LicenseTexts.h"
 #include "i18n/Locale.h"
 #include "i18n/catalog/Cli.h"
+#include "i18n/catalog/BackgroundExport.h"
 #include "i18n/catalog/Dense.h"
 #ifdef SS_HAVE_LPIPS
 #include "app/EvalLpips.h"
 #endif
 #ifdef SS_TOOL_SAM
+#include "app/InferenceWorkerDevices.h"
 #include "app/ModelLicenses.h"
 #include "app/cli/LicenseCli.h"   // --accept-license: the inference layer is in this build
 #include "nn/Device.h"
@@ -101,6 +105,9 @@ const std::vector<Tool>& tools() {
 #ifdef SS_TOOL_PARTITION
         {app::kToolPartition, &cmsg::tool_partition, spirula_partition_main},
 #endif
+#ifdef SS_TOOL_MARKER
+        {app::kToolMarker, &cmsg::tool_marker, spirula_marker_main},
+#endif
     };
     return kTools;
 }
@@ -139,9 +146,11 @@ void print_usage() {
                 cmsg::usage_open_target.get());
 #endif
     std::printf("  spirula <command> [options]\n\n");
+    std::printf("  spirula --licenses             %s\n\n", cmsg::usage_licenses.get());
     std::printf("%s\n", cmsg::usage_commands.get());
     for (const Tool& t : tools())
-        std::printf("  %-8s %s\n", t.name, t.summary->get());
+        std::printf("  %-10s %s\n", t.name, t.summary->get());
+    std::printf("  %-10s %s\n", "export-bg", spirula::i18n::msg::background_export::summary.get());
     std::printf("\n%s\n", cmsg::usage_per_command_help.get());
     std::printf("\n%s\n\n%s", cmsg::usage_lang.get(),
                 spirula::i18n::language_list().c_str());
@@ -181,24 +190,8 @@ int main(int argc, char** argv) {
     // Metal device opens; children inherit it, and a value already set is kept.
     setenv("AGX_RELAX_CDM_CTXSTORE_TIMEOUT", "1", 0);
 #endif
-    // Stop FULL buffering of stdout whenever it is NOT a terminal. Every tool
-    // here is routinely run as a CHILD PROCESS with its output piped to a live
-    // log -- the GUI does it for reconstruction, masking and meshing -- and the
-    // C runtime's default for a pipe is full buffering, which holds 4 KB of
-    // progress back until the buffer fills or the process exits. A run that
-    // prints one line a minute then appears to print nothing at all for the
-    // first hour, which is exactly the failure it looks like.
-    //
-    // The two runtimes need different modes for the same result, and the
-    // Windows one is unforgiving about both halves:
-    //   * its CRT has no line buffering at all -- `_IOLBF` is documented to be
-    //     treated as `_IOFBF` -- so asking for it would leave the stall in
-    //     place;
-    //   * and it rejects a zero size for the buffered modes, through an
-    //     invalid-parameter handler that is `__fastfail`. The process then dies
-    //     at this line with status 0xC0000409 and NOTHING on either stream --
-    //     which reads, from the parent, as a tool that failed instantly for no
-    //     reason. Only `_IONBF` is allowed a zero size there.
+    // Pipes feed the GUI's live log. Windows has no line buffering, and only
+    // _IONBF accepts a zero buffer size without aborting in its CRT.
     if (!isatty(fileno(stdout))) {
 #ifdef _WIN32
         std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -210,18 +203,23 @@ int main(int argc, char** argv) {
     use_utf8_console();
 #endif
 
-    // --lang is handled here and removed from argv, so no tool's own parser
-    // has to know about it. The chain that decides the language is in
-    // src/i18n/Locale.h; the GUI re-runs it once it has read its settings
-    // file, which is a step below --lang and the environment.
     const char* lang = spirula::i18n::take_lang_arg(&argc, argv);
     spirula::i18n::init(lang, nullptr);
+    spirula::i18n::set_terminal_output(true);
+
+    if (argc == 2 && std::strcmp(argv[1], "--licenses") == 0) {
+        std::printf("AprilTag\n\n%s\nArUco (OpenCV)\nCopyright 2025 OpenCV\n\n%s",
+                    spirula::license::kAprilTagBsd,
+                    spirula::license::kAprilTagOpenCvApache);
+        return std::fflush(stdout) == 0 ? 0 : 1;
+    }
 
 #ifdef SS_TOOL_SAM
     // --accept-license, anywhere in argv and for every command: how a terminal
     // accepts a model licence. Removed from argv, so no tool's parser sees it;
     // the gate installed here answers every command that fetches a licensed model.
     try {
+        app::workers_per_gpu();   // a malformed SS_WORKERS_PER_GPU fails every command here
         app::register_model_licenses();
         app::install_license_gate();
         app::consume_accept_license_args(argc, argv);
@@ -239,10 +237,7 @@ int main(int argc, char** argv) {
     // its parent an exit status and nothing else.
     app::install_crash_log(app::config_dir());
 
-    // An explicit subcommand wins over the argv[0] hint, so a binary that was
-    // renamed or symlinked still answers to every tool it holds. No subcommand
-    // name collides with an argument any of them takes, so `spirula-sfm auto`
-    // falls through to the name check below and reaches the SfM tool.
+    // Explicit subcommands take precedence over the argv[0] alias.
     if (argc > 1) {
         if (const Tool* t = find_tool(argv[1])) {
             // The tool sees "spirula sfm" as its program name, so its own usage
@@ -266,6 +261,25 @@ int main(int argc, char** argv) {
 
     if (argc > 1) {
         const std::string a = argv[1];
+        if (a == "export-bg" || a == "export_bg") {
+            namespace bgmsg = spirula::i18n::msg::background_export;
+            using spirula::i18n::format;
+            const bool help = argc == 3 && (std::string(argv[2]) == "--help" || std::string(argv[2]) == "-h");
+            if (argc < 3 || argc > 4 || help) {
+                std::fprintf(help ? stdout : stderr, "%s\n", format(bgmsg::usage,
+                    {"spirula export-bg <checkpoint_dir|run_dir|state.tar> [output.webp]"}).c_str());
+                return help ? 0 : 1;
+            }
+            std::filesystem::path ckpt_dir = argv[2];
+            std::filesystem::path out_path = argc > 3 ? std::filesystem::path(argv[3])
+                : (ckpt_dir.extension() == ".tar" ? ckpt_dir.parent_path() : ckpt_dir) / "background.webp";
+            if (ckpt::export_background_from_checkpoint(ckpt_dir, out_path)) {
+                std::printf("%s\n", format(bgmsg::saved, {out_path.string()}).c_str());
+                return 0;
+            }
+            std::fprintf(stderr, "%s\n", format(bgmsg::failed, {ckpt_dir.string(), out_path.string()}).c_str());
+            return 1;
+        }
         if (a == "help" || a == "--help" || a == "-h") {
             print_usage();
             return 0;

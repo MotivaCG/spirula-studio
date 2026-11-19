@@ -19,6 +19,7 @@
 #include "i18n/Message.h"
 
 #include <functional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -54,8 +55,6 @@ struct BatchPreset {
     std::string name;
 };
 
-// One training run of a row: which preset, and the three numbers changed often
-// enough that a preset per combination would be the wrong shape of work.
 struct BatchRun {
     BatchPreset preset{"", "3dgs"};
     // "" is "whatever the preset says". TEXT, because 0 is a legal
@@ -63,6 +62,10 @@ struct BatchRun {
     std::string cap_max;
     std::string sh_degree;
     std::string iterations;
+    std::string floater_suppression;
+    // --roi-region's spelling: "" the dataset's first region, "off" none,
+    // "roi/<name>.json" that one.
+    std::string roi_region;
     // Does the row's Mesh stage cover this run? Off for the big appearance
     // run that would run out of memory meshing, on for the cheap one trained
     // beside it for exactly that purpose.
@@ -167,11 +170,6 @@ struct BatchProgress {
 BatchProgress batch_progress(const std::vector<BatchTask>& tasks, int current,
                              double frac, double elapsed);
 
-// What stands for the summary line inside the command a finished queue runs.
-// Braces because the alternatives are punctuation a shell would eat: `<>` is
-// redirection, `%..%` and `$..` are variables. gui::command_argv() fills it.
-inline constexpr char kBatchMessageToken[] = "{message}";
-
 // What this build and this machine can do, asked once and handed to every
 // row's check so that no two rows can get different answers.
 struct BatchCapabilities {
@@ -233,7 +231,8 @@ bool batch_build_train_config(const BatchRow& row, int variant,
                               const std::string& image_dir,
                               const std::string& mask_dir, bool mask_flipped,
                               TrainConfig& cfg, std::string& preset_base,
-                              std::string& error);
+                              std::string& error,
+                              std::set<std::string>* touched_fields = nullptr);
 
 // The meshing job for one model. `dataset` is what the row resolved; empty
 // lets the child read it out of the run's own config.json.

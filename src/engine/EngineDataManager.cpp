@@ -1,17 +1,3 @@
-// Engine ↔ DataManager glue.
-//
-// engine_setup_data_manager:
-//   Build / replace the engine-owned DataManager from a parsed-out dataset.
-//   Idempotent; an existing DataManager is destroyed first (and its disk
-//   prefetch threads cleanly joined) before swap-in.
-//
-// engine_train_step_managed:
-//   Pull the next training batch from engine().dm and dispatch the same
-//   fused step as engine_train_step. The DataManager owns the per-step
-//   host buffers; we hand pointers into those buffers to the engine as
-//   TorchTensorViews. They stay alive until the *next* call to
-//   next_train_batch().
-
 #include "core/Camera.h"         // camera_model_to_string
 #include "core/ColorSpace.h"
 #include "data/DataManager.h"
@@ -63,6 +49,26 @@ void engine_setup_data_manager(
     engine().visit.num_post = (int32_t)(viewmats.size() / 16);
     engine().visit.cam_sum = DeviceVector<float>();
     engine().visit.cam_cnt = DeviceVector<uint32_t>();
+
+    std::vector<float4> centers(viewmats.size()/16);
+    for (size_t i = 0; i < centers.size(); ++i) {
+        const float* m = viewmats.data()+16*i;
+        centers[i] = {-m[0]*m[3]-m[4]*m[7]-m[8]*m[11],
+                      -m[1]*m[3]-m[5]*m[7]-m[9]*m[11],
+                      -m[2]*m[3]-m[6]*m[7]-m[10]*m[11],1};
+    }
+    // Virtual faces share a physical center; separate R^T t evaluations can differ by an ulp.
+    if (K_per_camera.size() == post_offsets.size())
+        for (size_t i = 0; i < K_per_camera.size(); ++i) {
+            int offset = post_offsets[i], count = K_per_camera[i];
+            if (count > 1 && offset >= 0 && int64_t(offset)+count <= int64_t(centers.size()))
+                std::fill(centers.begin()+offset+1,centers.begin()+offset+count,centers[offset]);
+        }
+    engine_clear_projective_depth();
+    engine().optim.projective_one_center = false;
+    engine().optim.projective_center_id = engine().optim.projective_step_center_id = -1;
+    engine().optim.projective_step_one_center = engine().optim.projective_step_photometric = false;
+    engine().projective_centers_host = std::move(centers);
 
     engine().dm = std::make_unique<DataManager>(
         std::move(cfg), std::move(camera_models), std::move(camera_distortions),
@@ -320,7 +326,7 @@ std::map<std::string, float> engine_train_step_managed(
 {
     if (!engine().dm) {
         throw std::runtime_error(
-            "engine_train_step_managed: DataManager not configured — "
+            "engine_train_step_managed: DataManager not configured -- "
             "call engine_setup_data_manager(...) first.");
     }
 
@@ -424,7 +430,7 @@ std::map<std::string, float> engine_train_step_managed(
         if (b.K > 1 || !b.input_source_models.empty()) {
             throw std::runtime_error(
                 "engine_train_step_managed: warp sub-batch (K>1 or re-distort) "
-                "inside a multi-sub-batch step — the scheduler must never pack "
+                "inside a multi-sub-batch step -- the scheduler must never pack "
                 "these.");
         }
         build_bg_idx(b, bg_bufs[i]);
@@ -559,20 +565,14 @@ static int _install_and_forward(const DecodedBatch& b, std::string primitive,
     return _batch_views(b, 0);
 }
 
-int engine_eval_forward(std::string primitive, int sh_degree, bool packed) {
+int engine_eval_forward(int index, std::string primitive, int sh_degree, bool packed) {
     if (!engine().dm)
         throw std::runtime_error(
-            "engine_eval_forward: DataManager not configured — call "
+            "engine_eval_forward: DataManager not configured -- call "
             "engine_setup_data_manager(...) with the eval split first.");
 
-    const TrainStep& stp = engine().dm->next_train_step();
-    if (stp.subs.empty()) return 0;
-    if (stp.subs.size() != 1)
-        throw std::runtime_error(
-            "engine_eval_forward: expected one sub-batch per eval step "
-            "(set train_batch_size = 1)");
-
-    const DecodedBatch& b = *stp.subs[0];
+    static DecodedBatch b;
+    engine().dm->fetch_one(index, b);
     if (b.face_passes.size() > 1)
         throw std::runtime_error(
             "engine_eval_forward: the eval split must be baked with uniform "
@@ -582,11 +582,11 @@ int engine_eval_forward(std::string primitive, int sh_degree, bool packed) {
 
 int engine_preview_forward(int index, std::string primitive, int sh_degree,
                            bool packed, bool apply_color_correction,
-                           const EngineStepConfig& cfg, int pass,
-                           int* out_passes) {
+                           bool apply_calib_warp, const EngineStepConfig& cfg,
+                           int pass, int* out_passes) {
     if (!engine().dm)
         throw std::runtime_error(
-            "engine_preview_forward: DataManager not configured — call "
+            "engine_preview_forward: DataManager not configured -- call "
             "engine_setup_data_manager(...) first.");
 
     // Static: the buffers the views point into must outlive the forward, and
@@ -626,5 +626,6 @@ int engine_preview_forward(int index, std::string primitive, int sh_degree,
     forward_3dgs(std::move(primitive), sh_degree, packed,
                  /*output_median=*/false, (int)dist_type);
     if (apply_color_correction) _engine_step_image_stages(cam_view);
+    if (apply_calib_warp) _engine_calib_warp_preview();
     return views;
 }

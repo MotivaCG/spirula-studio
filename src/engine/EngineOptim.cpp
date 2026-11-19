@@ -1,9 +1,13 @@
 // Engine Adam + per-splat regularization optimizer step.
 
 #include "engine/Engine.h"
+#include "backend/api/Optimizer.h"
+#include "shaders/screen_layout.h"
 #include "engine/EngineCommon.h"
+#include "engine/EngineInternal.h"
 #include "engine/EngineState.h"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <variant>
@@ -16,40 +20,72 @@
 static constexpr int64_t kFpboBlock = 256;
 
 
-// Hands the seeded fp32 rows to the value codec, whose zeroed init only
-// stands for all-zero rows. Host-side through core/Tensor.h's codec, as
-// checkpoint/Adapt.cpp re-encodes; once per run.
+// Host-side through core/Tensor.h's codec, as checkpoint/Adapt.cpp
+// re-encodes. Both layouts keep a bound's cells contiguous and inside 256
+// splats, so a bound is the unit of work and a run of them is one upload.
 template <int BITS>
-static void _encode_seeded_sh(QuantizedTensor<BITS, 256>& q,
-                              const std::vector<float>& rows, int64_t N,
-                              int K, bool fpbo) {
+static void encode_sh_rows_impl(QuantizedTensor<BITS, 256>& q,
+                                const float* rows, int64_t N, int K,
+                                bool fpbo, int64_t first, int64_t count) {
+    using Q = QuantizedTensor<BITS, 256>;
+    const int64_t end = first + count;
+    if (first < 0 || count < 0 || end > N || first % 256 != 0 ||
+        (end < N && end % 256 != 0))
+        throw std::runtime_error("encode_sh_rows: a run must start on a 256-splat "
+                                 "boundary and end on one or at the store's end");
     const ShQuantAddr a = sh_quant_addr((uint32_t)K, fpbo ? 0 : 256);
     const int64_t R = 3 * (int64_t)K;
-    std::vector<float2> mm((size_t)q.n_bounds, float2{1e30f, -1e30f});
-    auto each = [&](auto&& fn) {
-        for (int64_t i = 0; i < N; i++) {
-            const int64_t base = a.base(i);
-            for (int c = 0; c < R; c++) {
-                const int64_t cell = a.cell(base, c);
-                fn(cell, cell / a.bounds_stride, rows[(size_t)(i * R + c)]);
-            }
+    const int64_t span = a.bounds_stride;
+    const int64_t span_bytes = span * Q::kBytesPerCell;
+    const int64_t chunk = std::max<int64_t>(1, (int64_t(64) << 20) / span_bytes);
+    const int64_t b_first = fpbo ? first / 256 : first * R / 256;
+    const int64_t b_end = end == N ? q.n_bounds
+                                   : (fpbo ? end / 256 : end * R / 256);
+    std::vector<uint8_t> packed;
+    std::vector<float2> mm;
+    for (int64_t b0 = b_first; b0 < b_end; b0 += chunk) {
+        const int64_t nb = std::min(chunk, b_end - b0);
+        packed.assign((size_t)(nb * span_bytes), 0);
+        mm.assign((size_t)nb, float2{0.0f, 0.0f});
+#pragma omp parallel for schedule(static)
+        for (int64_t j = 0; j < nb; j++) {
+            const int64_t b = b0 + j;
+            auto each = [&](auto&& fn) {
+                if (fpbo) {
+                    for (int64_t i = b * 256; i < std::min(end, b * 256 + 256); i++)
+                        for (int c = 0; c < R; c++)
+                            fn(a.cell(a.base(i), c) - b * span, rows[(i - first) * R + c]);
+                } else {
+                    for (int64_t c = b * 256; c < std::min(end * R, b * 256 + 256); c++)
+                        fn(c - b * 256, rows[c - first * R]);
+                }
+            };
+            float2 m{1e30f, -1e30f};
+            each([&](int64_t, float v) {
+                m.x = std::min(m.x, v);
+                m.y = std::max(m.y, v);
+            });
+            if (m.x > m.y) m = float2{0.0f, 0.0f};
+            mm[(size_t)j] = m;
+            uint8_t* dst = packed.data() + j * span_bytes;
+            each([&](int64_t cell, float v) { Q::encode_v(dst, cell, v, m); });
         }
-    };
-    each([&](int64_t, int64_t b, float v) {
-        mm[(size_t)b].x = std::min(mm[(size_t)b].x, v);
-        mm[(size_t)b].y = std::max(mm[(size_t)b].y, v);
-    });
-    for (auto& m : mm)
-        if (m.x > m.y) m = float2{0.0f, 0.0f};
-    std::vector<uint8_t> packed((size_t)q.packed_bytes(), 0);
-    each([&](int64_t cell, int64_t b, float v) {
-        QuantizedTensor<BITS, 256>::encode_v(packed.data(), cell, v,
-                                             mm[(size_t)b]);
-    });
-    backend::memcpy_sync(q.packed_ptr(), packed.data(), packed.size(),
-                         backend::MemcpyKind::HostToDevice);
-    backend::memcpy_sync(q.bounds_ptr(), mm.data(), mm.size() * sizeof(float2),
-                         backend::MemcpyKind::HostToDevice);
+        const int64_t off = b0 * span_bytes;
+        backend::memcpy_sync(q.packed_ptr() + off, packed.data(),
+                             (size_t)std::min<int64_t>(nb * span_bytes, q.packed_bytes() - off),
+                             backend::MemcpyKind::HostToDevice);
+        backend::memcpy_sync(q.bounds_ptr() + b0, mm.data(), (size_t)nb * sizeof(float2),
+                             backend::MemcpyKind::HostToDevice);
+    }
+}
+
+void encode_sh_rows(QuantizedTensor<8, 256>& q, const float* rows, int64_t N,
+                    int K, bool fpbo, int64_t first, int64_t count) {
+    encode_sh_rows_impl(q, rows, N, K, fpbo, first, count < 0 ? N - first : count);
+}
+void encode_sh_rows(QuantizedTensor<16, 256>& q, const float* rows, int64_t N,
+                    int K, bool fpbo, int64_t first, int64_t count) {
+    encode_sh_rows_impl(q, rows, N, K, fpbo, first, count < 0 ? N - first : count);
 }
 
 static void _ensure_optim_state(int sh_optim_bits, int sh_value_bits,
@@ -306,10 +342,10 @@ static void _ensure_optim_state(int sh_optim_bits, int sh_value_bits,
     if (engine().world.features_sh_quant16_fpbo.initialized()) engine().world.features_sh_quant16_fpbo.zero();
     if (!seeded_sh.empty()) {
         auto& w = engine().world;
-        if (w.features_sh_quant8.initialized())       _encode_seeded_sh(w.features_sh_quant8, seeded_sh, N, (int)K, false);
-        if (w.features_sh_quant16.initialized())      _encode_seeded_sh(w.features_sh_quant16, seeded_sh, N, (int)K, false);
-        if (w.features_sh_quant8_fpbo.initialized())  _encode_seeded_sh(w.features_sh_quant8_fpbo, seeded_sh, N, (int)K, true);
-        if (w.features_sh_quant16_fpbo.initialized()) _encode_seeded_sh(w.features_sh_quant16_fpbo, seeded_sh, N, (int)K, true);
+        if (w.features_sh_quant8.initialized())       encode_sh_rows(w.features_sh_quant8, seeded_sh.data(), N, (int)K, false);
+        if (w.features_sh_quant16.initialized())      encode_sh_rows(w.features_sh_quant16, seeded_sh.data(), N, (int)K, false);
+        if (w.features_sh_quant8_fpbo.initialized())  encode_sh_rows(w.features_sh_quant8_fpbo, seeded_sh.data(), N, (int)K, true);
+        if (w.features_sh_quant16_fpbo.initialized()) encode_sh_rows(w.features_sh_quant16_fpbo, seeded_sh.data(), N, (int)K, true);
         w.features_sh_seeded = false;
     }
     engine().optim.accum_buffer.zero();
@@ -340,13 +376,121 @@ static inline DeviceTensorFloatND _fnd_view(float* ptr, int64_t N, int64_t P) {
 }
 
 
-// Fused projection-bwd + Adam-and-regularization optimizer step. Replaces
-// the projection_*_backward + engine_optim_step pair when
-// `cfg.use_fused_proj_bwd_optim` is set. Requires
-// engine_compute_loss_backward to have stashed v_splats_s into
-// engine().fwd.v_splats_s. World-space gradient buffers are not allocated
-// in this path (raster_*_bwd's world atomicStore is null-pointer-guarded
-// per channel, and the fused kernel's atomicLoad uses the same guard).
+// The angular bound of a step that one backward covers (the fused path): a
+// slice of that backward's arena phase rather than a buffer of its own.
+static const char* const kProjectiveBoundStep = "eng.projective_angular_bound.step";
+
+void engine_clear_projective_depth() {
+    auto& s = engine();
+    s.optim.observe_projective = {};
+    s.projective_state = DeviceVector<float4>();
+    s.projective_information = DeviceVector<float>();
+    s.projective_angular_bound = DeviceVector<float>();
+    s.projective_centers = DeviceVector<float4>();
+    auto& pool = DevicePool::global();
+    pool.free(PoolSlot::EngProjectiveState);
+    pool.free(PoolSlot::EngProjectiveInformation);
+    pool.free(PoolSlot::EngProjectiveAngularBound);
+    pool.free_dynamic_prefix(kProjectiveBoundStep);
+    pool.free(PoolSlot::EngProjectiveCenters);
+}
+
+static ProjectiveDepthOptim projective_depth_state(const OptimConfig& cfg) {
+    auto& s = engine();
+    ProjectiveDepthOptim depth;
+    if (cfg.lr_projective_depth <= 0) {
+        if (s.projective_state.data_ptr() || s.projective_information.data_ptr() || s.projective_centers.data_ptr())
+            engine_clear_projective_depth();
+        return depth;
+    }
+    if (!s.bilagrid_cur_cam_indices.data_ptr() || s.bilagrid_cur_cam_indices.size() == 0) return depth;
+    if (!s.projective_centers.data_ptr()) {
+        if (s.projective_centers_host.empty()) return depth;
+        s.projective_centers.resize(PoolSlot::EngProjectiveCenters,s.projective_centers_host.size());
+        backend::memcpy_sync(s.projective_centers.data_ptr(),s.projective_centers_host.data(),
+            s.projective_centers_host.size()*sizeof(float4),backend::MemcpyKind::HostToDevice);
+    }
+    if (!s.projective_state.data_ptr()) {
+        s.projective_state.resize(PoolSlot::EngProjectiveState,s.max_num_splats);
+        s.projective_state.zero();
+        s.projective_information.resize(PoolSlot::EngProjectiveInformation,s.max_num_splats);
+        s.projective_information.zero();
+    }
+    depth.angular_bound = s.projective_angular_bound.data_ptr();
+    depth.states = s.projective_state.data_ptr();
+    depth.information = s.projective_information.data_ptr();
+    depth.centers = s.projective_centers.data_ptr();
+    depth.camera_indices = s.bilagrid_cur_cam_indices.data_ptr();
+    depth.lr = cfg.lr_projective_depth;
+    depth.angular_lr = 3.333333f*cfg.lr_means;
+    depth.angular_relative = cfg.use_scale_agnostic_mean;
+    depth.single_observation = s.bilagrid_cur_cam_indices.size() == 1;
+    bool photometric = cfg.projective_photometric && !s.gt.depth.data_ptr() && !s.gt.normal.data_ptr();
+    depth.single_photometric = s.optim.zero_grad_in_optim
+        ? cfg.projective_photometric && s.optim.projective_step_photometric && s.optim.projective_step_one_center
+        : photometric && (depth.single_observation || s.optim.projective_one_center);
+    return depth;
+}
+
+void engine_prepare_projective_depth(const OptimConfig& cfg) {
+    auto& s = engine(); auto& opt = s.optim;
+    if (cfg.lr_projective_depth <= 0) { opt.observe_projective = projective_depth_state(cfg); return; }
+    if (!opt.zero_grad_in_optim) {
+        bool photometric = cfg.projective_photometric && !s.gt.depth.data_ptr() && !s.gt.normal.data_ptr();
+        bool one_center = opt.projective_one_center && opt.projective_center_id >= 0;
+        if (!opt.skip_grad_zero) {
+            opt.projective_step_one_center = one_center;
+            opt.projective_step_photometric = photometric;
+            opt.projective_step_center_id = opt.projective_center_id;
+        } else {
+            opt.projective_step_photometric &= photometric;
+            if (opt.projective_step_one_center && one_center) {
+                const float4 a = s.projective_centers_host[opt.projective_step_center_id];
+                const float4 b = s.projective_centers_host[opt.projective_center_id];
+                one_center = a.x == b.x && a.y == b.y && a.z == b.z;
+            }
+            opt.projective_step_one_center &= one_center;
+        }
+    }
+    opt.observe_projective = projective_depth_state(cfg);
+    if (opt.observe_projective.states && opt.use_fused_proj_bwd_optim) {
+        // Carved by engine_observe_projective_depth, once the phase is open.
+        if (s.projective_angular_bound.data_ptr() && DevicePool::global().phase() != PoolPhase::RasterBwd)
+            DevicePool::global().free(PoolSlot::EngProjectiveAngularBound);
+        s.projective_angular_bound = DeviceVector<float>();
+        opt.observe_projective.angular_bound = nullptr;
+    } else if (opt.observe_projective.states) {
+        s.projective_angular_bound.resize(PoolSlot::EngProjectiveAngularBound,s.max_num_splats);
+        opt.observe_projective.angular_bound = s.projective_angular_bound.data_ptr();
+        if (!opt.skip_grad_zero && !opt.zero_grad_in_optim)
+            backend::memset_async(opt.observe_projective.angular_bound,0,s.cur_num_splats*sizeof(float));
+    }
+}
+
+void engine_observe_projective_depth() {
+    auto& s = engine();
+    auto depth = s.optim.observe_projective;
+    s.optim.observe_projective = {};
+    if (!depth.states || s.fwd.v_splats_s.empty()) return;
+    if (s.optim.use_fused_proj_bwd_optim) {
+        float* bound = (float*)DevicePool::global().acquire_dynamic(
+            VramCategory::Splat, kProjectiveBoundStep,
+            (size_t)s.cur_num_splats * sizeof(float), PoolPhase::RasterBwd);
+        backend::memset_async(bound, 0, s.cur_num_splats * sizeof(float));
+        s.projective_angular_bound = DeviceVector<float>(std::make_tuple(
+            (uint64_t)bound, (uint32_t)sizeof(float), std::vector<int64_t>{s.cur_num_splats, 1}));
+        depth.angular_bound = bound;
+    }
+    bool gut = s.primitive == "3dgut";
+    int stride = gut ? SCRG_STRIDE : SCR2_STRIDE;
+    int offset = gut ? SCRG_OPAC : SCR2_OPAC;
+    int64_t count = s.packed ? s.fwd.gaussian_ids.size()
+        : s.cur_num_splats*s.bilagrid_cur_cam_indices.size();
+    projective_depth_observe_tensor(count,s.cur_num_splats,s.packed,
+        s.fwd.camera_ids,s.fwd.gaussian_ids,s.fwd.v_splats_s[0],stride,offset,
+        s.world.means,s.world.scales,s.world.quats,depth);
+}
+
 void engine_fused_proj_bwd_optim_step(int step, const OptimConfig& cfg) {
     _ensure_optim_state(cfg.sh_optim_bits, cfg.sh_value_bits,
                         cfg.non_sh_optim_bits,
@@ -358,23 +502,28 @@ void engine_fused_proj_bwd_optim_step(int step, const OptimConfig& cfg) {
             "engine_fused_proj_bwd_optim_step: v_splats_s not stashed; "
             "engine_compute_loss_backward must run first");
 
-    // World-grad vector handed to the FPBO kernel. For 3dgs / mip the
-    // per-channel slots stay null (raster_*_bwd never writes the world
-    // buffer for those prims, so there is nothing to pick up). For 3dgut,
-    // raster_*_bwd has already atomicAdded mean / quat / scale into the
-    // engine grad buffers (_alloc_grad_buffers allocates them in that case);
-    // pass those three slots so the kernel's atomicLoad picks them up and
-    // sums them with the projection-bwd contribution. Other slots remain
-    // null -- they were never written and reading 0 is correct.
+    // 3DGUT adds raster world gradients; 3DGS/Mip receive only projection
+    // gradients, plus the PCA regularizer's when it ran. Null channels are
+    // guarded by both raster stores and fused projection loads.
     std::vector<DeviceTensorFloatND> v_splats_w;
+    const auto& pca = engine().pca_reg;
     if (engine().grad.means.data_ptr() != nullptr) {
         v_splats_w = {
             DeviceTensorFloatND(engine().grad.means),         // [N, 3]
             DeviceTensorFloatND(engine().grad.quats),         // [N, 4]
             DeviceTensorFloatND(engine().grad.scales),        // [N, 3]
-            DeviceTensorFloatND(),                            // opacities -- null
+            pca.v_opacities.data_ptr() ? DeviceTensorFloatND(pca.v_opacities) : DeviceTensorFloatND(),
             DeviceTensorFloatND(),                            // features_dc -- null
             DeviceTensorFloatND(),                            // features_sh -- null
+        };
+    } else if (pca.v_means.data_ptr() != nullptr) {
+        v_splats_w = {
+            DeviceTensorFloatND(pca.v_means),
+            pca.v_quats.data_ptr() ? DeviceTensorFloatND(pca.v_quats) : DeviceTensorFloatND(),
+            pca.v_scales.data_ptr() ? DeviceTensorFloatND(pca.v_scales) : DeviceTensorFloatND(),
+            pca.v_opacities.data_ptr() ? DeviceTensorFloatND(pca.v_opacities) : DeviceTensorFloatND(),
+            DeviceTensorFloatND(),
+            DeviceTensorFloatND(),
         };
     }
 
@@ -512,7 +661,7 @@ void engine_fused_proj_bwd_optim_step(int step, const OptimConfig& cfg) {
             g1, g2,
             sh_packed_opt, sh_bounds_opt,
             sh_value_packed_opt, sh_value_bounds_opt,
-            non_sh, visit,
+            non_sh, visit, projective_depth_state(cfg),
             engine().optim.radii,
             densify_score,
             cfg.lr_means, cfg.lr_quats, cfg.lr_scales,
@@ -548,6 +697,7 @@ void engine_fused_proj_bwd_optim_step(int step, const OptimConfig& cfg) {
 
 
 void engine_optim_step(int step, const OptimConfig& cfg) {
+    StepTimingScope timing(StepPart::Optimizer, StepScale::Splats);
     if (engine().optim.use_fused_proj_bwd_optim) {
         engine_fused_proj_bwd_optim_step(step, cfg);
         return;
@@ -653,9 +803,9 @@ void engine_optim_step(int step, const OptimConfig& cfg) {
         color_trust,
         non_sh_optim,
         visit,
-        grad_q,
+        grad_q, projective_depth_state(cfg),
         step + 1, per_splat_steps,
-        grad_scale, zero_grad
+        grad_scale, zero_grad, engine().pca_reg.v_opacities
     );
 
     // DC color update path. When non-SH quant is on the geometry kernel
