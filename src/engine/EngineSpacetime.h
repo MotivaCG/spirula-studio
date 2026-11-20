@@ -1,7 +1,7 @@
 // Spacetime chunk training: every subject row is one .vgs record over the whole
 // chunk. Position, rotation, base colour and opacity are uniform cubic B-splines
-// in time, opacity also times a soft window [t0, t1] (frames); scale and SH stay
-// the engine's, constant per record as .vgs stores them. Each step evaluates the
+// in time, opacity also times a soft window [t0, t1] (frames); scale and SH sit in
+// the engine's buffers, constant per record as .vgs stores them. Each step evaluates the
 // records at the frame of the step's view into the live buffers, the engine
 // trains as usual, and the gradients it leaves in engine().grad are chained back
 // to the records, which keep their own Adam state. Design: 4DGS_Papers PLAN.md.
@@ -32,6 +32,8 @@ struct SpacetimeRates {
     // The engine's opacity penalty (mcmc_opacity_reg_weight): its optimizer adds
     // it past the gradient buffers, so the records take it here.
     float opacity_reg = 0;
+    // Scale and SH, one per record over the chunk; their penalties as opacity_reg.
+    float scale = 0, sh = 0, scale_reg = 0, sh_reg = 0;
 };
 
 // Weights of the K control points of a clamped uniform cubic B-spline at frame

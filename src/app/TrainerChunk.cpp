@@ -64,8 +64,11 @@ void TrainerSession::configure_chunk() {
     // unfused optimizer leaves them in engine().grad, one view a step.
     if (spacetime()) {
         cfg.use_fused_proj_bwd_optim = false;
-        // Scale and SH come converged from the chunk run and .vgs keeps them per
-        // record; trained one view a step they cost 0.56 dB (battery ST).
+        // Scale and SH, one per record as .vgs keeps them, step with the records on
+        // the batch's gradients: the engine's one view a step cost 0.56 dB (battery ST).
+        _spacetime_scales_lr = cfg.scales_lr;
+        _spacetime_scales_lr_final = cfg.scales_lr_final;
+        _spacetime_sh_lr = cfg.features_sh_lr;
         cfg.scales_lr = 0.0f;
         cfg.scales_lr_final = 0.0f;
         cfg.features_sh_lr = 0.0f;

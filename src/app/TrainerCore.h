@@ -390,6 +390,8 @@ private:
     void save_spacetime(int step);
     void spacetime_after_step(int step, const EngineStepConfig& sc);
     SpacetimeRecords _spacetime;  // fitted by spacetime_seed, until the engine takes them
+    float _spacetime_scales_lr = 0, _spacetime_sh_lr = 0;  // the records', not the engine's
+    std::optional<float> _spacetime_scales_lr_final;
     void advance_window(int step);
     int first_frame_steps() const {
         if (continues()) return 0;  // held, see setup_chunk

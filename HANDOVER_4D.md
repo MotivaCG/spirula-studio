@@ -2,7 +2,7 @@
 
 Documento de traspaso para que cualquier LLM (o persona) pueda retomar el trabajo sin el historial de la conversación. Cubre lo que se quiere, las reglas del dueño, todo lo probado con sus números y fallos, contra qué se compara y dónde está cada cosa (datos, código, papers, herramientas).
 
-- Fecha: 2026-11-03.
+- Fecha: 2026-11-03; actualizado el 2026-11-19 y el 2026-11-20 (§0, §6, §8.8-8.10, §9, §10, §11).
 - Dueño: Victor (MotivaCG / ScanMeNow / THE4DSCANNER).
 - Idioma: conversación en español; código, comentarios y commits en inglés.
 - Cifras: todas salen de logs o medidas guardadas. Donde algo no se midió, se dice.
@@ -14,6 +14,39 @@ Documentos más antiguos que este (no los sustituye; este resume y actualiza):
 - `D:\Dependencias\spirula-studio\TEMPORAL_VGS_TEST_PLAN.md`: plan de pruebas del códec de septiembre.
 - `D:\Dependencias\4DGS_Papers\_notes\deep\PLAN.md`: plan de investigación salido de los papers (25 de octubre), con el diseño del entrenador 4D nativo.
 - Memoria del agente: `C:\Users\Victor\.claude\projects\D--Trabajos-FORMS-LichtFeld-Studio\memory\` (`temporal-chunk-training.md` es el diario completo; `spacetime-st9-ppisp.md` lo último).
+
+---
+
+## 0. Estado a 2026-11-20 (leer primero)
+
+- **Mejor resultado estable:** TP2, rehecho con la binaria actual como TP2M (§8.8, §9.1).
+  - Es spacetime (ST7L) más transplantes de NAIF cada 3 frames y `--opacity-reg 0.01`.
+  - Error HP 66/73/76: 14,08 / 11,83 / 12,70 (NAIF: 11,98 / 10,18 / 11,16).
+  - Vibración 0,30 mm.
+  - **Ocupa 59,6 MB por chunk en VGSEditor; Gracia ocupa 26-45 MB. No sirve como producto.**
+- **Mejor compromiso tamaño/detalle:** J1a (§9.1).
+  - 41,3 MB; error HP 14,53 / 12,48 / 13,27.
+  - Cara limpia, mano como TP2M, luz algo baja (0,95).
+  - Se queda a un 3-5 % del criterio de detalle.
+- **Descartado:**
+  - Del 8 al 12 de noviembre (§8.9):
+    - pérdida de movimiento con semilla NAIF60 (MS);
+    - la cadena secuencial antigua (SEQ);
+    - podar las capas tenues de TP2 (FP/FT).
+  - Del 19 al 20 de noviembre (§9.1):
+    - recolocación activa con forma entrenable (J1c): no añade detalle;
+    - **TRiGS ejecutado tal cual en modo PLY (T1): bastante peor que ST7L en 73/76, cara borrosa**.
+- **Diagnóstico de por qué fallamos:** §8.10. Hay que matizarlo con J1c: la recolocación y la forma entrenable juntas tampoco crean detalle.
+  - Lo que hace TP2 mejor son sus transplantes densos de NAIF.
+  - Su coste en tamaño está en los ~470k registros tenues que los acompañan.
+- **Decisión pendiente del dueño:**
+  1. T2: TRiGS con imágenes reales (modo COLMAP).
+  2. J1a con más presupuesto de registros (~44 MB).
+  3. Una idea nueva.
+- **Código:**
+  - `Gracia` está fusionada en `TemporalChunk` (commit `b1bc0608`); la binaria es `outputs\tc\bin_merge`.
+  - La forma entrenable de spacetime (parche de ST10 reaplicado) está **sin commitear** en el árbol; su binaria es `bin_j1`.
+  - La binaria nueva cambia valores por defecto (§6). Las comparaciones van contra TP2M, no contra el TP2 antiguo.
 
 ---
 
@@ -186,7 +219,7 @@ Lo que existe hoy no cumple las tres a la vez:
 
 ## 6. Código actual (spirula)
 
-- **Repo:** `D:\Dependencias\spirula-studio`, rama **`TemporalChunk`**. El árbol está limpio salvo `TEMPORAL_SUBJECT_ONLY.md` (sin seguimiento).
+- **Repo:** `D:\Dependencias\spirula-studio`, rama **`TemporalChunk`** (árbol limpio tras `b1bc0608`).
 - **Commits clave:**
 
 | Commit | Contenido |
@@ -252,6 +285,35 @@ Lo que existe hoy no cumple las tres a la vez:
 - El trabajo de chunks está en el commit temporal `6dd9310` (rama `TemporalChunk`) y en el worktree `SMNForge_tc`.
 - `graciachunk.cpp/.h` lleva la receta, la poda de chunk, el pipeline `.vgs` y la continuación.
 - **No tocar la copia de trabajo principal.**
+
+**Actualización 2026-11-19**
+
+| Commit | Contenido |
+|---|---|
+| `fe696e3f` | Código MS (`EngineSpacetimeMotion.*`, `--spacetime-motion*`) y documentos `HANDOVER_4D.md`, `MOTION_SUPERVISED_4D.md`, `POPULATION_BUILDER_4D.md`, `TEMPORAL_SUBJECT_ONLY.md`. MS está descartado (§8.9); el flag queda apagado por defecto |
+| `b1bc0608` | Merge de la rama `Gracia` (117 commits: upstream hasta 2026.11.12 + SMNPrune) |
+
+Cambios de ese merge que afectan al trabajo 4D:
+
+- **Valores por defecto nuevos:**
+  - `use_calib_warp=1` y `calib_correction=basic`: deformación por cámara contra errores de calibración. En spacetime se indexa por cámara física, a través del hook `engine_spacetime_camera`, igual que PPISP.
+  - `noise_gate_peak_weight=0`.
+  - `densify_min_split_opacity=0.05`, `min_weight=0.05`, `max_dead_fraction=0.02`.
+  - Por esto los runs con binarias anteriores no se comparan directamente con `bin_merge`.
+- **Firma nueva de `engine_save_checkpoint`:** `(dir, full, step, bg_height, basename, y_up, keep_all)`.
+  - El `true` posicional de antes habría caído en `bg_height` sin avisar. Está corregido en `TrainerChunk.cpp` y `TrainerSpacetime.cpp`.
+  - `keep_all` sigue descartando filas no finitas. Una fila NaN desplazaría los índices entre frames.
+- **Cabecera PLY:** ahora rellena el contador con ceros (`element vertex 00000000000001266118`). `split_ply` está corregido. Python (`int()`) y `vgsplyseq` (`stoll`) lo leen bien.
+- **Salida de los runs estáticos:** escriben `<run>.ply`/`.tar` en la carpeta del run en lugar de `step-*.ckpt/splat.ply`. Los frames de chunk y spacetime no cambian (`frames/NNN/splat.ply`).
+- **`tools/check_ui_text.py`** limita las ayudas a 3 líneas; las ayudas `temporal_*` y `spacetime_*` se acortaron.
+- **Binarias de experimento:**
+  - `bin_merge`: la actual, con el merge.
+  - `bin_ms`: MS.
+  - `bin_st` sigue siendo la de TP1/TP2/FT10.
+- **Prueba de humo del merge:** `outputs\tc\smoke_merge.ps1` → `SMK_merge`.
+  - Receta de TP2 con 300 pasos.
+  - Resultado: 32 frames × 1.175.535 registros, igual que `birth_events.tsv`, y `room.ply` de 90.583 filas.
+- **Pendientes que vienen de `Gracia`:** las traducciones de `ppisp_from` y `export_keep_all_splats` están corrompidas ("R?utiliser"). En el merge se dejó nuestra versión en inglés.
 
 **Spirula desplegado para Forge:** `D:\Dependencias\spirula-studio\build_tc_deploy`. Es lo que apunta el registro `HKCU\Software\SMN\Forge\Paths\Spirula`.
 
@@ -412,22 +474,196 @@ La revisión `4DGS_Papers\_notes\REVISION_374_20261103.md` (§6 R07-R22 y matriz
 4. **Gracia demuestra que es viable en producto** (registros persistentes, nítidos, ~155 B), con una rotación de población parecida en la salida. No sabemos cómo entrena ni cuánto recicla internamente.
 5. La estabilidad (vibración ~0,3 mm, luz plana, sin saltos entre chunks) y el tamaño **están resueltos para ST7L y la cadena**. Un método nuevo tiene que volver a demostrarlos, junto con el detalle.
 
+### 8.8 Constructor de población: transplantes de NAIF (5-8 de noviembre)
+
+Diseño en `POPULATION_BUILDER_4D.md` (§11-12). Métricas:
+
+- **Error HP:** error de alta frecuencia (×1000, menos es mejor) en los píxeles donde a ST7L le falta detalle. Lo calcula `transplant_eval.py`.
+- **Tamaño:** se mide con **VGSEditor**, el que se compara con Gracia. `vgsplyseq` da ~2× más; nunca mezclar los dos.
+
+**Fase 0 (oráculo, sin entrenar; `transplant_oracle.py`, `TPO_battery.log`):**
+
+1. **Los splats de NAIF no persisten:** solo el 0,4-1,5 % tiene pareja en f+1 en posición y escala. Cada frame de NAIF es una solución distinta.
+2. **TPO_A, transplante por frame:** cierra el 30-50 % del hueco. Mano del 73 casi como NAIF, pero 271 B por splat mostrado.
+3. **TPO_K, un keyframe NAIF cada 8 frames llevado por el movimiento de los vecinos:** roto (manchas naranjas en el pelo, rayas).
+
+**Fase 1:**
+
+- **TP1:** ST7L + NAIF de cada 3er frame en las regiones malas, vivos f-1..f+1, 20k pasos.
+- **TP2:** TP1 + `--opacity-reg 0.01`.
+- **TP0:** control, ST7L reentrenado igual sin transplantes.
+
+| Run | HP 52 / 60 / 66 / 73 / 76 | VGSEditor | Vibración | Nota |
+|---|---|---|---|---|
+| ST7L | 16,05 / 15,96 / 16,32 / 15,18 / 14,57 | 28,7 MB | 0,35 mm | Base spacetime |
+| NAIF | 14,02 / 13,73 / 11,98 / 10,18 / 11,16 | — | — | Referencia de detalle (frame a frame, parpadea) |
+| TP0 | — / — / — / 14,53 (73) / — | 29,3 MB | — | Control |
+| TP1 | 14,90 / 14,64 / 13,94 / 11,73 / 12,53 | 56,6 MB | 0,31 mm | Mano del 73 casi NAIF, pelo algo más nítido |
+| **TP2** | 14,87 / 14,67 / 13,94 / 11,70 / 12,57 | **56,9 MB** | 0,30 mm | Suelo como TP0. **Falla el tamaño** |
+
+**Por qué es tan grande:** los bytes siguen al número de **registros**. TP1 tiene 1,19 M registros y 401k de ellos nunca superan alfa 0,1 (TP0: 69k de 472k). La regularización atenúa pero no mata (las capas tenues pasan del 24 al 30 %).
+
+**Hoja de espalda y pies** (`back_feet_sheet.py`, cámara H5_P15, frames 52/66/73):
+
+- Espalda: Gracia ≈ NAIF; TP2 más blando y con rayas verticales. La distancia es del paso temporal, no del entrenador base.
+- Pies: TP2 deja humo oscuro y unos 2,2k splats bajo el suelo.
+
+### 8.9 Lo descartado del 8 al 12 de noviembre
+
+**MS: pérdida de movimiento persistente desde flujo RAFT multivista, semilla NAIF60** (`MOTION_SUPERVISED_4D.md` §9, `MS_battery.log`)
+
+- **MS1 = MS0** en error HP, vibración (0,44 mm), capas tenues (34 %) y bytes (26,5 MB).
+- La λ se calibró (2,6e-8) y la pérdida estaba activa, pero las posiciones entrenadas quedan a 0,1-0,6 mm de la semilla: no había nada que corregir.
+- Solo es buena en el 60. En el 73 da 13,4 (TP1 11,7): pelo que se desvanece, pajitas con rayas, mano con manchas.
+- **Lección:** el detalle lejos del keyframe no es un problema de movimiento. La forma de un frame de NAIF no aguanta 13-16 frames.
+
+**SEQ: ¿la cadena secuencial antigua conserva el detalle?** (`SEQ_battery.log`, `SEQ_FACE/HAND73/BACK_FEET.png`; runs de septiembre, mismo registro de cámaras, sin PPISP)
+
+| Run | HP 52 / 60 / 66 / 73 / 76 | Vibración |
+|---|---|---|
+| KB_K2 | 14,22 / 13,96 / 12,43 / 10,92 / 11,83 | 8,46 mm |
+| L1 (escala bloqueada) | 14,48 / 14,49 / 12,84 / 11,51 / 12,38 | 8,67 mm |
+| S2 (suavizado de posición cada 20) | 15,39 / 14,79 / 14,62 / 13,56 / 13,26 | 0,53 mm |
+
+- KB_K2 está numéricamente cerca de NAIF, pero **vibra 8 mm**: inservible para el códec.
+- A ojo, en el 73 TP1 es más nítido que KB_K2 y L1 (la métrica y el ojo no coinciden), y S2 es blando.
+- **Conclusión:** la cadena conserva el detalle solo mientras vibra. El suavizado que la hace usable lo borra.
+
+**FP/FT: podar las capas tenues de TP2** (`faint_prune.py`, `FP_battery.log`, `FT_battery.log`)
+
+| Run | Qué es | VGSEditor | HP 66 / 73 / 76 | Luz | Recortes |
+|---|---|---|---|---|---|
+| FP05 | Ocultar registros con alfa pico < 0,05 | 47,7 MB | — / 12,31 / — | ≈ TP2 | ≈ TP2 |
+| FP10 | Ídem < 0,1 | 38,4 MB | 15,89 / 14,21 / 14,85 | 1,00 | Cara del 73 moteada |
+| FT10 | FP10 reentrenado 6000 pasos (708k registros) | 39,0 MB | 15,21 / 13,34 / 13,95 | **0,94** | Pelo más blando que TP2 |
+
+- El criterio fijado de antemano era ≤ 45 MB y HP ≤ 14,36 / 12,05 / 12,95. **Ninguno lo cumple.**
+- **Conclusión:** el detalle de TP2 vive en sus ~470k registros tenues apilados. En esa representación tamaño y detalle van atados, y quitarlos después se lleva el detalle.
+
+### 8.10 Por qué hemos fallado (diagnóstico, 2026-11-15/19)
+
+1. **Todo fue "semilla + pulido".** La población salía de otro sitio (cadena RM0, NAIF60, NAIF cada 3 frames) y luego se refinaba. El resultado siempre acabó en el detalle de su semilla (ST5-ST11, MS, TP0). En estático, el detalle lo crea la reestructuración, no el refinado: un frame recoloca ~414k splats.
+2. **La recolocación nunca funcionó junto con una forma entrenable:**
+   - Con opacidad por frame (cadena, JT, ST6), "muerto" exige estar apagado en todos los frames, y casi nada muere.
+   - Cuando se desbloqueó (ST7-ST9), la forma estaba congelada y el clon era idéntico: salieron rayas fuera del rig.
+3. **Transportamos soluciones de un solo frame** (NAIF), que no persisten.
+4. **Lectura equivocada de Gracia:**
+   - Gracia logra detalle de nivel NAIF con 249-285k registros por chunk, el 60-85 % de chunk entero. ST7L tiene 472k y es más blando.
+   - La conclusión de ST10 ("más detalle = más registros") era falsa y llevó a TP1/TP2 y a la poda.
+5. **Lo que no era el problema:**
+   - **El presupuesto de entrenamiento.** Nuestros 20k pasos × 4 vistas son ~2.500 renders por frame; TRiGS usa ~2.000.
+   - **El movimiento de la semilla** (flujo, MS).
+6. **Lo que enseñan TRiGS y open4dgs** (§10):
+   - La opacidad es un escalar × campana temporal, y una regularización 4D empuja lo inútil a morir. "Muerto" es global, así que la recolocación nunca se queda sin sitio.
+   - La escala se entrena, con regularización de tamaño y tope de anisotropía (en su código, contra las "agujas" que se ven como rayas).
+   - El clon reparte opacidad y escala con la fuente al estilo MCMC, sin saltos, y hereda su ventana.
+   - Su modo PLY convierte justo PLYs estáticos por frame, como los nuestros, en 4D.
+   - Su pérdida de alfa fuera de la máscara causa la transparencia que reconocen; **no se adopta** (regla del dueño).
+
 ---
 
-## 9. Caminos abiertos (ninguno lanzado; todos requieren visto bueno)
+## 9. Hacia dónde vamos
 
-1. **Analizar a fondo los registros del `.vgs` de Gracia** (sin GPU). Comparar, en zonas con detalle (pelo, cara, mano), cómo evolucionan por registro el color, la opacidad, la escala aparente y el movimiento frente a los nuestros. Objetivo: una hipótesis concreta de qué hace distinto un registro suyo que se mantiene nítido.
-   - Ya medido: cambia de color ~2,5× más por frame.
-   - LS1 (tasas de color sin frenar, 45-60): detalle 0,631 / 0,584 frente a 0,621 / 0,572 de LC1, con |ΔRGB| por frame 0,038, mucho más que Gracia. No cerró la distancia (`LS_battery.log`). De ahí salen las tasas de color de CS1.
-2. **Partir del estático nítido:** tomar los frames de NAIF y buscar correspondencias entre ellos para formar registros, en lugar de partir de la cadena. Es un diseño nuevo y más largo, y el obstáculo es el tamaño (NAIF recicla casi todo en cada frame).
-3. **Pasos de `PLAN.md` sin ejecutar:**
-   - Paso 3 "mover primero": etapa solo de movimiento en el frame que entra, más un residuo de velocidad propio del splat.
-   - Paso 4: más resolución de movimiento (dividir nodos cuando divergen las trayectorias, splats de vida corta con velocidad propia, supervisión de flujo renderizado).
-   - Aviso: el resultado del flujo (8.4) hace dudar de que el movimiento sea el límite.
-4. **Métrica de detalle por región** (pelo, ojos, manos) que no premie las rayas. Es el Paso 0 de `PLAN.md`; no está hecha.
-5. **Pendientes menores:**
-   - Bug en spirula: con `--temporal-birth-dir auto` se ignora un `--temporal-warp-dir` de fichero.
-   - La lista "upstream features of interest" de la memoria: `--dead-criterion`, `--densify-learned-score`, `max_split_fraction`…
+### 9.1 Vía J: reconstrucción conjunta del chunk (aprobada 2026-11-19; J1a/J1c y TRiGS T1 probados, ninguno cumple)
+
+Diseño propio con ideas de TRiGS y open4dgs (nada de código copiado). Se implementa sobre el motor spacetime actual (`EngineSpacetime.*`, `TrainerSpacetime.cpp`).
+
+1. **Registro:**
+   - Spline de posición (K16) y de rotación (K8), como ahora; ya es compatible con VGS.
+   - Color K8, como ahora.
+   - **Opacidad = escalar base × ventana temporal aprendible** (centro μ_t, log-duración σ_t), en lugar de la spline de opacidad.
+   - **Escala y SH constantes pero entrenadas**, con gradiente sumado sobre lotes de varios frames.
+2. **Semilla:**
+   - NAIF del chunk cada 3 frames: posición, color y forma.
+   - Velocidad de nuestro flujo multivista.
+   - σ_t por fila según la aceleración (σ = √(2·k·radio/|a|)): el movimiento uniforme vive mucho y los cambios de dirección poco.
+   - Deduplicación de las filas lentas entre keyframes (probabilidad de quedarse = redundancia·Δ/alcance).
+   - Presupuesto de ~300k registros, como Gracia.
+3. **Pérdidas:**
+   - L1 + SSIM;
+   - **regularización 4D de opacidad** 0,01·mean(α·γ(t)), con γ desacoplado del gradiente;
+   - **regularización de escala** 0,01·mean(exp(s)) con **tope de anisotropía**;
+   - curvatura del movimiento;
+   - nuestra coherencia afín;
+   - consistencia profundidad-normal (contra la falsa transparencia);
+   - habitación congelada;
+   - nunca alfa fuera de la máscara.
+4. **Recolocación cada 100 pasos, desde el paso 1.000 hasta el 83 %:**
+   - Muerto si α < 0,005.
+   - Puntuación = α + velocidad × vida dentro del chunk + gradiente 2D por vista visible + |dL/dμ_t| por visita.
+   - Reparto MCMC de opacidad y escala entre la fuente y sus clones.
+   - El clon hereda la ventana, con μ_t ± 0,25σ, y la trayectoria realineada a la nueva fase.
+5. **Presupuesto:** ~80k renders por chunk, como ahora (~30 min).
+6. **Exportación a VGS:** la vida del registro es donde α·γ > 1/255; la opacidad por frame es α·γ(t).
+7. **Prueba J1, frames 45-76.** Criterio fijado de antemano, contra TP2M (TP2 rehecho con `bin_merge`):
+   - error HP en 66/73/76 ≤ TP2M;
+   - ≤ 45 MB en VGSEditor;
+   - vibración ≤ 0,5 mm;
+   - luz entre 0,98 y 1,02;
+   - recortes de cara, mano y espalda sin rayas en cámaras no usadas en el entrenamiento.
+
+   Si falla, la línea se deja.
+8. **Orden de prueba (2026-11-19):**
+   - **J1a**, la mecánica sobre una semilla existente (`battery_J1A.ps1`, binaria `bin_j1`):
+     - semilla de FT10 (`FP10_clean`, 708k registros);
+     - escala y SH entrenables (parche de ST10 reaplicado);
+     - `--spacetime-relocate 0.01 --spacetime-relocate-every 100`;
+     - receta de TP2, 20k pasos.
+     - Criterio: ≤ 45 MB y HP 66/73/76 ≤ TP2M + 3 %, cara del 73 sin moteado, luz 0,98-1,02 y vibración ≤ 0,5 mm.
+   - **J1b**, la semilla multi-keyframe, solo si J1a funciona.
+   - **Resultado (2026-11-19)**, con el control TP2M (TP2 con `bin_merge`: HP 14,08 / 11,83 / 12,70, 59,6 MB, luz 1,03; el merge no cambió nada):
+     - **J1a** (reg 0,01):
+       - 41,3 MB, HP 14,53 / 12,48 / 13,27, luz 0,95, vibración 0,32 mm.
+       - Cara sin moteado, mano como TP2M, pelo algo más blando.
+       - Pero la recolocación se quedó sin sitio: movió 13k registros en 200 eventos.
+       - La forma entrenable sola cierra ~60 % del hueco FT10→TP2M.
+     - **J1c** (reg 0,03):
+       - Recolocación activa (71k registros), pero HP 14,58 / 12,60 / 13,41 y 41,6 MB.
+       - Recortes iguales que J1a: **reciclar con forma entrenable no añade detalle**.
+     - Ninguno cumple el criterio. La bajada de luz a 0,94-0,95 viene de la semilla podada FP10 (FT10 igual).
+     - El parche de forma entrenable está sin commitear en el árbol (binaria `bin_j1`).
+9. **Segunda iteración opcional:** supervisión extra con renders de NAIF desde cámaras virtuales fuera del rig (como el modo PLY de TRiGS, que entrena contra renders de los PLY). Ataca las rayas fuera del rig, pero mete el parpadeo de NAIF.
+10. **TRiGS ejecutado tal cual, T1 (2026-11-20).** Repo `D:\Dependencias\open4dgs-trigs-main`, AGPL, solo para evaluar; nada de su código entra en spirula.
+    - **Modo:** PLY (`trigs.cli.train_from_plys`, que por debajo usa el entrenador "upstream" de TriGSVanilla).
+      - Entrada: los NAIF 45-76.
+      - Supervisión: renders de esos PLY desde cámaras sintéticas en órbita.
+    - **Entorno:** venv de `ref4d` (torch 2.10 cu128, gsplat 1.5.3), más `gsply` y `splines` por pip, y `trigs` instalado editable sin dependencias.
+      - `pytorch3d` no se compiló. En `ref4d\venv\Lib\site-packages\pytorch3d\` hay un sustituto propio: `knn_points` con KD-tree de scipy, y `sample_farthest_points` cambiado por un subconjunto aleatorio.
+    - **Arnés `outputs\tc\run_trigs_ply.py`:** no modifica su código y da el mismo resultado. Dos ajustes:
+      - la inicialización de anclas va en bloques de 256 filas en lugar de 2048, porque con 2048 desbordaba los 12 GB;
+      - el grado SH del render se limita al de los datos. Su calentamiento lo sube a 3 aunque nuestros PLY son de grado 1, y fallaba en el paso 2000.
+    - **Entrada recortada** a la caja del sujeto (`trigs_crop_inputs.py` → `outputs\tc\TRIGS_in`).
+      - Los flotantes de NAIF a cientos de metros daban `scene_extent` = 740 m, y las cámaras en órbita veían a la persona diminuta.
+      - La primera ejecución, con esos flotantes, se descartó.
+    - **Receta:**
+      - 800k primitivas, keyframe cada 3, 12.000 pasos (8 min).
+      - 40 cámaras de 1024². Su caché de referencias vive en la GPU, y 120 cámaras necesitarían 16 GB.
+      - PSNR de entrenamiento contra los renders de NAIF: 41,5.
+    - **Resultado** con nuestras cámaras reales contra el vídeo (`TRIGS_T1_battery.log`, `TRIGS_T1_FACE.png`, `TRIGS_T1_HAND73.png`):
+
+      | Run | HP 52 / 60 / 66 / 73 / 76 | Luz |
+      |---|---|---|
+      | NAIF | 14,02 / 13,73 / 11,98 / 10,18 / 11,16 | 0,99 |
+      | TP2M | 15,06 / 14,87 / 14,08 / 11,83 / 12,70 | 1,03 |
+      | ST7L | 16,05 / 15,96 / 16,32 / 15,18 / 14,57 | 1,03 |
+      | **TRIGS_T1** | 16,89 / 15,97 / 15,16 / 15,20 / 15,62 | 0,98-0,99 |
+
+      - Peor que ST7L en 52, 73 y 76.
+      - Cara del 73 borrosa y con fantasmas.
+      - La luz es buena porque copia la de NAIF.
+      - Sus frames exportados quitan las filas invisibles, así que el número de filas cambia por frame. Por eso no se midieron tamaño `.vgs` ni vibración.
+    - **Matiz:** prueba su modo PLY en esta GPU, no TRiGS con imágenes reales. En la órbita sintética la cara ocupa ~100 px y la supervisión de detalle es pobre.
+    - **T2**, modo COLMAP con las imágenes del rig y un NPZ de inicio nuestro, **no se ha hecho**.
+
+### 9.2 Caminos anteriores, con su estado
+
+| Camino (lista del 2026-11-03) | Estado |
+|---|---|
+| Analizar los registros de Gracia | Hecho en parte (estructura, SH temporales, churn). Sigue siendo útil para la métrica por región |
+| Partir del estático nítido (NAIF) con correspondencias | Probado como transplante (TP) y como semilla NAIF60 (MS). La correspondencia directa no existe (0,4-1,5 %). Lo recoge J en forma de semilla multi-keyframe con forma reentrenada |
+| `PLAN.md` paso 3 "mover primero" y paso 4 más resolución de movimiento | Descartado: MS mostró que el movimiento no es el límite |
+| Métrica de detalle por región | Pendiente. El error HP en píxeles malos de ST7L es lo usado hasta ahora; siempre junto con recortes |
+| Bug de `--temporal-birth-dir auto` que ignora un `--temporal-warp-dir` de fichero | Pendiente, menor |
 
 ---
 
@@ -446,6 +682,15 @@ La revisión `4DGS_Papers\_notes\REVISION_374_20261103.md` (§6 R07-R22 y matriz
 | `_notes\deep\grupo_A.md` … `grupo_L.md` | Síntesis por tema: A flujo→movimiento por splat; B jerarquía movimiento/apariencia en humanos; C streaming y keyframes; D códecs con identidades persistentes; E-F compresión; G-H multivista dinámico; I-J monocular; … |
 | `_notes\deep\PLAN.md` | Plan de investigación y diseño del entrenador 4D nativo |
 | `_lists\` | Listas de origen (qianx77 Awesome-4DGS, awesome-4dgs, enlaces del dueño + gaussian-splatting-daily) |
+
+**Repos leídos el 2026-11-19** (base de la vía J; solo ideas):
+
+| Repo | Licencia | Qué aporta |
+|---|---|---|
+| `D:\Dependencias\open4dgs-core-main` | MIT | Preparación: RoMa v2 multivista + seguimiento MEMFOF → posición, velocidad y aceleración por punto cada 5 frames; subkeyframes de vida 1 frame para lo rápido; presupuesto que nunca aclara lo que se mueve; cadenas largas con comprobación de ciclo; reparación rígida por clúster. Exportación `.trigsbin`. Medida suya: la nitidez sube con los splats vivos por frame hasta el techo de un frame solo |
+| `D:\Dependencias\open4dgs-trigs-main` | AGPL-3.0 | Entrenador TRiGS: ventana temporal por splat, regularización 4D de opacidad, regularización de escala con tope de anisotropía, recolocación (`strategy/motion_guided_relocation.py`) con reparto MCMC y ventana heredada, σ_t inicial por aceleración, modo PLY (`cli/train_from_plys.py`, `init/from_plys.py`) |
+
+Resumen de valores en la memoria `open4dgs-core-reference.md`. Nota del paper TRiGS: `_notes\deep\2604.00538.md`.
 
 **Otras carpetas** (solo ideas, nunca código):
 
@@ -483,3 +728,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\Dependencias\spirula-stud
 - `battery_ST11.ps1` es el modelo de batería completa: entrena, renombra, limpia con `subject_filter --hide` en `<run>_clean`, y pasa `det_eval2`, `vib_runs`, `fade_drift`, `hand_views` y `face_crop`.
 - Tarda ~22 min por run de 20k pasos.
 - Se lanza desacoplado. El resumen va a `<BATERÍA>_battery.log`.
+
+**Con la binaria del merge (desde 2026-11-19):**
+
+- La prueba de humo es `outputs\tc\smoke_merge.ps1`: receta de TP2, 300 pasos, sobre `TP2_clean`.
+- Para la receta completa de TP2 (20k pasos) con `bin_merge`, la plantilla es `battery_TP2.ps1`: hay que cambiar la binaria y el nombre del run.
+- La evaluación completa (limpieza, `vgsplyseq`, VGSEditor, `transplant_eval`, `hand_views`, `back_feet_sheet`, `floor_dirt`, `vib_runs`) está en `battery_FT.ps1`.
+- `back_feet_sheet.py` falla en el frame 76 (caja vacía): usar 45 52 66 73.
+
+**TRiGS T1** (venv de `ref4d`, desde `%TEMP%`):
+
+```powershell
+python outputs\tc\trigs_crop_inputs.py C:\Users\Victor\AppData\Local\Temp\trigs_in outputs\tc\TRIGS_in 45 76
+D:\Dependencias\ref4d\venv\Scripts\python.exe -I -u -X utf8 outputs\tc\run_trigs_ply.py --input-dir outputs\tc\TRIGS_in --output-dir outputs\tc\TRIGS_T1 --config.keyframe-stride 3 --config.fps 30 --config.n-steps 12000 --config.target-count 800000 --camera.width 1024 --camera.height 1024 --camera.longitude-steps 8 --camera.latitude-steps 5 --no-render-debug
+powershell -File outputs\tc\battery_TRIGS_eval.ps1
+```
+
+- `trigs_in` son enlaces duros a los NAIF de `C:\Users\Victor\Documents\Gracia4DGSConverter\VIDEOTIKI\output`.
+- Las rutas de `outputs\tc` son relativas a `D:\Dependencias\spirula-studio`; en la ejecución real se pasaron absolutas.

@@ -232,9 +232,13 @@ void TrainerSession::save_spacetime(int step) {
 }
 
 void TrainerSession::spacetime_after_step(int step, const EngineStepConfig& sc) {
+    const int max_steps = cfg.max_steps.value_or(cfg.num_iterations);
     engine_spacetime_after_step({sc.optim.lr_means, sc.optim.lr_quats, sc.optim.lr_features_dc,
                                  sc.optim.lr_opacities, cfg.spacetime_window_lr, cfg.spacetime_batch,
-                                 sc.optim.mcmc_opacity_reg_weight});
+                                 sc.optim.mcmc_opacity_reg_weight,
+                                 scheduled_lr(step, max_steps, _spacetime_scales_lr, _spacetime_scales_lr_final),
+                                 scheduled_lr(step, max_steps, _spacetime_sh_lr),
+                                 sc.optim.mcmc_scale_reg_weight, sc.optim.sh_reg_weight});
     if (cfg.spacetime_relocate <= 0.0f || cfg.spacetime_relocate_every <= 0 ||
         (step + 1) % cfg.spacetime_relocate_every != 0)
         return;

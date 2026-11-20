@@ -46,11 +46,12 @@ struct Spacetime {
     int64_t room = 0;
     // Basis weights per integer frame, [frames, K].
     std::vector<float> bpos, brot, bcolor, bopacity;
-    Adam apos, arot, acolor, aopacity, awindow;
+    Adam apos, arot, acolor, aopacity, awindow, ascale, ash;
+    size_t sh = 0;  // SH floats per row
     std::vector<int32_t> steps;
-    // Gradients of the batch's views per record (kGradWidth each), and whether
-    // any view of the batch saw the record.
-    std::vector<float> acc;
+    // Gradients of the batch's views per record (kGradWidth each, scale and SH
+    // 3 + sh each), and whether any view of the batch saw the record.
+    std::vector<float> acc, acc_shape;
     std::vector<uint8_t> seen;
     int views = 0;
     // The room as it came in, put back before every step: trained one view at a
@@ -130,6 +131,9 @@ void engine_spacetime_begin(SpacetimeRecords records, int frames, int views_per_
     st->acolor.resize(st->rec.color.size());
     st->aopacity.resize(n * kSpacetimeOpacity);
     st->awindow.resize(2 * n);
+    st->sh = (size_t)engine().world.features_sh.size<1>() * 3;
+    st->ascale.resize(3 * n);
+    st->ash.resize(st->sh * n);
     st->steps.assign(n, 0);
     if (room > 0) {
         EngineState& s = engine();
@@ -223,9 +227,13 @@ void engine_spacetime_after_step(const SpacetimeRates& lr) {
     if (!s.grad.means.data_ptr() || !s.grad.quats.data_ptr() || !s.grad.opacities.data_ptr() ||
         !s.grad.features_dc.data_ptr())
         throw std::runtime_error("spacetime: no gradient buffers (needs --use-fused-proj-bwd-optim 0)");
-    const size_t n = (size_t)st.rec.rows;
+    const size_t n = (size_t)st.rec.rows, shw = 3 + st.sh;
+    const bool shape = lr.scale > 0.0f || lr.sh > 0.0f;
+    if (shape && (!s.grad.scales.data_ptr() || (st.sh > 0 && !s.grad.features_sh.data_ptr())))
+        throw std::runtime_error("spacetime: no scale or SH gradient buffers");
     if (st.acc.empty()) {
         st.acc.assign(n * kGradWidth, 0.0f);
+        st.acc_shape.assign(n * shw, 0.0f);
         st.seen.assign(n, 0);
     }
     backend::device_synchronize();
@@ -233,6 +241,11 @@ void engine_spacetime_after_step(const SpacetimeRates& lr) {
     const std::vector<float> gq = download(after_room(s.grad.quats.data_ptr(), 16), 4 * n);
     const std::vector<float> go = download(after_room(s.grad.opacities.data_ptr(), 4), n);
     const std::vector<float> gd = download(after_room(s.grad.features_dc.data_ptr(), 12), 3 * n);
+    std::vector<float> gs, gh;
+    if (shape) {
+        gs = download(after_room(s.grad.scales.data_ptr(), 12), 3 * n);
+        gh = download(after_room(s.grad.features_sh.data_ptr(), 4 * st.sh), st.sh * n);
+    }
     const float t = (float)st.frame;
     const float* wp = st.bpos.data() + (size_t)st.frame * kSpacetimePos;
     const float* wr = st.brot.data() + (size_t)st.frame * kSpacetimeRot;
@@ -272,6 +285,11 @@ void engine_spacetime_after_step(const SpacetimeRates& lr) {
             for (int k = 0; k < kSpacetimeOpacity; k++) g[kGradOpacity + k] += wo[k] * go_o;
             g[kGradWindow] += -gl * (1.0f - s0) / ((1.0f - a) * kEdge);
             g[kGradWindow + 1] += gl * (1.0f - s1) / ((1.0f - a) * kEdge);
+            if (shape) {
+                float* h = st.acc_shape.data() + (size_t)r * shw;
+                for (int c = 0; c < 3; c++) h[c] += gs[3 * r + c];
+                for (size_t k = 0; k < st.sh; k++) h[3 + k] += gh[st.sh * r + k];
+            }
             st.seen[r] = 1;
         }
     });
@@ -283,7 +301,13 @@ void engine_spacetime_after_step(const SpacetimeRates& lr) {
     if (++st.views < std::max(lr.batch, 1)) return;
 
     // One Adam step per record the batch saw, on the batch's mean gradient.
-    const std::vector<float> scales = download(after_room(s.world.scales.data_ptr(), 12), 3 * n);
+    std::vector<float> scales = download(after_room(s.world.scales.data_ptr(), 12), 3 * n);
+    std::vector<float> shs;
+    if (shape) shs = download(after_room(s.world.features_sh.data_ptr(), 4 * st.sh), st.sh * n);
+    // The engine's shape penalties on their gradients (its optimizer's normalisation):
+    // mcmc_scale_reg on log scales, sh_reg an L2 on the coefficients.
+    const float scale_reg = lr.scale_reg * 1e-2f / 3.0f / (float)s.cur_num_splats;
+    const float sh_reg = 2.0f * lr.sh_reg / (3.0f * (float)s.cur_num_splats);
     const float inv = 1.0f / (float)st.views;
     st.views = 0;
     nn::parallel_for((int64_t)n, [&](int64_t lo, int64_t hi) {
@@ -307,8 +331,19 @@ void engine_spacetime_after_step(const SpacetimeRates& lr) {
             st.aopacity.step(st.rec.opacity.data(), g + kGradOpacity, (size_t)r, kSpacetimeOpacity, lr.opacity, c2);
             st.awindow.step(st.rec.window.data(), g + kGradWindow, (size_t)r, 2, lr.window, c2);
             std::fill_n(g, kGradWidth, 0.0f);
+            if (!shape) continue;
+            float* h = st.acc_shape.data() + (size_t)r * shw;
+            for (int c = 0; c < 3; c++) h[c] = h[c] * inv + scale_reg;
+            for (size_t k = 0; k < st.sh; k++) h[3 + k] = h[3 + k] * inv + sh_reg * shs[st.sh * r + k];
+            st.ascale.step(scales.data(), h, (size_t)r, 3, lr.scale, c2);
+            st.ash.step(shs.data(), h + 3, (size_t)r, st.sh, lr.sh, c2);
+            std::fill_n(h, shw, 0.0f);
         }
     });
+    if (shape) {
+        upload(after_room(s.world.scales.data_ptr(), 12), scales);
+        upload(after_room(s.world.features_sh.data_ptr(), 4 * st.sh), shs);
+    }
 }
 
 int64_t engine_spacetime_relocate(int64_t max_new, float min_opacity, uint64_t seed) {
@@ -367,9 +402,12 @@ int64_t engine_spacetime_relocate(int64_t max_new, float min_opacity, uint64_t s
         zero(st.acolor, kSpacetimeColor * 3);
         zero(st.aopacity, kSpacetimeOpacity);
         zero(st.awindow, 2);
+        zero(st.ascale, 3);
+        zero(st.ash, st.sh);
         st.steps[r] = 0;
         if (!st.acc.empty()) {
             std::fill_n(st.acc.begin() + r * kGradWidth, kGradWidth, 0.0f);
+            std::fill_n(st.acc_shape.begin() + r * (3 + st.sh), 3 + st.sh, 0.0f);
             st.seen[r] = 0;
         }
         spacetime_motion_forget((int64_t)r);
