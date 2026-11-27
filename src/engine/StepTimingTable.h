@@ -46,6 +46,7 @@
   X("bilagrid_tv.bilagrid_scatter_floats",           Scope,       Images) \
   X("bilagrid_tv.bilagrid_tv_loss_bwd",              Scope,       Images) \
   X("bilagrid_tv.bilagrid_tv_loss_fwd",              Scope,       Images) \
+  X("bilagrid_tv.bilagrid_tv_sum",                   Scope,       Images) \
   X("bilagrid_tv.ppisp_add_into_grad",               Appearance,  Images) \
   X("bilagrid_tv.ppisp_original_default_init",      Appearance,  Images) \
   X("calib_warp.calib_warp_accum",                   Calibration, Pixels) \
@@ -60,21 +61,12 @@
   X("densify.densify_accum_finalize",                Densify,     Splats) \
   X("densify.densify_clip_scale",                    Densify,     Splats) \
   X("densify.densify_clip_score",                    Densify,     Splats) \
-  X("densify.densify_copy_qsh_map",                  Densify,     Splats) \
   X("densify.densify_copy_qsh_pairs",                Densify,     Splats) \
   X("densify.densify_efraimidis_keys",               Densify,     Splats) \
   X("densify.densify_gather_score",                  Densify,     Splats) \
   X("densify.densify_learned_score",                 Densify,     Splats) \
   X("densify.densify_max_weight_init",               Densify,     Splats) \
   X("densify.densify_max_weight_scale",              Densify,     Splats) \
-  X("densify.densify_mcmc_add_index_map",            Densify,     Splats) \
-  X("densify.densify_mcmc_add_noise",                Densify,     Splats) \
-  X("densify.densify_mcmc_compute_add",              Densify,     Splats) \
-  X("densify.densify_mcmc_probs",                    Densify,     Splats) \
-  X("densify.densify_mcmc_relocation",               Densify,     Splats) \
-  X("densify.densify_mcmc_reloc_index_map",          Densify,     Splats) \
-  X("densify.densify_mcmc_update_add",               Densify,     Splats) \
-  X("densify.densify_mcmc_update_reloc",             Densify,     Splats) \
   X("densify.densify_relocate_las",                  Densify,     Splats) \
   X("densify.densify_reloc_mask",                    Densify,     Splats) \
   X("densify.densify_revised_add_noise",             Densify,     Splats) \
@@ -96,10 +88,12 @@
   X("fused_ssim.ssim_bt_bwd_wide",                   Loss,        Pixels) \
   X("fused_ssim.ssim_bwd_inplace",                   Loss,        Pixels) \
   X("fused_ssim.ssim_mask_cov",                      Loss,        Pixels) \
+  X("intersect_tile.active_radii_accum",             Render,      Splats) \
   X("intersect_tile.intersect_offset",               Render,      SplatsPixels) \
   X("intersect_tile.intersect_tile_count",           Render,      SplatsPixels) \
   X("intersect_tile.intersect_tile_write",           Render,      SplatsPixels) \
   X("intersect_tile.tile_active_map",                Masks,       Pixels) \
+  X("intersect_tile.tile_quad_rays",                 Render,      Pixels) \
   X("meshing.mesh_activate",                         Other,       Fixed) \
   X("meshing.mesh_bisect",                           Other,       Fixed) \
   X("meshing.mesh_bvh_prep",                         Other,       Fixed) \
@@ -196,18 +190,16 @@
   X("rasterize_bwd_nodepth.rasterize_bwd_3dgut_nodepth", Backward, SplatsPixels) \
   X("rasterize_fwd.rasterize_fwd_2d",                Render,      SplatsPixels) \
   X("rasterize_fwd.rasterize_fwd_3dgut",             Render,      SplatsPixels) \
+  X("rasterize_stochastic.rasterize_stochastic",     Render,      SplatsPixels) \
   X("rasterize_moments.rasterize_moments_3dgut",     Render,      SplatsPixels) \
   X("region.decay_opacity",                          Densify,     Splats) \
   X("region.densify_scale_score",                    Densify,     Splats) \
   X("region.region_weight",                          Densify,     Splats) \
-  X("sort_scan.scan_add_f32",                        Scope,       Scope) \
   X("sort_scan.scan_add_i32",                        Scope,       Scope) \
   X("sort_scan.scan_add_i64",                        Scope,       Scope) \
-  X("sort_scan.scan_blocks_f32",                     Scope,       Scope) \
   X("sort_scan.scan_blocks_flags",                   Scope,       Scope) \
   X("sort_scan.scan_blocks_i32",                     Scope,       Scope) \
   X("sort_scan.scan_blocks_i64",                     Scope,       Scope) \
-  X("sort_scan.scan_spine_f32",                      Scope,       Scope) \
   X("sort_scan.scan_spine_i32",                      Scope,       Scope) \
   X("sort_scan.scan_spine_i64",                      Scope,       Scope) \
   X("sort_scan.scatter_flagged_u32",                 Scope,       Scope) \
@@ -217,6 +209,7 @@
   X("sort_scan.sort_hist_u64",                       Scope,       Scope) \
   X("sort_scan.sort_spine_global",                   Scope,       Scope) \
   X("sort_scan.sort_spine_local",                    Scope,       Scope) \
+  X("surfel_test.surfel_eval",                       Other,       Fixed) \
   X("test_kernels.dispatch_grid",                    Other,       Fixed) \
   X("test_kernels.dispatch_group_only",              Other,       Fixed) \
   X("test_kernels.iota_u32",                         Other,       Fixed) \

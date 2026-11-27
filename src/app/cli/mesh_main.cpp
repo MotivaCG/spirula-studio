@@ -18,7 +18,11 @@
 #include "backend/api/BackendRuntime.h"
 #include "checkpoint/SplatPly.h"
 #include "mesh/Meshing.h"
+#include "app/MeshPreviewFile.h"
+#include "mesh/MeshCheck.h"
+#include "mesh/MeshImport.h"
 #include "core/Camera.h"
+#include "core/HostMemory.h"
 #include "data/DatasetParser.h"
 #include "data/ImageProbe.h"
 #include "data/Json.h"
@@ -28,6 +32,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -222,17 +227,28 @@ void print_help(const char* argv0) {
     help_row("--chart-angle-deg <a>", mmsg::help_chart_angle,
              {(double)d.m.chart_angle_deg});
     std::printf("\n");
+    help_row("--method <m>", mmsg::help_method, {"opacity"});
+    help_row("--tsdf-voxel <v>", mmsg::help_tsdf_voxel, {(double)d.m.tsdf_voxel});
+    help_row("--tsdf-trunc <v>", mmsg::help_tsdf_trunc, {(double)d.m.tsdf_trunc});
+    help_row("--tsdf-max-depth <v>", mmsg::help_tsdf_max_depth, {(double)d.m.tsdf_max_depth});
     help_row("--iso <v>", mmsg::help_iso);
     help_row("--merge-factor <v>", mmsg::help_merge_factor,
              {(double)d.m.merge_factor});
+    help_row("--merge-flat-px <v>", mmsg::help_merge_flat_px,
+             {(double)d.m.merge_flat_px});
+    help_row("--merge-thin <v>", mmsg::help_merge_thin, {(double)d.m.merge_thin});
+    help_row("--merge-max-edge-px <v>", mmsg::help_merge_max_edge_px,
+             {(double)d.m.merge_max_edge_px});
+    help_row("--merge-color <v>", mmsg::help_merge_color, {(double)d.m.merge_color});
     help_row("--bisection-iters <n>", mmsg::help_bisection_iters,
              {d.m.bisection_iters});
+    help_row("--samples-per-gaussian <1|7>", mmsg::help_samples_per_gaussian,
+             {d.m.samples_per_gaussian});
     help_row("--max-cameras <n>", mmsg::help_max_cameras, {d.m.max_cameras});
     help_row("--max-grid-res <n>", mmsg::help_max_grid_res, {d.m.max_grid_res});
     help_row("--grid-cell-factor <v>", mmsg::help_grid_cell_factor,
              {(double)d.m.grid_cell_factor});
     help_row("--num-threads <n>", mmsg::help_num_threads, {d.m.num_threads});
-    help_row("--carve-k <n>", mmsg::help_carve_k, {d.m.carve_k});
     help_row("--cull-unseen <0|1>", mmsg::help_cull_unseen,
              {(int)d.m.cull_unseen});
     help_row("--merge-max-flip-deg <a>", mmsg::help_merge_max_flip,
@@ -247,6 +263,7 @@ void print_help(const char* argv0) {
              {(double)d.m.degenerate_angle_deg});
     help_row("--quality-iters <n>", mmsg::help_quality_iters,
              {d.m.quality_iters});
+    help_row("--check <0|1|2>", mmsg::help_check, {d.m.check});
     help_row("--progress-dir <dir>", mmsg::help_progress_dir);
     help_row("--quiet", mmsg::help_quiet);
 }
@@ -292,14 +309,31 @@ Options parse_args(int argc, char** argv) {
         else if (key == "texture_size")    o.m.texture_size = parse_i(key, next());
         else if (key == "tex_gutter_px")   o.m.tex_gutter_px = parse_i(key, next());
         else if (key == "chart_angle_deg") o.m.chart_angle_deg = parse_f(key, next());
+        else if (key == "method") {
+            const std::string v = next();
+            if (v == "opacity") o.m.method = meshing::MeshMethod::Opacity;
+            else if (v == "tsdf") o.m.method = meshing::MeshMethod::Tsdf;
+            else throw std::runtime_error("--method: expected opacity or tsdf, got '" + v + "'");
+        }
+        else if (key == "tsdf_voxel")      o.m.tsdf_voxel = parse_f(key, next());
+        else if (key == "tsdf_trunc")      o.m.tsdf_trunc = parse_f(key, next());
+        else if (key == "tsdf_max_depth")  o.m.tsdf_max_depth = parse_f(key, next());
         else if (key == "iso")             o.iso = parse_f(key, next());
         else if (key == "merge_factor")    o.m.merge_factor = parse_f(key, next());
+        else if (key == "merge_flat_px")   o.m.merge_flat_px = parse_f(key, next());
+        else if (key == "merge_thin")      o.m.merge_thin = parse_f(key, next());
+        else if (key == "merge_max_edge_px") o.m.merge_max_edge_px = parse_f(key, next());
+        else if (key == "merge_color")     o.m.merge_color = parse_f(key, next());
         else if (key == "bisection_iters") o.m.bisection_iters = parse_i(key, next());
+        else if (key == "samples_per_gaussian") {
+            o.m.samples_per_gaussian = parse_i(key, next());
+            if (o.m.samples_per_gaussian != 1 && o.m.samples_per_gaussian != 7)
+                throw std::runtime_error("--samples-per-gaussian: expected 1 or 7");
+        }
         else if (key == "max_cameras")     o.m.max_cameras = parse_i(key, next());
         else if (key == "max_grid_res")    o.m.max_grid_res = parse_i(key, next());
         else if (key == "grid_cell_factor") o.m.grid_cell_factor = parse_f(key, next());
         else if (key == "num_threads")     o.m.num_threads = parse_i(key, next());
-        else if (key == "carve_k")         o.m.carve_k = parse_i(key, next());
         else if (key == "cull_unseen")     o.m.cull_unseen = parse_i(key, next()) != 0;
         else if (key == "no_cull_unseen")  o.m.cull_unseen = false;
         else if (key == "merge_max_flip_deg") o.m.merge_max_flip_deg = parse_f(key, next());
@@ -308,6 +342,7 @@ Options parse_args(int argc, char** argv) {
         else if (key == "fill_hole_max_edges") o.m.fill_hole_max_edges = parse_i(key, next());
         else if (key == "degenerate_angle_deg") o.m.degenerate_angle_deg = parse_f(key, next());
         else if (key == "quality_iters")   o.m.quality_iters = parse_i(key, next());
+        else if (key == "check")           o.m.check = parse_i(key, next());
         else if (key == "progress_dir")    o.progress_dir = next();
         else if (key == "quiet")           o.m.verbose = false;
         else throw std::runtime_error("unknown flag: --" + key + " (see --help)");
@@ -331,12 +366,29 @@ int spirula_mesh_main(int argc, char** argv) {
             d.others = m.has_used && m.used_bytes > m.process_bytes ? m.used_bytes - m.process_bytes : 0;
             return true;
         });
-        if (!o.progress_dir.empty())
-            o.m.on_progress = [&report](const meshing::MeshProgressReport& r) {
+        meshing::MeshProgressReport forecast;
+        std::chrono::steady_clock::time_point next_intermediate{};
+        if (!o.progress_dir.empty()) {
+            o.m.on_progress = [&](const meshing::MeshProgressReport& r) {
+                forecast = r;
                 report.work(r.work);
                 report.host_peak({r.host_peak, r.host_sigma});
                 report.device_peak({r.device_peak, r.device_sigma});
             };
+            const uint64_t gl_free = spirula::load_preview_device_free(o.progress_dir);
+            o.m.on_preview_mesh = [&, gl_free](const meshing::MeshData& mesh, int stage, bool cleaned) {
+                const auto now = std::chrono::steady_clock::now();
+                if (!cleaned && now < next_intermediate) return;
+                const auto m = backend::memory_usage();
+                uint64_t free = spirula::mesh_preview_device_free(m);
+                if (gl_free) free = free ? std::min(gl_free, free) : gl_free;
+                const auto budget = spirula::mesh_preview_budget(free,
+                    forecast.host_peak + forecast.host_sigma - spirula::processRamBytes(),
+                    forecast.device_peak + forecast.device_sigma - m.process_bytes);
+                spirula::write_mesh_preview(o.progress_dir, mesh, stage, budget, cleaned);
+                next_intermediate = now + std::chrono::seconds(2);
+            };
+        }
 
         // The identity API is Vulkan-only; a CUDA child receives its ordinal.
 #ifdef SS_BACKEND_VULKAN
@@ -370,6 +422,22 @@ int spirula_mesh_main(int argc, char** argv) {
         o.m.colors = modes;
         o.m.formats.clear();
         for (const auto& spec : specs) o.m.formats.push_back(spec.token());
+
+        // ---- --check on a mesh file: check it, write nothing ----
+        if (o.m.check > 0 && fs::is_regular_file(o.checkpoint) &&
+            meshing::is_mesh_path(o.checkpoint) &&
+            (fs::path(o.checkpoint).extension() != ".ply" || meshing::ply_is_mesh(o.checkpoint))) {
+            meshing::MeshData mesh;
+            std::string err;
+            if (!meshing::read_mesh(o.checkpoint, mesh, err)) throw std::runtime_error(err);
+            meshing::MeshCheckLimits lim;
+            lim.min_part_faces = o.m.floater_min_faces;
+            lim.num_threads = o.m.num_threads;
+            const meshing::MeshCheckReport r = meshing::check_mesh(mesh, lim);
+            for (const std::string& line : meshing::format_mesh_check(r, lim, o.checkpoint))
+                mlog::out_raw(mlog::Stage::Debug, line);
+            return r.defects() == 0 ? 0 : 1;
+        }
 
         // ---- checkpoint ----
         auto [splat_ply_s, run_dir_s] = spirula::find_splat_ply(o.checkpoint);
@@ -431,6 +499,10 @@ int spirula_mesh_main(int argc, char** argv) {
             }
         }
         const bool using_cameras = cams.num() > 0;
+        if (!using_cameras && o.m.method == meshing::MeshMethod::Tsdf) {
+            mlog::fail(mlog::Stage::Tsdf, mmsg::tsdf_needs_cameras);
+            return 1;
+        }
         if (!using_cameras)
             mlog::warn(mlog::Stage::Loading, cmsg::mesh_no_cameras);
 

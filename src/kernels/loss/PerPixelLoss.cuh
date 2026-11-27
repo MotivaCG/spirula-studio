@@ -89,6 +89,13 @@ enum class LossIndex {
     length
 };
 
+enum class PoolMaskClasses : uint32_t {
+    Foreground = 1u << 1,
+    Rgb = (1u << 1) | (1u << 3),
+    Alpha = (1u << 1) | (1u << 2) | (1u << 3),
+    All = (1u << 4) - 1
+};
+
 struct PerPixelGrads {
     TorchTensorView v_render_rgb, v_ref_rgb, v_render_depth, v_ref_depth;
     TorchTensorView v_render_normal, v_depth_normal, v_ref_normal;
@@ -224,5 +231,6 @@ LossValues compute_multi_scale_per_pixel_losses(
     int loss_map_mode,
     float robust_edge_aware_quantile,
     float nms_falloff,
-    PerPixelGrads& grads_out
+    PerPixelGrads& grads_out,
+    bool segment_and_ignore_mask
 );

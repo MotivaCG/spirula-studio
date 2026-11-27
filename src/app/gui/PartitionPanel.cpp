@@ -156,7 +156,9 @@ void PartitionPanel::run_compute() {
         opt = _compute_opt;
     }
     const bool reuse = _cov_valid && _cov_opt.source == opt.source &&
+                       (opt.method == spirula::PartitionMethod::Voronoi || _cov.camera_graph_built) &&
                        _cov_opt.max_projected_points == opt.max_projected_points &&
+                       _cov_opt.projection_depth_slack == opt.projection_depth_slack &&
                        _cov_opt.proximity_neighbours == opt.proximity_neighbours;
     if (!reuse) {
         spirula::Covisibility cov = spirula::build_covisibility(_ds, &_tracks, opt, log, &_cancel);
@@ -193,11 +195,10 @@ void PartitionPanel::run_merge() {
         saved = _saved_path;
     }
     spirula::MergeStats stats;
-    const spirula::SplatCloud merged = spirula::merge_partition_splats(_part, runs, stats);
-    spirula::write_splat_ply(merged, out);
+    spirula::merge_partition_splats_file(_part, runs, out, stats);
     std::lock_guard<std::mutex> lk(_mu);
     _merged_path = out;
-    _merge_status = format(pmsg::merge_done, {out, (long long)merged.num});
+    _merge_status = format(pmsg::merge_done, {out, (long long)stats.total});
 }
 
 void PartitionPanel::poll() {
@@ -259,6 +260,9 @@ bool PartitionPanel::options_changed() const {
            a.ring_fraction != b.ring_fraction || a.ring_min_points != b.ring_min_points ||
            a.method != b.method || a.outside_seed_fraction != b.outside_seed_fraction ||
            a.max_seeds != b.max_seeds ||
+           a.max_projected_points != b.max_projected_points ||
+           a.projection_depth_slack != b.projection_depth_slack ||
+           a.proximity_neighbours != b.proximity_neighbours ||
            a.source != b.source;
 }
 
@@ -395,7 +399,7 @@ void PartitionPanel::draw_controls() {
             ImGui::EndDisabled();
         }
     } else if (!_status.empty()) {
-        ui::TextColoredWrappedRaw(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), _status);
+        ui::TextColoredWrappedRaw(kErr, _status);
     } else if (_notice) {
         ui::TextDisabledWrapped(*_notice);
     } else if (_part_valid) {
@@ -410,10 +414,10 @@ void PartitionPanel::draw_controls() {
     ImGui::BeginDisabled(busy || !_loaded);
     // ---- options ----
     {
-        int m = _opt.method == spirula::PartitionMethod::ViewGraph ? 1 : 0;
+        int m = (int)_opt.method;
         ImGui::SetNextItemWidth(px(-80.0f));
-        if (ui::Combo(pmsg::lbl_method, &m, {&pmsg::meth_graph, &pmsg::meth_viewgraph}))
-            _opt.method = m == 1 ? spirula::PartitionMethod::ViewGraph : spirula::PartitionMethod::Graph;
+        if (ui::Combo(pmsg::lbl_method, &m, {&pmsg::meth_graph, &pmsg::meth_viewgraph, &pmsg::meth_voronoi}))
+            _opt.method = (spirula::PartitionMethod)m;
         ui::help_on_hover(pmsg::opt_method);
     }
     ImGui::SetNextItemWidth(px(-80.0f));
@@ -426,7 +430,7 @@ void PartitionPanel::draw_controls() {
         ui::TextDisabled(pmsg::log_dataset,
                          {(long long)_ds.num_cameras, (long long)_ds.points.num(),
                           tracked ? pmsg::word_yes.get() : pmsg::word_no.get()});
-        if (!tracked) ui::TextColoredWrapped(ImVec4(1.0f, 0.75f, 0.30f, 1.0f), pmsg::warn_no_tracks);
+        if (!tracked) ui::TextColoredWrapped(kWarn, pmsg::warn_no_tracks);
     }
 
     ui::Text(pmsg::lbl_split_by);
@@ -434,7 +438,7 @@ void PartitionPanel::draw_controls() {
     ImGui::SameLine();
     if (ui::RadioButton(pmsg::mode_max, _mode == 1)) _mode = 1;
     ui::help_on_hover(pmsg::mode_help);
-    ImGui::SetNextItemWidth(px(120.0f));
+    ImGui::SetNextItemWidth(px(kCompactFieldW));
     if (_mode == 0) {
         int parts = std::max(2, _opt.parts);
         if (ui::InputIntRaw("##parts", &parts)) _opt.parts = std::max(2, parts);
@@ -454,7 +458,7 @@ void PartitionPanel::draw_controls() {
         int idx = 2;
         for (int i = 0; i < 5; i++)
             if (kSeeds[i] == _opt.max_seeds) idx = i;
-        ImGui::SetNextItemWidth(px(120.0f));
+        ImGui::SetNextItemWidth(px(kCompactFieldW));
         if (ui::ComboRaw(ui::detail::label(pmsg::lbl_seeds), &idx, kSeedNames, 5))
             _opt.max_seeds = kSeeds[idx];
         ui::help_on_hover(pmsg::lbl_seeds_help);
@@ -627,7 +631,7 @@ void PartitionPanel::draw_merge() {
     }
     ImGui::EndDisabled();
     if (!_merge_error.empty())
-        ui::TextColoredWrappedRaw(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), _merge_error);
+        ui::TextColoredWrappedRaw(kErr, _merge_error);
     if (!_merge_status.empty()) {
         ui::TextWrappedRaw(_merge_status);
         if (_hooks.open_splat && !_merged_path.empty() && ui::Button(pmsg::btn_open_merged))

@@ -48,6 +48,7 @@
 
 #include "core/HardwareThreads.h"
 #include "core/HostMemory.h"
+#include "data/ImageColors.h"
 #include "sfm/core/Image.h"
 
 namespace sfm {
@@ -59,6 +60,8 @@ struct ImageLoadOptions {
     // The files' colour space; decoded pixels are converted to sRGB.
     std::string gamut;
     std::optional<bool> is_linear;
+    const spirula::ImageColors* image_colors = nullptr;
+    std::filesystem::path image_root;
     colorspace::Exposure exposure;
     // Keypoint masks (sfm/core/Mask.h), one per entry of the `paths` passed to
     // loadImagesInOrder and in the same order; "" means "no mask for this
@@ -67,8 +70,8 @@ struct ImageLoadOptions {
     // order of magnitude -- doing them serially on the consumer thread would
     // hand the GPU stage back the decode cost the pool exists to hide.
     std::vector<std::string> mask_paths;
-    // --feature-masks, laid out as mask_paths and intersected into them.
-    std::vector<std::string> feature_mask_paths;
+    // --mask-segment-only: a mask's 0 keeps, only the segment band drops.
+    bool mask_segment_only = false;
     // Swap keep and ignore in every decoded mask (sfm/core/Mask.h). On the pool
     // rather than the consumer thread, which the mask decode is already on.
     bool flip_mask = false;
@@ -86,13 +89,11 @@ struct ImageLoadOptions {
     size_t memory_budget_bytes = 0;
 };
 
-// A quarter of physical RAM, clamped to [1 GiB, 8 GiB]. The decoder's peak
-// in-flight set is bounded by this, so it is peak *anonymous* RSS for the
-// stage; a quarter leaves the page cache the room it needs to keep serving the
-// very files being decoded. Falls back to the historical 1 GiB when the
-// platform will not say how much memory it has.
+// A quarter of the RAM this process can hold, in [1 GiB, 8 GiB]: it bounds the
+// decoder's peak anonymous RSS, and the rest leaves the page cache room to serve
+// the files being decoded. 1 GiB when the platform will not say.
 inline size_t defaultDecodeBudget() {
-    const size_t total = spirula::physicalRamBytes();
+    const size_t total = spirula::totalRamBytes();
     if (total == 0) return 1ull << 30;
     return std::min<size_t>(std::max<size_t>(total / 4, 1ull << 30), 8ull << 30);
 }
@@ -142,8 +143,7 @@ inline ImageLoadPlan planImageLoad(const std::vector<std::pair<int, int>>& dims,
     // or below the image resolution in every convention we have seen, and
     // 1 B/px against the image's 3 B/px leaves the budget dominated by the
     // image either way.
-    const size_t masks = (opt.mask_paths.empty() ? 0 : 1) +
-                         (opt.feature_mask_paths.empty() ? 0 : 1);
+    const size_t masks = opt.mask_paths.empty() ? 0 : 1;
     // An exposure keeps the unexposed colour beside the exposed (GrayImage::color).
     const size_t colours = opt.want_color ? (opt.exposure.active() ? 2 : 1) : 0;
     plan.decode_peak_bytes = maxPix * 3 * (colours > 1 ? 2 : 1) +
@@ -184,12 +184,15 @@ inline void loadImagesInOrder(const std::vector<std::string>& paths, const Image
     auto decodeOne = [&](size_t i, GrayImage& out, std::string& err) {
         static const std::string kNoMask;
         const std::string& mp = i < opt.mask_paths.size() ? opt.mask_paths[i] : kNoMask;
-        const std::string& fmp =
-            i < opt.feature_mask_paths.size() ? opt.feature_mask_paths[i] : kNoMask;
         try {
+            const auto* color = opt.image_colors ? spirula::image_color_for(
+                *opt.image_colors, std::filesystem::path(paths[i]).lexically_relative(opt.image_root))
+                : nullptr;
             out = loadGrayImage(paths[i], opt.max_image_size, opt.want_color, mp,
-                                opt.gamut, opt.is_linear, opt.flip_mask,
-                                opt.apply_exif_orientation, fmp, opt.exposure);
+                                color ? color->gamut : opt.gamut,
+                                color ? color->linear : opt.is_linear, opt.flip_mask,
+                                opt.apply_exif_orientation, opt.mask_segment_only,
+                                opt.exposure);
         } catch (const std::exception& e) {
             err = e.what();
         }

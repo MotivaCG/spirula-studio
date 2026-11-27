@@ -1,6 +1,7 @@
 // TrainerCore.cpp -- see TrainerCore.h.
 
 #include "app/TrainerCore.h"
+#include "checkpoint/RegionCameras.h"
 #include "app/ForecastTrace.h"
 #include "backend/api/BackendRuntime.h"
 #include "core/Env.h"
@@ -25,6 +26,7 @@
 #include "data/RandomPoints.h"
 #include "data/ScenePartition.h"
 #include "data/Json.h"
+#include "data/JsonWrite.h"
 #include "data/RegionProgram.h"
 #include "data/RoiDocument.h"
 #include "data/LabelField.h"
@@ -32,6 +34,7 @@
 #include "data/Knn.h"
 #include "engine/EngineTemporal.h"
 #include "kernels/loss/PcaReg.cuh"
+#include "primitives/Primitive2DGS.cuh"
 #include "sfm/core/Exif.h"
 
 #ifndef _WIN32
@@ -628,17 +631,29 @@ std::string parser_seed(const std::string& seed) {
     return seed == spirula::dense::kSparseSeed ? std::string() : seed;
 }
 
+// 0 -> 1 over `steps`, full weight throughout when steps <= 0.
+float warmup_ramp(int step, int steps, const std::string& schedule) {
+    if (steps <= 0) return 1.0f;
+    const float t = std::min((float)step / (float)steps, 1.0f);
+    if (schedule == "linear")    return t;
+    if (schedule == "cosine")    return 0.5f * (1.0f - std::cos(3.14159265f * t));
+    if (schedule == "quadratic") return t * t;
+    if (schedule == "quartic")   return (t * t) * (t * t);
+    if (schedule == "step")      return t >= 1.0f ? 1.0f : 0.0f;
+    throw std::runtime_error("unknown warm-up schedule: " + schedule);
+}
+
 }  // namespace
 
 std::array<float, (int)LossWeightIndex::length>
 build_loss_weights(const TrainConfig& c, int step) {
-    float dist_factor = std::min((float)step / std::max(c.distortion_reg_warmup, 1), 1.0f);
-    float reg_active  = step >= c.reg_warmup_length ? 1.0f : 0.0f;
-    float sup_active  = step > c.supervision_warmup ? 1.0f : 0.0f;
-    float median_factor = std::min((float)step / std::max(c.median_warmup, 1), 1.0f);
-    float alpha_reg_factor = c.alpha_reg_weight *
-        std::min((float)step / std::max(c.alpha_reg_warmup, 1), 1.0f);
-    float mask = c.apply_loss_for_mask.value_or(false) ? 1.0f : 0.0f;
+    const float dist_factor =
+        warmup_ramp(step, c.distortion_reg_warmup, c.distortion_reg_warmup_schedule);
+    const float median_factor =
+        warmup_ramp(step, c.median_warmup, c.median_warmup_schedule);
+    const float alpha_reg_factor =
+        warmup_ramp(step, c.alpha_reg_warmup, c.alpha_reg_warmup_schedule);
+    float mask = train_mask_applies_alpha_loss(c) ? 1.0f : 0.0f;
 
     float w_rgb_l1 = std::max(0.0f, c.l1_weight);
     float w_rgb_l2 = std::max(0.0f, c.l2_weight);
@@ -656,15 +671,15 @@ build_loss_weights(const TrainConfig& c, int step) {
     w[(int)LossWeightIndex::YSupL2]        = w_y_l2 * scale;
     w[(int)LossWeightIndex::USupL2]        = w_u_l2 * scale;
     w[(int)LossWeightIndex::VSupL2]        = w_v_l2 * scale;
-    w[(int)LossWeightIndex::DepthSup]      = sup_active * c.depth_supervision_weight;
-    w[(int)LossWeightIndex::NormalSup]     = sup_active * c.normal_supervision_weight;
+    w[(int)LossWeightIndex::DepthSup]      = c.depth_supervision_weight;
+    w[(int)LossWeightIndex::NormalSup]     = c.normal_supervision_weight;
     w[(int)LossWeightIndex::AlphaSup]      = mask * c.alpha_loss_weight;
     w[(int)LossWeightIndex::AlphaSupUnder] = mask * c.alpha_loss_weight_under;
-    w[(int)LossWeightIndex::NormalReg]     = reg_active * c.normal_reg_weight * dist_factor;
-    w[(int)LossWeightIndex::AlphaReg]      = reg_active * alpha_reg_factor;
-    w[(int)LossWeightIndex::RgbDistReg]    = reg_active * c.rgb_distortion_reg * dist_factor;
-    w[(int)LossWeightIndex::DepthDistReg]  = reg_active * c.depth_distortion_reg * dist_factor;
-    w[(int)LossWeightIndex::NormalDistReg] = reg_active * c.normal_distortion_reg * dist_factor;
+    w[(int)LossWeightIndex::NormalReg]     = c.normal_reg_weight * dist_factor;
+    w[(int)LossWeightIndex::AlphaReg]      = c.alpha_reg_weight * alpha_reg_factor;
+    w[(int)LossWeightIndex::RgbDistReg]    = c.rgb_distortion_reg * dist_factor;
+    w[(int)LossWeightIndex::DepthDistReg]  = c.depth_distortion_reg * dist_factor;
+    w[(int)LossWeightIndex::NormalDistReg] = c.normal_distortion_reg * dist_factor;
     w[(int)LossWeightIndex::MeanMedianDepthSup]    = median_factor * c.mean_median_depth_weight;
     w[(int)LossWeightIndex::MedianDepthNormalReg]  = median_factor * c.median_depth_normal_reg_weight;
     w[(int)LossWeightIndex::MedianNormalSup]       = median_factor * c.median_normal_supervision_weight;
@@ -695,8 +710,11 @@ EngineStepConfig build_step_config(const TrainConfig& c, const RunState& st, int
         densify_loss_map_mode_int(c.densify_loss_map_mode, c.perceptual_loss);
     // blend >= 1: world-grad score only, loss map has no consumer.
     if (c.densify_score_blend_world_grad >= 1.0f) loss_map_mode = 0;
+    // Error maps and world-grad scores are only consumed while densification can run.
+    const bool densify_ongoing = densify_scoring_active(
+        c.refine_every, c.refine_stop_iter, c.refine_stop_num_iter, step, c.num_iterations);
     cfg.loss.loss_map_mode = loss_map_mode;
-    cfg.loss.compute_loss_map = (loss_map_mode != 0);
+    cfg.loss.compute_loss_map = (loss_map_mode != 0) && densify_ongoing;
     cfg.loss.robust_edge_aware_quantile = c.densify_robust_edge_aware_quantile;
     cfg.loss.nms_falloff = c.densify_nms_falloff;
     cfg.loss.loss_map_normalize = c.densify_loss_map_normalize;
@@ -714,6 +732,7 @@ EngineStepConfig build_step_config(const TrainConfig& c, const RunState& st, int
             std::max(0.0f, 1.0f - 1.0f / std::max(c.color_shift_reg_ema_period, 1));
     }
     cfg.loss.input_depth_is_ray_depth = st.input_depth_is_ray_depth;
+    cfg.loss.segment_and_ignore_mask = train_mask_is_segment_and_ignore(c);
 
     // ---- optim ---------------------------------------------------------
     float means_lr = scheduled_lr(step, max_steps_lr, c.means_lr, c.means_lr_final);
@@ -746,8 +765,10 @@ EngineStepConfig build_step_config(const TrainConfig& c, const RunState& st, int
         c.opacity_reg * reg_decay(c.opacity_reg_decay_power);
     cfg.optim.mcmc_scale_reg_weight       =
         c.scale_reg * reg_decay(c.scale_reg_decay_power) / alpha;
-    cfg.optim.erank_reg_weight            = c.erank_reg;
-    cfg.optim.erank_reg_weight_s3         = c.erank_reg_s3;
+    cfg.optim.erank_reg_weight            = c.erank_reg *
+        warmup_ramp(step, c.erank_reg_warmup, c.erank_reg_warmup_schedule);
+    cfg.optim.erank_reg_weight_s3         = c.erank_reg_s3 *
+        warmup_ramp(step, c.erank_reg_s3_warmup, c.erank_reg_s3_warmup_schedule);
     cfg.optim.quat_norm_reg_weight        = c.quat_norm_reg;
     cfg.optim.dc_reg_weight               = c.dc_reg;
     cfg.optim.sh_reg_weight               = c.sh_reg;
@@ -765,14 +786,13 @@ EngineStepConfig build_step_config(const TrainConfig& c, const RunState& st, int
     cfg.optim.reg_rendered_only             = c.reg_rendered_only;
     cfg.optim.use_fused_proj_bwd_optim      = c.use_fused_proj_bwd_optim;
     cfg.optim.write_densify_world_grad_score =
-        c.densify_score_blend_world_grad > 0.0f && c.use_revised_densification;
+        c.densify_score_blend_world_grad > 0.0f && densify_ongoing;
     cfg.optim.split_batch     = c.split_batch;
     cfg.optim.color_is_linear = st.splat_linear;
     cfg.optim.use_color_trust_region = st.splat_linear;
     cfg.optim.eps_tr = 1e-6f * std::pow(0.01f, (float)step / std::max(max_steps_lr, 1));
 
     // ---- densify -------------------------------------------------------
-    float noise_lr_scalar = c.use_revised_densification ? 1.0f : alpha;
     cfg.densify.refine_start_iter             = c.refine_start_iter;
     cfg.densify.refine_stop_num_iter          = c.refine_stop_num_iter;
     cfg.densify.refine_stop_iter              = c.refine_stop_iter;
@@ -787,10 +807,9 @@ EngineStepConfig build_step_config(const TrainConfig& c, const RunState& st, int
     cfg.densify.max_screen_size_clip_hardness = c.max_screen_size_clip_hardness;
     cfg.densify.clip_screen_size_at_refine    = c.max_screen_size_penalty > 0.0f;
     cfg.densify.max_world_size                = c.max_world_size * alpha;
-    cfg.densify.noise_lr                      = c.noise_lr * noise_lr_scalar;
-    cfg.densify.noise_lr_final                = c.noise_lr_final * noise_lr_scalar;
+    cfg.densify.noise_lr                      = c.noise_lr;
+    cfg.densify.noise_lr_final                = c.noise_lr_final;
     cfg.densify.noise_gate_peak_weight        = c.noise_gate_peak_weight;
-    cfg.densify.use_revised_densification     = c.use_revised_densification;
     cfg.densify.score_mode = c.densify_score_mode == "mean" ? 0
         : c.densify_score_mode == "max" ? 1
         : c.densify_score_mode == "median" ? 2 : 3;
@@ -799,8 +818,7 @@ EngineStepConfig build_step_config(const TrainConfig& c, const RunState& st, int
     cfg.densify.score_clip_quantile = c.densify_score_clip_quantile;
     cfg.densify.final_score_power = c.densify_final_score_power;
     cfg.densify.learned_score = c.densify_learned_score;
-    cfg.loss.learned_score = c.densify_learned_score && loss_map_mode != 0 &&
-        step < std::max(c.refine_stop_iter, c.num_iterations - c.refine_stop_num_iter);
+    cfg.loss.learned_score = c.densify_learned_score && cfg.loss.compute_loss_map;
     cfg.densify.oversize_split_fraction = c.densify_oversize_split_fraction;
     cfg.densify.oversize_score_blend = c.densify_oversize_score_blend;
     cfg.densify.las_split_opacity_k_init   = c.long_axis_split_opacity_k[0];
@@ -900,13 +918,13 @@ EngineStepConfig build_step_config(const TrainConfig& c, const RunState& st, int
     cfg.ppisp.run_before_color_space = c.apply_ppisp_before_color_space;
 
     // ---- background ----------------------------------------------------
-    if (c.background_mode == "noise" || c.background_mode == "pseudorandom" ||
-        c.background_mode == "random") {
+    if (c.background_transparency_suppression != "none") {
         float rw = std::min((float)step / std::max(c.background_noise_warmup, 1), 1.0f);
         cfg.background.randomize_weight =
             1.0f - (1.0f - c.background_noise_pre_warmup) * (1.0f - rw);
         cfg.background.match_luminance = c.background_match_luminance;
-    } else if (c.background_mode == "sh") {
+    }
+    if (c.background_mode == "skybox") {
         cfg.background.lr_dc = scheduled_lr(step, max_steps_lr, c.background_dc_lr);
         cfg.background.lr_sh = scheduled_lr(step, max_steps_lr, c.background_sh_lr);
         // One band less per that fraction of the run, down to a flat DC sky
@@ -966,6 +984,59 @@ void save_config_json(const TrainConfig& c, const fs::path& out_dir,
 // TrainerSession
 // ===========================================================================
 
+static std::string utc_iso8601(std::chrono::system_clock::time_point t) {
+    const std::time_t tt = std::chrono::system_clock::to_time_t(t);
+    std::tm tm{};
+#ifdef _WIN32
+    gmtime_s(&tm, &tt);
+#else
+    gmtime_r(&tt, &tm);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof buf, "%Y-%m-%dT%H:%M:%SZ", &tm);
+    return buf;
+}
+
+// Never throws: it runs inside the handlers that rethrow a run's own error.
+void TrainerSession::write_run_record(const char* status, const std::string& error) try {
+    if (_run_started == std::chrono::system_clock::time_point{}) return;
+    const bool running = !std::strcmp(status, "running");
+    auto str_or_null = [](const std::string& v) { return json_field::emit(v); };
+    JsonWriter w;
+    w.object();
+    w.field("status", status);
+    w.field_raw("error", str_or_null(error));
+    w.field("started", utc_iso8601(_run_started));
+    w.field_raw("ended", running ? std::string("null")
+                                 : json_quote(utc_iso8601(std::chrono::system_clock::now())));
+    w.field("training_time_s", elapsed_seconds());
+    w.field("start_step", start_step);
+    w.field("final_step", std::max(cur_step.load(), start_step));
+    w.field("num_iterations", cfg.num_iterations);
+    w.field("final_checkpoint", _final_saved);
+    w.field("num_splats", (long long)_live_splats.load());
+    w.field("device", _device_name);
+#ifdef SS_BACKEND_VULKAN
+    w.field("backend", "vulkan");
+#else
+    w.field("backend", "cuda");
+#endif
+    w.field_raw("spirula_version", str_or_null(app_version));
+    w.field("preset", preset);
+    w.field("data", fs::absolute(cfg.data).string());
+    w.field_raw("resume", str_or_null(cfg.resume));
+    w.field_raw("log", str_or_null(run_log));
+    if (!_earlier_runs.empty()) {
+        w.key("earlier_runs").array();
+        for (const JsonValue& r : _earlier_runs) json_write(w, r);
+        w.end();
+    }
+    w.end();
+    const std::string text = w.str();
+    write_file_atomic(out_dir / "run.json", text.data(), text.size());
+} catch (const std::exception&) {
+}
+
 void TrainerSession::log(const std::string& msg) {
     if (log_fn) { log_fn(msg); return; }
     std::printf("%s\n", msg.c_str());
@@ -999,10 +1070,8 @@ std::string train_config_error(const TrainConfig& c) {
         return lmsg::bad_quantization_level.get();
     if (c.sb_lobes < 0 || c.sb_lobes > ColorBasis::kMaxSbLobes)
         return lfmt(lmsg::bad_sb_lobes, {ColorBasis::kMaxSbLobes});
-    if (c.dead_criterion != "opacity" && !c.use_revised_densification)
-        return lfmt(lmsg::dead_criterion_needs_revised, {c.dead_criterion});
     if (c.densify_learned_score &&
-        (!c.use_revised_densification || c.densify_loss_map_mode == "none" ||
+        (c.densify_loss_map_mode == "none" ||
          c.densify_score_blend_world_grad != 0.0f || !(c.densify_score_power > 0.0f) ||
          !(c.densify_loss_map_power > 0.0f)))
         return lmsg::learned_score_needs.get();
@@ -1068,7 +1137,21 @@ void TrainerSession::load_region() {
     }
 }
 
+RegionCameras TrainerSession::build_region_cameras() const {
+    std::vector<int32_t> idx((size_t)ds.num_cameras, 0);
+    std::vector<float> centers((size_t)ds.num_cameras * 3);
+    for (int64_t i = 0; i < ds.num_cameras; i++)
+        for (int r = 0; r < 3; r++) centers[(size_t)i * 3 + r] = ds.c2w[(size_t)i * 12 + r * 4 + 3];
+    RegionCameras cameras;
+    cameras.field = LabelField::build(centers.data(), idx.data(), nullptr, ds.num_cameras, 4);
+    cameras.train_from_dataset.scale = cfg.relative_scale.value_or(1.0f);
+    for (int k = 0; k < 3; k++)
+        cameras.train_from_dataset.t[k] = -cameras.train_from_dataset.scale * ds.center[k];
+    return cameras;
+}
+
 void TrainerSession::setup_region() {
+    roi_cameras.reset();
     if (!roi) {
         engine_set_region({}, {}, {}, {}, {}, {}, 1.0f);
         return;
@@ -1079,14 +1162,8 @@ void TrainerSession::setup_region() {
     RegionProgram prog;
     std::string err;
     if (!compile_region(*roi, prog, err, rs, shift)) throw std::runtime_error(err);
-    // The training cameras, indexed, orient each splat's normal on the device.
-    std::vector<int32_t> idx((size_t)ds.num_cameras);
-    std::vector<float> centers((size_t)ds.num_cameras * 3);
-    for (int64_t i = 0; i < ds.num_cameras; i++) {
-        idx[(size_t)i] = (int32_t)std::min<int64_t>(i, 254);
-        for (int r = 0; r < 3; r++) centers[(size_t)i * 3 + r] = ds.c2w[(size_t)i * 12 + r * 4 + 3];
-    }
-    const LabelField cams = LabelField::build(centers.data(), idx.data(), nullptr, ds.num_cameras, 4);
+    roi_cameras = std::make_shared<RegionCameras>(build_region_cameras());
+    const LabelField& cams = roi_cameras->field;
     static const std::vector<float> none;
     auto tv = [](const std::vector<float>& v) -> TorchTensorView {
         if (v.empty()) return {};
@@ -1132,18 +1209,34 @@ void TrainerSession::check_config() {
 // eval scores a render against, and what a soft edge renders as.
 void TrainerSession::set_alpha_config(DataManagerConfig& dm,
                                       const std::vector<uint8_t>& alpha) const {
-    if (cfg.load_masks) dm.alpha_masks = alpha;
-    if (cfg.background_mode == "color") {
+    if (train_mask_enabled(cfg)) dm.alpha_masks = alpha;
+    if (cfg.background_mode == "black" || cfg.background_mode == "color") {
         dm.composite_alpha = alpha;
-        for (int c = 0; c < 3; c++) dm.composite_color[c] = cfg.background_color[c];
+        for (int c = 0; c < 3; c++)
+            dm.composite_color[c] =
+                cfg.background_mode == "color" ? cfg.background_color[c] : 0.0f;
     }
 }
 
+static BackgroundSuppression background_suppression_from_name(const std::string& name) {
+    if (name == "noise") return BackgroundSuppression::Noise;
+    if (name == "pseudorandom") return BackgroundSuppression::Pseudorandom;
+    if (name == "random") return BackgroundSuppression::Random;
+    return BackgroundSuppression::None;
+}
+
+void TrainerSession::set_mask_classes(DataManagerConfig& dm) const {
+    dm.segment_and_ignore_masks = train_mask_is_segment_and_ignore(cfg);
+    dm.segment_masks = train_mask_applies_alpha_loss(cfg);
+    dm.segment_rgb = train_mask_preserves_background(cfg);
+}
+
 void TrainerSession::set_downscale_cache(DataManagerConfig& dm) const {
+    dm.cache_progressive_images = cfg.cache_downscaled_images && cfg.progressive_resolution;
+    dm.image_dir = (fs::path(cfg.data) / cfg.image_dir).lexically_normal().string();
     const float d = cfg.train_resolution_divisor;
     if (!cfg.cache_downscaled_images || !(d >= 2.0f) || d != std::floor(d)) return;
     dm.downscale_cache_divisor = (int)d;
-    dm.image_dir = (fs::path(cfg.data) / cfg.image_dir).lexically_normal().string();
     dm.downscale_rounding_mode = cfg.downscale_rounding_mode;
 }
 
@@ -1249,6 +1342,17 @@ void TrainerSession::load_dataset() {
             log(lfmt(lmsg::file_gamut_unknown, {declared.format}));
     }
 
+    // A sparse model can declare its own colors, independently of the images.
+    std::error_code seed_error;
+    if (ds.points.num() > 0 && cfg.random_init != "always" &&
+        (pcfg.seed_pointcloud.empty() ||
+         fs::is_directory(fs::path(cfg.data) / pcfg.seed_pointcloud, seed_error))) {
+        if (cfg.point_color_gamut.empty()) cfg.point_color_gamut = ds.point_color_gamut;
+        if (!cfg.point_color_is_linear) cfg.point_color_is_linear = ds.point_color_is_linear;
+        if (cfg.point_color_transfer.empty() && ds.point_color_is_linear)
+            cfg.point_color_transfer = "srgb";
+    }
+
     // Scale both cloud and cameras before baking view matrices.
     if (cfg.relative_scale.has_value()) {
         float rs = *cfg.relative_scale;
@@ -1272,16 +1376,17 @@ void TrainerSession::load_dataset() {
 
     // Warp-path guards, plus: a modality no weight reads is not loaded at all.
     alpha_images = probe_alpha_masks(ds.image_filenames);
+    const bool masks_on = train_mask_enabled(cfg);
     has_mask   = (!ds.mask_filenames.empty() || !alpha_images.empty()) &&
-                 cfg.load_masks;
-    if (!alpha_images.empty() && cfg.load_masks) {
+                 masks_on;
+    if (!alpha_images.empty() && masks_on) {
         const long long n = std::count(alpha_images.begin(), alpha_images.end(), 1);
         log(lfmt(ds.mask_filenames.empty() ? lmsg::alpha_masks_found
                                            : lmsg::alpha_masks_with_files,
                  {n, (long long)ds.num_cameras}));
     }
     // Alpha cut-outs treat excluded pixels as empty space.
-    if (!cfg.apply_loss_for_mask.has_value()) {
+    if (cfg.mask_mode == "auto" && masks_on && !cfg.apply_loss_for_mask.has_value()) {
         cfg.apply_loss_for_mask = !alpha_images.empty() && ds.mask_filenames.empty();
         if (*cfg.apply_loss_for_mask) log(lmsg::alpha_masks_cut_out.get());
     }
@@ -1455,6 +1560,15 @@ static float estimate_views_per_point(const ParsedDataset& ds, float quantile) {
 }
 
 void TrainerSession::setup_engine() {
+    try {
+        setup_engine_steps();
+    } catch (const std::exception& e) {
+        write_run_record("failed", e.what());
+        throw;
+    }
+}
+
+void TrainerSession::setup_engine_steps() {
 #ifndef SS_BACKEND_VULKAN
     check_cuda_runtime();
 #endif
@@ -1484,6 +1598,22 @@ void TrainerSession::setup_engine() {
     if (write_config_json) {
         save_config_json(cfg, out_dir, preset);
         save_scene_transform_json(ds, cfg, out_dir);
+        _run_started = std::chrono::system_clock::now();
+        _device_name = backend::device_info(backend::device_current()).name;
+        _final_saved = false;
+        _earlier_runs.clear();
+        try {
+            const JsonValue prev = json_parse_file((out_dir / "run.json").string());
+            if (const JsonValue* runs = prev.find("earlier_runs"); runs && runs->is_array())
+                _earlier_runs = runs->arr;
+            JsonValue last = prev;
+            last.obj.erase(std::remove_if(last.obj.begin(), last.obj.end(),
+                                          [](const auto& kv) { return kv.first == "earlier_runs"; }),
+                           last.obj.end());
+            if (last.is_object()) _earlier_runs.push_back(std::move(last));
+        } catch (const std::exception&) {
+        }
+        write_run_record("running");
     }
     log(lfmt(lmsg::output_directory, {fs::absolute(out_dir).string()}));
     _perf_dir.clear();
@@ -1500,6 +1630,8 @@ void TrainerSession::setup_engine() {
     ColorResolution color = resolve_color(cfg);
     SeedSplats seed = with_room(seed_world(color), color);
     int64_t cap = (int64_t)seed.opacities.size();
+    if (cfg.primitive == "2dgs")
+        for (int64_t i = 0; i < cap; i++) seed.scales[(size_t)i * 3 + 2] = kSurfelLogScaleZ;
     const int64_t K = ColorBasis{cfg.sh_degree, cfg.sb_lobes}.coeffs();
     auto tv = [](std::vector<float>& v, std::vector<int64_t> shape) -> TorchTensorView {
         return {(uint64_t)(uintptr_t)v.data(), (uint32_t)sizeof(float), std::move(shape)};
@@ -1547,23 +1679,17 @@ void TrainerSession::setup_engine() {
     }
 
     // Background blending.
-    if (cfg.background_mode == "noise")
-        engine_init_background_noise((int)color.splat_transfer,
-                                     color.splat_linear);
-    else if (cfg.background_mode == "pseudorandom")
-        engine_init_background_pseudorandom((int)color.splat_transfer,
-                                            color.splat_linear);
-    else if (cfg.background_mode == "random")
-        engine_init_background_random((int)color.splat_transfer,
-                                      color.splat_linear);
-    else if (cfg.background_mode == "color")
+    if (cfg.background_mode == "color")
         engine_init_background_color(cfg.background_color.data(),
                                      (int)color.splat_transfer,
                                      color.splat_linear);
-    else if (cfg.background_mode == "sh")
+    else if (cfg.background_mode == "skybox")
         engine_init_background_sh(cfg.background_sh_degree,
                                   (int)color.splat_transfer,
                                   color.splat_linear);
+    engine_init_background_suppression(
+        background_suppression_from_name(cfg.background_transparency_suppression),
+        (int)color.splat_transfer, color.splat_linear);
 
     // Output transfer / wide-gamut color space.
     const bool splat_cs_on = color.splat_on();
@@ -1641,7 +1767,6 @@ void TrainerSession::setup_engine() {
         st.bilagrid_rgb_init = true;
     }
     if (cfg.use_bilateral_grid_for_geometry && has_depth &&
-        cfg.depth_supervision_weight > 0.0f &&
         (cfg.use_adagrad_bilagrid_optim ? cfg.bilagrid_adagrad_depth_lr
                                         : cfg.bilagrid_depth_lr) > 0.0f) {
         engine_init_bilagrid_depth(n_grids,
@@ -1653,7 +1778,6 @@ void TrainerSession::setup_engine() {
         st.bilagrid_depth_init = true;
     }
     if (cfg.use_bilateral_grid_for_geometry && has_normal &&
-        cfg.normal_supervision_weight > 0.0f &&
         (cfg.use_adagrad_bilagrid_optim ? cfg.bilagrid_adagrad_normal_lr
                                         : cfg.bilagrid_normal_lr) > 0.0f) {
         engine_init_bilagrid_normal(n_grids,
@@ -1715,10 +1839,9 @@ void TrainerSession::install_data_manager(const std::vector<std::string>& images
                                           const std::vector<std::string>& depths,
                                           const std::vector<std::string>& normals, int frames) {
     const int64_t N = ds.num_cameras;
-    int64_t num_val = (int64_t)ds.val_indices.size() * frames;
-    int64_t num_train = N * frames - num_val;
+    const int64_t num_train = N * frames - (int64_t)ds.val_indices.size() * frames;
     // Batch-size policy.
-    double n_batch = std::max((double)num_train / std::max(cfg.max_batch_per_epoch, 1), 1.0);
+    const double n_batch = std::max((double)num_train / std::max(cfg.max_batch_per_epoch, 1), 1.0);
     int train_bs = std::max(1, (int)(n_batch + 0.5));
     if (cfg.min_renders_per_refine > 0.0f && num_train > 0) {
         // A splat seen by V cameras is rendered B * refine_every * V / N_train
@@ -1730,15 +1853,11 @@ void TrainerSession::install_data_manager(const std::vector<std::string>& images
         const int bs_old = train_bs;
         if (cfg.max_train_batch_size > 0)
             train_bs = std::max(1, std::min(std::max(train_bs, bs_need), cfg.max_train_batch_size));
-        n_batch = (double)train_bs;
         log(lfmt(lmsg::batch_from_renders,
                  {(double)v_q, (long long)bs_old, (long long)train_bs}));
     }
     if (frames > 1) train_bs = 1;  // a step's views must share a frame
     _batches_per_epoch = (int)std::max<int64_t>(1, (num_train + train_bs - 1) / train_bs);
-    int val_bs = 1;
-    if (num_val > 0)
-        val_bs = std::max(1, (int)std::ceil(n_batch * (double)num_val / (double)num_train));
 
     DataManagerConfig dm;
     dm.cache_mode  = (cfg.cache_images == "disk") ? CacheMode::DISK : CacheMode::CPU;
@@ -1747,10 +1866,10 @@ void TrainerSession::install_data_manager(const std::vector<std::string>& images
     // all-white one becomes the post-split FOV mask (0 past the lens),
     // without which the unseen face regions train as black.
     dm.load_masks  = has_mask || post.any_fov_mask;
+    set_mask_classes(dm);
     dm.load_depths      = has_depth;
     dm.load_normals     = has_normal;
     dm.train_batch_size = train_bs;
-    dm.val_batch_size   = val_bs;
     dm.flip_mask = cfg.flip_mask;
     // Per-camera inputs repeated for each frame; view indices shifted by N a frame.
     auto tile = [frames](auto v) {
@@ -1885,44 +2004,68 @@ void TrainerSession::restore_checkpoint() {
     if (adapted) remove_tree(tmp);
     int bg_deg = 0;
     if (engine_has_background_sh(&bg_deg)) {
-        cfg.background_mode = "sh";
+        cfg.background_mode = "skybox";
         cfg.background_sh_degree = bg_deg;
     }
     log(lfmt(lmsg::resumed_from, {r.tar_path.string(), (long long)start_step}));
 }
 
-void TrainerSession::save_checkpoint(int step, bool full) {
-    if (engine_temporal_active()) {
-        save_chunk(step);
-        return;
-    }
-    if (engine_spacetime_active()) {
-        save_spacetime(step);
-        return;
-    }
+static std::string checkpoint_run_name(const fs::path& out_dir) {
     fs::path run_path = fs::absolute(out_dir).lexically_normal();
     if (run_path.filename().empty()) run_path = run_path.parent_path();
-    const std::string run_name = run_path.filename().string();
+    return run_path.filename().string();
+}
+
+void TrainerSession::save_checkpoint(int step, bool full) {
+    write_checkpoint(step, full, false);
+    prune_checkpoints();
+}
+
+std::future<void> TrainerSession::write_checkpoint(int step, bool full, bool periodic) {
+    // Chunk and spacetime runs write their own outputs, synchronously.
+    if (engine_temporal_active() || engine_spacetime_active()) {
+        std::lock_guard<std::mutex> lk(engine_mutex);
+        if (engine_temporal_active()) save_chunk(step);
+        else save_spacetime(step);
+        return {};
+    }
+    const std::string run_name = checkpoint_run_name(out_dir);
     std::string basename = run_name;
     if (!cfg.save_only_latest_checkpoint) {
         char suffix[32];
         std::snprintf(suffix, sizeof suffix, "_step-%09d", step);
         basename += suffix;
     }
-    engine_save_checkpoint(out_dir.string(), full, step, cfg.background_export_height,
-                           basename, cfg.export_y_up, cfg.export_keep_all_splats);
-    if (cfg.save_only_latest_checkpoint) {
-        std::vector<fs::path> stale;
-        for (const auto& e : fs::directory_iterator(out_dir)) {
-            const std::string b = e.path().filename().string();
-            if (e.is_directory() && b.rfind("step-", 0) == 0 && e.path().extension() == ".ckpt")
-                stale.push_back(e.path());
-            if (e.is_regular_file() && b.rfind(run_name + "_step-", 0) == 0 &&
-                (e.path().extension() == ".ply" || e.path().extension() == ".tar"))
-                stale.push_back(e.path());
-        }
-        for (const auto& p : stale) remove_tree(p);
+    const std::string camera_hash = roi_cameras ? save_region_cameras(out_dir.string(), *roi_cameras) : "";
+    const std::string root = out_dir.string();
+    if (periodic) {
+        const auto vram = _forecast.vram(false);
+        auto save = engine_try_save_checkpoint_async(engine_mutex, vram.peak_mean,
+            root, full, step, cfg.background_export_height, basename, cfg.export_y_up, camera_hash,
+            cfg.export_keep_all_splats);
+        _perf.checkpoint(step, save.pending.valid(), save.reason);
+        if (save.pending.valid()) return std::move(save.pending);
     }
+    std::lock_guard<std::mutex> lk(engine_mutex);
+    engine_save_checkpoint(root, full, step, cfg.background_export_height, basename, cfg.export_y_up, camera_hash,
+                           cfg.export_keep_all_splats);
+    return {};
+}
+
+void TrainerSession::prune_checkpoints() {
+    // Chunk and spacetime outputs are not step checkpoints.
+    if (!cfg.save_only_latest_checkpoint || engine_temporal_active() || engine_spacetime_active()) return;
+    const std::string run_name = checkpoint_run_name(out_dir);
+    std::vector<fs::path> stale;
+    for (const auto& e : fs::directory_iterator(out_dir)) {
+        const std::string b = e.path().filename().string();
+        if (e.is_directory() && b.rfind("step-", 0) == 0 && e.path().extension() == ".ckpt")
+            stale.push_back(e.path());
+        if (e.is_regular_file() && b.rfind(run_name + "_step-", 0) == 0 &&
+            (e.path().extension() == ".ply" || e.path().extension() == ".tar"))
+            stale.push_back(e.path());
+    }
+    for (const auto& p : stale) remove_tree(p);
 }
 
 // SMN opacity boost, at 40% and 85% of the run. In train_step() rather than
@@ -2041,6 +2184,7 @@ TimeBreakdown TrainerSession::time_breakdown(bool whole_run) const {
 
 void TrainerSession::observe_memory(int step, int64_t splats_ran) {
     MemorySample m;
+    m.resolution_divisor = engine_train_resolution_divisor();
     m.step = step;
     m.splats_ran = splats_ran;
     m.splats_next = _live_splats.load();
@@ -2105,6 +2249,17 @@ void TrainerSession::observe_memory(int step, int64_t splats_ran) {
 }
 
 void TrainerSession::train(const TrainerCallbacks& cb) {
+    try {
+        train_steps(cb);
+    } catch (const std::exception& e) {
+        write_run_record("failed", e.what());
+        throw;
+    }
+    write_run_record(std::max(cur_step.load(), start_step) < cfg.num_iterations ? "stopped"
+                                                                                 : "completed");
+}
+
+void TrainerSession::train_steps(const TrainerCallbacks& cb) {
     {
         std::lock_guard<std::mutex> lk(_time_mutex);
         _start_time = std::chrono::steady_clock::now();
@@ -2136,13 +2291,24 @@ void TrainerSession::train(const TrainerCallbacks& cb) {
 
     _perf.open(out_dir, _perf_dir);
     int step = start_step;
-    for (; step < cfg.num_iterations; step++) {
+    std::future<void> pending;
+    auto reap = [&] {
+        if (!pending.valid()) return;
+        pending.get();
+        prune_checkpoints();
+    };
+    auto save_ready = [&] {
+        return pending.valid() && pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+    };
+    for (; step < cfg.num_iterations; step++) try {
         // Pause gate + render-fairness yield: give viewer render workers an
         // uncontended window to take the engine mutex.
         if (paused.load() && !stop_requested.load()) {
             pause_clock_start();
-            while (paused.load() && !stop_requested.load())
+            while (paused.load() && !stop_requested.load()) {
+                if (save_ready()) reap();
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
             pause_clock_stop();
         }
         if (stop_requested.load()) break;
@@ -2150,6 +2316,21 @@ void TrainerSession::train(const TrainerCallbacks& cb) {
         // is time this step took. Timing only the work below reported 6 ms on
         // a step the run was actually spending 24 ms on.
         auto step_start = std::chrono::steady_clock::now();
+        double save_s = 0.0;
+        const bool periodic = step > start_step && cfg.steps_per_save > 0 && step % cfg.steps_per_save == 0;
+        if (periodic || save_ready()) {
+            StepTimingScope saving(StepPart::Saving, StepScale::Splats);
+            const auto t0 = std::chrono::steady_clock::now();
+            reap();
+            if (stop_requested.load()) break;
+            if (periodic) {
+                // The one checkpoint kept is what a crash resumes from, so it carries the optimizer.
+                pending = write_checkpoint(step, cfg.save_full_checkpoint || cfg.save_only_latest_checkpoint,
+                                           true);
+                if (!pending.valid()) prune_checkpoints();
+            }
+            save_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        }
         // One step in ten: on Vulkan each bracket is a queue submission.
         const bool timed = step % 10 == 0;
         // The breakdown also times every densify step, a stratum of its own.
@@ -2167,21 +2348,13 @@ void TrainerSession::train(const TrainerCallbacks& cb) {
 
         std::map<std::string, float> losses;
         std::string data_error;
-        double save_s = 0.0, splat_gpu_s = -1.0, data_wait_s = 0.0;
+        double splat_gpu_s = -1.0, data_wait_s = 0.0;
         int64_t splats_ran = 0, reg_splats = 0;
         bool reg_probed = false;
         ForecastTraceStep traced;
         StepSample sample;
         {
             std::lock_guard<std::mutex> lk(engine_mutex);
-            if (step > start_step && cfg.steps_per_save > 0 && step % cfg.steps_per_save == 0) {
-                StepTimingScope saving(StepPart::Saving, StepScale::Splats);
-                const auto t0 = std::chrono::steady_clock::now();
-                // The one checkpoint kept is what a crash resumes from, so it carries the optimizer.
-                save_checkpoint(step, cfg.save_full_checkpoint || cfg.save_only_latest_checkpoint);
-                save_s = std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - t0).count();
-            }
             splats_ran = engine_get_cur_num_splats();
             if (timed) engine_step_timing_arm();
             try {
@@ -2226,7 +2399,9 @@ void TrainerSession::train(const TrainerCallbacks& cb) {
         const bool probe_step = cfg.pca_reg_neighbors > 0 && step < cfg.pca_reg_start_iter &&
                                 step % kPcaRegProbeEvery == 10;
         if (probe_step) sample.gpu.at(StepPart::Regularizer, StepScale::Splats) = 0.0;
-        else _forecast.add_step(step, latency - save_s, splats_ran, splat_gpu_s);
+        sample.resolution_divisor = engine_train_resolution_divisor();
+        if (!probe_step) _forecast.add_step(step, latency - save_s, splats_ran, splat_gpu_s,
+                                           sample.resolution_divisor);
         sample.step = step;
         sample.wall_s = latency;
         sample.save_s = save_s;
@@ -2250,7 +2425,8 @@ void TrainerSession::train(const TrainerCallbacks& cb) {
                 return bytes;
             }, [] { return spirula::processRamBytes(); });
         }
-        if (save_s > 0.0) _forecast.add_save(save_s, splats_ran);
+        // A step that only collected a finished background write is not a save.
+        if (periodic && save_s > 0.0) _forecast.add_save(save_s, splats_ran);
         observe_memory(step, splats_ran);
         // SS_FORECAST_LOG=1: the forecast's state every 100 steps, English,
         // for checking it against how the run actually ends.
@@ -2262,9 +2438,9 @@ void TrainerSession::train(const TrainerCallbacks& cb) {
                 std::string line = "[step-timing] step " + std::to_string(step + 1);
                 char buf[160];
                 const DevicePool::CategoryBytes pool = DevicePool::global().category_bytes();
-                std::snprintf(buf, sizeof buf, "  splats %lld  splat_x_img %.1f MiB",
+                std::snprintf(buf, sizeof buf, "  splats %lld  splat_x_pix %.1f MiB",
                               (long long)_live_splats.load(),
-                              pool.cap[(int)VramCategory::SplatXImg] / 1048576.0);
+                              pool.cap[(int)VramCategory::SplatXPix] / 1048576.0);
                 line += buf;
                 std::snprintf(buf, sizeof buf, "  total %.2f ms  unaccounted %.2f", b.total() * 1e3,
                               b.unaccounted * 1e3);
@@ -2317,6 +2493,16 @@ void TrainerSession::train(const TrainerCallbacks& cb) {
             p.losses = std::move(losses);
             cb.on_step(p);
         }
+    } catch (...) {
+        try {
+            reap();
+        } catch (const std::exception& e) {
+            try { log(e.what()); }
+            catch (...) { std::fprintf(stderr, "%s\n", e.what()); }
+        } catch (...) {
+            std::fputs("checkpoint writer failed with a non-standard exception\n", stderr);
+        }
+        throw;
     }
 
     {
@@ -2324,6 +2510,7 @@ void TrainerSession::train(const TrainerCallbacks& cb) {
         _end_time = std::chrono::steady_clock::now();
     }
     training_time_s = elapsed_seconds();
+    reap();
     // Pool capacities are a monotonic high-water mark, so reading them after
     // the loop gives the training-time peak.
     {
@@ -2334,9 +2521,9 @@ void TrainerSession::train(const TrainerCallbacks& cb) {
     engine_profile_capture_vram();
 
     if (cfg.steps_per_save != 0 && save_on_stop.load()) {
-        std::lock_guard<std::mutex> lk(engine_mutex);
         // A run stopped short is one to continue later, so its save must be resumable.
         save_checkpoint(step, cfg.save_full_checkpoint || step < cfg.num_iterations);
+        _final_saved = true;
         log(lfmt(lmsg::checkpoint_saved, {fs::absolute(out_dir).string()}));
     }
 
@@ -2387,6 +2574,9 @@ ViewerRenderConfig TrainerSession::make_viewer_config() const {
     vc.primitive = cfg.primitive;
     vc.packed = cfg.packed;
     vc.sh_degree_warmup_every = cfg.sh_degree_warmup_every;
+    vc.sh_degree = cfg.sh_degree;
+    vc.sb_lobes = cfg.sb_lobes;
+    vc.refinement_score = true;
     vc.relative_scale = cfg.relative_scale;
     vc.output_median = cfg.mean_median_depth_weight > 0.0f ||
                        cfg.median_depth_normal_reg_weight > 0.0f ||
@@ -2397,6 +2587,9 @@ ViewerRenderConfig TrainerSession::make_viewer_config() const {
                            cfg.normal_distortion_reg != 0.0f;
     const auto color = resolve_color(cfg);
     vc.color_space_on = color.splat_on();
+    vc.background_draw_on = cfg.background_transparency_suppression != "none";
+    // Segments are where background_mode is trained, so a view shows it there.
+    vc.background_base_view = has_mask && train_mask_applies_alpha_loss(cfg);
     vc.centers = dsparse::scene_centers(ds);
     vc.center_cameras = ds.num_cameras > 0;
     const auto nav = dsparse::navigation_hint(ds.c2w.data(), ds.num_cameras);
@@ -2519,13 +2712,13 @@ void TrainerSession::eval_frame(const std::string& data, const fs::path& metrics
     dm.seed = (uint64_t)std::max(cfg.sampling_seed,0);
     const std::vector<uint8_t> eval_alpha = probe_alpha_masks(eds.image_filenames);
     const bool eval_masks =
-        (!eds.mask_filenames.empty() || !eval_alpha.empty()) && cfg.load_masks;
+        (!eds.mask_filenames.empty() || !eval_alpha.empty()) && train_mask_enabled(cfg);
     dm.load_masks  = eval_masks || epost.any_fov_mask;
+    set_mask_classes(dm);
     set_alpha_config(dm, eval_alpha);
     dm.load_depths = false;
     dm.load_normals = false;
     dm.train_batch_size = 1;
-    dm.val_batch_size   = 1;
     dm.flip_mask = cfg.flip_mask;
     dm.mask_boundary_offset = cfg.mask_boundary_offset;
     dm.exif_quarter_turns = eds.exif_quarter_turns;
@@ -2822,7 +3015,8 @@ void TrainerSession::eval_frame(const std::string& data, const fs::path& metrics
                 TorchTensorView{0, 0, {}}, TorchTensorView{0, 0, {}});
             engine_copy_gt_rgb_to_host(
                 TorchTensorView{(uint64_t)(uintptr_t)gt.data(), 4, {B, H, W, Cc}});
-            if (!cfg.apply_loss_for_mask.value_or(false)) {
+            if (!train_mask_applies_alpha_loss(cfg) ||
+                train_mask_is_segment_and_ignore(cfg)) {
                 auto ms = engine_get_gt_alpha_shape();
                 const int64_t mh = std::get<1>(ms), mw = std::get<2>(ms);
                 if (std::get<0>(ms) == B && mh > 0 && mw > 0) {
@@ -2835,7 +3029,7 @@ void TrainerSession::eval_frame(const std::string& data, const fs::path& metrics
                             for (int64_t x = 0; x < W; ++x) {
                                 int64_t sy = std::min((int64_t)((y + 0.5) * mh / H), mh - 1);
                                 int64_t sx = std::min((int64_t)((x + 0.5) * mw / W), mw - 1);
-                                mask[(b*H+y)*W+x] = source[(b*mh+sy)*mw+sx];
+                                mask[(b*H+y)*W+x] = source[(b*mh+sy)*mw+sx] & 1;
                             }
                 }
             }

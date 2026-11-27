@@ -67,7 +67,10 @@ struct ContextOptions {
 class Context {
 public:
     // Creates the process context if needed and returns it. Thread-safe.
-    static Context& get(const ContextOptions& opts = {});
+    static Context& get(const ContextOptions& opts);
+    // An overload, not a default argument: GCC's -Wdangling-reference flags
+    // `const Context& c = get()` when get() binds a temporary ContextOptions.
+    static Context& get();
     // True once get() has run; lets callers avoid forcing device creation.
     static bool     initialized();
     // Releases the device. Every buffer, pipeline and pool must already be
@@ -160,6 +163,11 @@ public:
     // Human-readable VkResult, used by every VK_CHECK site.
     static const char* resultName(VkResult r);
 
+    // Set by any call that returns VK_ERROR_DEVICE_LOST; cleared when the
+    // context goes, since every later call on this device fails too.
+    static void markLost();
+    static bool lost();
+
 private:
     Context() = default;
     ~Context();
@@ -218,6 +226,7 @@ private:
 #define NN_VK_CHECK(expr)                                                    \
     do {                                                                       \
         VkResult _r = (expr);                                                  \
+        if (_r == VK_ERROR_DEVICE_LOST) ::nn::vk::Context::markLost();        \
         if (_r != VK_SUCCESS)                                                  \
             ::nn::fail("%s failed: %s (%d) at %s:%d", #expr,                 \
                          ::nn::vk::Context::resultName(_r), (int)_r,         \

@@ -13,6 +13,7 @@
 #include "app/Pano360.h"
 #include "app/gui/FilmReel.h"
 #include "app/gui/PrepProgress.h"
+#include "data/ImageColors.h"
 
 #include <cstddef>
 #include <algorithm>
@@ -71,15 +72,16 @@ inline std::string rig_letter(int letter) {
     return s;
 }
 
-// Which parts of a row of the fixed-areas table follow the row above it
-// (StencilRows.h); a part that does not is the row's own choice.
+// A row of the fixed-areas table (StencilRows.h): whether its drawn areas
+// follow the row above, and the lens circle it shares. Rows of a job with one
+// nonzero `share` get one border fit over all their frames; 0 fits its own.
 struct StencilFollow {
-    bool border = false;
+    int share = 0;
     bool areas = false;
 };
 
-// PrepInput::fps for "every frame" -- a 0 there already means "^". Everywhere
-// else, a rate of 0 is every frame.
+// PrepInput::fps for "every frame" -- a 0 there already means "^", the rate
+// and adaptive group of the row above. Everywhere else, a rate of 0 is every frame.
 inline constexpr float kFpsEveryFrame = -1.0f;
 
 // PrepInput::lut for "no LUT", where empty would find one (input_lut).
@@ -129,6 +131,8 @@ struct PrepInput {
     // The colour LUT baked into this video's frames as they are extracted: a
     // spec (app/CubeLut.h), kLutNone, or empty for automatic (input_lut).
     std::string lut;
+    std::optional<spirula::ImageColor> color;
+    spirula::ImageColor detected_color;
     // The built-in the file's own metadata asks for (app::detect_log_lut).
     // Probed, never saved.
     std::string lut_detected;
@@ -167,7 +171,8 @@ struct PrepInput {
     // resolved per camera folder when it asks for the border to be fitted
     // (app::FrameStencil), which is what gives a dual-fisheye file two circles.
     app::FrameStencil stencil;
-    // Its rows' "same as above", by FrameStencil camera key (settle_follow).
+    // Its rows' "same as above" and shared borders, by FrameStencil camera key
+    // (settle_follow).
     std::map<std::string, StencilFollow> stencil_follow;
     // The laser scan these photographs came out of (LidarStep.h), "" for
     // anything else. Their drawn areas are the scan's, PrepJob::scan_stencils.
@@ -257,6 +262,10 @@ struct PrepCapture {
 // moved aside since. A run that keeps the frames takes both out again.
 inline constexpr const char* kSkippedListFile = ".spirula-skipped";
 
+// The frame cap presets and records carried while it was on by default. It
+// never bound in practice, so it reads as no cap.
+inline constexpr int kRetiredMaxFrames = 100000;
+
 struct PrepJob {
     std::vector<PrepInput> inputs;   // in the order the user added them
     // Drawn areas for a laser scan's photographs, by scan file: given to the
@@ -324,7 +333,7 @@ struct PrepJob {
     bool  sort_frames = false;
     // Every track keeps the same instants in the streaming extraction path.
     bool  sync_tracks = true;
-    int   max_frames = 100000;
+    int   max_frames = 0;           // per video track; 0 = no cap
     // Turn every extracted frame by the rotation the capture asks for, so a
     // portrait clip lands upright and the written files need no metadata read
     // to be shown the right way up.
@@ -346,9 +355,9 @@ struct PrepJob {
     bool mask_enable = false;
     std::string mask_prompt;         // "people; cars; ..."
     std::string mask_negative_prompt;
-    // What reconstruction skips and training keeps ("sky; cloud"): its own
-    // tree, feature_masks/, which SfM intersects with masks/. Needs a text
-    // model, and is run even over an input that brought its own masks.
+    // What reconstruction skips ("sky; cloud"): written into masks/ as 128,
+    // the trainer's segment class (app::kMaskSegment). Needs a text model, and
+    // is folded even into a copy of masks an input brought.
     std::string mask_feature_prompt;
     bool mask_keep_subject = false;  // prompt names what to KEEP, not remove
     // Share of its own size every matched object's boundary moves by before
@@ -401,7 +410,7 @@ inline float input_fps(const std::vector<PrepInput>& inputs, float dataset_fps,
 
 // Rows extracted at one rate, named by the one that states it -- so an adaptive
 // plan can spend one budget over all of them and give the clip that moves more
-// the denser frames.
+// the denser frames. A row that states its own rate starts a group of its own.
 inline size_t fps_group(const std::vector<PrepInput>& inputs, size_t at) {
     size_t g = 0;
     for (size_t k = 1; k <= at && k < inputs.size(); k++)
@@ -495,6 +504,20 @@ inline constexpr bool kStreamingFrameExtraction = false;
 // The numbering that wrote a capture, independent of today's decoder/device.
 PrepCapture video_capture(const PrepJob& job, const PrepInput& in, bool source_indices);
 
+inline bool has_source_colors(const std::vector<PrepInput>& inputs) {
+    return std::any_of(inputs.begin(), inputs.end(),
+                       [](const PrepInput& in) { return in.color.has_value(); });
+}
+
+inline spirula::ImageColors source_colors(const PrepJob& job, bool per_file = false) {
+    spirula::ImageColors colors;
+    if (!per_file && !has_source_colors(job.inputs)) return colors;
+    const spirula::ImageColor fallback{job.image_gamut, job.image_is_linear};
+    for (const PrepInput& in : job.inputs)
+        colors[in.subdir.empty() ? "." : in.subdir] = in.color.value_or(fallback);
+    return colors;
+}
+
 struct PrepResult {
     std::vector<PrepCapture> captures;
     std::string image_dir;           // absolute; what SfM should index
@@ -508,9 +531,9 @@ struct PrepResult {
     // only where the run handed them on untouched; what it wrote itself is in
     // the usual convention and the readers need no flag.
     bool mask_dir_flipped = false;
-    // Absolute, "" when this run asked for none: PrepJob::mask_feature_prompt's
-    // masks, for feature extraction only. Never flipped.
-    std::string feature_mask_dir;
+    // mask_dir carries PrepJob::mask_feature_prompt's 128 band, which SfM and
+    // COLMAP must be told to drop even where 0 is not dropped.
+    bool masks_segment = false;
     int  n_images = 0;
     // images/ came out holding one sub-folder per camera -- several inputs, or
     // a multi-track video -- so intrinsics must not be shared across them.
@@ -558,6 +581,10 @@ bool is_packed_lens_path(const std::string& path);
 inline bool is_dual_lens(const PrepInput& in) {
     return in.active_lens < 0 && (is_dual_fisheye_path(in.path) || in.packed_lenses >= 2);
 }
+// The camera behind a dual-fisheye input, as far as its file tells: its type
+// and frame size (0 when not measured). Only inputs of one setup share a lens
+// circle by default (settle_follow). "" for any other input.
+std::string lens_setup(const PrepInput& in, int width = 0, int height = 0);
 // The video track the lens kept is decoded from; -1 for every track, which is
 // also a packed frame's case: its lens is cut out of the picture afterwards.
 inline int kept_track(const PrepInput& in) {
@@ -684,6 +711,7 @@ bool folder_has_heif(const std::string& dir);
 
 // The photo extensions an input folder is indexed for.
 bool is_image_file(const std::filesystem::path& p);
+spirula::ImageColor probe_photo_color(const std::string& path, const std::atomic<bool>& cancel);
 
 // Is this folder an already-reconstructed dataset -- something the trainer's
 // dataparsers can read -- rather than raw input? True for a Nerfstudio
@@ -705,7 +733,7 @@ bool folder_looks_like_dataset(const std::string& dir);
 struct WorkspaceState {
     bool frames = false;    // images/ this run would extract into
     bool features = false;  // features/, matches.bin, database.db -- reusable
-    bool masks = false;     // masks/ or feature_masks/ this run would generate into
+    bool masks = false;     // masks/ this run would generate into
     bool input_masks = false;  // masks an input came with (PrepInput::mask_dir)
     // A reconstruction any dataset reader can open: this run's own sparse/, or
     // the transforms.json, root-level COLMAP files or Metashape export of a
@@ -748,8 +776,9 @@ bool is_mask_folder(const std::string& path);
 // finished dataset carries beside images/ and masks/ and which holds PNGs.
 bool is_mask_edits_folder(const std::string& path);
 
-// Where PrepJob::mask_feature_prompt's masks go, beside masks/ and mirroring it.
-inline constexpr const char* kFeatureMaskDirName = "feature_masks";
+// Where older runs put PrepJob::mask_feature_prompt's masks. Nothing reads it;
+// it is skipped as a camera and cleared with the project.
+inline constexpr const char* kLegacyFeatureMaskDirName = "feature_masks";
 bool is_feature_mask_folder(const std::string& path);
 
 // One counter for a whole step, rather than one per input: a job with three
@@ -854,15 +883,15 @@ private:
                        const std::string& images, const std::string& masks,
                        bool& have_masks, std::string& error);
     // ONE input's masks, so a memory bank or a click never crosses captures.
-    // `folded`: its stencil went in as they were made, sparing apply_stencil a
-    // re-encode. `train` false writes only `feature_masks` ("" for none).
+    // `folded`: the stencil went in here. `features` adds the sky as 128; with
+    // `train` false, into the input's own masks (`merge_from`, "" = `masks`).
     bool generate_masks(const PrepJob& job, const PrepInput& in,
                         const std::string& images, const std::string& masks,
-                        const std::string& feature_masks, bool train,
+                        const std::string& merge_from, bool features, bool train,
                         bool& folded, std::string& error);
     bool generate_masks_builtin(const PrepJob& job, const PrepInput& in,
                                 const std::string& images, const std::string& masks,
-                                const std::string& feature_masks, bool train,
+                                const std::string& merge_from, bool features, bool train,
                                 bool& folded, std::string& error);
     // The static stencil on its own, for the masks segmentation did not make.
     // `merge_from` names the masks it folds in when they are not the ones it
@@ -870,6 +899,10 @@ private:
     bool apply_stencil(const PrepJob& job, const PrepInput& in,
                        const std::string& images, const std::string& masks,
                        const std::string& merge_from, std::string& error);
+    // Each lens circle rows share (StencilFollow::share), fitted once over all
+    // their frames and drawn into their stencils. `images`/`masks` by input.
+    void fit_shared_borders(PrepJob& job, const std::vector<std::string>& images,
+                            const std::vector<std::string>& masks);
     int exec(const std::vector<std::string>& argv,
              const std::function<void(const std::string&)>& on_line = {});
     // What this input is expected to put in images/, for the step's bar: the

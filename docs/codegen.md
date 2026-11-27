@@ -27,7 +27,8 @@ python3 tools/codegen/generate_backend_api.py
 ```
 
 The one exception is `src/shaders/build.bash`, which runs from `src/` and needs
-`slangc` on PATH. **The dev build scripts do NOT run it.** Editing anything
+`slangc` **2026.2.1** on PATH; it refuses any other version (the slangc the
+Vulkan build fetches is newer and does not reproduce the committed headers). **The dev build scripts do NOT run it.** Editing anything
 under `src/shaders/` and skipping it leaves the two backends computing
 different things: Vulkan compiles the Slang, CUDA compiles the committed
 `src/generated/*.cuh`.
@@ -80,10 +81,8 @@ Because of invariant 3, splitting is nearly free:
 python3 tools/codegen/generate_headers.py   # PixelWise.cuh's contents are unchanged
 ```
 
-No build file changes: both build systems glob the kernel directories through
-`cmake/sources.txt` (CMake with `CONFIGURE_DEPENDS`, so a new file is picked up
-without a manual reconfigure). No caller changes: the header keeps its name and
-its declaration set.
+CMake picks up new kernel files through the `CONFIGURE_DEPENDS` globs in
+`cmake/sources.txt`. Callers keep using the same header and declarations.
 
 Naming rules when splitting:
 

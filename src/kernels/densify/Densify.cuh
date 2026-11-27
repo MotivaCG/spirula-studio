@@ -95,6 +95,7 @@ void densify_clip_scale_tensor(
     DeviceVector<float> radii,
     DeviceVector<float3> log_scales,
     float* logit_opacs_ptr,
+    DeviceVector<uint32_t> visit_counters,
     float max_scale2d,
     float clip_hardness,
     float max_scale3d
@@ -273,73 +274,6 @@ int64_t add_splats_with_long_axis_split_tensor(
 );
 
 
-void relocate_splats_mcmc_tensor(
-    int64_t cur_num_splats,
-    float min_opacity,
-    DeviceVector<float3> means, DeviceVector<float4> quats, DeviceVector<float3> scales, DeviceVector<float> opacs, DeviceVector<float3> features_dc, DeviceVector<float3> features_sh,
-    DeviceVector<float3> g1_means, DeviceVector<float4> g1_quats, DeviceVector<float3> g1_scales, DeviceVector<float> g1_opacs, DeviceVector<float3> g1_features_dc, DeviceVector<float3> g1_features_sh,
-    DeviceVector<float3> g2_means, DeviceVector<float4> g2_quats, DeviceVector<float3> g2_scales, DeviceVector<float> g2_opacs, DeviceVector<float3> g2_features_dc, DeviceVector<float3> g2_features_sh,
-    DeviceVector<int32_t> bias_correction_steps,
-    int sh_optim_bits,
-    int num_sh,
-    DeviceVector<float4> sh_quant_bounds,
-    bool sh_bounds_per_splat,
-    DeviceVector<uint8_t> sh_value_packed,
-    DeviceVector<float2>  sh_value_bounds,
-    int  sh_value_bits,
-    bool sh_value_bounds_per_splat,
-    int  num_sh_buffer,
-    NonShQuantState non_sh,
-    DeviceVector<float4> projective_state, DeviceVector<float> projective_information,
-    uint32_t seed,
-    DeviceVector<float> draw_weight   // [N] or empty: scales each live splat's draw
-);
-
-
-void add_splats_mcmc_tensor(
-    int64_t cur_num_splats,
-    int64_t num_add,
-    float min_opacity,
-    DeviceVector<float3> means, DeviceVector<float4> quats, DeviceVector<float3> scales, DeviceVector<float> opacs, DeviceVector<float3> features_dc, DeviceVector<float3> features_sh,
-    DeviceVector<float3> g1_means, DeviceVector<float4> g1_quats, DeviceVector<float3> g1_scales, DeviceVector<float> g1_opacs, DeviceVector<float3> g1_features_dc, DeviceVector<float3> g1_features_sh,
-    DeviceVector<float3> g2_means, DeviceVector<float4> g2_quats, DeviceVector<float3> g2_scales, DeviceVector<float> g2_opacs, DeviceVector<float3> g2_features_dc, DeviceVector<float3> g2_features_sh,
-    DeviceVector<int32_t> bias_correction_steps,
-    int sh_optim_bits,
-    int num_sh,
-    DeviceVector<float4> sh_quant_bounds,
-    bool sh_bounds_per_splat,
-    DeviceVector<uint8_t> sh_value_packed,
-    DeviceVector<float2>  sh_value_bounds,
-    int  sh_value_bits,
-    bool sh_value_bounds_per_splat,
-    int  num_sh_buffer,
-    NonShQuantState non_sh,
-    DeviceVector<float4> projective_state, DeviceVector<float> projective_information,
-    uint32_t seed,
-    DeviceVector<float> draw_weight   // [N] or empty: scales each live splat's draw
-);
-
-
-void splat_decay_tensor(
-    int64_t num_splats,
-    float opacity_decay,
-    float scale_decay,
-    DeviceVector<float> opacs,
-    DeviceVector<float3> log_scales
-);
-
-
-void mcmc_add_noise_tensor(
-    int64_t num_splats,
-    float scaler,
-    DeviceVector<float3> means,
-    DeviceVector<float3> log_scales,
-    DeviceVector<float4> quats,
-    DeviceVector<float> opacs,
-    uint32_t seed
-);
-
-
 void revised_add_noise_tensor(
     int64_t num_splats,
     float scaler,
@@ -351,6 +285,15 @@ void revised_add_noise_tensor(
     DeviceVector<float> peak_weight,
     float peak_weight_scale,
     uint32_t seed
+);
+
+
+void splat_decay_tensor(
+    int64_t num_splats,
+    float opacity_decay,
+    float scale_decay,
+    DeviceVector<float> opacs,
+    DeviceVector<float3> log_scales
 );
 
 
@@ -380,7 +323,7 @@ void smoothed_laplacian_edge_filter_tensor(
 
 void canny_edge_filter_tensor(
     DeviceTensor3D<float3> img_in,
-    bool* mask_in_ptr,
+    TorchTensorView mask,
     DeviceTensor3D<float> img_out
 );
 
@@ -388,7 +331,7 @@ void canny_edge_filter_tensor(
 void robust_canny_residual_tensor(
     DeviceTensor3D<float3> render,   // [B, H, W, 3]
     DeviceTensor3D<float3> ref,      // [B, H, W, 3]
-    bool* mask_in_ptr,               // optional [B*H*W] mask; nullptr for none
+    TorchTensorView mask,
     float quantile,                  // Tukey cutoff = per-image q-quantile of |r|
     DeviceTensor3D<float> img_out    // [B, H, W, 1] -- written (not added)
 );
@@ -399,7 +342,7 @@ void region_weight_tensor(
     DeviceVector<float3> means,
     DeviceVector<float4> quats,          // optional with scales: the cameras orient the
     DeviceVector<float3> scales,         // test, the pattern samples it
-    DeviceVector<float4> camera_bvh,     // a label field over the cameras, index as label
+    DeviceVector<float4> camera_bvh,     // a BVH over camera positions
     DeviceVector<float4> camera_seeds,
     DeviceVector<float4> pattern,        // region_sample_pattern, or empty: centre only
     uint32_t seed,                       // turns the pattern, per call

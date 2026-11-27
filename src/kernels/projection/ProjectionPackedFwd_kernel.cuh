@@ -92,10 +92,10 @@ __global__ void projection_packed_mask_kernel(
         }
 
         // Save results
-        aabb.x = fminf(fmaxf(aabb.x, 0.0f), image_width-1.0f);
-        aabb.y = fminf(fmaxf(aabb.y, 0.0f), image_height-1.0f);
-        aabb.z = fminf(fmaxf(aabb.z, 0.0f), image_width-1.0f);
-        aabb.w = fminf(fmaxf(aabb.w, 0.0f), image_height-1.0f);
+        aabb.x = fminf(fmaxf(aabb.x, 0.0f), (float)image_width);
+        aabb.y = fminf(fmaxf(aabb.y, 0.0f), (float)image_height);
+        aabb.z = fminf(fmaxf(aabb.z, 0.0f), (float)image_width);
+        aabb.w = fminf(fmaxf(aabb.w, 0.0f), (float)image_height);
         if (aabb.z - aabb.x > 1e-3f && aabb.w - aabb.y > 1e-3f)
             atomicOr(&sh_bits[tid >> 5], 1u << (tid & 31));
     }
@@ -203,7 +203,8 @@ __global__ void projection_packed_fwd_kernel(
     aabbs[out_idx] = aabb16_encode(aabb, image_width, image_height);
     sorting_depths[out_idx] = sorting_depth;
     splat_screen.store(splats_screen, out_idx);
-    atomicMax(&radii[gid], radius);
+    if (radii != nullptr)
+        atomicMax(&radii[gid], radius);
 }
 
 

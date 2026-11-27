@@ -11,10 +11,16 @@ the detail.
 | [codegen.md](codegen.md) | the four generators, what they own, and the invariants |
 | [datasets.md](datasets.md) | supported dataset layouts and how they are parsed |
 | [i18n.md](i18n.md) | shipping a localized build: `SS_DEFAULT_LANG`, `SS_FONT_CJK`, what is translated |
+| [run-records.md](run-records.md) | what a training run leaves on disk: `logs/train_*.log` and `run.json` |
 | [testing.md](testing.md) | native parity tests and the CUDA-vs-Vulkan reference-dump workflow |
 | [notes/rename-and-i18n-plan.md](notes/rename-and-i18n-plan.md) | the Spirula Studio rename, 13-locale localization, and retiring the Python client |
 | [notes/pose-normalization.md](notes/pose-normalization.md) | orientation/centering: what the native parser implements, and the kept reference for what it doesn't |
 | [notes/compare-view.md](notes/compare-view.md) | showing several models at once: engine scene slots, the shared navigation frame |
+| [notes/2dgs.md](notes/2dgs.md) | the 2DGS surfel primitive: how it rides the eval3d path and 3DGS storage, the fragment, the preset weights and the measurements behind them |
+| [notes/mesh-field.md](notes/mesh-field.md) | the meshing field: the per-pixel depth profile, how the cameras' views are fused, the density term, sealing free space no camera connects to; what was tried |
+| [notes/tsdf.md](notes/tsdf.md) | TSDF meshing: adaptive fusion over the splat samples, the uniform-grid volume of the 2DGS paper, and how each compares with the opacity field |
+| [notes/mesh-merge.md](notes/mesh-merge.md) | the mesh merge: edge collapse under footprint, thickness and colour limits, its block-parallel queue, results |
+| [notes/mesh-check.md](notes/mesh-check.md) | `spirula mesh --check`: what counts as a bad mesh, where the mesher made them (crossings, duplicates, slivers, holes) and the cleanup that removes them, results |
 | [notes/spherical-beta.md](notes/spherical-beta.md) | spherical-beta lobes: the colour row they share with SH, training, rotation, the PLY layout, results |
 | [notes/s-cielab.md](notes/s-cielab.md) | the S-CIELAB alternative to SSIM: colour pipeline, blur radii, the `auto` densification map |
 | [notes/pca-reg.md](notes/pca-reg.md) | the local-PCA surface regularizer (PCAsplat): its terms, the six ways of finding neighbours, and what each costs |
@@ -22,7 +28,7 @@ the detail.
 | [notes/calib-warp.md](notes/calib-warp.md) | a per-image smooth warp of the ground truth that absorbs calibration residual, its Gauss-Newton fit, the aligned eval metrics (`al_`, `alcc_`), results and what was dropped |
 | [notes/ssim-blur-tolerance.md](notes/ssim-blur-tolerance.md) | blur-tolerant SSIM, so blurry photos stop blurring the scene; the loss and map study behind it on degraded mip-NeRF 360 scenes |
 | [notes/web-viewer-robustness.md](notes/web-viewer-robustness.md) | what web viewers draw differently, training on PlayCanvas's kernel for part of the steps, the peak-weight noise gate, the per-coefficient SH reg, and what did not help |
-| [notes/vram-splat-x-img.md](notes/vram-splat-x-img.md) | what the largest scratch category costs per element, the bitmask compaction, and the measured dead ends |
+| [notes/vram-splat-x-pixel.md](notes/vram-splat-x-pixel.md) | what the largest scratch category costs per element, the bitmask compaction, and the measured dead ends |
 | [notes/vram-high-res.md](notes/vram-high-res.md) | the per-pixel half of VRAM: the fused appearance chain, float16 images, what a 60 and a 120 MP image cost |
 | [notes/color-transfer.md](notes/color-transfer.md) | linear storage vs the output tone curve, the dynamic range a curve buys, and why its clip is straight-through |
 | [notes/gui-editing-plan.md](notes/gui-editing-plan.md) | editing in the GUI: the selection seam every tool shares, transforms, mask editing, trajectories, and the order to build them in |
@@ -30,6 +36,7 @@ the detail.
 | [notes/sfm-in-process-plan.md](notes/sfm-in-process-plan.md) | running SfM inside the GUI: the library seam, the input manifest, and what manual ties need |
 | [notes/sfm-quality-review.md](notes/sfm-quality-review.md) | initial source review, ranked hypotheses for SfM quality and merge robustness, and the prototype evaluation protocol |
 | [notes/sfm-quality-experiments.md](notes/sfm-quality-experiments.md) | selected SfM defaults, ranked prototype tradeoffs, calibration/rendering results, regressions, and resource costs |
+| [notes/gpu-crashes.md](notes/gpu-crashes.md) | crashes that start outside the program: what crash.log records, the Vulkan layers turned off at startup, and a device lost while decoding video |
 | [notes/](notes/) | design notes for individual subsystems |
 
 Authoritative documents that live next to their code rather than here:

@@ -478,6 +478,7 @@ SourcePreview::Result SourcePreview::draw(float height, double* clip_start, doub
                                            int* active_lens) {
     Result r;
     if (!active()) return r;
+    r.gpu_lost = _video.take_gpu_lost(r.lost_detail);
     {
         std::lock_guard<std::mutex> lk(_mu);
         if (_listing != _shown) {
@@ -525,7 +526,7 @@ SourcePreview::Result SourcePreview::draw(float height, double* clip_start, doub
     const float h = std::max(px(80.0f), height - (ImGui::GetCursorPosY() - y0));
 
     if (L && !L->error.empty() && _tab != Tab::Details) {
-        ui::TextColoredWrappedRaw(ImVec4(0.95f, 0.45f, 0.40f, 1.0f), L->error);
+        ui::TextColoredWrappedRaw(kErr, L->error);
         return r;
     }
     switch (_tab) {
@@ -537,6 +538,7 @@ SourcePreview::Result SourcePreview::draw(float height, double* clip_start, doub
             r.clip_changed = v.clip_changed && clip_start;
             r.want_gpu = v.want_gpu;
             r.lens_changed = v.lens_changed;
+            r.use_ffmpeg = v.use_ffmpeg;
             break;
         }
         case Tab::Photos:
@@ -640,7 +642,7 @@ void SourcePreview::draw_cloud(float height) {
         return;
     }
     if (!L->cloud) {
-        if (!L->model_error.empty()) ui::TextColoredWrappedRaw(ImVec4(0.95f, 0.45f, 0.40f, 1.0f), L->model_error);
+        if (!L->model_error.empty()) ui::TextColoredWrappedRaw(kErr, L->model_error);
         return;
     }
     if (!_cloud_attached) {

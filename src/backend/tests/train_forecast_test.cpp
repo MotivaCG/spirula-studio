@@ -130,7 +130,7 @@ static void eta_tracks_growth() {
     }
 }
 
-// splat x img follows 60 bytes per splat at 300k splats, as msplats^power,
+// splat x pixel follows 60 bytes per splat at 300k splats, as msplats^power,
 // with per-step spread; the rest is 1 GiB.
 static VramForecast run_vram(double others_gib, int stop_at, double power = 1.0) {
     const DensifyConfig d = densify(500, 15000, 100, 1.05f);
@@ -163,8 +163,8 @@ static VramForecast run_vram(double others_gib, int stop_at, double power = 1.0)
         m.step = s;
         m.splats_ran = n_at[s];
         m.splats_next = n_at[s + 1];
-        m.pool_used[(int)VramCategory::SplatXImg] = used;
-        m.pool_cap[(int)VramCategory::SplatXImg] = hw;
+        m.pool_used[(int)VramCategory::SplatXPix] = used;
+        m.pool_cap[(int)VramCategory::SplatXPix] = hw;
         m.pool_cap[(int)VramCategory::Splat] = (size_t)gib;
         m.has_process = m.has_used = m.has_total = true;
         m.process_bytes = (uint64_t)gib + hw;
@@ -216,7 +216,7 @@ static void vram_bounded_views(double loss_gib) {
     for (int i = 0; i < 1000; ++i) order[i] = i;
 
     const double gib = 1024.0 * 1024.0 * 1024.0;
-    const int sxi = (int)VramCategory::SplatXImg;
+    const int sxp = (int)VramCategory::SplatXPix;
     std::vector<int64_t> n_at(T + 1);
     sch.segments(0, 300000, [&](int f, int e, int64_t n) {
         for (int s = f; s < e; ++s) n_at[s] = n;
@@ -238,8 +238,8 @@ static void vram_bounded_views(double loss_gib) {
         m.step = s;
         m.splats_ran = n_at[s];
         m.splats_next = n_at[s + 1];
-        m.pool_used[sxi] = (size_t)(160.0 * visible);
-        m.pool_cap[sxi] = owned + arena;
+        m.pool_used[sxp] = (size_t)(160.0 * visible);
+        m.pool_cap[sxp] = owned + arena;
         m.pool_cap[(int)VramCategory::Splat] = (size_t)gib;
         m.arena_cap = arena;
         m.phase_pixels[(int)PoolPhase::Loss] = loss;
@@ -383,6 +383,208 @@ static void eta_follows_resolution() {
     }
 }
 
+static void eta_hides_loading_stalls() {
+    ForecastSetup fs;
+    fs.schedule = SplatSchedule(densify(10000, 10000, 100, 1.05f), 5000, 1000000);
+    fs.resolution_stages = {{0, 4}, {1000, 2}, {3000, 1}};
+    TrainForecast fc;
+    fc.reset(fs);
+    auto gpu_cost = [&](int step, StepCells& gpu) {
+        const double r = fc.pixel_ratio(step);
+        gpu.at(StepPart::Optimizer, StepScale::Splats) = 0.002;
+        gpu.at(StepPart::Render, StepScale::SplatsPixels) = 0.010 * std::pow(r, 0.7);
+        gpu.at(StepPart::Loss, StepScale::Pixels) = 0.030 * r;
+        gpu.at(StepPart::Other, StepScale::Fixed) = 0.001;
+        return gpu.total();
+    };
+    for (int step = 0; step < 2200; ++step) {
+        StepSample ss;
+        ss.step = step;
+        const double gpu = gpu_cost(step, ss.gpu);
+        ss.data_wait_s = step % 10 < 4 ? std::max(0.0, 0.030 - gpu) / 0.4 : 0.0;
+        ss.wall_s = gpu + ss.data_wait_s;
+        ss.timed = step % 10 == 0;
+        fc.add_step(step, ss.wall_s, 1000000, -1.0);
+        fc.add_breakdown(ss);
+    }
+    double truth = 0.0;
+    for (int step = 2200; step < 5000; ++step) {
+        StepCells gpu;
+        truth += std::max(0.030, gpu_cost(step, gpu));
+    }
+    const auto e = fc.eta(2200, 1000000);
+    std::printf("  loading overlap: ETA %.1f, truth %.1f, sigma %.1f\n", e.seconds, truth, e.sigma);
+    CHECK(std::abs(e.seconds / truth - 1.0) < 0.10, "GPU growth must hide producer stalls");
+    CHECK(fc.time_measured().cells.at(StepPart::Loading, StepScale::Pixels) == 0.0,
+          "source decoding is not rendered-pixel work");
+}
+
+static void eta_counts_recurring_stalls() {
+    ForecastSetup fs;
+    fs.schedule = SplatSchedule(densify(10000, 10000, 100, 1.05f), 5000, 1000000);
+    TrainForecast fc;
+    fc.reset(fs);
+    for (int step = 0; step < 2000; ++step)
+        fc.add_step(step, step % 10 < 4 ? 0.050 : 0.010, 1000000, -1.0);
+    const double truth = 3000 * (0.4 * 0.050 + 0.6 * 0.010);
+    CHECK(std::abs(fc.eta(2000, 1000000).seconds / truth - 1.0) < 0.05,
+          "recurring loading stalls were discarded as timing outliers");
+}
+
+static void eta_learns_pixel_cost() {
+    for (double exponent : {0.2, 0.8}) {
+        ForecastSetup fs;
+        fs.schedule = SplatSchedule(densify(10000, 10000, 100, 1.05f), 5000, 1000000);
+        fs.resolution_stages = {{0, 4}, {1000, 2}, {3000, 1}};
+        TrainForecast fc;
+        fc.reset(fs);
+        auto cost = [&](int step, StepCells& gpu) {
+            const double r = fc.pixel_ratio(step);
+            gpu.at(StepPart::Optimizer, StepScale::Splats) = 0.004;
+            gpu.at(StepPart::Render, StepScale::SplatsPixels) = 0.04 * std::pow(r, exponent);
+            gpu.at(StepPart::Loss, StepScale::Pixels) = 0.008 * r;
+            gpu.at(StepPart::Other, StepScale::Fixed) = 0.002;
+            return gpu.total() + 0.001;
+        };
+        for (int step = 0; step < 2200; ++step) {
+            StepSample ss;
+            ss.step = step;
+            ss.wall_s = cost(step, ss.gpu);
+            ss.timed = step % 10 == 0;
+            fc.add_step(step, ss.wall_s, 1000000, -1.0);
+            fc.add_breakdown(ss);
+        }
+        double truth = 0.0;
+        for (int step = 2200; step < 5000; ++step) {
+            StepCells gpu;
+            truth += cost(step, gpu);
+        }
+        const auto e = fc.eta(2200, 1000000);
+        std::printf("  pixel exponent %.1f: ETA %.1f, truth %.1f, sigma %.1f\n", exponent,
+                    e.seconds, truth, e.sigma);
+        CHECK(std::abs(e.seconds / truth - 1.0) < 0.10,
+              "pixel exponent %.1f still uses the fixed prior", exponent);
+    }
+}
+
+static void eta_before_first_window() {
+    ForecastSetup fs;
+    fs.schedule = SplatSchedule(densify(10000, 10000, 100, 1.05f), 1000, 1000000);
+    fs.resolution_stages = {{0, 4}, {300, 2}, {700, 1}};
+    TrainForecast fc;
+    fc.reset(fs);
+    auto cost = [&](int s) {
+        const double r = fc.pixel_ratio(s);
+        return 0.01 * (0.75 * r + 0.25 + 0.5 * std::pow(r, kSplatPixelTimeExp) + 0.5);
+    };
+    for (int s = 0; s < 30; ++s) fc.add_step(s, cost(s), 1000000, -1.0);
+    double truth = 0.0;
+    for (int s = 30; s < 1000; ++s) truth += cost(s);
+    CHECK(std::abs(fc.eta(30, 1000000).seconds / truth - 1.0) < 0.001,
+          "warmup ETA omits scheduled resolution growth");
+}
+
+static void vram_resolution_boundaries() {
+    constexpr size_t MiB = 1024 * 1024;
+    ForecastSetup fs;
+    fs.schedule = SplatSchedule(densify(10000, 10000, 100, 1.05f), 1000, 1000000);
+    fs.resolution_stages = {{0, 4}, {300, 2}, {700, 1}};
+    TrainForecast fc;
+    fc.reset(fs);
+    MemorySample m;
+    m.step = 0;
+    m.resolution_divisor = 4;
+    m.splats_ran = m.splats_next = 1000000;
+    m.pool_cap[(int)VramCategory::Splat] = 200 * MiB;
+    m.pool_cap[(int)VramCategory::Image] = 4 * MiB;
+    m.pool_cap[(int)VramCategory::SplatXPix] = 32 * MiB;
+    m.arena_cap = 16 * MiB;
+    m.phase_pixels[(int)PoolPhase::Loss] = 16 * MiB;
+    m.isect_pairs = 100000;
+    m.isect_count = m.isect_step = 100000;
+    fc.add_memory(m);
+    const auto v = fc.vram();
+    for (int step : {299, 300, 699, 700}) {
+        const auto it = std::find_if(v.projection.begin(), v.projection.end(),
+                                    [&](const auto& b) { return b.x == step; });
+        CHECK(it != v.projection.end(), "missing resolution boundary at %d", step);
+    }
+    CHECK(v.peak_mean > 500 * MiB, "future image buffers missing: %.1f MiB", v.peak_mean / MiB);
+    m.step = 299;
+    m.resolution_divisor = 2;
+    m.pool_cap[(int)VramCategory::Image] *= 4;
+    m.pool_cap[(int)VramCategory::SplatXPix] += 48 * MiB;
+    m.arena_cap *= 4;
+    m.phase_pixels[(int)PoolPhase::Loss] *= 4;
+    fc.add_memory(m);
+    const double early = fc.vram(false).peak_mean;
+    m.step = 300;
+    m.resolution_divisor = 4;
+    fc.add_memory(m);
+    CHECK(std::abs(fc.vram(false).peak_mean / early - 1.0) < 0.02,
+          "late coarse batch rescales retained image allocations");
+}
+
+static void timing_fallback_stays_in_its_resolution() {
+    ForecastSetup fs;
+    fs.schedule = SplatSchedule(densify(10000, 10000, 100, 1.05f), 3000, 1000000);
+    fs.resolution_stages = {{0, 4}, {550, 2}, {1500, 1}};
+    TrainForecast all, sparse;
+    all.reset(fs);
+    sparse.reset(fs);
+    for (int step = 0; step < 750; ++step) {
+        StepSample sample;
+        sample.step = step;
+        sample.resolution_divisor = step < 500 ? 4 : 2;
+        sample.densify = step % 5 == 0;
+        const double r = 1.0 / (sample.resolution_divisor * sample.resolution_divisor);
+        sample.gpu.at(StepPart::Optimizer, StepScale::Splats) = 0.002;
+        sample.gpu.at(StepPart::Render, StepScale::SplatsPixels) = 0.040 * std::pow(r, 0.7);
+        sample.gpu.at(StepPart::Loss, StepScale::Pixels) = 0.008 * r;
+        sample.wall_s = sample.gpu.total() + 0.001;
+        all.add_step(step, sample.wall_s, 1000000, -1.0, sample.resolution_divisor);
+        sparse.add_step(step, sample.wall_s, 1000000, -1.0, sample.resolution_divisor);
+        sample.timed = sample.densify || step % 5 == 1;
+        all.add_breakdown(sample);
+        if (step >= 500 && sample.densify) sample.timed = false;
+        sparse.add_breakdown(sample);
+    }
+    CHECK(std::abs(all.time_measured().cells.total() - sparse.time_measured().cells.total()) < 1e-10,
+          "a retained coarse densify timing contaminated the fine-stage breakdown");
+    CHECK(std::abs(all.eta(750, 1000000).seconds / sparse.eta(750, 1000000).seconds - 1.0) < 1e-8,
+          "old-stage timing fallback changed the fitted pixel cost");
+}
+
+static void vram_sh_warmup_keeps_view_horizon() {
+    constexpr size_t MiB = 1024 * 1024;
+    for (bool progressive : {false, true}) {
+        ForecastSetup fs;
+        fs.schedule = SplatSchedule(densify(10000, 10000, 100, 1.05f), 3000, 1000000);
+        fs.distinct_batches = 10000;
+        fs.sh_degree = 3;
+        if (progressive) fs.resolution_stages = {{0, 2}, {500, 1}};
+        TrainForecast full, warmup;
+        full.reset(fs);
+        fs.sh_degree_every = 700;
+        warmup.reset(fs);
+        MemorySample m;
+        m.step = 0;
+        m.splats_ran = m.splats_next = 1000000;
+        m.pool_cap[(int)VramCategory::Splat] = 200 * MiB;
+        m.pool_cap[(int)VramCategory::SplatXPix] = 32 * MiB;
+        m.arena_cap = 16 * MiB;
+        m.phase_splats[(int)PoolPhase::RasterBwd] = 16 * MiB;
+        m.isect_pairs = 100000;
+        m.isect_count = m.isect_step = 100000;
+        full.add_memory(m);
+        warmup.add_memory(m);
+        const auto a = full.vram(), b = warmup.vram();
+        CHECK(std::abs(a.peak_mean - b.peak_mean) < 1e-6 &&
+              std::abs(a.peak_sigma - b.peak_sigma) < 1e-6,
+              "SH boundaries shortened the held-count view horizon (progressive=%d)", progressive);
+    }
+}
+
 // A per-splat regularizer that starts mid-run, probed before it does: the ETA
 // carries it from the first probe on, and does not move when it starts.
 static void eta_counts_regularizer() {
@@ -430,6 +632,13 @@ int main() {
     breakdown_adds_up();
     eta_follows_resolution();
     eta_counts_regularizer();
+    vram_resolution_boundaries();
+    timing_fallback_stays_in_its_resolution();
+    vram_sh_warmup_keeps_view_horizon();
+    eta_before_first_window();
+    eta_learns_pixel_cost();
+    eta_counts_recurring_stalls();
+    eta_hides_loading_stalls();
     if (g_fail) {
         std::printf("train_forecast_test: %d failure(s)\n", g_fail);
         return 1;

@@ -26,9 +26,6 @@
 //                                    keys through the order-preserving
 //                                    uint32 flip transform on this overload)
 //   inclusive_sum / exclusive_sum  — int32 and int64 counters
-//   inclusive_sum<float>           — densify MCMC sampling cumsum (Vulkan
-//                                    backend only; the CUDA launcher calls
-//                                    CUB directly in DensifySampling.cu)
 //   select_flagged                 — int32 ids
 // Callers pass begin_bit/end_bit exactly as with CUB to skip radix passes.
 
@@ -55,6 +52,7 @@ void sort_pairs(DoubleBuffer<KeyT>& keys, DoubleBuffer<ValueT>& values,
                 int64_t num_items, int begin_bit, int end_bit,
                 Stream stream = kDefaultStream);
 
+// in may equal out, as with CUB.
 template <typename T>
 void inclusive_sum(const T* in, T* out, int64_t num_items,
                    Stream stream = kDefaultStream);

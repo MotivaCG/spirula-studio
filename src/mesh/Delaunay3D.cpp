@@ -120,10 +120,6 @@ namespace {
     #define LDBL_EPSILON DBL_EPSILON
 #endif
 
-        inline Sign sgn(real x) {
-            return (x > 0) ? POSITIVE : ((x < 0) ? NEGATIVE : ZERO);
-        }
-
         inline real det3(
             real a00, real a01, real a02,
             real a10, real a11, real a12,
@@ -600,19 +596,16 @@ namespace {
 
     class VertexArray {
     public:
-        VertexArray(index_t nb_vertices, const double* base, index_t stride) :
-            base_(base), stride_(stride), nb_vertices_(nb_vertices) {}
-        const double* point_ptr(index_t i) const { return base_ + i * stride_; }
+        VertexArray(const double* base, index_t stride) : base_(base), stride_(stride) {}
+        const double* point_ptr(index_t i) const { return base_ + size_t(i) * stride_; }
     private:
         const double* base_;
         index_t stride_;
-        index_t nb_vertices_;
     };
 
     class VertexMesh {
     public:
-        VertexMesh(index_t nb_vertices, const double* base, index_t stride) :
-            vertices(nb_vertices, base, stride) {}
+        VertexMesh(const double* base, index_t stride) : vertices(base, stride) {}
         VertexArray vertices;
     };
 
@@ -693,7 +686,7 @@ namespace {
                 sorted_indices, b, m, threshold, ratio, depth, levels
             );
         }
-        VertexMesh M(nb_vertices, vertices, stride);
+        VertexMesh M(vertices, stride);
         (void)dimension;
         HilbertSort3d<Hilbert_vcmp, VertexMesh>(M, m, e);
         if(levels != nullptr) {
@@ -741,7 +734,7 @@ namespace {
         index_t dimension() const { return dimension_; }
         index_t nb_vertices() const { return nb_vertices_; }
         const double* vertex_ptr(index_t i) const {
-            return vertices_ + i * dimension_;
+            return vertices_ + size_t(i) * dimension_;
         }
         virtual void set_vertices(index_t nb_vertices, const double* vertices) {
             nb_vertices_ = nb_vertices;
@@ -848,7 +841,6 @@ namespace {
             return std::max(work_end_ - work_begin_ + 1, index_t(0));
         }
 
-        index_t nb_threads() const;
         Delaunay3dThread* thread(index_t t);
 
         void run() override {
@@ -913,11 +905,12 @@ namespace {
         index_t max_t() const { return max_t_; }
 
         bool tet_is_finite(index_t t) const {
+            const size_t base = size_t(4) * t;
             return
-                cell_to_v_store_[4*t]   != NO_INDEX &&
-                cell_to_v_store_[4*t+1] != NO_INDEX &&
-                cell_to_v_store_[4*t+2] != NO_INDEX &&
-                cell_to_v_store_[4*t+3] != NO_INDEX;
+                cell_to_v_store_[base]   != NO_INDEX &&
+                cell_to_v_store_[base+1] != NO_INDEX &&
+                cell_to_v_store_[base+2] != NO_INDEX &&
+                cell_to_v_store_[base+3] != NO_INDEX;
         }
         bool tet_is_real(index_t t) const {
             return !tet_is_free(t) && tet_is_finite(t);
@@ -1438,36 +1431,36 @@ namespace {
         }
 
         bool tet_is_virtual(index_t t) const {
+            const size_t base = size_t(4) * t;
             return !tet_is_free(t) && (
-                cell_to_v_store_[4*t]   == VERTEX_AT_INFINITY ||
-                cell_to_v_store_[4*t+1] == VERTEX_AT_INFINITY ||
-                cell_to_v_store_[4*t+2] == VERTEX_AT_INFINITY ||
-                cell_to_v_store_[4*t+3] == VERTEX_AT_INFINITY);
+                cell_to_v_store_[base]   == VERTEX_AT_INFINITY ||
+                cell_to_v_store_[base+1] == VERTEX_AT_INFINITY ||
+                cell_to_v_store_[base+2] == VERTEX_AT_INFINITY ||
+                cell_to_v_store_[base+3] == VERTEX_AT_INFINITY);
         }
 
         static index_t tet_facet_vertex(index_t f, index_t v) {
             return index_t(tet_facet_vertex_[f][v]);
         }
         index_t tet_vertex(index_t t, index_t lv) const {
-            return cell_to_v_store_[4*t + lv];
+            return cell_to_v_store_[size_t(4)*t + lv];
         }
         index_t finite_tet_vertex(index_t t, index_t lv) const {
-            return cell_to_v_store_[4*t + lv];
+            return cell_to_v_store_[size_t(4)*t + lv];
         }
         index_t tet_adjacent(index_t t, index_t lf) const {
-            return cell_to_cell_store_[4*t + lf];
+            return cell_to_cell_store_[size_t(4)*t + lf];
         }
         void set_tet_adjacent(index_t t1, index_t lf1, index_t t2) {
-            cell_to_cell_store_[4*t1 + lf1] = t2;
+            cell_to_cell_store_[size_t(4)*t1 + lf1] = t2;
         }
         index_t find_tet_adjacent(index_t t1, index_t t2) const {
-            const index_t* T = &(cell_to_cell_store_[4*t1]);
+            const index_t* T = &(cell_to_cell_store_[size_t(4)*t1]);
             return find_4(T,t2);
         }
 
         static constexpr index_t END_OF_LIST = NO_INDEX;
         static constexpr index_t NOT_IN_LIST = index_t(-2);
-        static constexpr index_t VERTEX_OF_DELETED_TET = index_t(-2);
 
         index_t nb_vertices() const { return nb_vertices_; }
         const double* vertex_ptr(index_t i) const {
@@ -1496,10 +1489,11 @@ namespace {
         index_t new_tetrahedron();
         index_t new_tetrahedron(index_t v1, index_t v2, index_t v3, index_t v4) {
             index_t result = new_tetrahedron();
-            cell_to_v_store_[4*result]   = v1;
-            cell_to_v_store_[4*result+1] = v2;
-            cell_to_v_store_[4*result+2] = v3;
-            cell_to_v_store_[4*result+3] = v4;
+            const size_t base = size_t(4) * result;
+            cell_to_v_store_[base]   = v1;
+            cell_to_v_store_[base+1] = v2;
+            cell_to_v_store_[base+2] = v3;
+            cell_to_v_store_[base+3] = v4;
             return result;
         }
 
@@ -1633,7 +1627,7 @@ namespace {
         cell_status_(master_->cell_status_)
     {
         max_used_t_ = 1;
-        max_t_ = master_->cell_next_.size();
+        max_t_ = index_t(master_->cell_next_.size());
 
         nb_vertices_ = master_->nb_vertices();
         vertices_ = master_->vertex_ptr(0);
@@ -1668,9 +1662,6 @@ namespace {
         v4_ = NO_INDEX;
     }
 
-    index_t Delaunay3dThread::nb_threads() const {
-        return index_t(master_->threads_.size());
-    }
     Delaunay3dThread* Delaunay3dThread::thread(index_t t) {
         return static_cast<Delaunay3dThread*>(master_->threads_[t].get());
     }
@@ -1687,16 +1678,17 @@ namespace {
             master_->cell_status_.grow();
             ++nb_free_;
             ++max_t_;
-            first_free_ = master_->cell_status_.size() - 1;
+            first_free_ = index_t(master_->cell_status_.size() - 1);
         }
         acquire_and_mark_tet_as_created(first_free_);
         index_t result = first_free_;
         first_free_ = tet_next(first_free_);
         remove_tet_from_list(result);
-        cell_to_cell_store_[4*result]   = NO_INDEX;
-        cell_to_cell_store_[4*result+1] = NO_INDEX;
-        cell_to_cell_store_[4*result+2] = NO_INDEX;
-        cell_to_cell_store_[4*result+3] = NO_INDEX;
+        const size_t base = size_t(4) * result;
+        cell_to_cell_store_[base]   = NO_INDEX;
+        cell_to_cell_store_[base+1] = NO_INDEX;
+        cell_to_cell_store_[base+2] = NO_INDEX;
+        cell_to_cell_store_[base+3] = NO_INDEX;
         max_used_t_ = std::max(max_used_t_, result);
         --nb_free_;
         return result;
@@ -1707,10 +1699,10 @@ namespace {
     ) {
         Delaunay::set_vertices(nb_vertices, vertices);
 
-        index_t expected_tetra = nb_vertices * 7;
+        index_t expected_tetra = index_t(size_t(nb_vertices) * 7);
 
-        cell_to_v_store_.assign(expected_tetra * 4, NO_INDEX);
-        cell_to_cell_store_.assign(expected_tetra * 4, NO_INDEX);
+        cell_to_v_store_.assign(size_t(expected_tetra) * 4, NO_INDEX);
+        cell_to_cell_store_.assign(size_t(expected_tetra) * 4, NO_INDEX);
         cell_next_.assign(expected_tetra, NO_INDEX);
         cell_status_.resize(expected_tetra);
 
@@ -1813,14 +1805,14 @@ namespace {
                    thread0->tet_is_real(t)) {
                     if(t != nb_tets) {
                         std::memcpy(
-                            &cell_to_v_store_[nb_tets * 4],
-                            &cell_to_v_store_[t * 4],
+                            &cell_to_v_store_[size_t(nb_tets) * 4],
+                            &cell_to_v_store_[size_t(t) * 4],
                             4 * sizeof(index_t)
                         );
                         if(need_adj) {
                             std::memcpy(
-                                &cell_to_cell_store_[nb_tets * 4],
-                                &cell_to_cell_store_[t * 4],
+                                &cell_to_cell_store_[size_t(nb_tets) * 4],
+                                &cell_to_cell_store_[size_t(t) * 4],
                                 4 * sizeof(index_t)
                             );
                         }
@@ -1831,10 +1823,10 @@ namespace {
                     if(need_adj) old2new[t] = NO_INDEX;
                 }
             }
-            cell_to_v_store_.resize(4 * nb_tets);
+            cell_to_v_store_.resize(size_t(4) * nb_tets);
             if(need_adj) {
-                cell_to_cell_store_.resize(4 * nb_tets);
-                for(index_t i = 0; i < 4 * nb_tets; ++i) {
+                cell_to_cell_store_.resize(size_t(4) * nb_tets);
+                for(size_t i = 0; i < size_t(4) * nb_tets; ++i) {
                     index_t t = cell_to_cell_store_[i];
                     t = old2new[t];
                     cell_to_cell_store_[i] = t;
@@ -1862,20 +1854,20 @@ namespace {
                 ++nb_finite_cells_;
                 for(index_t lf = 0; lf < 4; ++lf) {
                     std::swap(
-                        cell_to_cell_store_[4*finite_ptr + lf],
-                        cell_to_cell_store_[4*infinite_ptr + lf]
+                        cell_to_cell_store_[size_t(4)*finite_ptr + lf],
+                        cell_to_cell_store_[size_t(4)*infinite_ptr + lf]
                     );
                 }
                 for(index_t lv = 0; lv < 4; ++lv) {
                     std::swap(
-                        cell_to_v_store_[4*finite_ptr + lv],
-                        cell_to_v_store_[4*infinite_ptr + lv]
+                        cell_to_v_store_[size_t(4)*finite_ptr + lv],
+                        cell_to_v_store_[size_t(4)*infinite_ptr + lv]
                     );
                 }
                 ++finite_ptr;
                 --infinite_ptr;
             }
-            for(index_t i = 0; i < 4 * nb_tets; ++i) {
+            for(size_t i = 0; i < size_t(4) * nb_tets; ++i) {
                 index_t t = cell_to_cell_store_[i];
                 t = old2new[t];
                 cell_to_cell_store_[i] = t;
@@ -1922,7 +1914,7 @@ namespace delaunay3d {
         del.set_vertices(index_t(nb_points), points);
 
         index_t nb_cells = del.nb_cells();
-        result.nb_cells = int(nb_cells);
+        result.nb_cells = int64_t(nb_cells);
         if(compute_adjacency) {
             const vector<index_t>& cc = del.cell_to_cell_store();
             result.cell_adjacents.resize(size_t(nb_cells) * 4);

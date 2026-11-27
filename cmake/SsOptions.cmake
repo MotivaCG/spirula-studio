@@ -69,7 +69,7 @@ add_compile_definitions(SS_SOURCE_ROOT="${SS_ROOT}")
 
 # The version the apps report with --version. Declared here and nowhere else;
 # it used to be read out of pyproject.toml, back when there was a package.
-set(SS_VERSION "2026.11.12")
+set(SS_VERSION "2026.11.27")
 
 # The commit goes in it too, so a crash report names an exact tree without
 # anyone having to bump a string by hand. Read at configure time, which is
@@ -316,7 +316,6 @@ if(MSVC)
     set(SPLAT_C_FLAGS "/O2")
 else()
     set(SPLAT_CXX_FLAGS "-O3")
-    list(APPEND SPLAT_CXX_FLAGS "-Wno-sign-compare")
     set(SPLAT_C_FLAGS "-O3")
 endif()
 

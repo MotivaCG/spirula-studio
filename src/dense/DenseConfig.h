@@ -1,5 +1,6 @@
 #pragma once
 
+#include "data/ImageColors.h"
 #include "dense/Geometry.h"
 #include "dense/PairSelection.h"
 #include "roma/Roma.h"
@@ -24,9 +25,10 @@ struct DenseConfig {
     GeometryOptions geometry;
     std::string preset = "balanced", checkpoint = "romav2.0.1";
     std::string image_dir = "images", recon_dir, pair_list;
-    std::string mask_dir = "masks", feature_mask_dir = "feature_masks";
+    std::string mask_dir = "masks";
     bool use_masks = true;
-    bool training_masks = true, alpha_masks = true, feature_masks = true;
+    // training_masks also drops their 128 band, the sky (app::kMaskSegment).
+    bool training_masks = true, alpha_masks = true;
     bool invert_masks = false;
     double mask_threshold = 0.5;
     int mask_boundary = 0;
@@ -57,6 +59,7 @@ struct DenseConfig {
     // Predictions stay on disk until the run succeeds, so a cancelled run resumes;
     // keep_cache keeps them afterwards too (about 10 MB a pair at 640, 80 MB at 1280 both ways).
     bool resume = true, rebuild = false, keep_cache = false;
+    spirula::ImageColors image_colors;
     std::string device, image_gamut, image_exposure;
     std::optional<bool> image_is_linear;
     void apply_preset(const std::string& name);

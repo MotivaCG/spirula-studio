@@ -271,7 +271,7 @@ void TrainerSession::write_frame(int slot, int step) {
     const int keep = engine_temporal_current();
     engine_temporal_select(slot);
     engine_save_checkpoint((out_dir / "frames" / name).string(), false, step,
-                           cfg.background_export_height, "", false, true);
+                           cfg.background_export_height, "", false, "", true);
     // The room is no frame's: the last frame written leaves it as the room's file.
     if (_room_rows > 0)
         split_ply(out_dir / "frames" / name / "splat.ply", out_dir / "frames" / "room.ply",

@@ -16,8 +16,8 @@
     X(max_relative_depth_error, geometry.max_relative_depth_error) \
     X(min_source_images, geometry.min_source_images) \
     X(image_dir, image_dir) X(recon_dir, recon_dir) \
-    X(mask_dir, mask_dir) X(feature_mask_dir, feature_mask_dir) \
-    X(use_masks, use_masks) X(training_masks, training_masks) X(alpha_masks, alpha_masks) X(feature_masks, feature_masks) \
+    X(mask_dir, mask_dir) \
+    X(use_masks, use_masks) X(training_masks, training_masks) X(alpha_masks, alpha_masks) \
     X(invert_masks, invert_masks) X(mask_threshold, mask_threshold) X(mask_boundary, mask_boundary) \
     X(exif_orientation, exif_orientation) X(metashape_xml, metashape_xml) \
     X(metashape_psx, metashape_psx) X(metashape_component, metashape_component) \
@@ -56,6 +56,8 @@ inline std::string config_json(const DenseConfig& config) {
     w.object();
 #define SS_DENSE_EMIT(key, member) w.field_raw(#key, json_field::emit(config.member));
     SS_DENSE_CONFIG_FIELDS(SS_DENSE_EMIT)
+    if (!config.image_colors.empty())
+        w.field_raw("image_colors", spirula::write_image_colors(config.image_colors));
 #undef SS_DENSE_EMIT
     w.end();
     return w.str();
@@ -64,6 +66,10 @@ inline std::string config_json(const DenseConfig& config) {
 inline bool assign_config_field(DenseConfig& config, const std::string& key, const JsonValue& value) {
 #define SS_DENSE_ASSIGN(name, member) if (key == #name) { assign_dense_value(config.member, value); return true; }
     SS_DENSE_CONFIG_FIELDS(SS_DENSE_ASSIGN)
+    if (key == "image_colors") {
+        config.image_colors = spirula::read_image_colors(value);
+        return true;
+    }
 #undef SS_DENSE_ASSIGN
     return false;
 }

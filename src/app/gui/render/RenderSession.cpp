@@ -2180,6 +2180,7 @@ FrameSpec RenderSession::frame_spec(double t, int W, int H, bool photo) {
                 }
                 f.mode = 1;
                 f.a.source = A;
+                f.mix = su;
                 if (sh.transition == Transition::Sweep) {
                     // A level; the new model on one side of it, the old on
                     // the other, the band at the cut lit.
@@ -2498,7 +2499,7 @@ void RenderSession::start_export(bool no_builtin, bool confirmed) {
         const bool sphere = !_project.keys.empty() &&
                             _project.lens_at(0).projection == Projection::Equirect;
         _job.sink = open_pipe_sink(encoder_argv(e, W, H, o.fps, o.codec, o.quality, sphere,
-                                                o.path), W, H);
+                                                o.path));
     } else if (o.kind == OutputKind::Video) {
         _job.sink = open_gif_sink(o.path, W, H, o.fps, _job.frames, o.quality);
     } else {
@@ -2512,6 +2513,7 @@ void RenderSession::start_export(bool no_builtin, bool confirmed) {
     }
     _job.state = Job::Preparing;
     _job.started = now_s();
+    if (!no_builtin) _job_clock.start(progress_now());
     _status.clear();
     _status_err = false;
     _status_done = false;

@@ -2,8 +2,8 @@
 
 `src/app/gui/CompareView.{h,cpp}` is the GUI's model viewer: up to four
 finished models — splats, meshes, point clouds, in any mix — laid out in one
-pane, two, three, or a 2×2 grid, on one camera. It is what both the viewer
-screen and the meshing preview draw.
+pane, two, three, or a 2×2 grid, on one camera. It is what the viewer screen
+draws, a finished mesh beside the splats it came from included.
 
 Looking at one model answers "is this good?". Looking at two answers "is this
 better?", which is the question anyone tuning a reconstruction is actually
@@ -30,10 +30,10 @@ Three pieces make that work.
 
 ## Several splat models resident at once
 
-The engine is a process-global singleton with one set of world splats
-(`AGENTS.md`, "the engine is a process-global singleton"). Re-uploading a set
-per pane is not an option: a 274k-splat model with SH degree 3 is 65 MB on
-device, and a camera drag would re-upload every model every frame.
+The [process-global engine](../architecture.md#the-engine) has one set of
+world splats. A 274k-splat model with SH degree 3 is 65 MB on device.
+Uploading a set per pane would send every model again on each frame of a
+camera drag.
 
 So `Engine.h` grows **scene slots**: `engine_scene_set_data_3dgs(slot, …)`
 uploads a complete splat set into its own device buffers, and

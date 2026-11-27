@@ -1,21 +1,12 @@
 /*
  * Meshing.h
  *
- * Surface mesh extraction from a trained 3D Gaussian Splatting model.
- *
- * Pipeline (see MeshingHost.cpp for the orchestration):
- *   1. Sample a point cloud: 7 points per (kept) Gaussian -- the center plus
- *      6 points at +/- k*sigma along each principal axis, where
- *      k = sqrt(2 ln(opac / ALPHA_THRESHOLD)).
- *   2. Delaunay tetrahedralization of the point cloud (Delaunay3D.h).
- *   3. Marching tetrahedra over an occupancy field (iso = 0.5), with the
- *      crossing point on each cut edge found by bisection (not lerp).
- *   4. Manifold-preserving merge of short edges (local adaptive threshold).
- *   5. Write the mesh to a binary PLY.
- *
- * The occupancy field and all per-point GPU work live in Meshing.cu; the
- * OccupancyEvaluator owns the device-side Gaussian buffers + spatial grid and
- * is reused for both vertex evaluation and edge bisection.
+ * Surface mesh extraction from a trained splat model. The opacity field:
+ * samples around every splat (launch_pointcloud, mesh/MeshingDevice.h), their
+ * Delaunay tetrahedralization, marching tetrahedra at `iso` with every cut
+ * edge bisected, then merge, cleanup and export (mesh/MeshingHost.cpp). TSDF
+ * fusion is the other method (docs/notes/tsdf.md). OccupancyEvaluator owns the
+ * device buffers and answers every field query.
  */
 #ifndef SPIRULA_MESHING_H
 #define SPIRULA_MESHING_H
@@ -29,22 +20,34 @@
 
 namespace meshing {
 
+// Opacity: the opacity field over a Delaunay of splat samples. Tsdf: per-camera
+// depth fused into a truncated signed distance, over the same samples or a
+// uniform grid (docs/notes/tsdf.md); it needs cameras.
+enum class MeshMethod { Opacity, Tsdf };
+
 struct MeshingConfig {
+    MeshMethod method = MeshMethod::Opacity;
+    float tsdf_voxel = 0.0f;      // world units of a uniform grid; 0: adaptive, the splat samples
+    float tsdf_trunc = 4.0f;      // voxels; pixel footprints when adaptive
+    float tsdf_max_depth = 0.0f;  // world units; 0: no cap
     float iso = 0.5f;            // isosurface level on occupancy in [0,1]
-    float merge_factor = 1.0f;   // local merge threshold multiplier; <=0 disables
+    float merge_factor = 1.0f;   // scales every merge limit below; <=0 disables merging
+    float merge_flat_px = 1.0f;  // flatten bumps under this many pixels of footprint
+    float merge_thin = 0.1f;     // thin parts move by at most this share of their thickness
+    float merge_max_edge_px = 8.0f;   // longest edge a merge leaves, in pixels
+    float merge_color = 0.05f;   // largest colour range (0-1 per channel) one vertex may merge; 0: any
     int   bisection_iters = 3;  // bisection steps per cut edge; a linear
                                 // interpolation finishes the crossing estimate
+    int   samples_per_gaussian = 7; // 7: center + 6 axis ends; 1: center only
     int   max_cameras = -1;      // cap on cameras used (k-means subset)
     int   max_grid_res = 512;    // per-axis cap on the acceleration grid
     float grid_cell_factor = 2.0f; // cell size = factor * mean Gaussian radius
     int   num_threads = 0;       // 0 = all hardware threads (Delaunay + host)
     bool  verbose = true;
+    int   check = 0;             // MeshCheck.h: 1 the final mesh, 2 also after every stage
 
-    // --- short-edge merge quality guard ---
-    // A collapse is rejected when it would fold the surface: if any reshaped
-    // incident face's normal would rotate by more than this many degrees, the
-    // collapse is skipped (the link condition keeps topology manifold but does
-    // not prevent geometric folds / slivers). <=0 or >=180 disables the guard.
+    // A merge collapse that turns a reshaped face's normal by more than this
+    // many degrees is skipped; <=0 or >=180 disables the guard.
     float merge_max_flip_deg = 60.0f;
 
     // --- post-merge cleanup ---
@@ -75,21 +78,10 @@ struct MeshingConfig {
     int   fill_hole_max_edges = 12;
     bool  cull_unseen = true;    // drop final mesh verts seen by no camera
 
-    // --- occupancy estimate robustness (render path) ---                                                         
-    // The surface is lost when min-over-cameras meets per-view underestimation:                                   
-    // one view that underestimates occupancy at a true surface point carves it,                                   
-    // and adding cameras adds such outliers. These knobs make it robust.                                          
-    //   occ_normalize : occ = Phi((z-mean)/std) decoupled from the pixel's total                                  
-    //       accumulated alpha m0 (so the iso=0.5 surface sits at the mean depth,                                  
-    //       not behind it). When false, occ = m0 * Phi(...) (old behavior).                                       
-    //   occ_m0_thresh : a view whose pixel accumulated less than this alpha is                                    
-    //       uncertain (sky / grazing / thin) and ABSTAINS instead of carving.                                     
-    //   carve_k : aggregate occupancy as the k-th SMALLEST over the cameras that                                  
-    //       see the point (k=1 = strict min / space carving; k>1 ignores the                                      
-    //       k-1 most-underestimating views, trading carving power for robustness).                                
-    bool  occ_normalize = true;
-    float occ_m0_thresh = 0.5f;
-    int   carve_k = 1;
+    // --- how the cameras' views of a point are fused (docs/notes/mesh-field.md) ---
+    float occ_clean = 0.2f;        // occupancy under which one camera's sight carves alone
+    float occ_band_px = 6.0f;      // pixel footprints behind its surface a camera still votes fully
+    float occ_deep_weight = 0.01f; // its vote for points deeper than twice that
 
     // --- export ---
     // None, per-vertex color, or a baked texture atlas (MeshUV.h). More than
@@ -104,6 +96,7 @@ struct MeshingConfig {
 
     // Told at every stage how far the run is and the memory it expects.
     MeshProgressSink on_progress;
+    std::function<void(const MeshData&, int stage, bool cleaned)> on_preview_mesh;
 };
 
 // Full camera intrinsics/extrinsics for the rasterize-and-sample (dataset)
@@ -152,21 +145,18 @@ public:
     OccupancyEvaluator(const OccupancyEvaluator&) = delete;
     OccupancyEvaluator& operator=(const OccupancyEvaluator&) = delete;
 
-    // Generate the 7-points-per-kept-Gaussian point cloud, interleaved (x,y,z).
-    // Size = 3 * num_points(). float here; the caller widens to double only at
-    // the Delaunay boundary (the one place that needs the extra precision).
+    // Sample cfg.samples_per_gaussian (1 or 7) points per kept Gaussian,
+    // interleaved (x,y,z), size = 3 * num_points().
     void generate_point_cloud(std::vector<float>& xyz_out);
 
     // Evaluate the occupancy field at host points [n*3] floats -> occ[n].
     void evaluate(const float* xyz, int n, float* occ_out);
 
-    // For each cut edge (a,b) with endpoint occupancies (occ_a,occ_b) straddling
-    // iso, bisection-search the crossing point (finished with a linear
-    // interpolation). Endpoints are point-cloud indices into the cloud used to
-    // build this evaluator's point set. Writes crossing positions to xyz_out
-    // [n_edges*3] floats.
+    // The iso crossing on each cut edge (a,b), indices into `cloud_xyz`
+    // [cloud_points*3], by bisection finished with a linear interpolation;
+    // occ_a and occ_b are the ends' occupancies. xyz_out [n_edges*3].
     void bisect_edges(
-        const float* cloud_xyz,          // [num_points*3], the MT point cloud
+        const float* cloud_xyz, int cloud_points,
         const int32_t* edge_a, const int32_t* edge_b,
         const float* occ_a, const float* occ_b,
         int n_edges, float* xyz_out);
@@ -183,12 +173,22 @@ public:
     // much detail the training views actually captured at each surface point.
     void view_texel_density(const float* verts, int n, float* dens_out);
 
-    int num_points() const { return num_points_; }
+    // view_texel_density and (with rgb_out) colorize at verts [nv*3], and
+    // evaluate at probes [np*3], rendering each camera once for all three.
+    void merge_fields(const float* verts, int nv, float* dens_out, float* rgb_out,
+                      const float* probes, int np, float* occ_out);
+
+    int64_t num_points() const { return num_points_; }
     int num_kept()   const { return num_kept_; }
+    int64_t max_delaunay_points() const { return max_points_; }
 
     // True when the rasterize-and-sample (dataset / camera-intrinsics) path is
     // active, i.e. camera-based visibility culling is possible.
     bool has_render_cameras() const;
+
+    // Camera indices selected for rendering (all cameras, or the k-means
+    // medoids when cfg.max_cameras caps them). Empty without camera centers.
+    const std::vector<int>& selected_cameras() const;
 
     // Mark which mesh vertices are seen by >= 1 camera: a vertex is seen when it
     // projects in-frame AND the segment to that camera is not blocked by a mesh
@@ -199,21 +199,21 @@ public:
                               const int* faces, int n_faces,
                               unsigned char* visible_out);
 
-    // Debug: render camera `cam_idx`'s occupancy moments (m0, mean_depth,
-    // std_depth) into `out` [width*height*3], row-major. Returns false if the
-    // rasterize-and-sample render path is unavailable (no camera intrinsics).
-    bool debug_render_moments(int cam_idx, std::vector<float>& out,
-                              int& width, int& height);
+    // Render camera `cam_idx`'s occupancy moments (opacity, c0, c1; see
+    // moments_to_depth in mesh/Tsdf.h) into `out` [width*height*3], row-major.
+    // False without the camera render path.
+    bool render_moments(int cam_idx, std::vector<float>& out, int& width, int& height);
 
 private:
     struct Impl;
     Impl* impl_;
-    int num_points_ = 0;
+    int64_t num_points_ = 0;
     int num_kept_ = 0;
+    int64_t max_points_ = 0;
 };
 
-// Full pipeline entry point. Writes a binary PLY to output_path.
-// Returns true on success.
+// Full pipeline entry point. Writes a binary PLY to output_path. False on
+// failure, or when `cfg.check` found defects in the mesh it wrote.
 bool generate_mesh(
     const float* means, const float* quats,
     const float* log_scales, const float* logit_opac, const float* features_dc,

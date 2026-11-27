@@ -34,6 +34,14 @@ gradient against its regularizers at the scale of one batch's mean loss).
 `backend/vulkan/tests/` adds 3 Vulkan-only smoke tests (runtime, pipeline,
 sort/scan).
 
+`footprint_exact` is self-checking on both backends: every camera model
+renders random 3DGUT and 2DGS splats twice through the real forward
+rasterizer, binned and culled as the engine does and with every splat in every
+tile, and the two images must agree to one 8-bit level (they are bit-identical
+on Vulkan). The reference takes its visible set from the host, so a splat the
+projection wrongly culls fails it too; `noslab` and `nobox` say which bound a
+failure comes from (docs/notes/footprint.md).
+
 `missing_depth_supervision` is self-checking on both backends: missing and
 all-zero reference depth must give zero depth loss and gradients, while valid
 depth must retain finite supervision. It covers masks, multiple scales and
@@ -44,7 +52,7 @@ bearing information, and packed observation indexing; it also supports the
 dump/compare workflow below. `fpbo_parity` and `fpbo_split_parity` exercise
 projective updates with compressed and full-precision optimizer state.
 `noise_moments` checks zero mean, covariance, and temporal independence for
-identical Gaussians in both exploration kernels.
+identical Gaussians in the exploration kernel.
 `projective_camera_batches` checks host/device camera maps, coincident virtual
 views, geometry-supervision fallback, and reset.
 `projective_memory` checks lazy camera/state allocation, zero disabled GPU
@@ -268,6 +276,8 @@ as GPU image caching. It runs without a GPU on either backend.
 | a mesh format, or which colors it carries | `mesh_format_roundtrip` — writes every format and reads it back through the other implementation |
 | the UV atlas | `uv_atlas_split` — tens of thousands of charts that fail to flatten and must split |
 | a preset field | `preset_roundtrip_test` |
+| a `spirula sfm` detector, matcher or pair-selection option, or a quality preset value | `sfm_options_test` — every such row needs an owner the dataset panel draws, and the panel's boxes read their defaults from the same table |
+| what a dataset run reuses or redoes | `dataset_plan_test` ([dataset reruns](notes/dataset-rerun.md)) |
 | a batch row's shape or training overrides | `batch_process_test` |
 | what a typed-in command line becomes, or what a message may carry into it | `command_argv_test` — the message stays one argument and stays JSON-safe |
 | the home screen's recent list, or how `gui.conf` stores it | `recent_list_test` |
@@ -334,6 +344,18 @@ advertised 384. Encoding uncropped and setting the display crop only in the
 returned SPS preserves the coded grid. The grid/rotated-tile checks measured
 8.0/13.7 dB before this correction and 47.9/47.5 dB afterward. The same test
 also checks grid assembly, crop, rotation, mirroring, dimensions, and EXIF.
+
+## CPU-only training holdout regression
+
+`data_manager_validation_test` generates two RGB images and checks that disk
+prefetch delivers 64 training steps without pulling in the held-out view.
+It also covers CPU caching, an empty holdout, indexed fetch, teardown with a
+full ready queue, and retry or abort after a missing-file error. No GPU,
+models, or input dataset are needed.
+
+```sh
+ctest --test-dir build_vulkan -R "^data_manager_validation_test$" --output-on-failure --no-tests=error
+```
 
 ## CPU-only subprocess lifecycle regression
 

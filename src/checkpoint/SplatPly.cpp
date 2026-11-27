@@ -6,6 +6,7 @@
 #include "checkpoint/SplatPlyMetadata.h"
 #include "checkpoint/SplatTransform.h"
 #include "checkpoint/SplatYUp.h"
+#include "checkpoint/RegionCameras.h"
 #include "checkpoint/Resume.h"
 #include "core/SphericalBeta.h"
 
@@ -16,6 +17,7 @@
 #include <fstream>
 #include <future>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -44,6 +46,7 @@ struct PlyHeader {
     bool y_up = false;
     int64_t num_vertex = 0;
     std::string primitive;
+    std::string region_camera_hash;
     std::vector<PlyProp> props;
     size_t row_bytes = 0;
     std::streampos data_start = 0;
@@ -91,6 +94,14 @@ PlyHeader read_header(std::istream& f) {
             h.binary_le = tok == "binary_little_endian";
             h.ascii = tok == "ascii";
         } else if (tok == "comment") {
+            std::string tag;
+            ss >> tag;
+            if (tag == "spirula_roi_cameras") {
+                std::string hash, extra;
+                ss >> hash >> extra;
+                if (!h.region_camera_hash.empty() || hash.empty() || !extra.empty()) hash = "invalid";
+                h.region_camera_hash = std::move(hash);
+            }
             if (line == "comment spirula_coordinate_system supersplat_y_up") h.y_up = true;
             if (const auto mode = mip_from_ply_comment(line))
                 h.primitive = *mode ? "mip" : "";
@@ -187,10 +198,14 @@ int sb_lobes_from_params(int n_params, const std::string& path) {
 
 
 std::string splat_ply_header(int64_t vertices, const ColorBasis& basis,
-                             const std::string& primitive, bool y_up) {
+                             const std::string& primitive, bool y_up, const std::string& region_camera_hash) {
     std::ostringstream h;
     h << "ply\n";
     h << "format binary_little_endian 1.0\n";
+    if (!region_camera_hash.empty()) {
+        if (!valid_region_camera_hash(region_camera_hash)) throw std::runtime_error("invalid partition camera metadata reference");
+        h << "comment spirula_roi_cameras " << region_camera_hash << "\n";
+    }
     if (primitive == "mip") h << "comment SplatRenderMode: mip\n";
     if (y_up) h << "comment spirula_coordinate_system supersplat_y_up\n";
     h << "element vertex " << std::setfill('0') << std::setw(20) << vertices << "\n";
@@ -273,6 +288,7 @@ public:
             }
         }
         _shape.primitive = _h.primitive;
+        _shape.region_camera_hash = _h.region_camera_hash;
         _shape.sh_degree = sh_degree_from_rest((int)_crest.size(), path);
         _shape.sb_lobes = sb_lobes_from_params((int)_csb.size(), path);
         _shape.num = _h.num_vertex;
@@ -286,6 +302,26 @@ public:
 
     // The file's count, basis and primitive; no rows.
     const SplatCloud& shape() const { return _shape; }
+
+    void read_sample(SplatCloud& dst, int64_t limit, const std::function<bool()>& cancelled) {
+        if (cancelled && cancelled()) return;
+        dst = shape();
+        dst.num = std::min(dst.num, limit);
+        size(dst, dst.num);
+        // ASCII has no row offsets. Its preview uses the first rows.
+        if (_h.binary_le && uint64_t(_h.num_vertex) >
+            uint64_t(std::numeric_limits<std::streamoff>::max() - std::streamoff(_h.data_start)) / _h.row_bytes)
+            throw std::runtime_error(_path + ": invalid binary vertex count");
+        const int64_t block = dst.num == _h.num_vertex ? 4096 : std::clamp<int64_t>(dst.num / 1024, 32, 4096);
+        for (int64_t i = 0; i < dst.num; i += block) {
+            if (cancelled && cancelled()) { dst = {}; return; }
+            if (_h.binary_le && dst.num < _h.num_vertex) {
+                const int64_t row = (_h.num_vertex / dst.num) * i + (_h.num_vertex % dst.num) * i / dst.num;
+                _f.seekg(_h.data_start + std::streamoff(row * _h.row_bytes));
+            }
+            read(dst, i, std::min(block, dst.num - i));
+        }
+    }
 
     // Sizes dst's arrays for n rows of this file's basis.
     void size(SplatCloud& dst, int64_t n) const {
@@ -374,12 +410,24 @@ private:
 
 }  // namespace
 
+SplatCloud splat_ply_shape(const std::string& path) {
+    return SplatRowReader(path, true).shape();
+}
+
 SplatCloud read_splat_ply(const std::string& path, bool want_sh) {
     SplatRowReader r(path, want_sh);
     SplatCloud out = r.shape();
     r.size(out, out.num);
     r.read(out, 0, out.num);
     return out;
+}
+
+SplatCloud read_splat_ply_sample(const std::string& path, int limit, bool want_sh,
+                                 const std::function<bool()>& cancelled) {
+    SplatRowReader reader(path, want_sh);
+    SplatCloud sample;
+    reader.read_sample(sample, std::max(0, limit), cancelled);
+    return sample;
 }
 
 void read_splat_ply_chunks(
@@ -398,13 +446,13 @@ void read_splat_ply_chunks(
 }
 
 
-static void write_splat_rows(const SplatCloud& c, std::ostream& ply,
+void write_splat_ply_rows(const SplatCloud& c, std::ostream& ply, std::vector<float>& buf,
                               const uint8_t* keep, const SplatTransform* moved) {
     const ColorBasis basis = c.basis();
     const int64_t K = c.coeffs();
     const int row_floats = splat_ply_row_floats(basis);
     const int kRowsPerFlush = (int)std::max<size_t>(1, kFileBufferBytes / (row_floats * sizeof(float)));
-    std::vector<float> buf((size_t)row_floats * kRowsPerFlush);
+    buf.resize((size_t)row_floats * kRowsPerFlush);
     int rows = 0;
     auto flush = [&] {
         if (!rows) return;
@@ -451,10 +499,11 @@ void write_splat_ply(const SplatCloud& c, const std::string& path,
     }
     std::error_code ec;
     fs::create_directories(fs::path(path).parent_path(), ec);
-    std::ofstream ply(path, std::ios::binary);
+    BufferedOutputFile ply(path, std::ios::binary);
     if (!ply) throw std::runtime_error("cannot open for writing: " + path);
     ply << splat_ply_header(kept, c.basis(), c.primitive);
-    write_splat_rows(c, ply, keep, moved);
+    std::vector<float> buffer;
+    write_splat_ply_rows(c, ply, buffer, keep, moved);
     ply.close();
     if (!ply) throw std::runtime_error("write failed: " + path);
 }
@@ -469,14 +518,15 @@ void transform_splat_ply(const std::string& source, const std::string& destinati
     const int64_t total = chunk.num;
     const int64_t chunk_rows = 65536;
     const SplatTransform moved(transform, chunk.basis());
-    std::ofstream ply(destination, std::ios::binary);
+    BufferedOutputFile ply(destination, std::ios::binary);
+    std::vector<float> buffer;
     if (!ply) throw std::runtime_error("cannot open for writing: " + destination);
     ply << splat_ply_header(total, chunk.basis(), chunk.primitive);
     for (int64_t first = 0; first < total; first += chunk_rows) {
         chunk.num = std::min(chunk_rows, total - first);
         reader.size(chunk, chunk.num);
         reader.read(chunk, 0, chunk.num);
-        write_splat_rows(chunk, ply, nullptr, &moved);
+        write_splat_ply_rows(chunk, ply, buffer, nullptr, &moved);
     }
     ply.close();
     if (!ply) throw std::runtime_error("write failed: " + destination);

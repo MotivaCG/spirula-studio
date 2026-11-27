@@ -249,11 +249,7 @@ void MaskSession::draw_toolbar() {
     draw_revert_all_modal();
     ImGui::SameLine(0.0f, px(24.0f));
     // The way out of the window, so it looks like one rather than one more tool.
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.52f, 0.28f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.62f, 0.34f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.13f, 0.44f, 0.24f, 1.0f));
-    if (ui::Button(msg::done, ImVec2(px(120.0f), 0.0f))) _close_requested = true;
-    ImGui::PopStyleColor(3);
+    if (ui::GoButton(msg::done, ImVec2(px(120.0f), 0.0f))) _close_requested = true;
     ui::help_on_hover(msg::done_help);
     _toolbar_w = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x +
                  ImGui::GetStyle().WindowPadding.x;
@@ -380,7 +376,7 @@ void MaskSession::draw_workflow_row() {
     ui::help_on_hover_disabled(msg::prop_undo_help);
     ImGui::EndDisabled();
     note_row_width();
-    // In the warning's row and at its height, so a run moves nothing below it.
+    // Propagation replaces the warning while it runs.
     if (const int total = propagate_total(); total > 0) {
         const int done = std::min(propagate_done(), total);
         const double now = progress_now();
@@ -394,7 +390,7 @@ void MaskSession::draw_workflow_row() {
         if (ui::SmallButton(msg::prop_cancel)) cancel_propagate();
         ImGui::EndDisabled();
         ui::help_on_hover_disabled(msg::prop_cancel_help);
-        ImGui::SameLine();
+        note_row_width();
         progress_time_line(_prop_clock);
     } else {
         _prop_clock = ProgressClock{};
@@ -749,7 +745,7 @@ void MaskSession::draw_revert_all_modal() {
     }
     if (!ui::BeginPopupModal(msg::revert_all_title, nullptr, ImGuiWindowFlags_AlwaysAutoResize))
         return;
-    ImGui::PushTextWrapPos(px(460.0f));
+    ImGui::PushTextWrapPos(px(kModalWrapW));
     ui::Text(msg::revert_all_confirm);
     ImGui::Spacing();
     ui::Text(msg::corrected_count, {corrected_count()});
@@ -764,7 +760,7 @@ void MaskSession::draw_revert_all_modal() {
         ImGui::CloseCurrentPopup();
     }
     ImGui::SameLine();
-    if (ui::Button(dmsg::cancel, ImVec2(px(150.0f), 0))) ImGui::CloseCurrentPopup();
+    if (ui::Button(dmsg::cancel, ImVec2(px(kModalButtonW), 0))) ImGui::CloseCurrentPopup();
     ImGui::EndPopup();
 }
 
@@ -772,7 +768,7 @@ void MaskSession::draw_status() {
     // First, where a short window clips it last: a failed save's error.
     const std::string err = error();
     const std::string st = err.empty() ? status() : std::string();
-    if (!err.empty()) ui::TextColoredRaw(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), err);
+    if (!err.empty()) ui::TextColoredRaw(kErr, err);
     else if (!st.empty()) ui::TextDisabledRaw(st);
     else ImGui::Dummy(ImVec2(0.0f, ImGui::GetTextLineHeight()));
     const int at = _slide_playing ? _slide_index : _idx;
@@ -868,7 +864,7 @@ void MaskSession::draw_sam_status() {
         ui::TextDisabledRaw(sam_status());
         ui::TextDisabledWrapped(msg::sam_cancel_slow);
     } else if (!sam_err.empty()) {
-        ui::TextColoredRaw(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), sam_err);
+        ui::TextColoredRaw(kErr, sam_err);
     } else if (const spirula::i18n::Msg* note = sam_empty_note()) {
         ui::TextDisabledWrapped(*note);
     } else if (sam_results() > 0) {

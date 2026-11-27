@@ -12,6 +12,7 @@
 #include "data/DatasetParser.h"
 #include "app/TemporalInputs.h"
 #include "engine/EngineSpacetime.h"
+#include "data/Json.h"
 #include "data/Region.h"
 #include "app/webviewer/RenderWorker.h"
 #include "config/TrainConfig.h"
@@ -32,6 +33,8 @@
 #include <vector>
 
 namespace spirula {
+
+struct RegionCameras;
 
 // ===========================================================================
 // Color-space handling
@@ -235,7 +238,11 @@ public:
 
     // Output-dir / config.json overrides, for a front-end that owns them.
     std::string out_dir_override;      // "" = derive from cfg
+    // Also gates run.json (docs/run-records.md).
     bool        write_config_json = true;
+    // For run.json: the front end's <dataset>/logs/train_*.log, and its version.
+    std::string run_log;
+    std::string app_version;
 
     // Filled by load_dataset().
     ParsedDataset ds;
@@ -287,12 +294,14 @@ public:
     // --roi-region (by default the dataset's first roi/*.json), or both
     // intersected. Null for all of space.
     std::shared_ptr<const Region> roi;
+    std::shared_ptr<const RegionCameras> roi_cameras;
     // The whole seed cloud (parsed frame) and which of it the part owns, kept
     // from before the partition cut it down: what the region masks project.
     std::vector<double> roi_cloud;
     std::vector<uint8_t> roi_cloud_inside;
     // Reads --roi-region into `roi`, writing back the file it picked.
     void load_region();
+    RegionCameras build_region_cameras() const;
     void setup_region();
 
     // Create the output dir, dump config.json, reset + seed the engine,
@@ -314,6 +323,7 @@ public:
 
     void maybe_boost_opacity(int step);
 
+    // Synchronous save for callers outside train(); acquires engine_mutex.
     void save_checkpoint(int step, bool full);
 
     // Scores the held-out views into metrics.json: l1/psnr/ssim, LPIPS when its
@@ -353,8 +363,19 @@ public:
     void log(const std::string& msg);
 
 private:
+    void setup_engine_steps();
+    void train_steps(const TrainerCallbacks& cb);
+    // <out_dir>/run.json. A no-op until setup_engine() has made out_dir.
+    void write_run_record(const char* status, const std::string& error = {});
+    std::chrono::system_clock::time_point _run_started{};
+    std::string _device_name;
+    bool _final_saved = false;
+    // The records a run.json already in out_dir held: a resume reuses the folder.
+    std::vector<JsonValue> _earlier_runs;
+
     // ds.points drawn at random when --random-init asks for it.
     void seed_at_random();
+    void set_mask_classes(DataManagerConfig& dm) const;
     void set_downscale_cache(DataManagerConfig& dm) const;
     void set_alpha_config(DataManagerConfig& dm,
                           const std::vector<uint8_t>& alpha) const;
@@ -438,6 +459,9 @@ private:
     mutable std::mutex _progress_mutex;    // guards the latency window
     std::deque<double> _step_latencies;    // last 100, seconds
     bool _diverged_loss_reported = false;
+
+    std::future<void> write_checkpoint(int step, bool full, bool periodic);
+    void prune_checkpoints();
 
     void observe_memory(int step, int64_t splats_ran);
     TrainForecast _forecast;
