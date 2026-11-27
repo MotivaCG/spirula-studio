@@ -61,6 +61,7 @@ for A/B testing):
   the 148 ".int8" ones (ppl_fwd, ppl_bwd, fused_adam_qq, ...) crash its
   compiler in amdvlk64.dll, and the gindex_t loads index before they cast,
   the shape the float CAS was miscompiled in.
+  On an RDNA4 R9700 (driver 26.10.44) the plain CAS blobs run correctly.
 - `shaderInt64` — 64-bit sort keys, morton codes, large-buffer indexing.
   Entries in an int64_compat-including source get a `.noint64` variant
   compiled with `-DSS_EMULATE_INT64` (`backend/vulkan/shaders/int64_compat.slang`),
@@ -373,10 +374,8 @@ the 64-bit requirement is DECIDED — tile keys are `(tile_id << 32) |
 ordered_float_depth` and 32-bit packing overflows on large real-world
 scenes). Values int32. Host side ping-pongs the caller's `DoubleBuffer`
 exactly like CUB. `inclusive_sum`/`exclusive_sum` = two-level
-workgroup-scan (int32/int64, plus a float inclusive_sum for the densify
-MCMC sampling cumsum — deterministic per device, but its summation
-association differs from CUB's so cross-backend float cumsums agree only
-to rounding); `select_flagged` = scan + scatter + count readback.
+workgroup-scan (int32/int64); `select_flagged` = scan + scatter + count
+readback.
 Parity-tested against CPU references on every available device. Float
 keys are sorted by emitting the order-preserving uint32 flip transform
 from the producing kernel and sorting raw-unsigned via the int32 overload
@@ -469,11 +468,14 @@ Vulkan.
   `do_intersect_tile_generic` = count -> `backend::inclusive_sum<int32>` ->
   4-byte n_isects readback -> key write -> `backend::sort_pairs<int64,int32>`
   (begin 0, end 32 + tile bits, exactly the CUB call) -> offset kernel, per
-  band of tile rows when the pairs are many (docs/notes/vram-splat-x-img.md,
+  band of tile rows when the pairs are many (docs/notes/vram-splat-x-pixel.md,
   "Sorting in bands"). The sort starts in the payload buffer that leaves its
   result in the caller's list: one swap per 8 key bits.
   Ellipse-vs-AABB mode is a runtime null-check on proj_conic (the CUDA
-  template bool only folds that check).
+  template bool only folds that check). The eval3d primitives take a third
+  mode, `kFootprint`, with a `FootprintView` of the splats and cameras: an
+  exact ellipse sweep for undistorted pinhole and orthographic views, a ray
+  test against `tile_quad_rays` otherwise (docs/notes/footprint.md).
 - `kernels/RasterizeFwd.cpp` + `backend/vulkan/shaders/rasterize_fwd.slang`: closely
   follows RasterizationEval3DFwd_kernel.cuh (the CUDA source of both the 2D
   and eval3D kernels). Two entries (2D shared by 3DGS/MIP; 3DGUT eval3d
@@ -550,7 +552,7 @@ the engine level.
   fallback (the identity distortion tier reads nothing at all: a large
   camera index would run past the 4 KB fallback);
   "null selects a mode" moved to specialization constants
-  (intersect_tile kEllipse/kHasXy/kPacked, rasterize_fwd kRasterPacked —
+  (intersect_tile kEllipse/kHasXy/kPacked/kFootprint, rasterize_fwd kRasterPacked —
   spec-folding removes the dead load entirely) or explicit flag fields
   (blit has_lss/has_tri, thumbnails has_alpha, optimizer has_steps/
   grad_quant, densify use_opacs/use_w2). Guarded STORES are fine (never
@@ -680,13 +682,12 @@ the engine level.
     `count` and beyond) — NVIDIA segfaulted inside pipeline creation,
     llvmpipe silently ran with garbage spec values. kMax is now 16 with an
     assert; if a kernel ever needs more axes, raise kMax explicitly.
-- **Densify/MCMC + remaining optimizer variants (phase 5, fifth slice)**:
+- **Densify + remaining optimizer variants (phase 5, fifth slice)**:
   `kernels/Densify.cpp` implements the full densification API
-  (densify_clip_scale, MCMC/revised noise, long-axis-split relocate/add,
-  MCMC relocate/add) over `backend/vulkan/shaders/densify.slang`, which includes the
+  (densify_clip_scale, exploration noise, long-axis-split relocate/add)
+  over `backend/vulkan/shaders/densify.slang`, which includes the
   canonical `shaders/densify.slang` device code (long_axis_split_3dgs, the
-  Gaussian noise kernels) and mirrors the McmcRelocation.cu-only mcmc_relocation
-  math; `kernels/Optimizer.cpp` gains the adamtr trust-region color
+  Gaussian noise kernel); `kernels/Optimizer.cpp` gains the adamtr trust-region color
   variants (`backend/vulkan/shaders/optim_color.slang`) and the fused 3DGS geometry
   step (`backend/vulkan/shaders/optim_geometry.slang`, sharing the FPBO helpers
   refactored into optim_quant.slang: oq_state_read/oq_accum_us/
@@ -698,13 +699,6 @@ the engine level.
     identical key bits. The `u` draw hashes (seed, blockIdx, threadIdx)
     with an integer hash (bit-exact both backends); the kernels keep
     CUDA's 256-thread linearized geometry so hashes match.
-  - **Float cumsum**: `backend::inclusive_sum<float>` (new
-    scan_blocks/spine/add_f32 entries in sort_scan.slang) feeds the MCMC
-    binary-search draws. Its summation association differs from CUB's, so
-    cross-backend cumsums agree only to rounding — rare boundary flips in
-    the sampled indices are expected and the parity tool budgets for them
-    (loose channel / code violation caps; each flip rewrites one splat's
-    row).
   - **Relocation compaction** keeps CUDA's atomic-counter form, so the
     src→dst PAIRING is scheduling-dependent (true on CUDA alone);
     densify_parity's relocate configs are built with exactly one
@@ -782,7 +776,7 @@ the engine level.
     pixel-range partition determines the writeback structure), but run as
     flat 64-wide workgroups with an in-shader 8x8 decode — full subgroups
     need workgroup X to be a multiple of the pinned width (VUID-02757;
-    same reason the TV/channel-mean 4x4x4 blocks and the single-thread
+    same reason the TV-backward/channel-mean 4x4x4 blocks and the single-thread
     reg-loss finals are 64-/32-wide with logical decode / a tid-0 guard).
     `bg_block_add_64` folds across subgroups in shared memory, then finishes
     with subgroup reads in the shared tree's original addition order.
@@ -821,6 +815,13 @@ the engine level.
     shift by a fixed offset (~300 codes = ~0.007 in value space on
     NVIDIA). Same +-1-flip amplification class as fpbo_parity; the code
     violation caps budget for it.
+  - **TV loss forward** does not mirror CUDA's 4x4x4 blocks: a coalesced
+    grid-stride pass writes one partial per workgroup (1024 of them) and a
+    single workgroup sums them in a fixed order, so the loss is the same on
+    every run. CUDA's geometry read lanes 12 KB apart and ended in a float
+    atomic per block, which serializes on RDNA 4: 338 -> 41 us a call on an
+    R9700, 25 -> 24 us on an RTX 5070 Ti (garden, `3dgs`). CUDA keeps its
+    kernel; `bilagrid_parity` against a CUDA dump passes on both GPUs.
   - Parity: `bilagrid_parity` (372K tight + 207K loose floats + 20K
     codes; all 30 sampler launchers incl. q16 readers, grid_indices,
     mult>1 block-reduce path, mi batching, packed int64 indices; TV /

@@ -9,6 +9,7 @@
 #include "dense/Artifact.h"
 #include "data/JsonWrite.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -38,6 +39,12 @@ void touch(const fs::path& p) {
     std::ofstream(p) << "x";
 }
 
+void write_cloud(const fs::path& p) {
+    fs::create_directories(p.parent_path());
+    std::ofstream(p) << "ply\nformat ascii 1.0\nelement vertex 1\nproperty float x\nproperty float y\n"
+                        "property float z\nend_header\n0 0 0\n";
+}
+
 // A dual-fisheye clip, the way the panel hands it over once probed.
 PrepInput insv() {
     PrepInput in;
@@ -61,7 +68,6 @@ SfmJob video_job(const fs::path& ws) {
     j.prep.mask_detector_path = "/cache/gdino.onnx";
     j.camera_model = "thin-prism-fisheye";
     j.camera_mode = 1;
-    j.data_type = 1;
     return j;
 }
 
@@ -72,7 +78,6 @@ void build(const fs::path& ws, const SfmJob& job) {
         for (const char* f : {"00010.jpg", "00020.jpg", "00030.jpg"}) {
             touch(ws / "images" / cam / f);
             touch(ws / "masks" / cam / (std::string(f) + ".png"));
-            touch(ws / "feature_masks" / cam / (std::string(f) + ".png"));
         }
     touch(ws / "sparse" / "0" / "cameras.bin");
     StepRecorder rec(ws.string(), DatasetRecord{});
@@ -136,6 +141,69 @@ int main() {
                    masks_fields(made.prep) == masks_fields(workers.prep) &&
                    geometry_fields(made.geometry) == geometry_fields(workers.geometry),
                "GPU routing does not change output recipes");
+    }
+
+    {
+        SfmJob color_job = made;
+        auto& inputs = color_job.prep.inputs;
+        inputs[0].subdir = "cam";
+        inputs.push_back(inputs[0]);
+        inputs[1].path += "2";
+        inputs[1].subdir = "cam2";
+        color_job.prep.image_gamut = "Rec.709";
+        color_job.prep.image_is_linear = true;
+        const auto before = plan_job(color_job);
+        const auto frames = frames_fields(color_job.prep);
+        const auto masks = masks_fields(color_job.prep);
+        inputs[0].color = spirula::ImageColor{"Rec.2020", false};
+        inputs[1].color = spirula::ImageColor{};
+        const auto now = plan_job(color_job);
+        expect(frames == frames_fields(color_job.prep) &&
+                   masks != masks_fields(color_job.prep) && before.model != now.model &&
+                   geometry_fields(before.geometry) != geometry_fields(now.geometry) &&
+                   dense_fields(before.dense) != dense_fields(now.dense),
+               "source color changes analysis without changing frame extraction");
+
+        const auto saved = encode_record_inputs({inputs, {}}, ws.string());
+        DatasetRecord rec;
+        rec.inputs = json_parse(saved);
+        inputs[0].color.reset();
+        inputs[1].color.reset();
+        restore_record_inputs(rec, color_job.prep, color_job.camera_model);
+        expect(inputs[0].color && inputs[0].color->gamut == "Rec.2020" &&
+                   inputs[0].color->linear == false && inputs[1].color &&
+                   inputs[1].color->gamut.empty() && !inputs[1].color->linear,
+               "source colors preserve display overrides and file defaults across restore");
+
+        auto colors = spirula::read_image_colors(json_parse(
+            spirula::write_image_colors(source_colors(color_job.prep))));
+        const auto* nested = spirula::image_color_for(colors, "cam/lens/frame.jpg");
+        const auto* separate = spirula::image_color_for(colors, "cam2/frame.jpg");
+        expect(nested && nested->gamut == "Rec.2020" && nested->linear == false &&
+                   separate && separate->gamut.empty() && !separate->linear &&
+                   !spirula::image_color_for(colors, "camera/frame.jpg"),
+               "folder colors match nested images and respect directory boundaries");
+    }
+
+    {
+        SfmJob job = made;
+        PrepInput video = insv();
+        video.color = spirula::ImageColor{"Rec.2020", true};
+        PrepInput photos;
+        photos.path = "photos";
+        photos.detected_color = {"Rec.2020", true};
+        job.prep.inputs = {video, photos};
+        auto point = resolve_point_color(job, job.prep.inputs);
+        expect(point.gamut == "Rec.2020" && point.linear == true,
+               "automatic point color uses shared source settings, including metadata");
+        job.prep.inputs[1].color = spirula::ImageColor{"ACEScg", true};
+        point = resolve_point_color(job, job.prep.inputs);
+        expect(point.gamut == "Rec.709" && point.linear == true,
+               "automatic point color falls back only for fields that disagree");
+        job.point_color = {"DCI-P3", false};
+        point = resolve_point_color(job, job.prep.inputs);
+        expect(point.gamut == "DCI-P3" && point.linear == false,
+               "manual point settings override both automatic fields");
     }
 
     // ---- which LUT a row's frames go through ---------------------------------
@@ -416,7 +484,6 @@ int main() {
         for (const char* cam : {"a/cam0", "a/cam1", "b"}) {
             touch(two / "images" / cam / "00010.jpg");
             touch(two / "masks" / cam / "00010.png");
-            touch(two / "feature_masks" / cam / "00010.png");
         }
         touch(two / "sparse" / "0" / "cameras.bin");
         StepRecorder rec(two.string(), DatasetRecord{});
@@ -519,10 +586,81 @@ int main() {
         StepRecorder rec(ws.string(), read_dataset_record(ws.string()));
         rec.begin(Step::Frames, frames_fields(made.prep));
         const DatasetPlan p = plan(made);
-        expect(p[Step::Frames].act == Act::Redo && p[Step::Frames].why == Why::Unrecorded,
+        expect(p[Step::Frames].act == Act::Redo && p[Step::Frames].why == Why::Resume &&
+                   !p[Step::Frames].can_keep,
                "interrupted video frames without timing are extracted again");
+        expect(!p.ask(), "... without asking: nothing finished is lost with them");
         expect(p[Step::Model].act == Act::Redo,
                "... and the model built from the frames before them is not trusted");
+    }
+
+    // ---- a record from before the capture type and automatic pairing went ------
+    build(ws, made);
+    {
+        DatasetRecord rec = read_dataset_record(ws.string());
+        StepRecord old = rec.step(Step::Model);
+        for (StepField& f : old.fields)
+            if (f.key == "pairs") f.value = "auto";
+        old.fields.push_back({"data_type", "", "video"});
+        old.fields.push_back({"overlap", "", "10"});
+        write_step_record(ws.string(), Step::Model, old);
+        const DatasetPlan p = plan(made);
+        expect(p[Step::Model].act == Act::Reuse && p[Step::Model].changes.empty(),
+               "a model recorded with a capture type and automatic pairing is still current");
+        SfmJob every = made;
+        every.pairs = kPairsExhaustive;
+        expect(plan(every)[Step::Model].act == Act::Redo, "... and another pairing still is not");
+    }
+
+    // ---- frames from while the frame cap was on by default ---------------------
+    build(ws, made);
+    {
+        StepRecord old = read_dataset_record(ws.string()).step(Step::Frames);
+        old.fields.push_back({"max_frames", "", "100000"});
+        write_step_record(ws.string(), Step::Frames, old);
+        expect(read_plan_record(ws.string(), made.prep).step(Step::Frames).fields ==
+                   frames_fields(made.prep),
+               "frames cut under the old default cap read as uncapped");
+        SfmJob capped = made;
+        capped.prep.max_frames = 500;
+        expect(plan(capped)[Step::Frames].changes.size() == 1, "... and a cap set now is a change");
+    }
+
+    // ---- sequential-only settings under pair selection -------------------------
+    build(ws, made);
+    {
+        SfmJob j = made;
+        j.loop_closure = false;
+        j.overlap = 20;
+        expect(plan(j)[Step::Model].act == Act::Reuse,
+               "loop closure and overlap change nothing under pair selection");
+        DatasetRecord rec = read_dataset_record(ws.string());
+        StepRecord old = rec.step(Step::Model);
+        old.fields.push_back({"loop_closure", "", "on"});
+        old.fields.push_back({"prefilter_sequential", "", "off"});
+        write_step_record(ws.string(), Step::Model, old);
+        const DatasetPlan p = plan(made);
+        expect(p[Step::Model].act == Act::Reuse && p[Step::Model].changes.empty(),
+               "... nor does a record that still lists them");
+        SfmJob seq = made;
+        seq.pairs = kPairsSequential;
+        const StepFields f = model_fields(seq);
+        expect(std::count_if(f.begin(), f.end(), [](const StepField& x) {
+                   return x.key == "overlap" || x.key == "loop_closure";
+               }) == 2,
+               "... while sequential pairing records both");
+    }
+
+    // ---- an option the panel edits off the table --------------------------------
+    build(ws, made);
+    {
+        SfmJob j = made;
+        j.options["prefilter-neighbors"] = "64";
+        const StepFields f = model_fields(j);
+        expect(std::any_of(f.begin(), f.end(), [](const StepField& x) {
+                   return x.key == "prefilter_neighbors" && x.value == "64";
+               }), "an option is a model field under its flag's name");
+        expect(plan(j)[Step::Model].act == Act::Redo, "... so changing it rebuilds");
     }
 
     // ---- the reconstruction's own stages ---------------------------------------
@@ -557,6 +695,16 @@ int main() {
             << "features=sift\n" << sfm::resume::kSignedImages << (ws / "images").string() << "\n";
         expect(plan(made, redo)[ModelPart::Features].act == Act::Reuse,
                "... and ones from these images are not");
+        std::ofstream(ws / sfm::resume::kDir / sfm::resume::kExtractSig)
+            << "features=sift\n" << sfm::resume::kSignedImages << "images\n";
+        expect(plan(made, redo)[ModelPart::Features].act == Act::Reuse,
+               "... and workspace-relative images=images is also reused");
+        std::ofstream(ws / sfm::resume::kDir / sfm::resume::kExtractSig)
+            << "features=sift\n" << sfm::resume::kSignedImages << "../other/images\n";
+        expect(plan(made, redo)[ModelPart::Features].why == Why::Moved,
+               "... while a different workspace-relative images folder is treated as moved");
+        std::ofstream(ws / sfm::resume::kDir / sfm::resume::kExtractSig)
+            << "features=sift\n" << sfm::resume::kSignedImages << "images\n";
 
         SfmJob j = made;
         j.features = (int)std::size(kSfmFeatures) - 1;
@@ -567,12 +715,12 @@ int main() {
                    p[ModelPart::Mapping].why == Why::Matches,
                "another frontend extracts again, and the stages after it follow");
         j = made;
-        j.loop_closure = false;
+        j.pairs = kPairsExhaustive;
         p = plan(j);
         expect(p[ModelPart::Features].act == Act::Reuse &&
                    p[ModelPart::Matching].act == Act::Redo &&
                    p[ModelPart::Matching].changes.size() == 1 &&
-                   p[ModelPart::Matching].changes[0].key == "loop_closure" &&
+                   p[ModelPart::Matching].changes[0].key == "pairs" &&
                    p[ModelPart::Features].changes.empty(),
                "a pairing setting keeps the features and matches again, naming itself");
         j = made;
@@ -647,7 +795,7 @@ int main() {
                    p[ModelPart::Features].lock == Lock::Frontend,
                "feature points of another type are not kept");
         j = made;
-        j.max_features = 1000;
+        j.options["max-features"] = "1000";
         p = plan(j, keep_features);
         expect(p[ModelPart::Features].act == Act::Keep &&
                    p[ModelPart::Matching].act == Act::Reuse,
@@ -728,7 +876,7 @@ int main() {
         expect(plan(j)[Step::Dense].act == Act::None, "old settings keep dense processing disabled");
         j.dense.enable = true;
         expect(plan(j)[Step::Dense].act == Act::Run, "enabling dense starts its own step");
-        touch(ws / "dense" / "roma.ply");
+        write_cloud(ws / "dense" / "roma.ply");
         expect(spirula::dense::is_dense_seed(ws.string(), (ws / "dense" / "roma.ply").string()) &&
                spirula::dense::is_dense_seed(ws.string(), "dense/roma.ply") &&
                !spirula::dense::is_dense_seed(ws.string(), "other.ply"), "dense seed mask mode recognizes absolute and dataset-relative paths");
@@ -736,7 +884,7 @@ int main() {
         touch(source);
         const std::vector<std::string> watched{source.string()};
         auto write_manifest = [&](int revision = spirula::dense::reconstruction_revision) {
-            JsonWriter manifest; manifest.object().field("complete", true).field("cloud_sha256", spirula::sha256_file((ws / "dense" / "roma.ply").string()));
+            JsonWriter manifest; manifest.object().field("complete", true);
             manifest.field("reconstruction_revision",revision);
             manifest.field("cloud_bytes", 1).field("input_stamp", spirula::dense::input_stamp(watched));
             manifest.field("input_content_stamp",spirula::dense::input_content_stamp(watched));
@@ -810,7 +958,7 @@ int main() {
         write_manifest();
         std::ofstream(ws / "dense" / "roma.ply", std::ios::app) << "truncated replacement";
         expect(plan(j)[Step::Dense].act == Act::Reuse, "a changed output size does not discard external cloud edits");
-        touch(ws / "dense" / "roma.ply");
+        write_cloud(ws / "dense" / "roma.ply");
         j.dense.use_for_training = false;
         j.dense.config.image_cache_bytes = 123456789;
         expect(plan(j)[Step::Dense].act == Act::Reuse, "training selection and cache budget do not invalidate dense output");
@@ -825,6 +973,41 @@ int main() {
                "dense-only redo leaves the camera reconstruction reusable");
         j.dense.enable = false;
         expect(plan(j)[Step::Dense].act == Act::None, "disabling dense keeps its artifact without running it");
+    }
+
+    // ---- a rebuild cut short: only the stages it finished are the record's ------
+    build(ws, made);
+    {
+        touch(ws / "features" / "cam0" / "00010.jpg.bin");
+        touch(ws / "matches.bin");
+        touch(ws / sfm::resume::kDir / sfm::resume::kExtractSig);
+        touch(ws / sfm::resume::kDir / sfm::resume::kMatchSig);
+        SfmJob j = made;
+        j.pairs = kPairsExhaustive;
+        StepRecorder rec(ws.string(), read_dataset_record(ws.string()));
+        rec.begin(Step::Model, model_fields(j));
+        DatasetPlan p = plan(j);
+        expect(p[Step::Model].act == Act::Run && p[Step::Model].why == Why::Resume &&
+                   p[ModelPart::Features].act == Act::Run &&
+                   p[ModelPart::Matching].act == Act::Redo,
+               "cut short before a stage finished, nothing on disk is the new settings'");
+        rec.note(Step::Model, kMadeFeatures);
+        p = plan(j);
+        expect(p[ModelPart::Features].act == Act::Reuse &&
+                   p[ModelPart::Matching].act == Act::Run &&
+                   p[ModelPart::Matching].why == Why::Resume && !p.ask(),
+               "cut short while matching: the matches on disk are the last run's, "
+               "so matching is finished rather than reused");
+        PlanRequest keep;
+        keep.parts[(int)ModelPart::Matching] = PartChoice::Keep;
+        expect(plan(j, keep)[ModelPart::Matching].act == Act::Keep,
+               "... unless the user keeps them");
+        rec.note(Step::Model, kMadeMatches);
+        p = plan(j);
+        expect(p[ModelPart::Features].act == Act::Reuse &&
+                   p[ModelPart::Matching].act == Act::Reuse &&
+                   p[ModelPart::Mapping].act == Act::Run,
+               "cut short while mapping: both are the new settings' and only mapping is left");
     }
 
     // ---- depth and normals ---------------------------------------------------
@@ -951,6 +1134,23 @@ int main() {
                "... and a scan's photographs joining is a model change");
     }
 
+    {
+        // Two clips' lenses fitting one circle: who shares is a masks setting.
+        PrepJob own = video_job(ws).prep;
+        own.inputs.push_back(own.inputs[0]);
+        own.inputs[0].subdir = "a";
+        own.inputs[1].subdir = "b";
+        for (PrepInput& in : own.inputs) in.stencil.detect_border = true;
+        PrepJob shared = own;
+        for (PrepInput& in : shared.inputs) in.stencil_follow[""].share = 1;
+        expect(!(masks_fields(shared) == masks_fields(own)),
+               "lenses sharing their border circle is a masks setting changed");
+        PrepJob renumbered = shared;
+        for (PrepInput& in : renumbered.inputs) in.stencil_follow[""].share = 7;
+        expect(masks_fields(renumbered) == masks_fields(shared),
+               "... recorded by who shares, not by the share's number");
+    }
+
     // ---- and what the old stamps still say, back on the panel --------------
     {
         std::ofstream(ws / ".spirula-recon")
@@ -964,9 +1164,9 @@ int main() {
         SfmJob j;
         bool colmap = true;
         const DatasetRecord old = read_legacy_settings(ws.string(), j, colmap);
-        expect(old.present && !colmap && j.quality == 3 && j.data_type == 1 &&
+        expect(old.present && !colmap && j.quality == 3 && sfm_pairs(j.pairs) == kPairsPrefilter &&
                    j.camera_model == "thin-prism-fisheye" && j.metric_gps == 1 &&
-                   !j.prefilter_sequential && j.mask_features && j.prep.video_fps == 2.0f,
+                   j.mask_features && j.prep.video_fps == 2.0f,
                "the old stamps give back the settings they recorded");
         SfmJob d = dropped_images(ws, made);
         restore_record_inputs(old, d.prep, d.camera_model);
@@ -1042,6 +1242,20 @@ int main() {
         expect(every_frame(j, j.inputs[1]) && !every_frame(j, j.inputs[0]) &&
                    fps_group(j.inputs, 1) == 1,
                "a row set to every frame opens a group of its own");
+        // Two clips at one rate, each adapting to its own motion (issue 404).
+        j.inputs[0].fps = 0.0f;
+        j.inputs[1].fps = 2.0f;
+        j.adaptive_fps = true;
+        PrepJob shared = j;
+        shared.inputs[1].fps = 0.0f;
+        expect(fps_group(j.inputs, 1) == 1 && fps_group(shared.inputs, 1) == 0 &&
+                   input_fps(j.inputs, j.video_fps, 1) == 2.0f,
+               "a row stating the rate above is its own adaptive group at that rate");
+        expect(!(frames_fields(j) == frames_fields(shared)),
+               "... which makes other frames than sharing the budget");
+        j.adaptive_fps = shared.adaptive_fps = false;
+        expect(frames_fields(j) == frames_fields(shared),
+               "... and the same ones when the rate is not adaptive");
     }
 
     {
@@ -1057,6 +1271,16 @@ int main() {
         in.stencil.cameras["cam1"].mask.shapes.resize(2);
         expect(stencil_cameras(PrepJob{}, in) == std::vector<std::string>{"cam1"},
                "the fixed areas list the extracted lens only");
+        expect(lens_setup(in).empty(), "one lens of a dual file has no setup to share");
+        in.active_lens = -1;
+        in.path = "/captures/VID_1.INSV";
+        expect(lens_setup(in, 2880, 2880) == ".insv 2880x2880",
+               "a dual file's type and frame size name its setup");
+        in.path = "/captures/VID_1.osv";
+        expect(lens_setup(in, 2880, 2880) != ".insv 2880x2880", "another type is another setup");
+        PrepInput phone = insv();
+        phone.path = "/captures/phone.mp4";
+        expect(lens_setup(phone).empty(), "a phone clip has none");
     }
     {
         PrepInput in = insv();
@@ -1097,6 +1321,63 @@ int main() {
         expect(p[Step::Frames].act == Act::Redo && p[Step::Frames].can_keep,
                "both lenses again is a setting changed, not a source that went stale");
         fs::remove_all(w);
+    }
+
+    // ---- moved dataset input rows and missing-absolute fallback --------------
+    {
+        const fs::path old_parent = ws.string() + "_move_old";
+        const fs::path old_ws = old_parent / "dataset";
+        const fs::path new_parent = ws.string() + "_move_new";
+        const fs::path new_ws = new_parent / "dataset";
+        fs::remove_all(old_parent);
+        fs::remove_all(new_parent);
+        fs::create_directories(old_ws);
+        const fs::path old_video = old_parent / "clip.OSV";
+        touch(old_video);
+
+        PrepInput row = insv();
+        row.path = old_video.string();
+        row.focal_factor = 0.75f;
+        MaskClick clk;
+        clk.x = 12.0f;
+        clk.y = 34.0f;
+        clk.source = old_video.string();
+        const std::string encoded = encode_record_inputs({{row}, {clk}}, old_ws.string());
+        const JsonValue parsed = json_parse(encoded);
+        expect(parsed.find("rows")->arr[0].find("path")->as_string() == "../clip.OSV" &&
+                   parsed.find("clicks")->arr[0].find("source")->as_string() == "../clip.OSV",
+               "record inputs encode sibling video relative to workspace");
+
+        const bool all[kNumSteps] = {true, true, true, true};
+        write_record_settings(old_ws.string(), "{}", encoded, all);
+        fs::rename(old_parent, new_parent);
+        const fs::path moved_video = new_parent / "clip.OSV";
+
+        const RecordInputs dec =
+            decode_record_inputs(read_dataset_record(new_ws.string()).inputs, new_ws.string());
+        expect(dec.rows.size() == 1 &&
+                   fs::equivalent(fs::u8path(dec.rows[0].path), moved_video) &&
+                   dec.clicks.size() == 1 &&
+                   fs::equivalent(fs::u8path(dec.clicks[0].source), moved_video),
+               "moved record inputs resolve relative path to moved video");
+
+        // Legacy absolute path missing after move falls back to sibling filename.
+        PrepInput legacy_row = row;
+        legacy_row.path = "/missing/dir/clip.OSV";
+        MaskClick legacy_clk = clk;
+        legacy_clk.source = "/missing/dir/clip.OSV";
+        write_record_settings(new_ws.string(), "{}",
+                              encode_record_inputs({{legacy_row}, {legacy_clk}}), all);
+        SfmJob restore_job = video_job(new_ws);
+        restore_job.prep.inputs[0].path = moved_video.string();
+        restore_job.prep.inputs[0].focal_factor = 0.0f;
+        restore_record_inputs(read_dataset_record(new_ws.string()), restore_job.prep,
+                              restore_job.camera_model);
+        expect(restore_job.prep.inputs[0].focal_factor == 0.75f &&
+                   restore_job.prep.mask_clicks.size() == 1 &&
+                   restore_job.prep.mask_clicks[0].source == moved_video.string(),
+               "missing absolute record path falls back to sibling filename and restores row + clicks");
+        fs::remove_all(new_parent);
     }
 
     fs::remove_all(ws);

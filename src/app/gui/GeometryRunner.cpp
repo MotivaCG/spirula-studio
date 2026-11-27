@@ -212,6 +212,8 @@ bool run_geometry_step(const GeometryJob& job, const std::string& dataset,
     if (device.empty()) device = nn::configured_device_selector();
 #endif
     if (!device.empty()) argv.insert(argv.end(), {"--device", device});
+    if (!job.image_colors.empty())
+        argv.insert(argv.end(), {"--image-colors", spirula::write_image_colors(job.image_colors)});
     if (!job.image_gamut.empty()) {
         argv.push_back("--image-gamut");
         argv.push_back(job.image_gamut);
@@ -237,10 +239,11 @@ bool run_geometry_step(const GeometryJob& job, const std::string& dataset,
         const std::string line = trim_right(raw);
         if (line.empty()) return;
         std::vector<std::string> got;
-        if (spirula::i18n::scan(gmsg::log_progress, line, got) && got.size() >= 2) {
+        if (spirula::i18n::scan(gmsg::log_progress, line, got) && got.size() == 4) {
             prog.count(Stage::Geometry, std::atoll(got[0].c_str()),
                        std::atoll(got[1].c_str()));
-            prog.detail(Stage::Geometry, line);
+            prog.detail(Stage::Geometry,
+                        spirula::i18n::format(gmsg::progress_caption, {got[0], got[1], got[2]}));
             watch.poll();
             return;
         }

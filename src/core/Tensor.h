@@ -186,7 +186,7 @@ class DevicePool {
     // later reservation of that phase must leave room for.
     std::array<size_t, (size_t)PoolPhase::Count> _tail{};
     // Per phase, the most its slices came to: `pixels` in the per-image
-    // categories, `splats` in SplatXImg, `capped` in Splat -- those at what
+    // categories, `splats` in SplatXPix, `capped` in Splat -- those at what
     // cap_max makes them, which is what the arena holds for them (_arena_bump).
 public:
     struct PhaseBytes { size_t pixels = 0, splats = 0, capped = 0; };
@@ -321,7 +321,7 @@ private:
             _phase_now.capped += std::max(span, (size_t)((double)bytes * grow));
             _phase_live += span;
         } else {
-            (cat == VramCategory::SplatXImg ? _phase_now.splats : _phase_now.pixels) += span;
+            (cat == VramCategory::SplatXPix ? _phase_now.splats : _phase_now.pixels) += span;
         }
         PhaseBytes& peak = _phase_peak[(size_t)_phase];
         peak.pixels = std::max(peak.pixels, _phase_now.pixels);
@@ -598,7 +598,7 @@ public:
             out.used[c] += kv.second.slot.used_bytes;
             out.cap[c] += kv.second.slot.cap_bytes;
         }
-        out.cap[(int)VramCategory::SplatXImg] += _arena.cap;
+        out.cap[(int)VramCategory::SplatXPix] += _arena.cap;
         return out;
     }
 
@@ -837,7 +837,7 @@ public:
         return _data_ptr;
     }
 
-    DeviceVector() : _data_ptr(nullptr), _numel(0) {}
+    DeviceVector() : _numel(0), _data_ptr(nullptr) {}
 
     DeviceVector(const TorchTensorView& view) {
         _data_ptr = (T*)std::get<0>(view);
@@ -853,6 +853,7 @@ public:
     }
 
     // shallow copy
+    DeviceVector(const DeviceVector&) = default;
     DeviceVector& operator=(const DeviceVector&) = default;
 
     // Pool-backed resize: memory owned by DevicePool, this is a non-owning view.
@@ -931,7 +932,7 @@ public:
         return _data_ptr;
     }
 
-    DeviceTensor2D() : _data_ptr(nullptr), _numel_0(0), _numel_1(0) {}
+    DeviceTensor2D() : _numel_0(0), _numel_1(0), _data_ptr(nullptr) {}
 
     DeviceTensor2D(const TorchTensorView& view) {
         _data_ptr = (T*)std::get<0>(view);
@@ -948,6 +949,7 @@ public:
     }
 
     // shallow copy
+    DeviceTensor2D(const DeviceTensor2D&) = default;
     DeviceTensor2D& operator=(const DeviceTensor2D&) = default;
 
     // Pool-backed resize: memory owned by DevicePool, this is a non-owning view.
@@ -1032,7 +1034,7 @@ public:
         return _data_ptr;
     }
 
-    DeviceTensor3D() : _data_ptr(nullptr), _numel_0(0), _numel_1(0), _numel_2(0) {}
+    DeviceTensor3D() : _numel_0(0), _numel_1(0), _numel_2(0), _data_ptr(nullptr) {}
 
     DeviceTensor3D(const TorchTensorView& view) {
         _data_ptr = (T*)std::get<0>(view);
@@ -1050,6 +1052,7 @@ public:
     }
 
     // shallow copy
+    DeviceTensor3D(const DeviceTensor3D&) = default;
     DeviceTensor3D& operator=(const DeviceTensor3D&) = default;
 
     // Pool-backed resize: memory owned by DevicePool, this is a non-owning view.
@@ -1133,8 +1136,8 @@ public:
         return _data_ptr;
     }
 
-    DeviceTensor5D() : _data_ptr(nullptr),
-        _numel_0(0), _numel_1(0), _numel_2(0), _numel_3(0), _numel_4(0) {}
+    DeviceTensor5D() : _numel_0(0), _numel_1(0), _numel_2(0), _numel_3(0), _numel_4(0),
+        _data_ptr(nullptr) {}
 
     DeviceTensor5D(const TorchTensorView& view) {
         _data_ptr = (T*)std::get<0>(view);
@@ -1154,6 +1157,7 @@ public:
     }
 
     // shallow copy
+    DeviceTensor5D(const DeviceTensor5D&) = default;
     DeviceTensor5D& operator=(const DeviceTensor5D&) = default;
 
     // Pool-backed resize: memory owned by DevicePool, this is a non-owning view.
@@ -1230,7 +1234,7 @@ public:
         return _data_ptr;
     }
 
-    DeviceTensorND() : _data_ptr(nullptr), ndim(0) {}
+    DeviceTensorND() : ndim(0), _data_ptr(nullptr) {}
 
     DeviceTensorND(const TorchTensorView& view) {
         _data_ptr = (T*)std::get<0>(view);
@@ -1366,9 +1370,8 @@ inline size_t pool_arena_span_like(const std::vector<DeviceTensorFloatND>& tmpl)
 // straight-line arithmetic plus log1pf / expm1f (single CUDA math-lib calls).
 // ============================================================================
 
-// The finite test that survives every compiler this header sees; neither
-// spelling of isfinite does (AGENTS.md gotchas). Mirrors _oq_finite in
-// backend/vulkan/shaders/optim_quant.slang.
+// nvcc with MSVC and GCC disagree on which isfinite overload device code can call.
+// Match _oq_finite in backend/vulkan/shaders/optim_quant.slang.
 __device__ inline bool q_finite(float v) {
     uint32_t u;
     std::memcpy(&u, &v, sizeof(u));

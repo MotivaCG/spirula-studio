@@ -275,7 +275,7 @@ void bind_file_views(ViewportPanel& panel, const std::string& asked,
 
 void ViewportPanel::set_views(std::shared_ptr<ViewBookmarkSet> set,
                               const Sim3& model_to_store) {
-    if (set && set != _views) _show_cams = true;
+    if (set && set != _views && !_show_cams) _show_cams = _dirty = true;
     _views = std::move(set);
     _views_m2s = model_to_store;
 }
@@ -363,12 +363,6 @@ void ViewportPanel::handle_view_keys() {
         if (io.KeyCtrl) save_view(i);
         else go_to_view(i);
     }
-}
-
-float ViewportPanel::views_width() const {
-    const ImGuiStyle& st = ImGui::GetStyle();
-    return ImGui::CalcTextSize(msg::viewport_views.get()).x +
-           kNumViews * (ImGui::GetFrameHeight() + st.ItemSpacing.x);
 }
 
 void ViewportPanel::draw_view_buttons() {

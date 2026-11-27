@@ -9,6 +9,7 @@
 // still be replaced by COLMAP's equivalent to bisect a failure.
 
 #include "sfm/Pipeline.h"
+#include "data/ImageDiscovery.h"
 
 #include <algorithm>
 #include <array>
@@ -30,10 +31,12 @@
 #include <thread>
 #include <vector>
 
+#include "core/AtomicFile.h"
 #include "core/ColorSpace.h"
 #include "core/Env.h"
 #include "core/HardwareThreads.h"
 #include "core/ImageFile.h"
+#include "core/RelativePath.h"
 #include "sfm/core/Cancel.h"
 #include "sfm/core/Events.h"
 #include "sfm/core/Exif.h"
@@ -94,26 +97,17 @@ bool isImageExt(const std::string& e) {
 // `._00168.bin` stops the reconstruction on a magic the reader cannot place.
 bool isSidecar(const fs::path& p) {
     const std::string n = p.filename().string();
-    return n.size() > 2 && n[0] == '.' && n[1] == '_';
+    return image_discovery::generated_cache(p) ||
+           (n.size() > 2 && n[0] == '.' && n[1] == '_');
 }
 
 // Does `root` hold an image outside `nested`? Reinterpreting `auto DATASET`
 // as `auto DATASET/images` is allowed only when it cannot lose one: otherwise
 // a capture of two folders loses half, under names the trainer cannot resolve.
 bool holdsImagesOutside(const fs::path& root, const fs::path& nested) {
-    std::error_code walk, ec;
-    for (auto it = fs::recursive_directory_iterator(
-             root, fs::directory_options::follow_directory_symlink, walk);
-         !walk && it != fs::recursive_directory_iterator(); it.increment(walk)) {
-        if (it->is_directory(ec)) {
-            if (fs::equivalent(it->path(), nested, ec)) it.disable_recursion_pending();
-            continue;
-        }
-        if (it->is_regular_file(ec) && isImageExt(it->path().extension().string()) &&
-            !isSidecar(it->path()))
-            return true;
-    }
-    return false;
+    return image_discovery::holds_images_outside(root, nested, [](const fs::path& p) {
+        return isImageExt(p.extension().string()) && !isSidecar(p);
+    });
 }
 
 // Path of `p` relative to the directory it was enumerated from. NOT
@@ -476,6 +470,7 @@ MetricGpsEvidence metricGpsEvidence(const SfmConfig& cfg, const SensorCaptures& 
     for (auto it = fs::recursive_directory_iterator(
              imagedir, fs::directory_options::follow_directory_symlink, walk);
          !walk && it != fs::recursive_directory_iterator(); it.increment(walk)) {
+        if (image_discovery::skip_cache(it)) continue;
         if (!it->is_regular_file(ec) || isSidecar(it->path()) ||
             !isImageExt(it->path().extension().string()))
             continue;
@@ -951,13 +946,21 @@ bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
 // --point-color and the reported space both do, so adopt it before any stage.
 void adoptFileColorSpace(SfmConfig& cfg, const std::string& imagedir,
                          const std::set<std::string>& seen) {
-    const bool take_gamut = !seen.count("image-gamut");
-    const bool take_linear = !seen.count("image-linear");
+    if (cfg.image_colors.size() > 1) return;
+    const auto color = cfg.image_colors.find(".");
+    if (color != cfg.image_colors.end()) {
+        cfg.image_gamut = color->second.gamut;
+        cfg.image_is_linear = color->second.linear.value_or(false);
+    }
+    const bool from_root = color != cfg.image_colors.end();
+    const bool take_gamut = from_root ? color->second.gamut.empty() : !seen.count("image-gamut");
+    const bool take_linear = from_root ? !color->second.linear : !seen.count("image-linear");
     if (!take_gamut && !take_linear) return;
     std::error_code ec, walk;
     for (auto it = fs::recursive_directory_iterator(
              imagedir, fs::directory_options::follow_directory_symlink, walk);
          !walk && it != fs::recursive_directory_iterator(); it.increment(walk)) {
+        if (image_discovery::skip_cache(it)) continue;
         if (!it->is_regular_file(ec)) continue;
         if (!isImageExt(it->path().extension().string()) || isSidecar(it->path()))
             continue;
@@ -1007,16 +1010,16 @@ void reportFeatureCompaction(const FeatureCompactionStats& stats) {
             (long long)stats.correspondences});
 }
 
-// Point colours are sampled from images the loader converted to sRGB, which is
-// where "srgb" leaves them. "image" puts them back in the photographs' space,
-// which is where the trainer's point_color_* assume them by default.
+// Samples reach the mapper in sRGB, regardless of their source.
 void recolorPoints(std::vector<Reconstruction>& models, const SfmConfig& cfg) {
-    if (cfg.point_color_space != "image") return;
-    if (colorspace::is_identity(cfg.image_gamut, cfg.image_is_linear)) return;
+    if (!cfg.point_color && (cfg.point_color_space != "image" || cfg.image_colors.size() > 1))
+        return;
+    const auto color = cfg.point_color.value_or(spirula::ImageColor{cfg.image_gamut, cfg.image_is_linear});
+    const bool linear = color.linear.value_or(false);
+    if (colorspace::is_identity(color.gamut, linear)) return;
     for (Reconstruction& m : models)
         for (auto& kv : m.points3D)
-            colorspace::from_srgb_inplace(kv.second.rgb, 1, cfg.image_gamut,
-                                          cfg.image_is_linear);
+            colorspace::from_srgb_inplace(kv.second.rgb, 1, color.gamut, linear);
 }
 
 // A COLMAP camera *is* a frame size, and grouping buckets sizes within 2%
@@ -1067,24 +1070,34 @@ void splitCamerasBySize(std::vector<Reconstruction>& models,
 // gauge.txt beside the model: whether +Z is up, whether a unit is a metre, and
 // where on Earth (0,0,0) is. Plain text and not hidden, because it is as much
 // for the user reading the folder as for the viewer that stops guessing an up axis.
-void writeGauge(const fs::path& dir, const ModelGauge& g) {
-    std::ofstream f(dir / "gauge.txt", std::ios::trunc);
-    if (!f) return;
+void writeGauge(const fs::path& dir, const ModelGauge& g,
+                const std::optional<spirula::ImageColor>& point_color) {
+    std::ostringstream f;
+    if (point_color) {
+        f << "point_gamut " << point_color->gamut << "\n";
+        f << "point_linear " << (point_color->linear.value_or(false) ? 1 : 0) << "\n";
+    }
     f << "# What this model's frame means, from spirula sfm.\n";
     f << "oriented " << (g.oriented ? 1 : 0) << "\n";
     f << "metric " << (g.metric ? 1 : 0) << "\n";
     f << "up " << g.up << "\n";
     f << "scale " << g.scale << "\n";
     if (g.scale_sigma > 0) f << "scale_sigma " << g.scale_sigma << "\n";
-    if (!g.origin.ok) return;
-    // 1e-9 degrees is 0.1 mm.
-    char buf[128];
-    std::snprintf(buf, sizeof buf, "origin_lat %.9f\norigin_lon %.9f\n", g.origin.at.lat_deg,
-                  g.origin.at.lon_deg);
-    f << "# x east, y north of this WGS-84 point, in metres\n" << buf;
-    if (g.origin.alt.empty()) return;
-    std::snprintf(buf, sizeof buf, "origin_alt %.3f\n", g.origin.at.alt_m);
-    f << buf << "alt_source " << g.origin.alt << "\n";
+    if (g.origin.ok) {
+        // 1e-9 degrees is 0.1 mm.
+        char buf[128];
+        std::snprintf(buf, sizeof buf, "origin_lat %.9f\norigin_lon %.9f\n",
+                      g.origin.at.lat_deg, g.origin.at.lon_deg);
+        f << "# x east, y north of this WGS-84 point, in metres\n" << buf;
+        if (!g.origin.alt.empty()) {
+            std::snprintf(buf, sizeof buf, "origin_alt %.3f\n", g.origin.at.alt_m);
+            f << buf << "alt_source " << g.origin.alt << "\n";
+        }
+    }
+    const std::string metadata = f.str();
+    const fs::path path = dir / "gauge.txt";
+    if (!spirula::write_file_atomic(path, metadata.data(), metadata.size()))
+        throw std::runtime_error("cannot write model metadata: " + path.string());
 }
 
 // rigs.txt beside a model that used one: each member's cam_from_rig as the
@@ -1170,13 +1183,14 @@ RigTable readRigs(const fs::path& dir, Reconstruction& m) {
 // view graph that is not connected. `sparse/0` has the most 3D points, so a
 // single-model dataset still writes exactly `sparse/0`.
 void writeModels(std::vector<Reconstruction>& models, const fs::path& dir,
-                 bool verbose, const std::vector<ModelGauge>& gauge, const RigTable* rigs) {
+                 bool verbose, const std::vector<ModelGauge>& gauge, const RigTable* rigs,
+                 const std::optional<spirula::ImageColor>& point_color) {
     for (size_t i = 0; i < models.size(); i++) {
         fs::path p = dir / std::to_string(i);
         fs::create_directories(p);
         models[i].updatePointErrors();
         models[i].writeBinary(p.string());
-        if (i < gauge.size()) writeGauge(p, gauge[i]);
+        if (i < gauge.size()) writeGauge(p, gauge[i], point_color);
         writeRigs(p, models[i], rigs);
         if (verbose)
             L::err(Tag::Map, M::map_wrote_model,
@@ -1257,13 +1271,15 @@ void printFolderCoverage(const std::vector<Reconstruction>& models,
 static std::map<std::string, std::string> imageStemMap(const std::string& imagedir) {
     std::map<std::string, std::string> stem2name;
     if (imagedir.empty()) return stem2name;
-    for (const auto& e : fs::recursive_directory_iterator(imagedir))
-        if (e.is_regular_file() && !isSidecar(e.path())) {
-            fs::path rel = relativeTo(e.path(), imagedir);
+    for (fs::recursive_directory_iterator it(imagedir), end; it != end; ++it) {
+        if (image_discovery::skip_cache(it)) continue;
+        if (it->is_regular_file() && !isSidecar(it->path())) {
+            fs::path rel = relativeTo(it->path(), imagedir);
             fs::path stem = rel;
             stem.replace_extension();
             stem2name[stem.generic_string()] = rel.generic_string();
         }
+    }
     return stem2name;
 }
 
@@ -1593,14 +1609,15 @@ namespace {
 // The feature files as matching indexes them -- name, size and write time --
 // folded into one token, since its leftovers are indices into this set. The
 // write time is what sees a RE-extracted image: its size is the same budget.
-std::string featureDirDigest(const fs::path& featdir) {
+std::string featureDirDigest(const fs::path& featdir, bool legacy_full_paths = false) {
     std::vector<std::string> rows;
     std::error_code walk, ec;
     for (auto it = fs::recursive_directory_iterator(featdir, walk);
          !walk && it != fs::recursive_directory_iterator(); it.increment(walk))
         if (it->is_regular_file(ec))
             rows.push_back(
-                it->path().generic_string() + ":" +
+                (legacy_full_paths ? it->path() : relativeTo(it->path(), featdir)).generic_string() +
+                ":" +
                 std::to_string((uint64_t)fs::file_size(it->path(), ec)) + ":" +
                 std::to_string((int64_t)fs::last_write_time(it->path(), ec)
                                    .time_since_epoch()
@@ -1630,14 +1647,13 @@ void sweepStaleFeatures(const fs::path& outdir, const std::set<fs::path>& live) 
 // mtime: regenerated frames or masks leave the settings identical. Given
 // `older`, a whole file with a newer image or mask passes and sets it.
 bool featuresAreCurrent(const fs::path& feat, const fs::path& img,
-                        const std::string& mask, const std::string& feature_mask,
-                        uint32_t& count, bool* older = nullptr) {
+                        const std::string& mask, uint32_t& count,
+                        bool* older = nullptr) {
     std::error_code fe, ie, me;
     const auto t = fs::last_write_time(feat, fe);
     if (fe) return false;
     bool stale = t < fs::last_write_time(img, ie) || ie;
-    for (const std::string* m : {&mask, &feature_mask})
-        stale = stale || (!m->empty() && t < fs::last_write_time(*m, me) && !me);
+    stale = stale || (!mask.empty() && t < fs::last_write_time(mask, me) && !me);
     if (stale && !older) return false;
     if (older) *older = stale;
     return peekFeatures(feat.string(), count);
@@ -1650,18 +1666,17 @@ int extractDirectory(const std::string& imagedir, const fs::path& outdir,
                      std::vector<fs::path>* trusted) {
     const SiftOptions& opt = cfg.sift;
     const std::string& maskdir = cfg.mask_dir;
-    const std::string& fmaskdir = cfg.feature_mask_dir;
     // Recursive: per-folder intrinsics (ppisp) keep images in images/<camera>/
     // and the folder is the grouping key (D17). A mask directory nested inside
     // is skipped -- masks are PNGs too, and would double the image count with
     // garbage views.
     std::error_code skip_ec;
     std::vector<std::string> skip;
-    for (const std::string* d : {&maskdir, &fmaskdir})
-        if (!d->empty() && fs::is_directory(*d, skip_ec)) skip.push_back(*d);
+    if (!maskdir.empty() && fs::is_directory(maskdir, skip_ec)) skip.push_back(maskdir);
     std::vector<fs::path> found;
     for (auto it = fs::recursive_directory_iterator(imagedir, fs::directory_options::follow_directory_symlink);
          it != fs::recursive_directory_iterator(); ++it) {
+        if (image_discovery::skip_cache(it)) continue;
         if (it->is_directory() &&
             std::any_of(skip.begin(), skip.end(), [&](const std::string& d) {
                 return fs::equivalent(it->path(), d, skip_ec);
@@ -1720,8 +1735,13 @@ int extractDirectory(const std::string& imagedir, const fs::path& outdir,
     lopt.want_color = true;  // sample per-keypoint colors while the image is hot
     lopt.gamut = cfg.image_gamut;
     lopt.is_linear = cfg.image_is_linear;
+    if (!cfg.image_colors.empty()) {
+        lopt.image_colors = &cfg.image_colors;
+        lopt.image_root = fs::path(imagedir);
+    }
     lopt.exposure = cfg.exposure;
     lopt.flip_mask = cfg.flip_mask;
+    lopt.mask_segment_only = cfg.mask_segment_only;
     lopt.apply_exif_orientation = cfg.exif_orientation == "apply";
     if (cfg.decode_budget_mb > 0)
         lopt.memory_budget_bytes = (size_t)cfg.decode_budget_mb << 20;
@@ -1755,25 +1775,6 @@ int extractDirectory(const std::string& imagedir, const fs::path& outdir,
             L::warn(Tag::Extract, M::extract_some_unmasked,
                     {(long long)stats.unmasked_images, stats.first_unmasked});
     }
-    // An image without one keeps all its features, as under --masks; a tree
-    // matching nothing is not fatal here, since the sky is often absent.
-    MaskIndex fmasks(fmaskdir);
-    if (!fmaskdir.empty() && !fmasks.valid())
-        L::warn(Tag::Extract, M::extract_mask_dir_missing, {fmaskdir});
-    if (fmasks.valid()) {
-        lopt.feature_mask_paths.assign(paths.size(), std::string());
-        size_t matched = 0;
-        for (size_t k = 0; k < paths.size(); k++) {
-            std::string& fp = lopt.feature_mask_paths[k];
-            fp = fmasks.find(relativeTo(paths[k], imagedir).generic_string());
-            if (fp.empty()) continue;
-            matched++;
-            if (lopt.mask_paths.empty() || lopt.mask_paths[k].empty()) stats.masked_images++;
-        }
-        L::out(Tag::Extract, M::extract_masks_matched,
-               {(long long)matched, (long long)paths.size(), fmaskdir});
-    }
-
     // Where each image's features belong, and what a previous run already put
     // there. The total the bar counts is the capture, not the work left.
     const size_t n_all = paths.size();
@@ -1793,11 +1794,8 @@ int extractDirectory(const std::string& imagedir, const fs::path& outdir,
             uint32_t count = 0;
             const std::string mask =
                 k < lopt.mask_paths.size() ? lopt.mask_paths[k] : std::string();
-            const std::string fmask = k < lopt.feature_mask_paths.size()
-                                          ? lopt.feature_mask_paths[k]
-                                          : std::string();
             bool older = false;
-            if (!featuresAreCurrent(outs[k], paths[k], mask, fmask, count,
+            if (!featuresAreCurrent(outs[k], paths[k], mask, count,
                                     trusted ? &older : nullptr)) {
                 todo.push_back(k);
                 continue;
@@ -1827,14 +1825,11 @@ int extractDirectory(const std::string& imagedir, const fs::path& outdir,
                 sorted_dims[i] = sorted_dims[k];
                 outs[i] = std::move(outs[k]);
                 if (!lopt.mask_paths.empty()) lopt.mask_paths[i] = std::move(lopt.mask_paths[k]);
-                if (!lopt.feature_mask_paths.empty())
-                    lopt.feature_mask_paths[i] = std::move(lopt.feature_mask_paths[k]);
             }
             paths.resize(todo.size());
             sorted_dims.resize(todo.size());
             outs.resize(todo.size());
             if (!lopt.mask_paths.empty()) lopt.mask_paths.resize(todo.size());
-            if (!lopt.feature_mask_paths.empty()) lopt.feature_mask_paths.resize(todo.size());
         }
     }
     if (paths.empty()) {
@@ -1867,9 +1862,7 @@ int extractDirectory(const std::string& imagedir, const fs::path& outdir,
         sampleFeatureColors(f, img);
         uint32_t dropped = 0;
         const std::string& mpath =
-            k < lopt.mask_paths.size() && !lopt.mask_paths[k].empty() ? lopt.mask_paths[k]
-            : k < lopt.feature_mask_paths.size() ? lopt.feature_mask_paths[k]
-                                                 : kNoPath;
+            k < lopt.mask_paths.size() ? lopt.mask_paths[k] : kNoPath;
         if (!mpath.empty()) {
             if (img.mask.empty()) {
                 stats.mask_unreadable++;
@@ -2026,7 +2019,8 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
                     MatchStats& stats, VerifyCalibration* calib,
                     const MatchResume* res) {
     const MatchOptions& opt = cfg.match;
-    const PairSelectionOptions& popt = cfg.prefilter;
+    PairSelectionOptions popt = cfg.prefilter;
+    popt.num_threads = cfg.threads;
     const TwoViewOptions& tvopt = cfg.twoview;
     const bool verbose = !cfg.quiet;
     if (int rc = loadFeatureDir(featdir, cfg, /*with_descriptors=*/true, feats, db)) return rc;
@@ -2074,24 +2068,12 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
         pairs = prefilterPairs(feats, popt, sp);
         events::stage_end(Stage::Select);
         stats.select_seconds = now() - t0;
-        if (verbose)
+        if (verbose) {
             fprintf(stderr, "\n");
             L::err(Tag::Match, M::match_prefilter_kept,
                    {(long long)pairs.size(), (long long)stats.scored,
                     popt.num_features, popt.num_neighbors,
                     format_duration(stats.select_seconds)});
-        // The shortlist keeps each image's top-k by a subsampled score, and a
-        // weak but real link just below the cut is gone for good; the file
-        // order still knows it.
-        if (cfg.prefilter_sequential) {
-            const size_t sel = pairs.size();
-            const std::vector<std::pair<uint32_t, uint32_t>> win = sequentialPairs(
-                (uint32_t)n_images, cfg.overlap, cfg.quadratic_overlap, folderRuns(image_names));
-            pairs.insert(pairs.end(), win.begin(), win.end());
-            std::sort(pairs.begin(), pairs.end());
-            pairs.erase(std::unique(pairs.begin(), pairs.end()), pairs.end());
-            L::err(Tag::Match, M::match_sequential_added,
-                   {(long long)(pairs.size() - sel), (long long)sel, (long long)win.size()});
         }
     } else {
         pairs = mode == PairMode::Exhaustive
@@ -2114,12 +2096,13 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
             pairs.insert(pairs.end(), extra.begin(), extra.end());
             std::sort(pairs.begin(), pairs.end());
             pairs.erase(std::unique(pairs.begin(), pairs.end()), pairs.end());
-            if (verbose)
+            if (verbose) {
                 fprintf(stderr, "\n");
                 L::err(Tag::Match, M::match_loop_closure_added,
                        {(long long)(pairs.size() - seq), (long long)seq,
                         (long long)extra.size(),
                         format_duration(stats.select_seconds)});
+            }
         }
     }
     // makes the mapper trust the sequence pairs,
@@ -2167,7 +2150,7 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
                 mode == PairMode::Exhaustive ? "exhaustive"
                 : mode == PairMode::Sequential
                     ? (cfg.loop_closure ? "sequential + loop closure" : "sequential")
-                    : (cfg.prefilter_sequential ? "prefilter + sequential" : "prefilter")});
+                    : "prefilter"});
     if (verbose && mode == PairMode::Prefilter)
         L::err(Tag::Match, M::match_prefilter_params,
                {popt.num_features, popt.num_neighbors});
@@ -2196,6 +2179,7 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
     // FlexGlue reads each image's pixels, so it is handed the file behind
     // every feature set.
     FlexGlueMatchOptions fgopt = cfg.flexglue;
+    fgopt.image_colors = &cfg.image_colors;
     if (cfg.matcher == "flexglue") {
         if (fgopt.image_dir.empty() && calib) fgopt.image_dir = calib->image_dir;
         if (fgopt.image_dir.empty() || !fs::is_directory(fgopt.image_dir)) {
@@ -2634,13 +2618,11 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     L::out(Tag::Run, M::run_quality,
            {cfg.quality, (long long)cfg.max_image_size,
             (long long)cfg.sift.max_num_features});
-    L::out(Tag::Run, M::run_data_type, {cfg.data_type});
     L::out(Tag::Run, M::run_cameras, {cfg.camera_model, cfg.camera_mode});
     std::vector<LensPlan> lens_plans = collectLensPlans(cfg.telemetry_inputs, _imagedir);
     applyLensPlans(cfg.camera, lens_plans);
     for (const LensPlan& p : lens_plans) logLensPlan(p);
     if (!cfg.mask_dir.empty()) L::out(Tag::Run, M::run_masks, {cfg.mask_dir});
-    if (!cfg.feature_mask_dir.empty()) L::out(Tag::Run, M::run_masks, {cfg.feature_mask_dir});
     // What the two knobs moved, so a surprising run is explainable from its own
     // output rather than from reading the preset table.
     for (const PresetChange& p : in.preset_changes)
@@ -2650,25 +2632,33 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     // The signature is stored BEFORE the stage rather than after it, so that a
     // run interrupted half way through leaves files the next one may reuse.
     const fs::path rdir = resume::dir(_workspace);
-    std::string extract_sig =
-        stageSignature(cfg, CMD_EXTRACT) + resume::kSignedImages + _imagedir + "\n";
+    std::string extract_extra;
     if (int grid = experimentInt("SFM_SIFT_GRID", 0, 16))
-        extract_sig += "sift-grid=" + std::to_string(grid) + "\n";
-    if (experimentInt("SFM_PIXEL_CENTER", 0, 1)) extract_sig += "pixel-corners=1\n";
+        extract_extra += "sift-grid=" + std::to_string(grid) + "\n";
+    if (experimentInt("SFM_PIXEL_CENTER", 0, 1)) extract_extra += "pixel-corners=1\n";
+    const std::string extract_sig =
+        stageSignature(cfg, CMD_EXTRACT, _workspace) + resume::kSignedImages +
+        spirula::relative_to_dir(_imagedir, _workspace) + "\n" + extract_extra;
     // What the files on disk were recorded as made with, before this run
     // records itself: matches over kept features were made under it.
     const std::string old_extract = resume::recorded(rdir / resume::kExtractSig);
+    // Signatures from before workspace-relative paths carry them as given.
+    const bool legacy_sig =
+        old_extract != extract_sig &&
+        old_extract == stageSignature(cfg, CMD_EXTRACT) + resume::kSignedImages + _imagedir +
+                           "\n" + extract_extra;
+    const bool extract_current = old_extract == extract_sig || legacy_sig;
     std::error_code rm_ec;
     bool reuse = cfg.reuse && cfg.reuse_features != "redo";
     const bool keep_features = reuse && cfg.reuse_features == "keep";
-    if (!reuse || (!keep_features && old_extract != extract_sig)) {
+    if (!reuse || (!keep_features && !extract_current)) {
         // The pair list and the journal index the feature files, so they go
         // wherever those go.
         reuse = false;
         resume::clear(_workspace);
         fs::remove_all(featdir, rm_ec);
         fs::remove(matchpath, rm_ec);
-    } else if (old_extract != extract_sig && fs::is_directory(featdir, rm_ec) &&
+    } else if (!extract_current && fs::is_directory(featdir, rm_ec) &&
                !fs::is_empty(featdir, rm_ec)) {
         L::out(Tag::Extract, M::extract_kept_other_settings, {featdir.string()});
     }
@@ -2690,29 +2680,12 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     }
     warnIfMasksLookInverted(est);
 
-    // Pairing: what --pairs says, except that "auto" only knows the image count
-    // once extraction has run. Above COLMAP's exhaustive cutoff -- where COLMAP
-    // switches to vocabulary-tree retrieval -- we switch to GPU pair selection
-    // (sfm/feature/PairSelection.h, D35).
-    //
-    // The same cutoff retires the video preset's sequential pairing. A temporal
-    // window is a chain, and a capture long enough to be worth this many frames
-    // is long enough to come back on itself; pair selection finds those links
-    // from content, at a cost that is a fraction of matching. Measured on a
-    // 262-frame walk: sequential gave four models (144 / 74 / 19 / 12 images),
-    // pair selection one with 254. Below the cutoff the temporal prior is still
-    // the cheaper way to get the same pairs, and --loop-closure covers its blind
-    // spot. `--pairs sequential` explicitly still means sequential.
-    PairMode mode = cfg.pairMode();
-    if ((mode == PairMode::Exhaustive || mode == PairMode::Sequential) &&
-        est.images >= 100 && !in.explicit_flags.count("pairs")) {
-        const char* was = mode == PairMode::Exhaustive ? "exhaustive" : "sequential";
-        mode = PairMode::Prefilter;
-        L::out(Tag::Match, M::match_switch_to_selection, {(long long)est.images, was});
-    } else if (mode == PairMode::Exhaustive && est.images >= 100) {
+    // What --pairs says, at any image count: a default that changed with the
+    // count made two runs of one command line two different pipelines.
+    const PairMode mode = cfg.pairMode();
+    if (mode == PairMode::Exhaustive && est.images >= 100)
         L::warn(Tag::Match, M::match_exhaustive_quadratic,
                 {(long long)est.images, (long long)(est.images * (est.images - 1) / 2)});
-    }
 
     // ---- 2. match + geometric verification ----
     t0 = now();
@@ -2728,13 +2701,17 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     // What this stage's output depends on: its own settings, the extraction
     // that produced its input, and the feature files themselves -- the pair
     // lists and the journal are indices into a particular set of those.
-    std::string match_settings = stageSignature(cfg, CMD_MATCH) + "pairs-resolved=" +
-                                       std::to_string((int)mode) + "\n";
+    std::string match_extra = "pairs-resolved=" + std::to_string((int)mode) + "\n";
     if (int expansion = experimentInt("SFM_PAIR_EXPAND", 0, 32))
-        match_settings += "pair-expansion=" + std::to_string(expansion) + "\n";
+        match_extra += "pair-expansion=" + std::to_string(expansion) + "\n";
     if (int essential = experimentInt("SFM_ESSENTIAL", 0, 3))
-        match_settings += "essential=" + std::to_string(essential) + "\n";
+        match_extra += "essential=" + std::to_string(essential) + "\n";
+    const std::string match_settings = stageSignature(cfg, CMD_MATCH, _workspace) + match_extra;
     const std::string features_before = "features=" + featureDirDigest(featdir) + "\n";
+    const std::string legacy_match =
+        legacy_sig ? old_extract + stageSignature(cfg, CMD_MATCH) + match_extra + "features=" +
+                         featureDirDigest(featdir, /*legacy_full_paths=*/true) + "\n"
+                   : std::string();
     // Kept features older than their image or mask are dated now, so the next
     // run counts them current as well.
     for (const fs::path& p : trusted)
@@ -2743,11 +2720,25 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     mres.dir = rdir;
     mres.signature =
         extract_sig + match_settings + "features=" + featureDirDigest(featdir) + "\n";
-    const std::string old_match = resume::recorded(rdir / resume::kMatchSig);
+    std::string old_match = resume::recorded(rdir / resume::kMatchSig);
+    // From while --prefilter-sequential was a row; "off" matched what runs now.
+    const std::string retired = "\nprefilter-sequential=off\n";
+    if (const size_t at = old_match.find(retired); at != std::string::npos)
+        old_match.erase(at + 1, retired.size() - 1);
+    // Recorded when --pairs defaulted to "auto"; the mode it resolved to is the
+    // pairs-resolved line, which still has to agree.
+    const auto as_auto = [](std::string sig) {
+        const size_t at = sig.find("\npairs=prefilter\n");
+        if (at != std::string::npos) sig.replace(at, 17, "\npairs=auto\n");
+        return sig;
+    };
     // Matches over features kept under other extraction settings are still
     // theirs: the digest is of the files they index, as they were then.
-    const bool current =
-        old_match == mres.signature || old_match == old_extract + match_settings + features_before;
+    const std::string kept_features_sig = old_extract + match_settings + features_before;
+    const bool current = old_match == mres.signature || old_match == kept_features_sig ||
+                         old_match == as_auto(mres.signature) ||
+                         old_match == as_auto(kept_features_sig) ||
+                         (legacy_sig && old_match == legacy_match);
     if (cfg.reuse_matches == "redo") {
         resume::forget(rdir / resume::kMatchSig);
         resume::forget(rdir / resume::kMatchJournal);
@@ -2919,7 +2910,7 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     // one camera per frame size is not that.
     const size_t n_cameras = models.empty() ? 0 : models.front().cameras.size();
     splitCamerasBySize(models, feats);
-    writeModels(models, sparsedir, verbose, gauge, &rigs);
+    writeModels(models, sparsedir, verbose, gauge, &rigs, cfg.point_color);
     // In the mapper's frame, not the gauge's: a scorer that aligns by Sim3 reads both alike.
     if (!ast.pre_weld.empty()) {
         resolveImageNames(ast.pre_weld, _imagedir);
@@ -3092,7 +3083,8 @@ bool cameraOverrideName(const std::string& a, OverrideKind& kind) {
 
 }  // namespace
 
-std::string parse_auto_args(const std::vector<std::string>& args, AutoRequest& out) {
+std::string parse_auto_args(const std::vector<std::string>& args, AutoRequest& out,
+                            std::string* finish_command) {
     // setConfigField consumes argv the way main() gets it; this is that view.
     std::vector<char*> argv;
     argv.reserve(args.size());
@@ -3132,9 +3124,17 @@ std::string parse_auto_args(const std::vector<std::string>& args, AutoRequest& o
             cfg.sequences.push_back(std::move(d));
             continue;
         }
+        if (a == "--data-type")
+            return "--data-type is retired: declare ordered frames with --sequence, give "
+                   "internet photos --camera-mode image, and choose pairing with --pairs";
         if (a == "--progress-dir") {
             if (i + 1 >= argc) return "--progress-dir: missing value";
             out.progress_dir = args[(size_t)++i];
+            continue;
+        }
+        if (finish_command && a == "--finish-command") {
+            if (i + 1 >= argc) return "--finish-command: missing value";
+            *finish_command = args[(size_t)++i];
             continue;
         }
         // Claimed, not merely cleared: manifest_apply fills in anything the
@@ -3184,6 +3184,7 @@ std::string parse_auto_args(const std::vector<std::string>& args, AutoRequest& o
             return manifest_path + ": " + err;
         if (!man.mask_dir.empty()) maskdir_explicit = true;
     }
+    applySequenceDefaults(cfg, seen, moved);
     if (std::string err = cfg.finalize(CMD_AUTO); !err.empty()) return err;
     if (std::string err = cfg.resolveDevice(); !err.empty()) return err;
 

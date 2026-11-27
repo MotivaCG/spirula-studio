@@ -4,6 +4,7 @@
 
 #include "kernels/densify/DensifyQuantCopy.cuh"
 #include "kernels/densify/DensifyInternal.cuh"
+#include "core/Interpolation.cuh"
 
 // ================
 // Long axis split (https://arxiv.org/abs/2508.12313)
@@ -46,7 +47,9 @@ void long_axis_split_tensor(
     if (num_splats == 0)
         return;
 
-    if (primitive == "3dgs" || primitive == "mip" || primitive == "3dgut")
+    // 2DGS seeds its normal-axis scale below any disc axis (kSurfelLogScaleZ).
+    if (primitive == "3dgs" || primitive == "mip" || primitive == "3dgut" ||
+        primitive == "2dgs")
         long_axis_split_3dgs_kernel<<<_LAUNCH_ARGS_1D(num_splats, 256)>>>(
             num_splats,
             split_opacity_k,
@@ -223,9 +226,21 @@ void smoothed_laplacian_edge_filter_tensor(
     );
 }
 
+struct CannyMask {
+    const uint8_t* pixels;
+    int h, w;
+
+    explicit CannyMask(const TorchTensorView& mask) : pixels((const uint8_t*)std::get<0>(mask)),
+        h(pixels ? (int)std::get<2>(mask)[1] : 0), w(pixels ? (int)std::get<2>(mask)[2] : 0) {}
+
+    __device__ bool keeps(int b, int x, int y, int width, int height) const {
+        return !pixels || (nearest_sample_u8(pixels, b, x, y, width, height, w, h) & 1);
+    }
+};
+
 __global__ void canny_edge_filter_kernel(
     TensorView<float, 4> img_in,
-    const bool* __restrict__ mask_in,
+    CannyMask mask,
     TensorView<float, 4> img_out
 ) {
     constexpr int BLOCK = 32;
@@ -250,8 +265,7 @@ __global__ void canny_edge_filter_kernel(
             int yi = min(max((int)(blockIdx.y * BLOCK) + y - HALO, 0), H-1);
             int xi = min(max((int)(blockIdx.x * BLOCK) + x - HALO, 0), W-1);
             shared_pixels[y][x] = dot(img_in.load3(bid, yi, xi), float3{0.299f, 0.587f, 0.114f});
-            shared_valid[y][x] = (mask_in == nullptr) ? 1.0f :
-                (float)mask_in[(&img_in.at(bid, yi, xi, 0) - img_in.data)/3];
+            shared_valid[y][x] = mask.keeps(bid, xi, yi, W, H) ? 1.0f : 0.0f;
         }
     }
     __syncthreads();
@@ -319,7 +333,7 @@ __global__ void canny_edge_filter_kernel(
             mag = 0.0f;
     }
     if (yid < H && xid < W) {
-        if (mask_in && !mask_in[(&img_in.at(bid, yid, xid, 0) - img_in.data)/3])
+        if (!mask.keeps(bid, xid, yid, W, H))
             mag = 0.0f;
         img_out.store1(bid, yid, xid, mag);
     }
@@ -328,7 +342,7 @@ __global__ void canny_edge_filter_kernel(
 /*[AutoHeaderGeneratorExport]*/
 void canny_edge_filter_tensor(
     DeviceTensor3D<float3> img_in,
-    bool* mask_in_ptr,
+    TorchTensorView mask,
     DeviceTensor3D<float> img_out
 ) {
     int B  = img_in.template size<0>();
@@ -337,7 +351,7 @@ void canny_edge_filter_tensor(
 
     canny_edge_filter_kernel<<<_LAUNCH_ARGS_3D(W, H, B, 32, 32, 1)>>>(
         _dt3d_to_tv4<float>(img_in),
-        mask_in_ptr,
+        CannyMask(mask),
         _dt3d_float_to_tv4_1ch(img_out)
     );
 }
@@ -366,7 +380,7 @@ __global__ void _robust_residual_luma_kernel(
     int B, int H, int W,
     const float3* __restrict__ render,
     const float3* __restrict__ ref,
-    const bool* __restrict__ mask_in,
+    CannyMask mask,
     float* __restrict__ out  // [B, H, W]
 ) {
     int xid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -377,7 +391,7 @@ __global__ void _robust_residual_luma_kernel(
     // Infinity, not zero: the quantile below counts only strictly positive
     // finite values, so a masked residual is dropped instead of dragging the
     // Tukey cutoff around. The Tukey pass turns it into a real zero.
-    if (mask_in != nullptr && !mask_in[idx]) {
+    if (!mask.keeps(bid, xid, yid, W, H)) {
         out[idx] = INFINITY;
         return;
     }
@@ -421,7 +435,7 @@ __global__ void _robust_tukey_inplace_kernel(
 // unroll heuristics.
 __global__ void canny_edge_filter_kernel_scalar(
     TensorView<float, 4> img_in,    // [B, H, W, 1]
-    const bool* __restrict__ mask_in,
+    CannyMask mask,
     TensorView<float, 4> img_out    // [B, H, W, 1]
 ) {
     constexpr int BLOCK = 32;
@@ -445,8 +459,7 @@ __global__ void canny_edge_filter_kernel_scalar(
             int yi = min(max((int)(blockIdx.y * BLOCK) + y - HALO, 0), H-1);
             int xi = min(max((int)(blockIdx.x * BLOCK) + x - HALO, 0), W-1);
             shared_pixels[y][x] = img_in.load1(bid, yi, xi);
-            shared_valid[y][x] = (mask_in == nullptr) ? 1.0f :
-                (float)mask_in[&img_in.at(bid, yi, xi, 0) - img_in.data];
+            shared_valid[y][x] = mask.keeps(bid, xi, yi, W, H) ? 1.0f : 0.0f;
         }
     }
     __syncthreads();
@@ -509,7 +522,7 @@ __global__ void canny_edge_filter_kernel_scalar(
             mag = 0.0f;
     }
     if (yid < H && xid < W) {
-        if (mask_in && !mask_in[(&img_in.at(bid, yid, xid, 0) - img_in.data)])
+        if (!mask.keeps(bid, xid, yid, W, H))
             mag = 0.0f;
         img_out.store1(bid, yid, xid, mag);
     }
@@ -519,7 +532,7 @@ __global__ void canny_edge_filter_kernel_scalar(
 void robust_canny_residual_tensor(
     DeviceTensor3D<float3> render,   // [B, H, W, 3]
     DeviceTensor3D<float3> ref,      // [B, H, W, 3]
-    bool* mask_in_ptr,               // optional [B*H*W] mask; nullptr for none
+    TorchTensorView mask,
     float quantile,                  // Tukey cutoff = per-image q-quantile of |r|
     DeviceTensor3D<float> img_out    // [B, H, W, 1] -- written (not added)
 ) {
@@ -541,7 +554,7 @@ void robust_canny_residual_tensor(
         B, H, W,
         (const float3*)render.data_ptr(),
         (const float3*)ref.data_ptr(),
-        mask_in_ptr,
+        CannyMask(mask),
         resid
     );
     CHECK_DEVICE_ERROR(cudaGetLastError());
@@ -570,7 +583,7 @@ void robust_canny_residual_tensor(
     resid_tv.strides[3] = 1;
     canny_edge_filter_kernel_scalar<<<_LAUNCH_ARGS_3D(W, H, B, 32, 32, 1)>>>(
         resid_tv,
-        mask_in_ptr,
+        CannyMask(mask),
         _dt3d_float_to_tv4_1ch(img_out)
     );
     CHECK_DEVICE_ERROR(cudaGetLastError());

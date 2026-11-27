@@ -30,8 +30,9 @@ MODULES = {
     "Rasterization.h": (
         ["kernels/raster/RasterizationFwd.cuh", "kernels/raster/RasterizationBwd.cuh",
          "kernels/raster/RasterizationEval3DFwd.cuh", "kernels/raster/RasterizationEval3DBwd.cuh",
-         "kernels/raster/RasterizationMomentsFwd.cuh"],
-        "Tile-based rasterization forward/backward (2D and eval-3D/3DGUT).",
+         "kernels/raster/RasterizationMomentsFwd.cuh", "kernels/raster/RasterizationStochastic.cuh"],
+        "Tile-based rasterization forward/backward (2D and eval-3D/3DGUT), and"
+        " the stochastic viewer forward.",
     ),
     "TileIntersect.h": (
         ["kernels/tile/IntersectTile.cuh", "kernels/tile/SplatTileIntersector.cuh"],
@@ -49,8 +50,8 @@ MODULES = {
     ),
     "Densify.h": (
         ["kernels/densify/Densify.cuh"],
-        "Densification: MCMC and long-axis-split add/relocate, edge filters,"
-        " scatter utilities.",
+        "Densification: long-axis-split add/relocate, exploration noise,"
+        " edge filters, scatter utilities.",
     ),
     "Loss.h": (
         ["kernels/loss/FusedSSIM.cuh", "kernels/loss/PerPixelLoss.cuh", "kernels/loss/PerSplatLoss.cuh",

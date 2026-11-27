@@ -6,7 +6,9 @@
 #include "app/CubeLut.h"
 #include "app/FrameMask.h"
 #include "app/gui/ColmapRunner.h"
+#include "app/gui/SfmOptions.h"
 #include "app/gui/SfmRunner.h"
+#include "core/ColorSpace.h"
 #include "data/Yaml.h"
 #include "i18n/catalog/Log.h"
 
@@ -111,6 +113,20 @@ std::string stencil_digest(const app::FrameStencil& st) {
     one("", st);
     for (const auto& [cam, c] : st.cameras) one(cam, c);
     return digest(s);
+}
+
+// The rows each cutting lens of `in` fits one circle with; "" when none.
+std::string share_digest(const PrepJob& job, const PrepInput& in) {
+    std::string s;
+    for (const auto& [camera, own] : in.stencil_follow) {
+        if (!own.share || !in.stencil.for_camera(camera).detect_border) continue;
+        std::vector<std::string> with;
+        for (const PrepInput& o : job.inputs)
+            for (const auto& [c, f] : o.stencil_follow)
+                if (f.share == own.share) with.push_back(o.subdir + "/" + c);
+        s += camera + "|" + joined(with) + "\n";
+    }
+    return s.empty() ? s : digest(s);
 }
 
 std::string clicks_digest(const std::vector<MaskClick>& clicks) {
@@ -254,25 +270,54 @@ bool soft_model_key(const std::string& key) {
 }
 
 // The first `spirula sfm` stage whose signature (sfm::stageSignature) carries
-// what a model field becomes on its command line. Unlisted counts as
-// extraction: overstating the work beats hiding it.
+// what a model field becomes on its command line. An option is filed by its
+// table row; anything unlisted counts as extraction, which overstates the work.
 ModelPart field_part(const std::string& key) {
     static const char* const matching[] = {
-        "lens",        "focal",        "camera_mode", "data_type", "matcher",
-        "pairs",       "overlap",      "loop_closure", "prefilter_sequential",
-        "focal_px",    "distortion",   "sequence",    "rig",        "scan_views",
+        "lens",        "focal",        "camera_mode", "matcher",
+        "pairs",       "overlap",      "loop_closure", "focal_px",
+        "distortion",  "sequence",     "rig",          "scan_views",
         "imu",         "gps",
     };
     static const char* const mapping[] = {
         "mapper",         "distortion_refine", "final_per_image_intrinsics",
         "final_free_rig", "metric_gps",        "sensor_gauge",
-        "exif_attitude",  "attitude",
+        "exif_attitude",  "attitude", "point_color", "point_color_gamut", "point_color_linear",
     };
     for (const char* k : matching)
         if (key == k) return ModelPart::Matching;
     for (const char* k : mapping)
         if (key == k) return ModelPart::Mapping;
-    return ModelPart::Features;
+    ModelPart part = ModelPart::Features;
+    sfm_option_part(key, part);
+    return part;
+}
+
+// An older model record, read as what it ran: no capture type, "auto" as pair selection,
+// `overlap` / `loop_closure` only under sequential (`prefilter_sequential` only ever ran
+// off), and a capture-type record's learned-detector feature count under its own key.
+void migrate_model_fields(StepFields& fields) {
+    auto value = [&](const char* key) {
+        for (const StepField& f : fields)
+            if (f.key == key) return f.value;
+        return std::string();
+    };
+    if (value("engine") != "builtin") return;
+    const bool typed = !value("data_type").empty();
+    const std::string pairs = value("pairs") == "auto" ? "prefilter" : value("pairs");
+    const std::string detector = value("features");
+    const char* count = detector.rfind("aliked", 0) == 0 ? "aliked_max_features"
+                        : detector.rfind("loma", 0) == 0 ? "loma_max_features"
+                                                          : "max_features";
+    StepFields out;
+    for (StepField& f : fields) {
+        if (f.key == "data_type" || f.key == "prefilter_sequential") continue;
+        if ((f.key == "overlap" || f.key == "loop_closure") && pairs != "sequential") continue;
+        if (f.key == "pairs") f.value = pairs;
+        if (typed && f.key == "max_features") f.key = count;
+        out.push_back(std::move(f));
+    }
+    fields = std::move(out);
 }
 
 std::vector<FieldChange> diff(const StepFields& was, const StepFields& now,
@@ -337,13 +382,22 @@ void plan_parts(DatasetPlan& p, const PlanJob& job, const WorkspaceState& ws,
         return false;
     };
 
+    // An interrupted run's record holds the settings it started with; only
+    // the stages it finished were made with them, and what else is on disk is
+    // an earlier run's, which `spirula sfm` judges by its own signature.
+    auto unfinished = [&](const char* stage) {
+        return rr.present && !rr.complete &&
+               std::find(rr.made.begin(), rr.made.end(), stage) == rr.made.end();
+    };
+
     if (job.staged && makes(md.act)) {
         if (rr.present)
             for (const FieldChange& c : diff(rr.fields, job.model))
                 p[field_part(c.key)].changes.push_back(c);
 
         const std::string dir = image_dir_field(job.prep);
-        const fs::path images = dir == "images" ? fs::path(job.prep.workspace) / dir : fs::path(dir);
+        const fs::path images =
+            fs::path(dir).is_absolute() ? fs::path(dir) : fs::path(job.prep.workspace) / dir;
         const bool moved = !ws.extracted_images.empty() && !same_dir(ws.extracted_images, images);
 
         // The runner deletes features/ and matches.bin under new frames.
@@ -362,7 +416,7 @@ void plan_parts(DatasetPlan& p, const PlanJob& job, const WorkspaceState& ws,
         } else if (masks_feed && (makes(mk.act) || rr.masks_id != rec.step(Step::Masks).id)) {
             // An image is extracted again when its mask file is newer.
             set(fe, Act::Redo, Why::Masks);
-        } else if (!rr.complete && !ws.matched) {
+        } else if (unfinished(kMadeFeatures)) {
             set(fe, Act::Run, Why::Resume);
             fe.lock = Lock::Nothing;
         } else {
@@ -385,11 +439,13 @@ void plan_parts(DatasetPlan& p, const PlanJob& job, const WorkspaceState& ws,
             set(ma, Act::Reuse, Why::Unrecorded);
         } else if (!ma.changes.empty()) {
             set(ma, Act::Redo, Why::Settings);
+        } else if (unfinished(kMadeMatches)) {
+            set(ma, Act::Run, Why::Resume);
         } else {
             set(ma, Act::Reuse);
         }
         if (ma.lock == Lock::None && changed(ma, {"lens", "focal", "camera_mode", "focal_px",
-                                                  "distortion", "data_type", "scan_views"}))
+                                                  "distortion", "scan_views"}))
             ma.lock = Lock::Lens;
         choose(ModelPart::Matching, ma);
 
@@ -448,7 +504,8 @@ bool apply_legacy_frames(const std::vector<std::string>& a, const PrepJob& now,
         else if (flag == "--range") j.adaptive_range = to_float(v);
         else if (flag == "--sharp") j.sharp_window = (int)to_float(v);
         else if (flag == "--sync") j.sync_tracks = v == "1";
-        else if (flag == "--max-frames") j.max_frames = (int)to_float(v);
+        else if (flag == "--max-frames")
+            j.max_frames = (int)to_float(v) == kRetiredMaxFrames ? 0 : (int)to_float(v);
         else if (flag == "--rotate") j.auto_rotate = v == "1";
         else if (flag == "--photos") j.photo_import = (PhotoImport)(int)to_float(v);
         else if (flag == "--360") j.pano.mode = (app::Pano360Mode)(int)to_float(v);
@@ -490,9 +547,8 @@ void apply_legacy_recon(const std::vector<std::string>& a, const std::string& im
                         SfmJob& job, StepFields& fields) {
     std::string manifest;
     // What a flag the run left out stood for.
-    job.pairs = 0;
+    job.pairs = kPairsPrefilter;
     job.overlap = 10;
-    job.prefilter_sequential = true;
     job.loop_closure = true;
     job.metric_gps = 0;
     job.sensor_gauge = job.exif_attitude = 2;
@@ -500,17 +556,17 @@ void apply_legacy_recon(const std::vector<std::string>& a, const std::string& im
     job.final_per_image_intrinsics = job.final_free_rig = false;
     job.init_focal_px = 0.0f;
     job.init_distortion.clear();
-    job.max_features = job.max_image_size = 0;
+    job.options.clear();
     job.image_gamut.clear();
     job.image_is_linear.reset();
     job.image_exposure.clear();
-    job.point_color_in_image_space = false;
+    job.point_color = {"Rec.709", false};
     for (size_t k = 1; k < a.size(); k++) {
         const std::string& flag = a[k];
         const std::string v = k + 1 < a.size() ? a[k + 1] : std::string();
         auto take = [&]() { k++; return v; };
         if (flag == "--quality") job.quality = index_in(kSfmQuality, take(), 2);
-        else if (flag == "--data-type") job.data_type = index_in(kSfmDataType, take(), 0);
+        else if (flag == "--data-type") take();
         else if (flag == "--camera-model") job.camera_model = take();
         else if (flag == "--camera-mode") job.camera_mode = index_in(kSfmCameraMode, take(), 1);
         else if (flag == "--mapper") job.mapper = index_in(kSfmMapper, take(), 0);
@@ -519,10 +575,9 @@ void apply_legacy_recon(const std::vector<std::string>& a, const std::string& im
             const std::string m = take();
             job.matcher = m == "bruteforce" ? 0 : m == "flexglue" ? 2 : 1;
         }
-        else if (flag == "--pairs") job.pairs = index_in(kSfmPairs, take(), 0);
+        else if (flag == "--pairs") job.pairs = sfm_pairs(index_in(kSfmPairs, take(), 0));
         else if (flag == "--overlap") job.overlap = (int)to_float(take());
         else if (flag == "--no-loop-closure") job.loop_closure = false;
-        else if (flag == "--no-prefilter-sequential") job.prefilter_sequential = false;
         else if (flag == "--focal") job.init_focal_px = to_float(take());
         else if (flag == "--distortion") job.init_distortion = take();
         else if (flag == "--no-refine-extra-params")
@@ -532,9 +587,8 @@ void apply_legacy_recon(const std::vector<std::string>& a, const std::string& im
         else if (flag == "--final-free-rig") job.final_free_rig = true;
         else if (flag == "--manifest") manifest = take();
         else if (flag == "--max-features" || flag == "--aliked-max-features" ||
-                 flag == "--loma-max-features")
-            job.max_features = (int)to_float(take());
-        else if (flag == "--max-image-size") job.max_image_size = (int)to_float(take());
+                 flag == "--loma-max-features" || flag == "--max-image-size")
+            job.options[flag.substr(2)] = take();
         else if (flag == "--metric-gps") job.metric_gps = index_in(kSfmMetricGps, take(), 0);
         else if (flag == "--sensor-gauge") job.sensor_gauge = index_in(kSfmSensorGauge, take(), 2);
         else if (flag == "--exif-attitude")
@@ -543,7 +597,9 @@ void apply_legacy_recon(const std::vector<std::string>& a, const std::string& im
         else if (flag == "--image-linear") job.image_is_linear = true;
         else if (flag == "--no-image-linear") job.image_is_linear = false;
         else if (flag == "--image-exposure") job.image_exposure = take();
-        else if (flag == "--point-color") job.point_color_in_image_space = take() == "image";
+        else if (flag == "--point-color") {
+            if (take() == "image") job.point_color = {};
+        }
         else if (flag == "--masks") { take(); job.mask_features = true; }
         else if (flag == "--no-masks") job.mask_features = false;
     }
@@ -551,6 +607,10 @@ void apply_legacy_recon(const std::vector<std::string>& a, const std::string& im
     try {
         if (!manifest.empty()) m = yaml_parse(manifest);
     } catch (const std::exception&) {
+    }
+    if (const auto* point = m.find("point_color")) {
+        try { job.point_color = spirula::read_image_color(*point); }
+        catch (const std::exception&) {}
     }
     std::vector<std::pair<std::string, std::string>> cameras;   // prefix, model
     if (const JsonValue* cs = m.find("cameras"); cs && cs->is_array())
@@ -676,6 +736,11 @@ StepFields frames_fields(const PrepJob& job) {
         const bool every = every_frame(job, in);
         rate = rate || !every;
         add(f, "fps", scope, every ? "every" : num(input_fps(job, in)));
+        // Listed only for a row repeating the rate above as its own choice,
+        // so a record from before that could be said compares equal.
+        if (job.adaptive_fps && !every && index > 0 && fps_group(job.inputs, index) == index &&
+            input_fps(job.inputs, job.video_fps, index - 1) == input_fps(job, in))
+            add(f, "own_motion_budget", scope, "on");
         if (in.clipped())
             add(f, "clip", scope,
                 num(in.clip_start) + "-" + (in.clip_end > 0.0 ? num(in.clip_end) : "end"));
@@ -704,7 +769,7 @@ StepFields frames_fields(const PrepJob& job) {
     }
     add(f, "decoder", "", job.force_external_decode ? "ffmpeg" : "auto");
     add(f, "frame_indices", "", kStreamingFrameExtraction ? "source" : "candidates");
-    add(f, "max_frames", "", num(job.max_frames));
+    if (job.max_frames > 0) add(f, "max_frames", "", num(job.max_frames));
     add(f, "auto_rotate", "", onoff(job.auto_rotate));
     if (rate) {
         add(f, "sharp_window", "", num(job.sharp_window));
@@ -722,6 +787,12 @@ StepFields frames_fields(const PrepJob& job) {
     return f;
 }
 
+void add_source_color(StepFields& fields, const std::string& scope,
+                      const spirula::ImageColor& color) {
+    add(fields, "source_gamut", scope, color.gamut.empty() ? "auto" : color.gamut);
+    add(fields, "source_linear", scope, color.linear ? onoff(*color.linear) : "auto");
+}
+
 StepFields masks_fields(const PrepJob& job) {
     StepFields f;
     // Some input's masks come from segmentation rather than from the input.
@@ -732,8 +803,11 @@ StepFields masks_fields(const PrepJob& job) {
         else if (!input_masks_in_dataset(job, in))
             add(f, "found_masks", scope, norm_path(in.mask_dir));
         if (!in.mask_dir.empty() && job.flip_found_masks) add(f, "flip_masks", scope, "on");
-        if (!in.stencil.empty() && in.scan.empty())
+        if (!in.stencil.empty() && in.scan.empty()) {
             add(f, "stencil", scope, stencil_digest(in.stencil));
+            const std::string shared = share_digest(job, in);
+            if (!shared.empty()) add(f, "stencil_share", scope, shared);
+        }
     }
     // Under the scan, which the plan knows before its photographs are inputs.
     for (const auto& [scan, st] : job.scan_stencils)
@@ -745,6 +819,12 @@ StepFields masks_fields(const PrepJob& job) {
     if (!job.mask_detector_path.empty()) {
         add(f, "mask_detector", "", file_name(job.mask_detector_path));
         add(f, "mask_box_threshold", "", num(job.mask_detector_threshold));
+    }
+    for (const PrepInput& in : job.inputs) {
+        if (!feature && !in.mask_dir.empty()) continue;
+        const auto color = in.color.value_or(spirula::ImageColor{job.image_gamut, job.image_is_linear});
+        if (in.color || !color.gamut.empty() || color.linear)
+            add_source_color(f, scope_of(in.subdir), color);
     }
     add(f, "mask_max_size", "", num(job.mask_max_image_size));
     if (!job.image_exposure.empty()) add(f, "image_exposure", "", job.image_exposure);
@@ -777,28 +857,36 @@ StepFields model_fields(const SfmJob& job) {
     add(f, "camera_mode", "",
         sfm_pick(kSfmCameraMode, effective_camera_mode(p, job.camera_mode), 1));
     add(f, "quality", "", sfm_pick(kSfmQuality, job.quality, 2));
-    add(f, "data_type", "", sfm_pick(kSfmDataType, job.data_type));
     add(f, "mapper", "", sfm_pick(kSfmMapper, job.mapper));
     add(f, "features", "", sfm_pick(kSfmFeatures, job.features));
     add(f, "matcher", "", sfm_matcher_for(job.features, job.matcher));
-    add(f, "pairs", "", sfm_pick(kSfmPairs, job.pairs));
-    if (sequential_window_applies(job)) add(f, "overlap", "", num(job.overlap));
-    add(f, "loop_closure", "", onoff(job.loop_closure));
-    add(f, "prefilter_sequential", "", onoff(job.prefilter_sequential));
+    add(f, "pairs", "", sfm_pick(kSfmPairs, sfm_pairs(job.pairs)));
+    if (sequential_pairing(job)) {
+        add(f, "overlap", "", num(job.overlap));
+        add(f, "loop_closure", "", onoff(job.loop_closure));
+    }
     if (job.init_focal_px > 0) add(f, "focal_px", "", num(job.init_focal_px));
     if (!job.init_distortion.empty()) add(f, "distortion", "", job.init_distortion);
     add(f, "distortion_refine", "", num(job.distortion_refine));
     add(f, "final_per_image_intrinsics", "", onoff(job.final_per_image_intrinsics));
     add(f, "final_free_rig", "", onoff(job.final_free_rig));
-    if (job.max_features > 0) add(f, "max_features", "", num(job.max_features));
-    if (job.max_image_size > 0) add(f, "max_image_size", "", num(job.max_image_size));
+    for (const auto& [flag, value] : active_sfm_options(job))
+        add(f, sfm_option_field(flag).c_str(), "", value);
     add(f, "metric_gps", "", sfm_pick(kSfmMetricGps, job.metric_gps));
     add(f, "sensor_gauge", "", sfm_pick(kSfmSensorGauge, job.sensor_gauge, 2));
     add(f, "exif_attitude", "", sfm_pick(kSfmExifAttitude, job.exif_attitude, 2));
     if (!job.image_gamut.empty()) add(f, "image_gamut", "", job.image_gamut);
     if (job.image_is_linear) add(f, "image_linear", "", onoff(*job.image_is_linear));
     if (!job.image_exposure.empty()) add(f, "image_exposure", "", job.image_exposure);
-    add(f, "point_color", "", job.point_color_in_image_space ? "image" : "srgb");
+    for (const auto& [scope, color] : source_colors(p))
+        add_source_color(f, scope, color);
+    const auto point = resolve_point_color(job, p.inputs);
+    if (colorspace::is_identity(point.gamut, *point.linear)) {
+        add(f, "point_color", "", "srgb");
+    } else {
+        add(f, "point_color_gamut", "", point.gamut);
+        add(f, "point_color_linear", "", onoff(*point.linear));
+    }
     if (!job.extra_args.empty()) add(f, "extra_args", "", job.extra_args);
     add_rigs(f, p);
     add_sequences(f, p);
@@ -863,6 +951,8 @@ StepFields geometry_fields(const GeometryJob& g) {
     add(f, "depth_mm", "", onoff(g.depth_mm));
     add(f, "normal_jpg", "", onoff(g.normal_jpg));
     if (g.normal_jpg) add(f, "jpeg_quality", "", num(g.jpeg_quality));
+    for (const auto& [scope, color] : g.image_colors)
+        add_source_color(f, scope, color);
     if (!g.image_gamut.empty()) add(f, "image_gamut", "", g.image_gamut);
     if (g.image_is_linear) add(f, "image_linear", "", onoff(*g.image_is_linear));
     if (!g.image_exposure.empty()) add(f, "image_exposure", "", g.image_exposure);
@@ -898,13 +988,15 @@ StepFields dense_fields(const DenseJob& job) {
     StepFields fields;
     const auto object = json_parse(spirula::dense::config_json(job.config));
     for (const auto& [key, value] : object.obj) {
-        if (key == "preset" || key == "device" || key == "memory_budget_bytes" || key == "image_cache_bytes" ||
+        if (key == "image_colors" || key == "preset" || key == "device" || key == "memory_budget_bytes" || key == "image_cache_bytes" ||
             key == "cpu_workers" || key == "resume" || key == "rebuild" || key == "keep_cache") continue;
         // A record from before reference spacing existed means 0, so such a cloud stays fresh.
         if (key == "reference_coverage" && value.num == 0) continue;
         JsonWriter writer; json_write(writer, value);
         fields.push_back({key, "", writer.str()});
     }
+    for (const auto& [scope, color] : job.config.image_colors)
+        add_source_color(fields, scope, color);
     return fields;
 }
 
@@ -922,12 +1014,14 @@ PlanJob plan_job(const SfmJob& job) {
     p.model = model_fields(job);
     p.mask_features = job.mask_features;
     p.geometry = job.geometry;
+    p.geometry.image_colors = source_colors(p.prep);
     // The scans give the run its depth and normals.
     if (job.lidar.enabled()) p.geometry.enable = false;
     p.staged = true;
     p.lidar_clouds = job.lidar.clouds;
     p.lidar_in_frame = job.lidar.in_frame;
     p.dense = job.dense;
+    p.dense.config.image_colors = source_colors(p.prep);
     return p;
 }
 
@@ -937,7 +1031,9 @@ PlanJob plan_job(const ColmapJob& job, const PrepJob& prep) {
     p.model = model_fields(job, prep);
     p.mask_features = job.mask_features;
     p.geometry = job.geometry;
+    p.geometry.image_colors = source_colors(p.prep);
     p.dense = job.dense;
+    p.dense.config.image_colors = source_colors(p.prep);
     return p;
 }
 
@@ -955,6 +1051,14 @@ DatasetRecord read_plan_record(const std::string& workspace, const PrepJob& job)
     DatasetRecord rec = read_dataset_record(workspace);
     if (!rec.steps[(int)Step::Frames].present)
         rec.steps[(int)Step::Frames] = legacy_frames(workspace, job);
+    StepFields& frames = rec.steps[(int)Step::Frames].fields;
+    const std::string retired_cap = num(kRetiredMaxFrames);
+    frames.erase(std::remove_if(frames.begin(), frames.end(),
+                                [&](const StepField& f) {
+                                    return f.key == "max_frames" && f.value == retired_cap;
+                                }),
+                 frames.end());
+    migrate_model_fields(rec.steps[(int)Step::Model].fields);
     return rec;
 }
 
@@ -971,7 +1075,14 @@ std::vector<PrepCapture> captures_behind(const PrepJob& job) {
         const fs::path images = dir.has_filename() ? dir : dir.parent_path();
         if (images.filename() != "images") continue;
         for (PrepCapture c : recorded_captures(images.parent_path().string(), job)) {
-            if (!fs::is_regular_file(c.path, ec)) continue;
+            if (!fs::is_regular_file(c.path, ec)) {
+                const fs::path ws_parent = images.parent_path().parent_path();
+                const fs::path name = fs::path(c.path).filename();
+                const fs::path sibling = ws_parent / name;
+                if (name.empty() || ws_parent.empty() || !fs::is_regular_file(sibling, ec))
+                    continue;
+                c.path = sibling.string();
+            }
             c.subdir = in.subdir.empty() ? c.subdir
                        : c.subdir.empty() ? in.subdir
                                           : in.subdir + "/" + c.subdir;
@@ -1042,9 +1153,13 @@ DatasetPlan plan_dataset(const PlanJob& job, const WorkspaceState& ws,
                     return c.subdir == in.subdir && norm_path(c.path) == norm_path(in.path);
                 });
             if (!recorded) {
-                set(fr, Act::Redo, req.redo_frames ? Why::Requested : Why::Unrecorded);
+                // An extraction that never finished left nothing complete to
+                // lose, so making its frames again needs no asking.
+                const bool interrupted = rf.present && !rf.complete;
+                set(fr, Act::Redo,
+                    req.redo_frames ? Why::Requested : interrupted ? Why::Resume : Why::Unrecorded);
                 fr.can_keep = false;
-                fr.ask = !req.redo_frames;
+                fr.ask = !req.redo_frames && !interrupted;
                 break;
             }
         }
@@ -1075,9 +1190,10 @@ DatasetPlan plan_dataset(const PlanJob& job, const WorkspaceState& ws,
     } else {
         const StepFields now = masks_fields(job.prep);
         // Masks that came with the input are there already; only a feature
-        // prompt still has something to make.
+        // prompt still has something to fold in, which may be over the input's
+        // own folder: its record is what says it was done.
         const bool features = job.prep.mask_enable && !job.prep.mask_feature_prompt.empty();
-        const bool have = masks_adopted ? (!features || ws.masks) : ws.masks;
+        const bool have = masks_adopted ? (!features || ws.masks || rm.present) : ws.masks;
         if (!have) {
             set(mk, Act::Run);
         } else if (!rm.present) {
@@ -1140,7 +1256,7 @@ DatasetPlan plan_dataset(const PlanJob& job, const WorkspaceState& ws,
     StepPlan& dense = p[Step::Dense];
     const auto& rd = rec.step(Step::Dense);
     const auto& dc = job.dense.config;
-    const bool dense_masks = dc.use_masks && (dc.training_masks || dc.alpha_masks || dc.feature_masks);
+    const bool dense_masks = dc.use_masks && (dc.training_masks || dc.alpha_masks);
     if (fixed(Step::Dense)) dense = (*done)[Step::Dense];
     else if (!job.dense.enable) {}
     else if (makes(fr.act) && ws.dense) set(dense, Act::Redo, Why::Frames);
@@ -1216,14 +1332,15 @@ void restore_record_inputs(const DatasetRecord& rec, PrepJob& job,
     // Each half of a row as the run that made its step left it.
     auto made_by = [&](Step s) {
         const JsonValue& v = rec.step_inputs[(int)s];
-        return decode_record_inputs(v.is_object() ? v : rec.inputs);
+        return decode_record_inputs(v.is_object() ? v : rec.inputs, job.workspace);
     };
     const RecordInputs lenses = made_by(Step::Model), rates = made_by(Step::Frames);
     const RecordInputs clicks = made_by(Step::Masks);
     std::vector<PrepInput>& rows = job.inputs;
     auto same_rows = [&](const RecordInputs& was) {
         bool same = !was.rows.empty() && was.rows.size() == rows.size();
-        for (size_t i = 0; same && i < rows.size(); i++) same = was.rows[i].path == rows[i].path;
+        for (size_t i = 0; same && i < rows.size(); i++)
+            same = norm_path(was.rows[i].path) == norm_path(rows[i].path);
         return same;
     };
     auto split = [](const std::string& list) {
@@ -1260,6 +1377,7 @@ void restore_record_inputs(const DatasetRecord& rec, PrepJob& job,
             in.sequential = r.sequential || (in.is_video && ran_in_order(in));
             in.use_imu = r.use_imu;
             in.use_gps = r.use_gps;
+            in.color = r.color;
             for (SubCamera& sc : in.subcameras)
                 for (const SubCamera& o : r.subcameras)
                     if (o.rel == sc.rel) sc = o;
@@ -1272,7 +1390,17 @@ void restore_record_inputs(const DatasetRecord& rec, PrepJob& job,
                 rows[i].clip_end = rates.rows[i].clip_end;
                 rows[i].active_lens = rates.rows[i].active_lens;
             }
-        if (same_rows(clicks)) job.mask_clicks = clicks.clicks;
+        if (same_rows(clicks)) {
+            job.mask_clicks = clicks.clicks;
+            for (MaskClick& c : job.mask_clicks) {
+                if (c.source.empty()) continue;
+                for (size_t i = 0; i < clicks.rows.size(); i++)
+                    if (norm_path(c.source) == norm_path(clicks.rows[i].path)) {
+                        c.source = rows[i].path;
+                        break;
+                    }
+            }
+        }
         if (!rows.empty()) camera_model = rows[0].camera_model;
         return;
     }
@@ -1441,6 +1569,13 @@ void StepRecorder::begin(Step s, StepFields fields, std::vector<std::string> mad
     if (s == Step::Dense) { r.model_id = _ids[(int)Step::Model]; r.masks_id = _ids[(int)Step::Masks]; }
     _ids[(int)s] = r.id;
     _open[(int)s] = r;
+    write_step_record(_ws, s, r);
+}
+
+void StepRecorder::note(Step s, const std::string& made) {
+    StepRecord& r = _open[(int)s];
+    if (!r.present || std::find(r.made.begin(), r.made.end(), made) != r.made.end()) return;
+    r.made.push_back(made);
     write_step_record(_ws, s, r);
 }
 

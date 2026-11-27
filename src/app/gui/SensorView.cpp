@@ -29,9 +29,6 @@ namespace {
 
 constexpr double kEarthR = 6378137.0;
 constexpr double kDeg = 3.14159265358979323846 / 180.0;
-const ImVec4 kGood(0.40f, 0.80f, 0.45f, 1.0f);
-const ImVec4 kWarn(0.95f, 0.75f, 0.30f, 1.0f);
-const ImVec4 kBad(0.95f, 0.45f, 0.40f, 1.0f);
 // How much the 3D track's heights may be stretched.
 constexpr float kHeightScales[] = {1.0f, 2.0f, 5.0f, 10.0f, 20.0f};
 
@@ -127,6 +124,7 @@ double median_rate(const std::vector<float>& t) {
     return 1.0 / dt[dt.size() / 2];
 }
 
+#ifdef SS_TOOL_SFM
 // An angle carried across +-180 so a slow turn is a line, not a saw.
 void unwrap_deg(std::vector<float>& a) {
     float offset = 0.0f;
@@ -144,7 +142,9 @@ void unwrap_deg(std::vector<float>& a) {
         a[i] = a[i - 1] + d;
     }
 }
+#endif
 
+#ifdef SS_TOOL_SFM
 // Samples in time order, which every plot's search assumes. A carrier
 // almost always writes them so; the odd one that does not is sorted.
 void time_order(SensorSeries& s) {
@@ -161,6 +161,7 @@ void time_order(SensorSeries& s) {
     apply(s.t);
     for (std::vector<float>& v : s.v) apply(v);
 }
+#endif
 
 SensorSeries& add_series(SensorData& d, SensorSeries::Kind kind, int channels) {
     d.series.emplace_back();
@@ -263,7 +264,7 @@ void fix_tooltip(const SensorData& d, const SensorFix& f) {
         ui::Text(pmsg::tip_pitch, {fixed(f.pitch, 1)});
     }
     if (f.no_fix) ui::TextColored(kWarn, pmsg::tip_no_fix);
-    else if (f.outlier) ui::TextColored(kBad, d.video ? pmsg::tip_outlier : pmsg::tip_far);
+    else if (f.outlier) ui::TextColored(kErr, d.video ? pmsg::tip_outlier : pmsg::tip_far);
     ui::TextDisabled(d.video ? pmsg::tip_click_seek : pmsg::tip_click_photo);
     ImGui::EndTooltip();
 }
@@ -291,6 +292,7 @@ float height_stretch(const SensorData& d, int choice) {
     return kHeightScales[std::size(kHeightScales) - 1];
 }
 
+#ifdef SS_TOOL_SFM
 // How long a stream may go quiet before it is a gap: a few of its own
 // intervals. Any channel's reading counts -- derived speed has none while a
 // position repeats, and that is not the receiver falling silent.
@@ -308,6 +310,7 @@ void set_gap(SensorSeries& s) {
     std::nth_element(dt.begin(), dt.begin() + dt.size() / 2, dt.end());
     s.gap = std::max(5.0f * dt[dt.size() / 2], 0.5f);
 }
+#endif
 
 // Each factor as the stops of light it lets in (log2 t, log2 ISO, -2 log2 N),
 // and their sum over the factors every record has: for one source, what
@@ -740,7 +743,7 @@ void SensorView::draw_status(const SensorData& d) {
         ui::TextColoredRaw(c, text);
         if (!tip.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort) &&
             ImGui::BeginTooltip()) {
-            ImGui::PushTextWrapPos(px(460.0f));
+            ImGui::PushTextWrapPos(px(kTooltipWrapW));
             ui::TextRaw(tip);
             ImGui::PopTextWrapPos();
             ImGui::EndTooltip();
@@ -754,29 +757,29 @@ void SensorView::draw_status(const SensorData& d) {
     }
     if (d.video) {
         if (!d.has_gps) chip(ImGui::GetStyle().Colors[ImGuiCol_TextDisabled], pmsg::gps_none.get(), "");
-        else if (d.gps_usable) chip(kGood, pmsg::gps_usable.get(), gps_tip);
+        else if (d.gps_usable) chip(kOk, pmsg::gps_usable.get(), gps_tip);
         else chip(kWarn, pmsg::gps_unusable.get(),
                   gps_tip.empty() ? std::string(pmsg::gps_unusable_help.get()) : gps_tip);
         if (!d.has_imu) chip(ImGui::GetStyle().Colors[ImGuiCol_TextDisabled], pmsg::imu_none.get(), "");
-        else if (d.imu_usable) chip(kGood, pmsg::imu_usable.get(), imu_tip);
+        else if (d.imu_usable) chip(kOk, pmsg::imu_usable.get(), imu_tip);
         else chip(kWarn, pmsg::imu_unusable.get(),
                   imu_tip.empty() ? std::string(pmsg::imu_unusable_help.get()) : imu_tip);
         if (!d.exposure.empty())
-            chip(kGood, spirula::i18n::format(pmsg::exposure_records,
+            chip(kOk, spirula::i18n::format(pmsg::exposure_records,
                                               {count_text((long long)d.exposure.size())}),
                  pmsg::exposure_records_help.get());
     } else {
         const ImVec4 c = d.with_gps == 0 ? ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]
-                         : d.with_gps < d.photos ? kWarn : kGood;
+                         : d.with_gps < d.photos ? kWarn : kOk;
         chip(c, spirula::i18n::format(pmsg::gps_photos,
                                       {count_text(d.with_gps), count_text(d.photos)}),
              pmsg::gps_photos_help.get());
         if (d.with_attitude > 0)
-            chip(kGood, spirula::i18n::format(pmsg::attitude_photos,
+            chip(kOk, spirula::i18n::format(pmsg::attitude_photos,
                                               {count_text(d.with_attitude), count_text(d.photos)}),
                  pmsg::attitude_photos_help.get());
         if (d.with_exposure > 0)
-            chip(d.with_exposure < d.photos ? kWarn : kGood,
+            chip(d.with_exposure < d.photos ? kWarn : kOk,
                  spirula::i18n::format(pmsg::exposure_photos,
                                        {count_text(d.with_exposure), count_text(d.photos)}),
                  pmsg::exposure_photos_help.get());
@@ -790,7 +793,7 @@ void SensorView::draw_status(const SensorData& d) {
                  "");
     }
     if (d.outliers > 0)
-        chip(kBad,
+        chip(kErr,
              spirula::i18n::format(d.video ? pmsg::gps_outliers : pmsg::gps_far,
                                    {count_text((long long)d.outliers)}),
              d.video ? pmsg::gps_outliers_help.get() : pmsg::gps_far_help.get());
@@ -814,7 +817,7 @@ SensorView::Result SensorView::draw(float height, double playhead, double clip_s
     }
     const SensorData& d = *held;
     if (!d.error.empty()) {
-        ui::TextColoredWrappedRaw(kBad, d.error);
+        ui::TextColoredWrappedRaw(kErr, d.error);
         return r;
     }
     if (d.video && !reads_video()) {
@@ -1616,7 +1619,7 @@ void SensorView::draw_series(const SensorData& d, const SensorSeries& s, float h
                 if (const SensorExposure* e = exposure_at(d, tm)) ui::TextRaw(exposure_text(*e));
             if (s.kind == SensorSeries::Exposure) ui::TextDisabled(pmsg::tip_exposure_mean);
             for (const auto& [a, b] : holes)
-                if (tm >= a && tm <= b) ui::TextColored(kBad, pmsg::tip_gap, {fixed(b - a, 1)});
+                if (tm >= a && tm <= b) ui::TextColored(kErr, pmsg::tip_gap, {fixed(b - a, 1)});
             ui::TextDisabled(d.video ? pmsg::plot_help : pmsg::plot_help_photos);
             ImGui::EndTooltip();
         }

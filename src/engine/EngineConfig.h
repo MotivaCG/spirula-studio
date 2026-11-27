@@ -97,6 +97,8 @@ struct LossConfig {
     // is converted from linear to ray depth in place (in set_training_data,
     // before the depth bilateral grid). True = already ray depth, no-op.
     bool  input_depth_is_ray_depth = true;
+    // 3-class masks in gt.alpha: 0=ignore, 1=keep, 2=segment.
+    bool  segment_and_ignore_mask = false;
 };
 
 
@@ -214,8 +216,7 @@ struct OptimConfig {
 // What relocation treats as dead (TrainConfig::dead_criterion).
 enum class DeadCriterion : int { Opacity = 0, MaxWeight = 1, Either = 2 };
 
-// MCMC / revised-relocate densification controls. max_world_size / noise_lr*
-// arrive pre-scaled by alpha.
+// Densification controls. max_world_size arrives pre-scaled by alpha.
 struct DensifyConfig {
     int   refine_start_iter             = 0;
     int   refine_stop_num_iter          = 0;
@@ -228,7 +229,7 @@ struct DensifyConfig {
     float growth_factor                 = 1.0f;
     float min_opacity                   = 0.0f;
     // MaxWeight compares min_weight against each splat's peak alpha * T,
-    // halved every max_weight_half_life steps. Revised relocation only.
+    // halved every max_weight_half_life steps.
     DeadCriterion dead_criterion        = DeadCriterion::Opacity;
     float max_weight_half_life          = 800.0f;
     float min_weight                    = 0.0f;
@@ -245,7 +246,6 @@ struct DensifyConfig {
     float noise_lr                      = 0.0f;
     float noise_lr_final                = 0.0f;
     bool  noise_gate_peak_weight        = false;
-    bool use_revised_densification      = true;
     int  score_mode                     = 0;    // 0=mean, 1=max, 2=median, 3=geom
     // Blend weight `w` between the image-space accum_weight score and the
     // world-space gradient score: per-step weight =
@@ -302,10 +302,27 @@ struct DensifyConfig {
 
 // The schedule engine_densify_step grows the model on; the trainer's ETA and
 // VRAM forecasts replay it.
+inline int densify_stop_step(int refine_stop_iter, int refine_stop_num_iter,
+                             int max_steps) {
+    return std::max(refine_stop_iter, max_steps - refine_stop_num_iter);
+}
+inline bool densify_scoring_active(int refine_every, int refine_stop_iter,
+                                   int refine_stop_num_iter,
+                                   int step, int max_steps) {
+    return refine_every > 0 &&
+           step < densify_stop_step(refine_stop_iter, refine_stop_num_iter,
+                                    max_steps);
+}
+inline bool densify_scoring_active(const DensifyConfig& c, int step,
+                                   int max_steps) {
+    return densify_scoring_active(c.refine_every, c.refine_stop_iter,
+                                  c.refine_stop_num_iter, step, max_steps);
+}
 inline bool densify_grows_at(const DensifyConfig& c, int step, int max_steps) {
     return c.refine_every > 0 && step > c.refine_start_iter &&
            step % c.refine_every == 0 &&
-           step < std::max(c.refine_stop_iter, max_steps - c.refine_stop_num_iter);
+           step < densify_stop_step(c.refine_stop_iter, c.refine_stop_num_iter,
+                                    max_steps);
 }
 inline int64_t densify_target(const DensifyConfig& c, int64_t cur, int64_t cap) {
     return std::max(cur, std::min(cap, (int64_t)(c.growth_factor * (float)cur)));
@@ -340,6 +357,13 @@ struct BilagridStepConfig {
 
 // Background blending step config. When mode=Noise, only `randomize_weight`
 // Adam over the per-band SH coefficients (index 0 = DC color, 1+ = bands).
+enum class BackgroundSuppression : int {
+    None = 0,
+    Noise = 1,         // a color per pixel
+    Pseudorandom = 2,  // an RGB cube corner per tile, which SSIM cannot average away
+    Random = 3,        // one color for the whole frame
+};
+
 struct BackgroundStepConfig {
     float    lr_dc           = 0.0f;
     float    lr_sh           = 0.0f;

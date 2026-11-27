@@ -293,37 +293,6 @@ SS_MSG(preset_meshing_help,
     TR("Ağ çıkarmak üzere splat eğitmek için hazır ayar. Splat'ların kendi "
        "görünüşünden çok, üretilecek ağ geometrisinin niteliğini gözetir."));
 
-SS_MSG(preset_academic_baseline,
-    EN("Academic baseline"),
-    JA("論文どおりのベースライン"),
-    ZH_HANS("论文基准"),
-    ZH_HANT("論文基準"),
-    KO("논문 기준선"),
-    DE("Akademische Referenz"),
-    FR("Référence académique"),
-    ES("Línea base académica"),
-    PT("Linha de base acadêmica"),
-    IT("Riferimento accademico"),
-    NL("Academische referentie"),
-    RU("Академический эталон"),
-    TR("Akademik referans"));
-
-SS_MSG(preset_academic_baseline_help,
-    EN("Preset that replicates 3DGS MCMC as faithful as possible."),
-    JA("3DGS MCMC をできるかぎり忠実に再現するプリセットです。"),
-    ZH_HANS("尽可能忠实复现 3DGS MCMC 的预设。"),
-    ZH_HANT("盡可能忠實重現 3DGS MCMC 的預設。"),
-    KO("3DGS MCMC를 가능한 한 충실하게 재현하는 프리셋입니다."),
-    DE("Voreinstellung, die 3DGS MCMC so getreu wie möglich nachbildet."),
-    FR("Préréglage qui reproduit 3DGS MCMC aussi fidèlement que possible."),
-    ES("Preajuste que reproduce 3DGS MCMC con la mayor fidelidad posible."),
-    PT("Predefinição que reproduz 3DGS MCMC com a maior fidelidade possível."),
-    IT("Preimpostazione che riproduce 3DGS MCMC nel modo più fedele "
-       "possibile."),
-    NL("Voorinstelling die 3DGS MCMC zo getrouw mogelijk nabootst."),
-    RU("Пресет, максимально точно воспроизводящий 3DGS MCMC."),
-    TR("3DGS MCMC'yi olabildiğince sadık biçimde yeniden üreten hazır ayar."));
-
 // ---------------------------------------------------------------------------
 // name -> text. The names are config/TrainConfig.h's kTrainPresets, and each
 // consumer static_asserts that the two lists are the same length.
@@ -343,8 +312,6 @@ inline constexpr PresetText kPresetText[] = {
     {"hdr",               &preset_hdr,               &preset_hdr_help},
     {"synthetic",         &preset_synthetic,         &preset_synthetic_help},
     {"meshing",           &preset_meshing,           &preset_meshing_help},
-    // hidden by default, uncomment to enable
-   //  {"academic-baseline", &preset_academic_baseline, &preset_academic_baseline_help},
 };
 inline constexpr size_t kNumPresetText =
     sizeof(kPresetText) / sizeof(kPresetText[0]);

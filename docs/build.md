@@ -37,6 +37,7 @@ directly; regenerate its committed output when those files change.
 | `SsApps.cmake` | the `spirula` executable — every tool the build has, in one binary (backend-agnostic) |
 | `SsPackage.cmake` | the `macos_app` / `macos_dmg` targets ([Packaging](#packaging)) |
 | `SsMacBundle.cmake` | `ss_mac_prefer_static()` — the static linking a one-file bundle depends on ([Packaging](#packaging)) |
+| `SsWarnings.cmake` | compiler warnings on the project's own sources, not vendored code ([Warnings](#warnings)) |
 | `SsChecks.cmake` | the source lints ([Lints](#lints)) — included last, so every target above depends on them |
 
 Exactly one backend module runs. It leaves behind `SS_WITH_TORCH` and
@@ -59,6 +60,15 @@ directory themselves — a `-B` of your own reaches CMake but not the build step
 that follows, so select the tree with `SS_BACKEND`, not with `-B`.
 `build_develop.bash` additionally caps the job count by available RAM
 (~750 MB/job).
+
+Compiler warnings are errors (`SS_WARNINGS_AS_ERRORS`, on in a plain CMake
+build too). If your compiler raises a warning ours do not and stops the build,
+`--allow-warnings` builds anyway and only prints it (plain CMake:
+`-DSS_WARNINGS_AS_ERRORS=OFF`); please report the warning. CI passes
+`--warnings-at-end` instead: the build compiles everything, prints the
+distinct warnings, then fails. That flag runs the build through
+`tools/check_build_warnings.py`, so it needs Python. Switching between these
+modes recompiles everything once.
 
 ## The matrix
 
@@ -88,6 +98,8 @@ from one checkout and neither reconfigures the other.
 | `SS_BUILD_SAM` | `ON` for `vulkan`, `OFF` for `cuda` | `ss_nn` + `ss_sam` + `spirula sam` + `nn_ops_test` / `sam_pipeline_test`, the GUI's in-process masking, and LPIPS in the eval pass (`ss_lpips`). Same rule as SfM. |
 | `SS_ENABLE_PATENTED` | `OFF` | `ss_video` — container demux (HEIF stills included) + `VK_KHR_video_decode_*`, and the `VK_KHR_video_encode_*` encoder behind `spirula encode`. **Read the note below before turning it on.** |
 | `SS_SFM_REALS` / `SS_SFM_LOSSES` | all | trim the bundle-adjustment shader variant matrix while iterating (`src/sfm/README.md`) |
+| `SS_WARNINGS` | `ON` | compile project sources with extra warnings ([Warnings](#warnings)) |
+| `SS_WARNINGS_AS_ERRORS` | `ON` | fail the compile of a project source on any warning: `-Werror`, `/WX`, and nvcc's `-Werror=all-warnings` |
 | `SS_CHECK_COMMENTS` | `ON` | run the comment-length lint on every build ([Lints](#lints)) |
 
 ### `SS_ENABLE_PATENTED`
@@ -115,6 +127,24 @@ Nothing else in the build changes.
 
 If you distribute binaries, decide for your jurisdiction and your users before
 shipping one built with it on.
+
+## Warnings
+
+Project sources build with `-Wall -Wextra` on GCC and Clang (host code in
+`.cu` files too, through nvcc) and `/W4` on MSVC. Code in `src/external/`
+and FetchContent dependencies gets neither. Keep both backends building
+without warnings on Linux, Windows and macOS: a build stops on the first
+one, and CI fails after a build that printed any.
+
+GCC misses several Clang warnings that fail the macOS job: unused private
+fields and constants, a variable that is only ever incremented, and a defaulted
+copy assignment with no copy constructor beside it.
+
+The exceptions are in `cmake/SsWarnings.cmake`. `-Wmissing-field-initializers`
+is off because Vulkan's `VkFoo info{VK_STRUCTURE_TYPE_FOO}` relies on zero
+fill. MSVC's /W4 checks that GCC only enables with `-Wconversion`,
+`-Wshadow` or `-Wpedantic` are off, so both compilers report the same kinds
+of issue.
 
 ## Lints
 

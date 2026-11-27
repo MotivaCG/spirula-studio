@@ -4,6 +4,7 @@
 // Part of the PixelWise family -- see PixelWiseCommon.cuh.
 
 #include "kernels/pixelwise/BackgroundNoise.cuh"
+#include "core/Interpolation.cuh"
 #include "core/PixelFormat.h"
 
 #include <cooperative_groups.h>
@@ -67,18 +68,22 @@ __device__ __forceinline__ float3x3 _app_matrix(const float* m) {
     return r;
 }
 
+// `drawn`: the randomized draw replaced the base here, so no v_bg flows back.
 __device__ __forceinline__ float3 _app_background(
     const AppearanceChainParams& p, unsigned bid, unsigned x, unsigned y,
-    unsigned W, size_t pix
+    unsigned W, unsigned H, size_t pix, bool& drawn
 ) {
-    switch (p.bg) {
-    case AppearanceBg::Color:
-        return make_float3(p.bg_color[0], p.bg_color[1], p.bg_color[2]);
-    case AppearanceBg::Noise:
+    drawn = p.bg_noise != 0 &&
+        !(p.bg_mask && (nearest_sample_u8(p.bg_mask, (int)bid, (int)x, (int)y, (int)W,
+                                          (int)H, p.bg_mask_w, p.bg_mask_h) & 2));
+    if (drawn)
         return _bg_color(p.bg_transfer, p.bg_is_linear != 0, p.bg_blocky != 0,
                          p.bg_block_px, p.bg_seed, bid, x, y, W,
                          p.bg_randomize_weight,
                          _bg_exponent(bid, p.bg_exponent_by_cam, p.cam_indices));
+    switch (p.bg) {
+    case AppearanceBg::Color:
+        return make_float3(p.bg_color[0], p.bg_color[1], p.bg_color[2]);
     case AppearanceBg::Image:
         return ((const float3*)p.bg_image)[pix];
     default:
@@ -110,8 +115,9 @@ __global__ void appearance_chain_forward_kernel(
         raw16[3 * pix + 1] = c.y;
         raw16[3 * pix + 2] = c.z;
     }
-    if (p.bg != AppearanceBg::None) {
-        const float3 bg = _app_background(p, bid, x, y, W, pix);
+    if (appearance_has_bg(p)) {
+        bool drawn;
+        const float3 bg = _app_background(p, bid, x, y, W, H, pix, drawn);
         c = SlangPixelWise::blend_background(c, in_transmittance.load1(bid, y, x), bg);
     }
     if constexpr (PL >= 0) {
@@ -160,10 +166,12 @@ __global__ void appearance_chain_backward_kernel(
     const unsigned y = inside ? gid / W : 0u, x = inside ? gid % W : 0u;
     constexpr int P = kAppParams<PL>;
 
-    FixedArray<float, P> params, v_params;
+    // maybe_unused: only `if constexpr (PL >= 0)` reads these.
+    [[maybe_unused]] FixedArray<float, P> params;
+    FixedArray<float, P> v_params;
     #pragma unroll
     for (int i = 0; i < P; i++) v_params[i] = 0.0f;
-    int slot = 0;
+    [[maybe_unused]] int slot = 0;
     if constexpr (PL >= 0) {
         __shared__ float params_shared[P];
         slot = p.cam_indices ? p.cam_indices[bid] : (int)bid;
@@ -178,9 +186,10 @@ __global__ void appearance_chain_backward_kernel(
         const size_t pix = (size_t)bid * H * W + gid;
         const float3 raw = make_float3(in_rgb[3 * pix], in_rgb[3 * pix + 1],
                                        in_rgb[3 * pix + 2]);
-        const bool has_bg = p.bg != AppearanceBg::None;
+        const bool has_bg = appearance_has_bg(p);
         const float T = has_bg ? in_transmittance.load1(bid, y, x) : 0.0f;
-        const float3 bg = has_bg ? _app_background(p, bid, x, y, W, pix)
+        bool drawn = false;
+        const float3 bg = has_bg ? _app_background(p, bid, x, y, W, H, pix, drawn)
                                  : make_float3(0.0f, 0.0f, 0.0f);
         const float3 c_bg = has_bg ? SlangPixelWise::blend_background(raw, T, bg) : raw;
         float3 v = v_rgb.load3(bid, y, x);
@@ -193,7 +202,7 @@ __global__ void appearance_chain_backward_kernel(
             const float2 px = make_float2((float)x, (float)y);
             const float2 center = make_float2(intr.z, intr.w);
             const float2 size = make_float2((float)W, (float)H);
-            const bool clamp = p.ppisp_clamp != 0;
+            [[maybe_unused]] const bool clamp = p.ppisp_clamp != 0;
             float3 c_pre = c_bg;
             if constexpr (PL >= 0)
                 if (p.ppisp == AppearancePpisp::BeforeEncode)
@@ -227,7 +236,8 @@ __global__ void appearance_chain_backward_kernel(
             v_transmittance.store1(bid, y, x,
                                    v_transmittance.load1(bid, y, x) + v_T);
             if (p.bg == AppearanceBg::Image)
-                ((float3*)p.v_bg_image)[pix] = v_bg;
+                ((float3*)p.v_bg_image)[pix] =
+                    drawn ? make_float3(0.0f, 0.0f, 0.0f) : v_bg;
         } else if (overexposure_scale != 0.0f) {
             v = v + SlangPixelWise::overexposure_grad(raw, overexposure_scale);
         }

@@ -2,17 +2,35 @@
 
 # Development build for Linux and macOS. Extra arguments are passed to CMake:
 #   ./build_develop.bash -DSS_BACKEND=vulkan -DSS_BUILD_GUI=OFF
+# Warnings fail the compile. --allow-warnings only prints them, a way past a
+# warning your compiler raises and ours do not. --warnings-at-end (CI) builds
+# to the end and then fails, so the log lists every warning.
 
-# One tree per backend, so building one does not reconfigure the other. The
-# arguments are read, never consumed: your own -B still reaches CMake, and the
+# One tree per backend, so building one does not reconfigure the other. Only
+# the warning flags are consumed: your own -B still reaches CMake, and the
 # build step below would then target a tree it did not configure.
 ss_backend=cuda
+ss_warnings=error
 for arg in "$@"; do
+    shift
     case "$arg" in
+        --warnings-at-end)
+            [ "$ss_warnings" = allow ] || ss_warnings=at-end
+            continue ;;
+        --allow-warnings)
+            ss_warnings=allow
+            continue ;;
         -DSS_BACKEND=*|-DSSPLAT_BACKEND=*)
             ss_backend=$(printf '%s' "${arg#*=}" | tr 'A-Z' 'a-z') ;;
     esac
+    set -- "$@" "$arg"
 done
+ss_werror=ON
+[ "$ss_warnings" = error ] || ss_werror=OFF
+if [ "$ss_warnings" = at-end ] && ! command -v python3 >/dev/null 2>&1; then
+    echo "--warnings-at-end needs python3" >&2
+    exit 1
+fi
 if [ "$(uname)" = "Darwin" ]; then
     build_dir=build     # one backend on macOS (Vulkan via MoltenVK)
 else
@@ -97,7 +115,8 @@ if [ "$(uname)" = "Darwin" ]; then
     esac
 fi
 
-cmake -G Ninja -B "$build_dir" "$@" || exit $?
+# After the default, so an explicit -DSS_WARNINGS_AS_ERRORS=OFF wins.
+cmake -G Ninja -B "$build_dir" -DSS_WARNINGS_AS_ERRORS=$ss_werror "$@" || exit $?
 
 # Repair the ninja dependency log.
 if [ -f "$build_dir/.ninja_deps" ]; then
@@ -132,6 +151,29 @@ else
     AVAILABLE_KB=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
     AVAILABLE_MB=$(( AVAILABLE_KB / 1024 ))
     CPU_CORES=$(nproc)
+    # A container's or Slurm job's cgroup limit binds before MemAvailable does:
+    # the tightest over our cgroup and its ancestors, as src/core/HostMemory.h reads it.
+    cg_root=/sys/fs/cgroup cg_limits="memory.max memory.high" cg_usage=memory.current cg_cache=inactive_file
+    cg_path=$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup 2>/dev/null)
+    cg_v1=$(awk -F: '$2 ~ /(^|,)memory(,|$)/ {print $3}' /proc/self/cgroup 2>/dev/null)
+    if [ -n "$cg_v1" ]; then
+        cg_root=/sys/fs/cgroup/memory cg_path=$cg_v1 cg_limits=memory.limit_in_bytes
+        cg_usage=memory.usage_in_bytes cg_cache=total_inactive_file
+    fi
+    cg_dir=$cg_root${cg_path%/}
+    [ -r "$cg_dir/$cg_usage" ] || cg_dir=$cg_root
+    while :; do
+        usage=$(cat "$cg_dir/$cg_usage" 2>/dev/null)
+        cache=$(awk -v k="$cg_cache" '$1 == k {print $2}' "$cg_dir/memory.stat" 2>/dev/null)
+        for file in $cg_limits; do
+            limit=$(cat "$cg_dir/$file" 2>/dev/null)
+            [[ $limit =~ ^[0-9]+$ && $usage =~ ^[0-9]+$ ]] && (( limit < 1 << 62 )) || continue
+            left_mb=$(( (limit - usage + ${cache:-0}) / 1048576 ))
+            (( left_mb < AVAILABLE_MB )) && AVAILABLE_MB=$(( left_mb > 0 ? left_mb : 0 ))
+        done
+        [ "$cg_dir" = "$cg_root" ] && break
+        cg_dir=${cg_dir%/*}
+    done
 fi
 MAX_JOBS_FROM_RAM=$(( AVAILABLE_MB / JOB_RAM_MB ))
 JOBS=$(( MAX_JOBS_FROM_RAM < CPU_CORES ? MAX_JOBS_FROM_RAM : CPU_CORES ))
@@ -142,8 +184,12 @@ echo "CPU cores     : ${CPU_CORES}"
 echo "Using jobs    : ${JOBS}"
 echo ""
 # Propagate the build's exit status.
-if ! cmake --build "$build_dir" --verbose -j"${JOBS}"; then
+ss_build=(cmake --build "$build_dir" -j"${JOBS}")
+[ "$ss_warnings" = at-end ] && ss_build=(python3 tools/check_build_warnings.py -- "${ss_build[@]}")
+if ! "${ss_build[@]}"; then
     echo "BUILD FAILED" >&2
+    [ "$ss_werror" = ON ] &&
+        echo "If a compiler warning stopped it, rerun with --allow-warnings and report the warning." >&2
     exit 1
 fi
 

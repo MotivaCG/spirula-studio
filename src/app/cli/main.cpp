@@ -3,8 +3,8 @@
 //     spirula train [<preset>] --data <dir> [--flag value ...]
 //
 // where <preset> is one of 3dgs (the default), 360-camera, in-the-wild,
-// centered-object, hdr, synthetic, meshing, academic-baseline. Flags are the
-// FLATTENED config fields (--sh-degree, not --model.sh-degree); '-' and '_'
+// centered-object, hdr, synthetic, meshing. Flags are
+// the FLATTENED config fields (--sh-degree, not --model.sh-degree); '-' and '_'
 // are interchangeable; booleans take a value (--warp-to-pinhole 1). Struct,
 // flag table and preset appliers all come from config/TrainConfig.h.
 //
@@ -13,13 +13,13 @@
 // web viewer wiring.
 
 #include "app/DeviceIssue.h"
+#include "app/RunLog.h"
 #include "app/Tools.h"
 #include "app/TrainerCore.h"
-#include "app/gui/Subprocess.h"
+#include "app/cli/FinishCommand.h"
 #include "app/webviewer/Viewer.h"
 #include "checkpoint/Resume.h"
 #include "i18n/catalog/Cli.h"
-#include "i18n/catalog/Log.h"
 #include "i18n/catalog/Train.h"
 #include "i18n/catalog/TrainFields.h"
 
@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <set>
 #include <string>
@@ -51,7 +52,6 @@ namespace fs = std::filesystem;
 using namespace spirula;
 
 namespace cmsg = spirula::i18n::msg::cli;
-namespace lmsg = spirula::i18n::msg::log;
 namespace tmsg = spirula::i18n::msg::train;
 using spirula::i18n::format;
 
@@ -158,6 +158,7 @@ bool set_config_field(TrainConfig& c, const std::string& key,
 #define SS_TRY_SET(type, member, default_, section, tier, choices)            \
     if (key == #member) {                                                      \
         consume(c.member, key, argc, argv, i);                                 \
+        train_upgrade_background_mode(c);                                      \
         check_choices(c.member, key, choices);                                 \
         seen.insert(#member);                                                  \
         return true;                                                           \
@@ -395,24 +396,36 @@ void dump_cameras_json(const char* path, const ParsedDataset& ds,
     std::fclose(f);
 }
 
-// Waits for it, so it ends before the trainer exits or parks on the viewer.
-void run_finish_command(const std::string& command, const std::string& message) {
-    const std::vector<std::string> argv =
-        gui::command_argv(command, gui::kMessageToken, message);
-    if (argv.empty()) return;
-    std::printf("%s\n", format(lmsg::finish_cmd_running, {command}).c_str());
-    std::fflush(stdout);
-    const std::atomic<bool> never{false};
-    const int code = gui::run_process(argv, "", [](const std::string& line) {
-        std::printf("%s\n", line.c_str());
-        std::fflush(stdout);
-    }, never);
-    if (code == gui::kSpawnFailed)
-        std::fprintf(stderr, "%s\n", format(lmsg::finish_cmd_missing, {argv.front()}).c_str());
-    else if (code != 0)
-        std::fprintf(stderr, "%s\n", format(lmsg::finish_cmd_exit, {(long long)code}).c_str());
-    else
-        std::printf("%s\n", lmsg::finish_cmd_ok.get());
+// The GUI's snapshot minus the panels a command line does not have.
+void write_run_settings(std::ofstream& f, const TrainConfig& cfg, const std::string& preset,
+                        int argc, char** argv) {
+    if (!f.is_open()) return;
+    std::string command;
+    for (int i = 0; i < argc; i++) {
+        const std::string a = argv[i];
+        const bool quote = a.empty() || a.find_first_of(" \t\"") != std::string::npos;
+        command += (i ? " " : "") + (quote ? "\"" + a + "\"" : a);
+    }
+    std::string out = runlog::run_heading();
+    out += runlog::entry("run_started", runlog::file_stamp());
+    out += runlog::entry("spirula_version", SS_VERSION);
+    out += runlog::entry("command", command);
+    const int cur = backend::device_current();
+    if (cur >= 0) {
+        const backend::DeviceInfo d = backend::device_info(cur);
+#ifdef SS_BACKEND_VULKAN
+        out += runlog::entry("native_device", d.uuid.empty() ? "auto" : d.uuid);
+        out += runlog::entry("native_device_name", d.name);
+#else
+        out += runlog::entry("cuda_device", std::to_string(cur));
+        out += runlog::entry("cuda_device_name", d.name);
+#endif
+    }
+    out += runlog::entry("preset", preset);
+    out += runlog::train_sections(cfg);
+    out += runlog::settings_end();
+    f << out;
+    f.flush();
 }
 
 }  // namespace
@@ -424,6 +437,7 @@ void run_finish_command(const std::string& command, const std::string& message) 
 
 int spirula_train_main(int argc, char** argv) {
     std::string finish_command;   // set once the config is final
+    std::ofstream run_log;        // <dataset>/logs/train_<stamp>.log, as the GUI writes
     try {
         // ---- Preset + flags ------------------------------------------------
         std::string preset = "3dgs";
@@ -508,10 +522,21 @@ int spirula_train_main(int argc, char** argv) {
 
         select_and_print_devices(device_flag, device_set);
 
+        const fs::path log_file = runlog::open(run_log, runlog::dataset_dir(cfg.data), "train",
+                                               runlog::file_stamp());
+        write_run_settings(run_log, cfg, preset, argc, argv);
+
         // ---- Session -------------------------------------------------------
         TrainerSession session;
         session.cfg = cfg;
         session.preset = preset;
+        session.run_log = log_file.string();
+        session.app_version = SS_VERSION;
+        session.log_fn = [&run_log](const std::string& s) {
+            std::printf("%s\n", s.c_str());
+            std::fflush(stdout);
+            runlog::write_line(run_log, s);
+        };
 
         session.check_config();
         session.load_dataset();
@@ -550,22 +575,28 @@ int spirula_train_main(int argc, char** argv) {
                 std::snprintf(step, sizeof step, "%6d", p.step + 1);
                 std::snprintf(pct, sizeof pct, "%3d",
                               100 * (p.step + 1) / p.total_steps);
-                std::printf("%s", format(cmsg::train_step_line,
-                                         {step, p.total_steps, pct,
-                                          (long long)p.num_splats,
-                                          format_duration(session.elapsed_seconds()),
-                                          format_duration(session.eta_seconds())}).c_str());
+                std::string line = format(cmsg::train_step_line,
+                                          {step, p.total_steps, pct,
+                                           (long long)p.num_splats,
+                                           format_duration(session.elapsed_seconds()),
+                                           format_duration(session.eta_seconds())});
+                char kv[64];
                 for (const char* k : {"rgb_loss", "ssim", "delta_e", "flip", "psnr",
                                       "pca_lambda1", "pca_tangent", "pca_normal"}) {
                     auto it = p.losses.find(k);
-                    if (it != p.losses.end()) std::printf("  %s=%.4g", k, it->second);
+                    if (it == p.losses.end()) continue;
+                    std::snprintf(kv, sizeof kv, "  %s=%.4g", k, it->second);
+                    line += kv;
                 }
                 for (const char* k : {"num_dead", "num_relocated", "num_added"}) {
                     auto it = p.losses.find(k);
-                    if (it != p.losses.end()) std::printf("  %s=%lld", k, (long long)it->second);
+                    if (it == p.losses.end()) continue;
+                    std::snprintf(kv, sizeof kv, "  %s=%lld", k, (long long)it->second);
+                    line += kv;
                 }
-                std::printf("\n");
+                std::printf("%s\n", line.c_str());
                 std::fflush(stdout);
+                runlog::write_line(run_log, line);
             }
         };
         const bool stop_on_interrupt = cfg.steps_per_save != 0;
@@ -580,18 +611,21 @@ int spirula_train_main(int argc, char** argv) {
             g_train_stop.store(nullptr);
         }
         if (g_train_interrupted.load()) {
-            std::printf("%s\n", format(cmsg::train_stopped_resume,
-                                       {(long long)session.cur_step.load(), cfg.num_iterations,
-                                        fs::absolute(session.out_dir).string()}).c_str());
+            const std::string stopped =
+                format(cmsg::train_stopped_resume,
+                       {(long long)session.cur_step.load(), cfg.num_iterations,
+                        fs::absolute(session.out_dir).string()});
+            std::printf("%s\n", stopped.c_str());
+            runlog::write_line(run_log, stopped);
             return 130;   // the shell's convention for SIGINT, 128 + 2
         }
         // Held-out eval. Replaces the engine's DataManager, so nothing may
         // train afterwards -- and the viewer, which only reads splats, is
         // unaffected. TODO: early stopping on the validation split.
         session.eval();
-        run_finish_command(finish_command,
-                           format(tmsg::finish_cmd_trained,
-                                  {fs::absolute(session.out_dir).string()}));
+        cli::run_finish_command(finish_command,
+                                format(tmsg::finish_cmd_trained,
+                                       {fs::absolute(session.out_dir).string()}));
 
         if (viewer_on && cfg.keep_viewer_alive) {
             std::printf("%s\n", cmsg::train_done_viewer.get());
@@ -600,8 +634,10 @@ int spirula_train_main(int argc, char** argv) {
         }
 
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "%s\n", format(cmsg::error_line, {e.what()}).c_str());
-        run_finish_command(finish_command, format(tmsg::finish_cmd_failed, {e.what()}));
+        const std::string error = format(cmsg::error_line, {e.what()});
+        std::fprintf(stderr, "%s\n", error.c_str());
+        runlog::write_line(run_log, error);
+        cli::run_finish_command(finish_command, format(tmsg::finish_cmd_failed, {e.what()}));
         return 1;
     }
     return 0;
