@@ -1,0 +1,61 @@
+diff --git a/src/app/TrainerCore.cpp b/src/app/TrainerCore.cpp
+index cb9bf2c2..9f168c0e 100644
+--- a/src/app/TrainerCore.cpp
++++ b/src/app/TrainerCore.cpp
+@@ -1750,6 +1750,10 @@ void TrainerSession::install_data_manager(const std::vector<std::string>& images
+     dm.load_depths      = has_depth;
+     dm.load_normals     = has_normal;
+     dm.train_batch_size = train_bs;
++    if (frames > 1 && cfg.spacetime_same_frame) {  // SPACETIME_KEYFRAMES.md
++        dm.frame_run = cfg.spacetime_batch;
++        dm.views_per_frame = (int)N;
++    }
+     dm.val_batch_size   = val_bs;
+     dm.flip_mask = cfg.flip_mask;
+     // Per-camera inputs repeated for each frame; view indices shifted by N a frame.
+diff --git a/src/data/DataManager.cpp b/src/data/DataManager.cpp
+index 69ba830b..3d273cdb 100644
+--- a/src/data/DataManager.cpp
++++ b/src/data/DataManager.cpp
+@@ -2125,6 +2125,25 @@ void DataManagerImpl::build_train_schedule_locked() {
+     // Interleave step order so full-chunk and mixed steps don't cluster.
+     std::shuffle(_train_schedule.begin(), _train_schedule.end(), _rng);
+ 
++    // Runs of frame_run steps from one frame, the last run of a frame padded with
++    // its first steps so every run starts on a multiple of frame_run.
++    if (_cfg.frame_run > 1 && _cfg.views_per_frame > 0 && B == 1) {
++        const size_t R = (size_t)_cfg.frame_run;
++        std::map<int32_t, std::vector<StepSpec>> by_frame;
++        for (auto& step : _train_schedule)
++            by_frame[step.front().picks.front() / _cfg.views_per_frame].push_back(std::move(step));
++        std::vector<std::vector<StepSpec>> runs;
++        for (auto& [frame, steps] : by_frame)
++            for (size_t i = 0; i < steps.size(); i += R) {
++                runs.emplace_back();
++                for (size_t k = 0; k < R; ++k) runs.back().push_back(steps[(i + k) % steps.size()]);
++            }
++        std::shuffle(runs.begin(), runs.end(), _rng);
++        _train_schedule.clear();
++        for (auto& run : runs)
++            for (auto& step : run) _train_schedule.push_back(std::move(step));
++    }
++
+     // One divisor per epoch, so each image trains equally often at each size. An
+     // epoch that would cross a stage switch ends at it, which keeps the switch on
+     // its planned step after a mid-epoch resume or a pass of uneven length.
+diff --git a/src/data/DataManager.h b/src/data/DataManager.h
+index 75d56c9d..3fc35f12 100644
+--- a/src/data/DataManager.h
++++ b/src/data/DataManager.h
+@@ -67,6 +67,11 @@ struct DataManagerConfig {
+     // with fewer than batch_size images yield a smaller batch.
+     int  train_batch_size = 1;
+ 
++    // Chunks: with frame_run > 1 the one-view steps come in runs of frame_run
++    // sharing a frame (view index / views_per_frame). 0 keeps the plain shuffle.
++    int  frame_run = 0;
++    int  views_per_frame = 0;
++
+     // Eval batch size. Ignored when val_indices is empty.
+     int  val_batch_size   = 1;
+ 

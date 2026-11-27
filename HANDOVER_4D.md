@@ -2,7 +2,7 @@
 
 Documento de traspaso para que cualquier LLM (o persona) pueda retomar el trabajo sin el historial de la conversación. Cubre lo que se quiere, las reglas del dueño, todo lo probado con sus números y fallos, contra qué se compara y dónde está cada cosa (datos, código, papers, herramientas).
 
-- Fecha: 2026-11-03; actualizado el 2026-11-19 y el 2026-11-20 (§0, §6, §8.8-8.10, §9, §10, §11).
+- Fecha: 2026-11-03; actualizado el 2026-11-19, el 2026-11-20 y el 2026-11-22 (§0, §6, §8.8-8.10, §9, §10, §11).
 - Dueño: Victor (MotivaCG / ScanMeNow / THE4DSCANNER).
 - Idioma: conversación en español; código, comentarios y commits en inglés.
 - Cifras: todas salen de logs o medidas guardadas. Donde algo no se midió, se dice.
@@ -17,13 +17,20 @@ Documentos más antiguos que este (no los sustituye; este resume y actualiza):
 
 ---
 
-## 0. Estado a 2026-11-20 (leer primero)
+## 0. Estado a 2026-11-22 (leer primero)
 
-- **Mejor resultado estable:** TP2, rehecho con la binaria actual como TP2M (§8.8, §9.1).
-  - Es spacetime (ST7L) más transplantes de NAIF cada 3 frames y `--opacity-reg 0.01`.
-  - Error HP 66/73/76: 14,08 / 11,83 / 12,70 (NAIF: 11,98 / 10,18 / 11,16).
-  - Vibración 0,30 mm.
-  - **Ocupa 59,6 MB por chunk en VGSEditor; Gracia ocupa 26-45 MB. No sirve como producto.**
+- **Primer resultado entregable: TRiGS T2c** (§9.1, punto 11).
+  - Modo COLMAP con imágenes reales, la habitación como filas estáticas y SH1.
+  - 41,2 MB en VGSEditor; error HP 66/73/76: 13,42 / 11,81 / 12,64 (mejor que TP2M).
+  - Luz 0,97-0,99; vibración 0,21 mm; cara y mano limpias.
+  - Es código AGPL ejecutado tal cual. Para producción hay que reimplementarlo en spirula como diseño propio.
+- **Reimplementación en spirula (KF1-KF6, 2026-11-22/23):** detalle y resultados en `SPACETIME_KEYFRAMES.md`.
+  - Todavía no cumple. Cara 73 más blanda que T2c, luz 0,93-0,96 y error de máscara por encima de TP2M; la vibración, 0,19 mm, es la mejor.
+  - Descartado: lote de 8 cámaras del mismo instante (KF2), normal 0,1 (KF3), sin PPISP (KF4), color constante (KF5) y sin las pérdidas extra (KF6). Ninguno mueve la cara 73.
+  - **Siguiente:** habitación entrenada a la vez, modelo de movimiento o tasas de aprendizaje (`SPACETIME_KEYFRAMES.md` §8).
+- **Anterior mejor resultado estable:** TP2, rehecho con la binaria actual como TP2M.
+  - Error HP 14,08 / 11,83 / 12,70.
+  - Ocupa 59,6 MB en VGSEditor, fuera de presupuesto.
 - **Mejor compromiso tamaño/detalle:** J1a (§9.1).
   - 41,3 MB; error HP 14,53 / 12,48 / 13,27.
   - Cara limpia, mano como TP2M, luz algo baja (0,95).
@@ -39,13 +46,9 @@ Documentos más antiguos que este (no los sustituye; este resume y actualiza):
 - **Diagnóstico de por qué fallamos:** §8.10. Hay que matizarlo con J1c: la recolocación y la forma entrenable juntas tampoco crean detalle.
   - Lo que hace TP2 mejor son sus transplantes densos de NAIF.
   - Su coste en tamaño está en los ~470k registros tenues que los acompañan.
-- **Decisión pendiente del dueño:**
-  1. T2: TRiGS con imágenes reales (modo COLMAP).
-  2. J1a con más presupuesto de registros (~44 MB).
-  3. Una idea nueva.
 - **Código:**
   - `Gracia` está fusionada en `TemporalChunk` (commit `b1bc0608`); la binaria es `outputs\tc\bin_merge`.
-  - La forma entrenable de spacetime (parche de ST10 reaplicado) está **sin commitear** en el árbol; su binaria es `bin_j1`.
+  - El entrenador por keyframes (KF1) está **sin commitear** en el árbol; su binaria es `outputs\tc\bin_kf`. Sus scripts están en `reference/temporal/kf/`.
   - La binaria nueva cambia valores por defecto (§6). Las comparaciones van contra TP2M, no contra el TP2 antiguo.
 
 ---
@@ -654,6 +657,37 @@ Diseño propio con ideas de TRiGS y open4dgs (nada de código copiado). Se imple
       - Sus frames exportados quitan las filas invisibles, así que el número de filas cambia por frame. Por eso no se midieron tamaño `.vgs` ni vibración.
     - **Matiz:** prueba su modo PLY en esta GPU, no TRiGS con imágenes reales. En la órbita sintética la cara ocupa ~100 px y la supervisión de detalle es pobre.
     - **T2**, modo COLMAP con las imágenes del rig y un NPZ de inicio nuestro, **no se ha hecho**.
+
+11. **TRiGS con imágenes reales: T2, T2b, T2c (2026-11-20/22).** Modo COLMAP de `open4dgs-trigs` sin modificar.
+    - **Preparación (`outputs\tc\trigs_t2_prep.py`):**
+      - `TRIGS_T2_data`: COLMAP del frame 45, más imágenes y máscaras de 45-76 como enlaces duros.
+      - NPZ propio: centros de NAIF cada 3 frames (150k por keyframe), velocidad y aceleración de los 4 registros de ST7L más cercanos, tiempos y duraciones normalizados.
+      - Con un tercer argumento, añade nuestra `room.ply` como filas `is_static`.
+    - **Arnés `run_trigs_ply.py colmap`:**
+      - caché de imágenes de 1500 vistas (fija a 300 en su código);
+      - `TRIGS_MAX_SH` para cambiar el grado SH, fijo a 3 en su camino NPZ.
+    - **Receta común:** 8 cámaras por paso, 12k pasos, 800k primitivas.
+    - **Exportación:** con todas las filas (`--no-apply-temporal-cull --active-opacity-thresh -1`). Después, `trigs_frames_subject.py` quita las filas estáticas y reordena al formato 3DGS.
+
+    | Run | Qué cambia | VGSEditor | HP 52 / 60 / 66 / 73 / 76 | Máscara 73 | Luz | Vibración |
+    |---|---|---|---|---|---|---|
+    | TP2M | (control) | 59,6 MB | 15,06 / 14,87 / 14,08 / 11,83 / 12,70 | 5,91 | 1,03 | 0,30 mm |
+    | T2 | solo sujeto en el NPZ | — | 13,38 / 13,67 / 12,81 / 11,98 / 12,82 | 6,78 | 1,01 | — |
+    | T2b (sin habitación al exportar) | + habitación estática, SH3 | 52,2 MB | 13,63 / 13,28 / 12,29 / 10,94 / 11,70 | 5,18 | 0,98 | 0,24 mm |
+    | T2b recortado a SH1 sin reentrenar | — | 41,2 MB | 15,10 / 14,90 / 13,80 / 12,47 / 13,19 | 6,27 | 0,99 | — |
+    | **T2c** | **SH1 entrenado** | **41,2 MB** | **14,70 / 14,36 / 13,42 / 11,81 / 12,64** | **5,66** | 0,97-0,99 | **0,21 mm** |
+
+    - **T2:** rayas blancas (el poste de la habitación) atraviesan al sujeto. Sin filas estáticas, los splats del sujeto explican el fondo.
+    - **T2b:** limpio; detalle al nivel de NAIF. Pasa de tamaño por el SH3.
+    - **T2c cumple el criterio completo** (≤ 45 MB, HP ≤ TP2M + 3 %, máscara ≤ TP2M):
+      - es el primer resultado entregable;
+      - cara y mano limpias, al nivel de TP2M;
+      - 724k registros, el 15 % de chunk entero.
+    - **Pendientes:**
+      - humo en el suelo bajo los pies (también en TP2M y J1a);
+      - ~2 h por chunk aquí, limitado por cargar los PNG (GPU al ~55 %);
+      - el código es AGPL, así que para producción hay que reimplementarlo como diseño propio en spirula;
+      - falta probarlo en otros chunks y otra toma.
 
 ### 9.2 Caminos anteriores, con su estado
 

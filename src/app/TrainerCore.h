@@ -386,6 +386,8 @@ private:
     // Spacetime training (cfg.spacetime_init), defined in TrainerSpacetime.cpp.
     bool spacetime() const;
     SeedSplats spacetime_seed(const ColorResolution& color, size_t cap);
+    SeedSplats keyframe_seed(const ColorResolution& color, size_t cap);
+    SeedSplats chunk_run_seed(const ColorResolution& color, size_t cap);
     void setup_spacetime();
     void save_spacetime(int step);
     void spacetime_after_step(int step, const EngineStepConfig& sc);

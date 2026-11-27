@@ -2579,17 +2579,17 @@ SS_MSG_EN(temporal_init_dir_help,
     "Folder of frames/NNN/splat.ply with the same rows: each frame starts from its own file, to refine a finished chunk.");
 SS_MSG_EN(spacetime_init, "Train the chunk in spacetime");
 SS_MSG_EN(spacetime_init_help,
-    "A finished chunk run to start from: each record becomes one splat with a trajectory over the chunk, trained on all frames at once.");
-SS_MSG_EN(spacetime_window_lr, "Life window rate");
+    "A finished chunk run, or a keyframe seed folder (seed.ply, motion.bin), to start from: each record is one splat with a trajectory and a life over the chunk.");
+SS_MSG_EN(spacetime_window_lr, "Life rate");
 SS_MSG_EN(spacetime_window_lr_help,
-    "How fast each record's first and last frame move, in frames per step.");
+    "How fast each record's life centre (frames) and log width move per step.");
 SS_MSG_EN(spacetime_batch, "Views per record step");
 SS_MSG_EN(spacetime_batch_help,
     "Views whose gradients one update of the records averages: one view a step is "
     "too noisy for a record seen from every frame.");
 SS_MSG_EN(spacetime_relocate, "Spacetime relocation budget");
 SS_MSG_EN(spacetime_relocate_help,
-    "Share of the records that may move every relocation interval: records shown in no frame take long-axis splits. 0 turns it off.");
+    "Share of the records that may move every relocation interval: faded records become copies of needed ones. 0 turns it off.");
 SS_MSG_EN(spacetime_relocate_every, "Spacetime relocation interval");
 SS_MSG_EN(spacetime_relocate_every_help, "Steps between two spacetime relocations.");
 SS_MSG_EN(spacetime_spare, "Spare records");

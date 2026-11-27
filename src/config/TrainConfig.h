@@ -227,7 +227,7 @@ inline bool train_choice_valid(const std::string& value, const char* choices) {
     X(std::string, temporal_init_dir, "", "splats", "advanced", "none")      \
     X(std::string, temporal_room_ply, "", "splats", "advanced", "none")      \
     X(std::string, spacetime_init, "", "splats", "advanced", "none")         \
-    X(float, spacetime_window_lr, 0.02f, "splats", "expert", "")             \
+    X(float, spacetime_window_lr, 0.005f, "splats", "expert", "")            \
     X(int, spacetime_batch, 4, "splats", "expert", "")                       \
     X(float, spacetime_relocate, 0.0f, "splats", "expert", "")               \
     X(int, spacetime_relocate_every, 100, "splats", "expert", "")            \

@@ -1,10 +1,12 @@
 // Spacetime chunk training: every subject row is one .vgs record over the whole
-// chunk. Position, rotation, base colour and opacity are uniform cubic B-splines
-// in time, opacity also times a soft window [t0, t1] (frames); scale and SH sit in
-// the engine's buffers, constant per record as .vgs stores them. Each step evaluates the
-// records at the frame of the step's view into the live buffers, the engine
-// trains as usual, and the gradients it leaves in engine().grad are chained back
-// to the records, which keep their own Adam state. Design: 4DGS_Papers PLAN.md.
+// chunk. Position, rotation and base colour are uniform cubic B-splines in time;
+// opacity is a base alpha times a Gaussian in time (centre mu, width sigma, in
+// frames), so a record's life is learnt and "dead" (base alpha low) is global.
+// Scale and SH sit in the engine's buffers, constant per record as .vgs stores them.
+// Each step evaluates the records at the frame of the step's view into the live
+// buffers, the engine trains as usual, and the gradients it leaves in engine().grad
+// are chained back to the records, which keep their own Adam state.
+// Design and decisions: SPACETIME_KEYFRAMES.md.
 #pragma once
 #include <cstdint>
 #include <vector>
@@ -14,33 +16,35 @@ struct TrainStep;
 constexpr int kSpacetimePos = 16;   // position control points per record (8: p90 1.6 mm off the chain)
 constexpr int kSpacetimeRot = 8;    // rotation control points (raw quaternions)
 constexpr int kSpacetimeColor = 8;  // base colour control points (DC coefficients)
-constexpr int kSpacetimeOpacity = 8;  // opacity logit control points (constant: less detail)
 
 // Rows [room, room + rows) of the engine, record r at row room + r.
 struct SpacetimeRecords {
     int64_t rows = 0;
-    std::vector<float> pos;      // [rows, kSpacetimePos, 3]
-    std::vector<float> rot;      // [rows, kSpacetimeRot, 4]
-    std::vector<float> color;    // [rows, kSpacetimeColor, 3]
-    std::vector<float> opacity;  // [rows, kSpacetimeOpacity] logit, times the window
-    std::vector<float> window;   // [rows, 2] t0, t1 in frames, soft edges
+    std::vector<float> pos;        // [rows, kSpacetimePos, 3]
+    std::vector<float> rot;        // [rows, kSpacetimeRot, 4]
+    std::vector<float> color;      // [rows, kSpacetimeColor, 3]
+    std::vector<float> opacity;    // [rows] base logit
+    std::vector<float> mu;         // [rows] life centre, frames
+    std::vector<float> log_sigma;  // [rows] life width, log frames
 };
 
 struct SpacetimeRates {
-    float pos = 0, rot = 0, color = 0, opacity = 0, window = 0;
+    float pos = 0, rot = 0, color = 0, opacity = 0, mu = 0, sigma = 0;
     int batch = 1;  // views whose gradients one step averages
-    // The engine's opacity penalty (mcmc_opacity_reg_weight): its optimizer adds
-    // it past the gradient buffers, so the records take it here.
+    // weight * mean over records of base alpha * gamma(t), gamma held fixed: what
+    // is not needed fades out of its frames and, once its base is low, relocates.
     float opacity_reg = 0;
-    // Scale and SH, one per record over the chunk; their penalties as opacity_reg.
+    // Scale and SH, one per record over the chunk; their penalties as the engine's.
     float scale = 0, sh = 0, scale_reg = 0, sh_reg = 0;
 };
 
 // Weights of the K control points of a clamped uniform cubic B-spline at frame
 // t of `frames` (t clamped to [0, frames - 1]).
 void spacetime_basis(int K, int frames, float t, float* w);
-// The soft life window's factor at frame t.
-float spacetime_window(float t0, float t1, float t);
+// The life factor gamma at frame t: exp(-(t - mu)^2 / 2 sigma^2), 0 under 0.01.
+float spacetime_life(float mu, float log_sigma, float t);
+// Record r's alpha at frame t.
+float spacetime_alpha(const SpacetimeRecords& rec, int64_t r, float t);
 
 void engine_spacetime_begin(SpacetimeRecords records, int frames, int views_per_frame, int64_t room);
 void engine_spacetime_end();
@@ -58,7 +62,7 @@ int engine_spacetime_frame();
 // step on their mean.
 void engine_spacetime_after_step(const SpacetimeRates& lr);
 const SpacetimeRecords& engine_spacetime_records();
-// Relocation in spacetime: records shown in no frame (alpha under min_opacity
-// everywhere) take long-axis splits of the records the densification score
-// points at, one record for the whole chunk each. Returns how many moved.
+// Relocation: up to max_new records of base alpha under min_opacity become copies
+// of live ones drawn by need, shifted in time by up to sigma / 4, alpha and scale
+// shared as 3DGS-MCMC does. Returns how many moved.
 int64_t engine_spacetime_relocate(int64_t max_new, float min_opacity, uint64_t seed);

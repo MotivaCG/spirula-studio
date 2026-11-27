@@ -26,8 +26,6 @@ constexpr float kMinDist = 0.0005f;  // inverse distance weights saturate here (
 constexpr int kCalibrationViews = 200;
 constexpr size_t kMinSamples = 1000;
 
-float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
-
 int64_t cell_key(int64_t x, int64_t y, int64_t z) {
     constexpr int64_t o = int64_t(1) << 20;
     return ((x + o) << 42) | ((y + o) << 21) | (z + o);
@@ -112,7 +110,7 @@ struct Motion {
     std::vector<Field> fwd, bwd;  // by frame; fwd[F - 1] and bwd[0] empty
     int frames = 0;
     float weight = 0.0f, lambda = 0.0f;
-    std::vector<float> bpos, brot, bopacity;
+    std::vector<float> bpos, brot;
     std::vector<Entry> cache;  // [rows, frames]
     int views = 0;
     std::vector<float> samples;
@@ -194,7 +192,6 @@ void spacetime_motion_begin(const std::string& dir, float weight, int frames, in
     }
     m->bpos = basis_table(kSpacetimePos, frames);
     m->brot = basis_table(kSpacetimeRot, frames);
-    m->bopacity = basis_table(kSpacetimeOpacity, frames);
     m->cache.assign((size_t)rows * (size_t)frames, Entry{});
     std::fprintf(stderr, "[spirula] spacetime motion: %zu field points over %d frames from %s, weight %g\n", points,
                  frames, dir.c_str(), weight);
@@ -215,7 +212,6 @@ void spacetime_motion_view(const SpacetimeMotionView& v) {
     const int F = m.frames, f = v.frame;
     const float* bf = m.bpos.data() + (size_t)f * kSpacetimePos;
     const float* wr = m.brot.data() + (size_t)f * kSpacetimeRot;
-    const float* wo = m.bopacity.data() + (size_t)f * kSpacetimeOpacity;
     const float* bnext = f + 1 < F ? m.bpos.data() + (size_t)(f + 1) * kSpacetimePos : nullptr;
     const float* bprev = f > 0 ? m.bpos.data() + (size_t)(f - 1) * kSpacetimePos : nullptr;
     const bool calibrating = m.views < kCalibrationViews;
@@ -258,11 +254,7 @@ void spacetime_motion_view(const SpacetimeMotionView& v) {
                 if ((e.cf > 0.0f || e.cb > 0.0f) && g > 0.0f && r % 4 == 0) samples.push_back(g * to_lambda);
                 continue;
             }
-            const float* W = rec.window.data() + 2 * r;
-            const float* O = rec.opacity.data() + (size_t)r * kSpacetimeOpacity;
-            float o = 0.0f;
-            for (int k = 0; k < kSpacetimeOpacity; k++) o += wo[k] * O[k];
-            const float alpha = sigmoid(o) * spacetime_window(W[0], W[1], (float)f);
+            const float alpha = spacetime_alpha(rec, r, (float)f);
             float* grad = v.acc + (size_t)r * v.stride;
             if (e.cf > 0.0f) spacetime_motion_pair(P, bf, bnext, e.sf, e.cf * alpha, m.lambda, grad);
             if (e.cb > 0.0f) spacetime_motion_pair(P, bf, bprev, e.sb, e.cb * alpha, m.lambda, grad);

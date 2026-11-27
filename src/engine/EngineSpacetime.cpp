@@ -15,17 +15,20 @@
 
 namespace {
 
-constexpr float kEdge = 0.3f;  // window edge, in frames
 constexpr float kBeta1 = 0.9f, kBeta2 = 0.999f, kEps = 1e-15f;
 constexpr float kDcMax = 0.5f / 0.28209479177387814f;  // DC of colour 0 or 1
+constexpr float kCull = 0.01f;                          // gamma under this: not drawn
+constexpr float kMinSigma = 0.15f;                      // frames (5 ms at 30 fps)
+constexpr int kMaxCopies = 50;                          // clones of one donor per relocation
 constexpr int kGradPos = 0, kGradRot = kGradPos + kSpacetimePos * 3, kGradColor = kGradRot + kSpacetimeRot * 4,
-              kGradOpacity = kGradColor + kSpacetimeColor * 3, kGradWindow = kGradOpacity + kSpacetimeOpacity,
-              kGradWidth = kGradWindow + 2;
+              kGradOpacity = kGradColor + kSpacetimeColor * 3, kGradMu = kGradOpacity + 1, kGradSigma = kGradMu + 1,
+              kGradWidth = kGradSigma + 1;
 
 float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
+float logit(float a) { return std::log(a / (1.0f - a)); }
 
 // One Adam state for a parameter array, with a step count per record: a step
-// only touches the records the view saw. As the engine's: no first-moment bias
+// only touches the records the batch saw. As the engine's: no first-moment bias
 // correction, so a record's first steps are small.
 struct Adam {
     std::vector<float> m, v;
@@ -38,6 +41,10 @@ struct Adam {
             x[j] -= lr * m[j] / (std::sqrt(v[j] / c2) + kEps);
         }
     }
+    void forget(size_t i, size_t width) {
+        std::fill_n(m.begin() + i * width, width, 0.0f);
+        std::fill_n(v.begin() + i * width, width, 0.0f);
+    }
 };
 
 struct Spacetime {
@@ -45,15 +52,17 @@ struct Spacetime {
     int frames = 0, views_per_frame = 0, frame = -1;
     int64_t room = 0;
     // Basis weights per integer frame, [frames, K].
-    std::vector<float> bpos, brot, bcolor, bopacity;
-    Adam apos, arot, acolor, aopacity, awindow, ascale, ash;
+    std::vector<float> bpos, brot, bcolor;
+    Adam apos, arot, acolor, aopacity, amu, asigma, ascale, ash;
     size_t sh = 0;  // SH floats per row
     std::vector<int32_t> steps;
     // Gradients of the batch's views per record (kGradWidth each, scale and SH
-    // 3 + sh each), and whether any view of the batch saw the record.
+    // 3 + sh each), and whether the batch touched the record.
     std::vector<float> acc, acc_shape;
     std::vector<uint8_t> seen;
     int views = 0;
+    // |dL/dmu| summed since the last relocation: records whose life wants to move.
+    std::vector<float> mu_need;
     // The room as it came in, put back before every step: trained one view at a
     // time, splats out of the view drifted up to metres in 100 steps (battery ST).
     std::vector<float> room_means, room_quats, room_scales, room_opacities, room_dc;
@@ -81,6 +90,26 @@ std::vector<float> basis_table(int K, int frames) {
     return b;
 }
 
+void spline_at(const float* P, const float* w, int K, float* x) {
+    x[0] = x[1] = x[2] = 0.0f;
+    for (int k = 0; k < K; k++)
+        for (int c = 0; c < 3; c++) x[c] += w[k] * P[k * 3 + c];
+}
+
+// 3DGS-MCMC's split (Kheradmand et al. 2024, eq. 9): a record and its n - 1 copies
+// at alpha_new = 1 - (1 - alpha)^(1/n) and this scale factor cover what it covered.
+float mcmc_scale_factor(float alpha, float alpha_new, int n) {
+    double denom = 0.0;
+    for (int i = 1; i <= n; i++) {
+        double binom = 1.0;  // C(i - 1, k)
+        for (int k = 0; k < i; k++) {
+            denom += binom * (k % 2 ? -1.0 : 1.0) * std::pow((double)alpha_new, k + 1) / std::sqrt((double)k + 1);
+            binom = binom * (double)(i - 1 - k) / (double)(k + 1);
+        }
+    }
+    return denom > 0.0 ? std::min((float)(alpha / denom), 1.0f) : 1.0f;
+}
+
 }  // namespace
 
 void spacetime_basis(int K, int frames, float t, float* w) {
@@ -104,8 +133,14 @@ void spacetime_basis(int K, int frames, float t, float* w) {
     std::copy_n(N.begin(), K, w);
 }
 
-float spacetime_window(float t0, float t1, float t) {
-    return sigmoid((t - t0) / kEdge) * sigmoid((t1 - t) / kEdge);
+float spacetime_life(float mu, float log_sigma, float t) {
+    const float z = (t - mu) * std::exp(-log_sigma);
+    const float g = std::exp(-0.5f * z * z);
+    return g < kCull ? 0.0f : g;
+}
+
+float spacetime_alpha(const SpacetimeRecords& rec, int64_t r, float t) {
+    return sigmoid(rec.opacity[(size_t)r]) * spacetime_life(rec.mu[(size_t)r], rec.log_sigma[(size_t)r], t);
 }
 
 void engine_spacetime_begin(SpacetimeRecords records, int frames, int views_per_frame, int64_t room) {
@@ -114,8 +149,8 @@ void engine_spacetime_begin(SpacetimeRecords records, int frames, int views_per_
         throw std::runtime_error("spacetime: the records do not fill the engine's rows");
     const size_t n = (size_t)records.rows;
     if (records.pos.size() != n * kSpacetimePos * 3 || records.rot.size() != n * kSpacetimeRot * 4 ||
-        records.color.size() != n * kSpacetimeColor * 3 || records.opacity.size() != n * kSpacetimeOpacity ||
-        records.window.size() != 2 * n)
+        records.color.size() != n * kSpacetimeColor * 3 || records.opacity.size() != n || records.mu.size() != n ||
+        records.log_sigma.size() != n)
         throw std::runtime_error("spacetime: record arrays of the wrong size");
     auto st = std::make_unique<Spacetime>();
     st->rec = std::move(records);
@@ -125,16 +160,17 @@ void engine_spacetime_begin(SpacetimeRecords records, int frames, int views_per_
     st->bpos = basis_table(kSpacetimePos, frames);
     st->brot = basis_table(kSpacetimeRot, frames);
     st->bcolor = basis_table(kSpacetimeColor, frames);
-    st->bopacity = basis_table(kSpacetimeOpacity, frames);
     st->apos.resize(st->rec.pos.size());
     st->arot.resize(st->rec.rot.size());
     st->acolor.resize(st->rec.color.size());
-    st->aopacity.resize(n * kSpacetimeOpacity);
-    st->awindow.resize(2 * n);
+    st->aopacity.resize(n);
+    st->amu.resize(n);
+    st->asigma.resize(n);
     st->sh = (size_t)engine().world.features_sh.size<1>() * 3;
     st->ascale.resize(3 * n);
     st->ash.resize(st->sh * n);
     st->steps.assign(n, 0);
+    st->mu_need.assign(n, 0.0f);
     if (room > 0) {
         EngineState& s = engine();
         backend::device_synchronize();
@@ -175,19 +211,11 @@ void engine_spacetime_set_frame(int frame, bool unit_quats) {
     const float* wp = st.bpos.data() + (size_t)frame * kSpacetimePos;
     const float* wr = st.brot.data() + (size_t)frame * kSpacetimeRot;
     const float* wc = st.bcolor.data() + (size_t)frame * kSpacetimeColor;
-    const float* wo = st.bopacity.data() + (size_t)frame * kSpacetimeOpacity;
     nn::parallel_for((int64_t)n, [&](int64_t lo, int64_t hi) {
         for (int64_t r = lo; r < hi; r++) {
-            const float* P = st.rec.pos.data() + (size_t)r * kSpacetimePos * 3;
+            spline_at(st.rec.pos.data() + (size_t)r * kSpacetimePos * 3, wp, kSpacetimePos, &means[3 * r]);
+            spline_at(st.rec.color.data() + (size_t)r * kSpacetimeColor * 3, wc, kSpacetimeColor, &dc[3 * r]);
             const float* Q = st.rec.rot.data() + (size_t)r * kSpacetimeRot * 4;
-            const float* C = st.rec.color.data() + (size_t)r * kSpacetimeColor * 3;
-            for (int c = 0; c < 3; c++) {
-                float x = 0.0f, y = 0.0f;
-                for (int k = 0; k < kSpacetimePos; k++) x += wp[k] * P[k * 3 + c];
-                for (int k = 0; k < kSpacetimeColor; k++) y += wc[k] * C[k * 3 + c];
-                means[3 * r + c] = x;
-                dc[3 * r + c] = y;
-            }
             for (int c = 0; c < 4; c++) {
                 float q = 0.0f;
                 for (int k = 0; k < kSpacetimeRot; k++) q += wr[k] * Q[k * 4 + c];
@@ -198,12 +226,7 @@ void engine_spacetime_set_frame(int frame, bool unit_quats) {
                 const float len = std::max(std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]), 1e-12f);
                 for (int c = 0; c < 4; c++) quats[4 * r + c] /= len;
             }
-            const float* w = st.rec.window.data() + 2 * r;
-            const float* O = st.rec.opacity.data() + (size_t)r * kSpacetimeOpacity;
-            float o = 0.0f;
-            for (int k = 0; k < kSpacetimeOpacity; k++) o += wo[k] * O[k];
-            const float a = std::clamp(sigmoid(o) * spacetime_window(w[0], w[1], (float)frame), 1e-7f, 1.0f - 1e-6f);
-            opacities[r] = std::log(a / (1.0f - a));
+            opacities[r] = logit(std::clamp(spacetime_alpha(st.rec, r, (float)frame), 1e-7f, 1.0f - 1e-6f));
         }
     });
     upload(after_room(s.world.means.data_ptr(), 12), means);
@@ -250,11 +273,16 @@ void engine_spacetime_after_step(const SpacetimeRates& lr) {
     const float* wp = st.bpos.data() + (size_t)st.frame * kSpacetimePos;
     const float* wr = st.brot.data() + (size_t)st.frame * kSpacetimeRot;
     const float* wc = st.bcolor.data() + (size_t)st.frame * kSpacetimeColor;
-    const float* wo = st.bopacity.data() + (size_t)st.frame * kSpacetimeOpacity;
-    const float reg = lr.opacity_reg / (float)s.cur_num_splats;
+    const float reg = lr.opacity_reg / (float)n;
     // The view's gradients chained to each record it saw, added to the batch's.
     nn::parallel_for((int64_t)n, [&](int64_t lo, int64_t hi) {
         for (int64_t r = lo; r < hi; r++) {
+            const float gamma = spacetime_life(st.rec.mu[r], st.rec.log_sigma[r], t);
+            if (gamma == 0.0f) continue;  // not drawn at this frame
+            float* g = st.acc.data() + (size_t)r * kGradWidth;
+            const float sb = sigmoid(st.rec.opacity[r]);
+            g[kGradOpacity] += reg * gamma * sb * (1.0f - sb);
+            st.seen[r] = 1;
             const float* m3 = gm.data() + 3 * r;
             const float* q4 = gq.data() + 4 * r;
             const float* d3 = gd.data() + 3 * r;
@@ -262,35 +290,27 @@ void engine_spacetime_after_step(const SpacetimeRates& lr) {
                 d3[1] == 0.0f && d3[2] == 0.0f && q4[0] == 0.0f && q4[1] == 0.0f && q4[2] == 0.0f &&
                 q4[3] == 0.0f)
                 continue;  // not in this view
-            float* g = st.acc.data() + (size_t)r * kGradWidth;
             for (int j = 0; j < kSpacetimePos; j++)
                 for (int c = 0; c < 3; c++) g[kGradPos + j * 3 + c] += wp[j] * m3[c];
             for (int j = 0; j < kSpacetimeRot; j++)
                 for (int c = 0; c < 4; c++) g[kGradRot + j * 4 + c] += wr[j] * q4[c];
             for (int j = 0; j < kSpacetimeColor; j++)
                 for (int c = 0; c < 3; c++) g[kGradColor + j * 3 + c] += wc[j] * d3[c];
-            // Rendered logit l = logit(sigmoid(o) * phi): dl/do and dl/dt0,1 written
-            // so that neither divides by a small alpha or window.
-            const float* w = st.rec.window.data() + 2 * r;
-            const float* O = st.rec.opacity.data() + (size_t)r * kSpacetimeOpacity;
-            float o = 0.0f;
-            for (int k = 0; k < kSpacetimeOpacity; k++) o += wo[k] * O[k];
-            const float sb = sigmoid(o);
-            const float s0 = sigmoid((t - w[0]) / kEdge), s1 = sigmoid((w[1] - t) / kEdge);
-            const float a = std::clamp(sb * s0 * s1, 1e-7f, 1.0f - 1e-6f);
-            // The penalty max(alpha, 0.5 + l / 4) on rendered splats, as the engine's.
-            const float l = std::log(a / (1.0f - a));
-            const float gl = go[r] == 0.0f ? 0.0f : go[r] + reg * (a > 0.5f + 0.25f * l ? a * (1.0f - a) : 0.25f);
-            const float go_o = gl * (1.0f - sb) / (1.0f - a);
-            for (int k = 0; k < kSpacetimeOpacity; k++) g[kGradOpacity + k] += wo[k] * go_o;
-            g[kGradWindow] += -gl * (1.0f - s0) / ((1.0f - a) * kEdge);
-            g[kGradWindow + 1] += gl * (1.0f - s1) / ((1.0f - a) * kEdge);
+            // Rendered logit l = logit(a), a = sigmoid(o) * gamma: every derivative
+            // carries a / (a (1 - a)) = 1 / (1 - a), none divides by a small alpha.
+            const float a = std::clamp(sb * gamma, 1e-7f, 1.0f - 1e-6f);
+            const float gl = go[r] / (1.0f - a);
+            const float z = (t - st.rec.mu[r]) * std::exp(-st.rec.log_sigma[r]);
+            const float gmu = gl * z * std::exp(-st.rec.log_sigma[r]);
+            g[kGradOpacity] += gl * (1.0f - sb);
+            g[kGradMu] += gmu;
+            g[kGradSigma] += gl * z * z;
+            st.mu_need[r] += std::abs(gmu);
             if (shape) {
                 float* h = st.acc_shape.data() + (size_t)r * shw;
                 for (int c = 0; c < 3; c++) h[c] += gs[3 * r + c];
                 for (size_t k = 0; k < st.sh; k++) h[3 + k] += gh[st.sh * r + k];
             }
-            st.seen[r] = 1;
         }
     });
     if (spacetime_motion_active()) {
@@ -300,7 +320,7 @@ void engine_spacetime_after_step(const SpacetimeRates& lr) {
     }
     if (++st.views < std::max(lr.batch, 1)) return;
 
-    // One Adam step per record the batch saw, on the batch's mean gradient.
+    // One Adam step per record the batch touched, on the batch's mean gradient.
     std::vector<float> scales = download(after_room(s.world.scales.data_ptr(), 12), 3 * n);
     std::vector<float> shs;
     if (shape) shs = download(after_room(s.world.features_sh.data_ptr(), 4 * st.sh), st.sh * n);
@@ -309,6 +329,7 @@ void engine_spacetime_after_step(const SpacetimeRates& lr) {
     const float scale_reg = lr.scale_reg * 1e-2f / 3.0f / (float)s.cur_num_splats;
     const float sh_reg = 2.0f * lr.sh_reg / (3.0f * (float)s.cur_num_splats);
     const float inv = 1.0f / (float)st.views;
+    const float max_mu = (float)(st.frames - 1), min_ls = std::log(kMinSigma), max_ls = std::log((float)st.frames);
     st.views = 0;
     nn::parallel_for((int64_t)n, [&](int64_t lo, int64_t hi) {
         for (int64_t r = lo; r < hi; r++) {
@@ -328,8 +349,11 @@ void engine_spacetime_after_step(const SpacetimeRates& lr) {
             // the spline is a convex blend, so every frame's colour stays there too.
             float* C = st.rec.color.data() + (size_t)r * kSpacetimeColor * 3;
             for (int k = 0; k < kSpacetimeColor * 3; k++) C[k] = std::clamp(C[k], -kDcMax, kDcMax);
-            st.aopacity.step(st.rec.opacity.data(), g + kGradOpacity, (size_t)r, kSpacetimeOpacity, lr.opacity, c2);
-            st.awindow.step(st.rec.window.data(), g + kGradWindow, (size_t)r, 2, lr.window, c2);
+            st.aopacity.step(st.rec.opacity.data(), g + kGradOpacity, (size_t)r, 1, lr.opacity, c2);
+            st.amu.step(st.rec.mu.data(), g + kGradMu, (size_t)r, 1, lr.mu, c2);
+            st.asigma.step(st.rec.log_sigma.data(), g + kGradSigma, (size_t)r, 1, lr.sigma, c2);
+            st.rec.mu[r] = std::clamp(st.rec.mu[r], 0.0f, max_mu);
+            st.rec.log_sigma[r] = std::clamp(st.rec.log_sigma[r], min_ls, max_ls);
             std::fill_n(g, kGradWidth, 0.0f);
             if (!shape) continue;
             float* h = st.acc_shape.data() + (size_t)r * shw;
@@ -352,58 +376,67 @@ int64_t engine_spacetime_relocate(int64_t max_new, float min_opacity, uint64_t s
     const size_t n = (size_t)st.rec.rows;
     const int F = st.frames;
     backend::device_synchronize();
-    // The densification score since the last call, read and restarted.
+    // The screen-gradient score (sum, views) since the last call, read and restarted.
     std::vector<float> score(2 * n);
     backend::memcpy_sync(score.data(), s.optim.accum_buffer.data_ptr() + st.room, 2 * n * sizeof(float),
                          backend::MemcpyKind::DeviceToHost);
     s.optim.accum_buffer.zero();
+    std::vector<float> mu_need(n, 0.0f);
+    std::swap(mu_need, st.mu_need);
     if (max_new <= 0) return 0;
 
-    // Each record's largest alpha over the chunk.
-    std::vector<float> peak(n, 0.0f);
-    nn::parallel_for((int64_t)n, [&](int64_t lo, int64_t hi) {
-        for (int64_t r = lo; r < hi; r++) {
-            const float* O = st.rec.opacity.data() + (size_t)r * kSpacetimeOpacity;
-            const float* w = st.rec.window.data() + 2 * r;
-            float best = 0.0f;
-            for (int f = 0; f < F; f++) {
-                const float* wo = st.bopacity.data() + (size_t)f * kSpacetimeOpacity;
-                float o = 0.0f;
-                for (int k = 0; k < kSpacetimeOpacity; k++) o += wo[k] * O[k];
-                best = std::max(best, sigmoid(o) * spacetime_window(w[0], w[1], (float)f));
-            }
-            peak[r] = best;
+    // Need of each live record: its alpha, how far it moves over its life, its
+    // mean screen gradient and its life-centre gradient, each cue over its total.
+    std::vector<int64_t> dead, live;
+    for (size_t r = 0; r < n; r++) (sigmoid(st.rec.opacity[r]) < min_opacity ? dead : live).push_back((int64_t)r);
+    if (dead.empty() || live.empty()) return 0;
+    std::vector<float> cue(4 * live.size());
+    double total[4] = {0, 0, 0, 0};
+    for (size_t i = 0; i < live.size(); i++) {
+        const size_t r = (size_t)live[i];
+        const int f = std::clamp((int)std::lround(st.rec.mu[r]), 0, F - 2);
+        float p0[3], p1[3];
+        const float* P = st.rec.pos.data() + r * kSpacetimePos * 3;
+        spline_at(P, st.bpos.data() + (size_t)f * kSpacetimePos, kSpacetimePos, p0);
+        spline_at(P, st.bpos.data() + (size_t)(f + 1) * kSpacetimePos, kSpacetimePos, p1);
+        const float speed = std::sqrt((p1[0] - p0[0]) * (p1[0] - p0[0]) + (p1[1] - p0[1]) * (p1[1] - p0[1]) +
+                                      (p1[2] - p0[2]) * (p1[2] - p0[2]));
+        const float c[4] = {sigmoid(st.rec.opacity[r]), speed * std::exp(st.rec.log_sigma[r]),
+                            score[2 * r] / std::max(score[2 * r + 1], 1.0f), mu_need[r]};
+        for (int k = 0; k < 4; k++) {
+            cue[4 * i + k] = c[k];
+            total[k] += c[k];
         }
-    });
-    std::vector<int64_t> dead;
-    for (size_t r = 0; r < n; r++)
-        if (peak[r] < min_opacity) dead.push_back((int64_t)r);
-    // Sources drawn by score without replacement (keys u^(1/w), largest first).
+    }
+    std::vector<double> need(live.size());
+    for (size_t i = 0; i < live.size(); i++)
+        for (int k = 0; k < 4; k++) need[i] += total[k] > 0.0 ? cue[4 * i + k] / total[k] : 0.0;
     std::mt19937_64 rng(seed);
-    std::uniform_real_distribution<float> uniform(1e-12f, 1.0f);
-    std::vector<std::pair<float, int64_t>> keys;
-    for (size_t r = 0; r < n; r++)
-        if (peak[r] > 0.05f && score[2 * r] > 0.0f) keys.push_back({std::log(uniform(rng)) / score[2 * r], (int64_t)r});
-    const size_t count = std::min({(size_t)max_new, dead.size(), keys.size()});
-    if (count == 0) return 0;
-    std::partial_sort(keys.begin(), keys.begin() + (std::ptrdiff_t)count, keys.end(),
-                      [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::discrete_distribution<size_t> draw(need.begin(), need.end());
+    std::uniform_real_distribution<float> shift(-0.25f, 0.25f);
+    const size_t want = std::min((size_t)max_new, dead.size());
+    std::vector<int32_t> copies(live.size(), 0);
+    std::vector<std::pair<size_t, int64_t>> moves;  // (live index, dead record)
+    for (size_t j = 0; j < want; j++) {
+        const size_t i = draw(rng);
+        if (copies[i] >= kMaxCopies) continue;
+        copies[i]++;
+        moves.push_back({i, dead[moves.size()]});
+    }
+    if (moves.empty()) return 0;
 
     const size_t sh = (size_t)s.world.features_sh.size<1>() * 3;
     std::vector<float> scales = download(after_room(s.world.scales.data_ptr(), 12), 3 * n);
     std::vector<float> shs = download(after_room(s.world.features_sh.data_ptr(), 4 * sh), sh * n);
-    auto reset = [&](size_t r) {
-        auto zero = [&](Adam& a, size_t width) {
-            std::fill_n(a.m.begin() + r * width, width, 0.0f);
-            std::fill_n(a.v.begin() + r * width, width, 0.0f);
-        };
-        zero(st.apos, kSpacetimePos * 3);
-        zero(st.arot, kSpacetimeRot * 4);
-        zero(st.acolor, kSpacetimeColor * 3);
-        zero(st.aopacity, kSpacetimeOpacity);
-        zero(st.awindow, 2);
-        zero(st.ascale, 3);
-        zero(st.ash, st.sh);
+    auto forget = [&](size_t r) {
+        st.apos.forget(r, kSpacetimePos * 3);
+        st.arot.forget(r, kSpacetimeRot * 4);
+        st.acolor.forget(r, kSpacetimeColor * 3);
+        st.aopacity.forget(r, 1);
+        st.amu.forget(r, 1);
+        st.asigma.forget(r, 1);
+        st.ascale.forget(r, 3);
+        st.ash.forget(r, st.sh);
         st.steps[r] = 0;
         if (!st.acc.empty()) {
             std::fill_n(st.acc.begin() + r * kGradWidth, kGradWidth, 0.0f);
@@ -412,51 +445,37 @@ int64_t engine_spacetime_relocate(int64_t max_new, float min_opacity, uint64_t s
         }
         spacetime_motion_forget((int64_t)r);
     };
-    for (size_t j = 0; j < count; j++) {
-        const size_t src = (size_t)keys[j].second, dst = (size_t)dead[j];
-        // The long axis as the record turns at the middle of its life; the halves
-        // stay that far apart all chunk long.
-        const float* w = st.rec.window.data() + 2 * src;
-        const int tm = std::clamp((int)std::lround(0.5f * (std::max(w[0], 0.0f) + std::min(w[1], (float)(F - 1)))), 0, F - 1);
-        const float* wr = st.brot.data() + (size_t)tm * kSpacetimeRot;
-        const float* Q = st.rec.rot.data() + src * kSpacetimeRot * 4;
-        float q[4] = {0, 0, 0, 0};
-        for (int k = 0; k < kSpacetimeRot; k++)
-            for (int c = 0; c < 4; c++) q[c] += wr[k] * Q[k * 4 + c];
-        const float qn = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
-        const float qw = q[0] / qn, x = q[1] / qn, y = q[2] / qn, z = q[3] / qn;
-        const float R[3][3] = {{1 - 2 * (y * y + z * z), 2 * (x * y - z * qw), 2 * (x * z + y * qw)},
-                               {2 * (x * y + z * qw), 1 - 2 * (x * x + z * z), 2 * (y * z - x * qw)},
-                               {2 * (x * z - y * qw), 2 * (y * z + x * qw), 1 - 2 * (x * x + y * y)}};
-        float* ls = scales.data() + 3 * src;
-        const int a = ls[0] > ls[1] && ls[0] > ls[2] ? 0 : ls[1] > ls[2] ? 1 : 2;
-        const float d = 0.5f * std::exp(ls[a]);
-        float* Ps = st.rec.pos.data() + src * kSpacetimePos * 3;
-        float* Pd = st.rec.pos.data() + dst * kSpacetimePos * 3;
-        for (int k = 0; k < kSpacetimePos; k++)
-            for (int c = 0; c < 3; c++) {
-                Pd[k * 3 + c] = Ps[k * 3 + c] + d * R[c][a];
-                Ps[k * 3 + c] -= d * R[c][a];
-            }
-        std::copy_n(Q, kSpacetimeRot * 4, st.rec.rot.data() + dst * kSpacetimeRot * 4);
+    // Donors first: alpha and scale shared with their copies, then the copies take them.
+    for (size_t i = 0; i < live.size(); i++) {
+        if (!copies[i]) continue;
+        const size_t r = (size_t)live[i];
+        const int parts = copies[i] + 1;
+        const float alpha = sigmoid(st.rec.opacity[r]);
+        const float alpha_new = std::max(1.0f - std::pow(1.0f - alpha, 1.0f / (float)parts), min_opacity);
+        const float k = std::log(mcmc_scale_factor(alpha, alpha_new, parts));
+        st.rec.opacity[r] = logit(std::min(alpha_new, 1.0f - 1e-6f));
+        for (int c = 0; c < 3; c++) scales[3 * r + c] += k;
+        forget(r);
+    }
+    for (const auto& [i, d] : moves) {
+        const size_t src = (size_t)live[i], dst = (size_t)d;
+        std::copy_n(st.rec.pos.data() + src * kSpacetimePos * 3, kSpacetimePos * 3,
+                    st.rec.pos.data() + dst * kSpacetimePos * 3);
+        std::copy_n(st.rec.rot.data() + src * kSpacetimeRot * 4, kSpacetimeRot * 4,
+                    st.rec.rot.data() + dst * kSpacetimeRot * 4);
         std::copy_n(st.rec.color.data() + src * kSpacetimeColor * 3, kSpacetimeColor * 3,
                     st.rec.color.data() + dst * kSpacetimeColor * 3);
-        std::copy_n(w, 2, st.rec.window.data() + 2 * dst);
-        // Opacity shared so the pair covers what the source did: 1 - (1 - o)^(1/2).
-        float* Os = st.rec.opacity.data() + src * kSpacetimeOpacity;
-        float* Od = st.rec.opacity.data() + dst * kSpacetimeOpacity;
-        for (int k = 0; k < kSpacetimeOpacity; k++) {
-            const float half = std::clamp(1.0f - std::sqrt(std::max(1.0f - sigmoid(Os[k]), 1e-6f)), 1e-6f, 1.0f - 1e-6f);
-            Os[k] = Od[k] = std::log(half / (1.0f - half));
-        }
-        for (int c = 0; c < 3; c++) ls[c] += std::log(c == a ? 0.5f : 0.85f);
-        std::copy_n(ls, 3, scales.data() + 3 * dst);
+        st.rec.opacity[dst] = st.rec.opacity[src];
+        st.rec.log_sigma[dst] = st.rec.log_sigma[src];
+        // Exact copies would take the same gradients forever: the life shift parts them.
+        st.rec.mu[dst] = std::clamp(st.rec.mu[src] + shift(rng) * std::exp(st.rec.log_sigma[src]), 0.0f,
+                                    (float)(F - 1));
+        std::copy_n(scales.data() + 3 * src, 3, scales.data() + 3 * dst);
         std::copy_n(shs.data() + sh * src, sh, shs.data() + sh * dst);
-        reset(src);
-        reset(dst);
+        forget(dst);
     }
     upload(after_room(s.world.scales.data_ptr(), 12), scales);
     upload(after_room(s.world.features_sh.data_ptr(), 4 * sh), shs);
     if (st.frame >= 0) engine_spacetime_set_frame(st.frame);
-    return (int64_t)count;
+    return (int64_t)moves.size();
 }

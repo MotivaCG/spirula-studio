@@ -1,6 +1,7 @@
 // Spacetime chunk training (--spacetime-init): the chunk trained whole, every
-// subject row one .vgs record with a trajectory (engine/EngineSpacetime.h). The
-// records start from a finished frame-by-frame chunk run, fitted to its frames.
+// subject row one .vgs record with a trajectory and a life (engine/EngineSpacetime.h).
+// The records start from a finished frame-by-frame chunk run, fitted to its frames,
+// or from a keyframe seed: per-keyframe clouds with their motion, short-lived.
 
 #include "app/TrainerCore.h"
 #include "engine/EngineSpacetime.h"
@@ -24,6 +25,7 @@ ColorResolution resolve_color(const TrainConfig& c);
 namespace {
 
 const float kShownLogit = std::log(1.0f / 254.0f);
+constexpr int kMotionFloats = 8;  // motion.bin per row: mu, sigma (frames), velocity, acceleration (per frame)
 
 // Least squares of K control points through samples (frame, value[width]), with
 // a small second-difference penalty so records seen in few frames stay smooth.
@@ -70,16 +72,96 @@ struct Record {
     int first, last;  // the segment of the row's frames this record owns
 };
 
+void allocate(SpacetimeRecords& st, SeedSplats& seed, size_t n, size_t cap, size_t sh) {
+    st.rows = (int64_t)n;
+    st.pos.assign(n * kSpacetimePos * 3, 0.0f);
+    st.rot.assign(n * kSpacetimeRot * 4, 0.0f);
+    st.color.assign(n * kSpacetimeColor * 3, 0.0f);
+    st.opacity.assign(n, 0.0f);
+    st.mu.assign(n, 0.0f);
+    st.log_sigma.assign(n, 0.0f);
+    seed.num = (int64_t)n;
+    seed.means.assign(3 * cap, 0.0f);
+    seed.quats.assign(4 * cap, 0.0f);
+    seed.scales.assign(3 * cap, -10.0f);
+    seed.opacities.assign(cap, -20.0f);
+    seed.features_dc.assign(3 * cap, 0.0f);
+    seed.features_sh.assign(sh * cap, 0.0f);
+}
+
+void copy_row(const SeedSplats& from, size_t r, SeedSplats& to, size_t i, size_t sh) {
+    std::copy_n(&from.means[3 * r], 3, &to.means[3 * i]);
+    std::copy_n(&from.quats[4 * r], 4, &to.quats[4 * i]);
+    std::copy_n(&from.scales[3 * r], 3, &to.scales[3 * i]);
+    to.opacities[i] = from.opacities[r];
+    std::copy_n(&from.features_dc[3 * r], 3, &to.features_dc[3 * i]);
+    std::copy_n(&from.features_sh[sh * r], sh, &to.features_sh[sh * i]);
+}
+
 }  // namespace
 
 bool TrainerSession::spacetime() const {
     return !cfg.spacetime_init.empty() && cfg.spacetime_init != "none";
 }
 
+SeedSplats TrainerSession::spacetime_seed(const ColorResolution& color, size_t cap) {
+    const fs::path dir(cfg.spacetime_init);
+    if (fs::exists(dir / "motion.bin")) return keyframe_seed(color, cap);
+    return chunk_run_seed(color, cap);
+}
+
+// A keyframe seed (SPACETIME_KEYFRAMES.md): seed.ply holds every record's
+// splat, motion.bin its life and motion at its keyframe. The trajectory is the
+// motion over the life (+-2 sigma) and constant velocity past it, fitted.
+SeedSplats TrainerSession::keyframe_seed(const ColorResolution& color, size_t cap) {
+    const int F = (int)_chunk_dirs.size();
+    const fs::path dir(cfg.spacetime_init);
+    const SeedSplats kf = seed_splats_from_ply((dir / "seed.ply").string(), cfg, color);
+    const size_t n = (size_t)kf.num, sh = kf.features_sh.size() / kf.opacities.size();
+    std::vector<float> motion(n * kMotionFloats);
+    std::ifstream in(dir / "motion.bin", std::ios::binary | std::ios::ate);
+    if (!in || (size_t)in.tellg() != motion.size() * 4)
+        throw std::runtime_error("--spacetime-init: motion.bin does not hold 8 floats per seed.ply row (cap_max?)");
+    in.seekg(0);
+    in.read(reinterpret_cast<char*>(motion.data()), (std::streamsize)(motion.size() * 4));
+    if (n + (size_t)_room_rows > cap)
+        throw std::runtime_error("--spacetime-init: the seed and the room exceed cap_max");
+
+    SpacetimeRecords& st = _spacetime;
+    SeedSplats seed;
+    allocate(st, seed, n, cap, sh);
+    std::vector<int> frames((size_t)F);
+    for (int f = 0; f < F; f++) frames[(size_t)f] = f;
+    nn::parallel_for((int64_t)n, [&](int64_t lo, int64_t hi) {
+        std::vector<float> x((size_t)F * 3);
+        for (int64_t i = lo; i < hi; i++) {
+            const float* m = motion.data() + (size_t)i * kMotionFloats;
+            const float mu = m[0], sigma = std::max(m[1], 0.15f), *v = m + 2, *a = m + 5;
+            const float* x0 = &kf.means[3 * (size_t)i];
+            for (int f = 0; f < F; f++) {
+                const float dt = (float)f - mu, e = std::clamp(dt, -2.0f * sigma, 2.0f * sigma);
+                for (int c = 0; c < 3; c++)
+                    x[(size_t)f * 3 + c] = x0[c] + v[c] * e + 0.5f * a[c] * e * e + (v[c] + a[c] * e) * (dt - e);
+            }
+            fit_spline(kSpacetimePos, F, frames, x, 3, st.pos.data() + (size_t)i * kSpacetimePos * 3);
+            for (int k = 0; k < kSpacetimeRot; k++)
+                std::copy_n(&kf.quats[4 * (size_t)i], 4, st.rot.data() + ((size_t)i * kSpacetimeRot + k) * 4);
+            for (int k = 0; k < kSpacetimeColor; k++)
+                std::copy_n(&kf.features_dc[3 * (size_t)i], 3, st.color.data() + ((size_t)i * kSpacetimeColor + k) * 3);
+            st.opacity[(size_t)i] = kf.opacities[(size_t)i];
+            st.mu[(size_t)i] = std::clamp(mu, 0.0f, (float)(F - 1));
+            st.log_sigma[(size_t)i] = std::log(std::min(sigma, (float)F));
+            copy_row(kf, (size_t)i, seed, (size_t)i, sh);
+        }
+    });
+    log("spacetime: " + std::to_string(n) + " records from the keyframe seed " + cfg.spacetime_init);
+    return seed;
+}
+
 // The chunk run's frames cut into records: a row's records follow one another,
 // each starting at its birth event, and lives from its first shown frame to its
 // last. Scale and SH come from the first; the trajectories are fitted.
-SeedSplats TrainerSession::spacetime_seed(const ColorResolution& color, size_t cap) {
+SeedSplats TrainerSession::chunk_run_seed(const ColorResolution& color, size_t cap) {
     const int F = (int)_chunk_dirs.size();
     const fs::path run(cfg.spacetime_init);
     std::vector<SeedSplats> frames;
@@ -127,28 +209,17 @@ SeedSplats TrainerSession::spacetime_seed(const ColorResolution& color, size_t c
 
     const size_t n = records.size(), sh = frames[0].features_sh.size() / frames[0].opacities.size();
     SpacetimeRecords& st = _spacetime;
-    st.rows = (int64_t)n;
-    st.pos.assign(n * kSpacetimePos * 3, 0.0f);
-    st.rot.assign(n * kSpacetimeRot * 4, 0.0f);
-    st.color.assign(n * kSpacetimeColor * 3, 0.0f);
-    st.opacity.assign(n * kSpacetimeOpacity, 0.0f);
-    st.window.assign(2 * n, 0.0f);
     SeedSplats seed;
-    seed.num = (int64_t)n;
-    seed.means.assign(3 * cap, 0.0f);
-    seed.quats.assign(4 * cap, 0.0f);
-    seed.scales.assign(3 * cap, -10.0f);
-    seed.opacities.assign(cap, -20.0f);
-    seed.features_dc.assign(3 * cap, 0.0f);
-    seed.features_sh.assign(sh * cap, 0.0f);
+    allocate(st, seed, n, cap, sh);
     nn::parallel_for((int64_t)n, [&](int64_t lo, int64_t hi) {
         std::vector<int> at;
-        std::vector<float> x, q, c, o;
+        std::vector<float> x, q, c;
         for (int64_t i = lo; i < hi; i++) {
             const Record& rec = records[(size_t)i];
             const size_t r = (size_t)rec.row;
-            at.clear(), x.clear(), q.clear(), c.clear(), o.clear();
+            at.clear(), x.clear(), q.clear(), c.clear();
             const float* q0 = frames[rec.first].quats.data() + 4 * r;
+            float peak = -9.0f;
             for (int f = rec.first; f <= rec.last; f++) {
                 const SeedSplats& s = frames[f];
                 if (s.opacities[r] <= kShownLogit) continue;
@@ -159,25 +230,20 @@ SeedSplats TrainerSession::spacetime_seed(const ColorResolution& color, size_t c
                 const float* qf = &s.quats[4 * r];
                 const float dot = qf[0] * q0[0] + qf[1] * q0[1] + qf[2] * q0[2] + qf[3] * q0[3];
                 for (int k = 0; k < 4; k++) q.push_back(dot < 0.0f ? -qf[k] : qf[k]);
-                o.push_back(std::clamp(s.opacities[r], -9.0f, 9.0f));
+                peak = std::max(peak, std::min(s.opacities[r], 9.0f));
             }
             fit_spline(kSpacetimePos, F, at, x, 3, st.pos.data() + (size_t)i * kSpacetimePos * 3);
             fit_spline(kSpacetimeRot, F, at, q, 4, st.rot.data() + (size_t)i * kSpacetimeRot * 4);
             fit_spline(kSpacetimeColor, F, at, c, 3, st.color.data() + (size_t)i * kSpacetimeColor * 3);
-            fit_spline(kSpacetimeOpacity, F, at, o, 1, st.opacity.data() + (size_t)i * kSpacetimeOpacity);
-            st.window[2 * (size_t)i] = rec.first == 0 ? -3.0f : (float)rec.first - 0.5f;
-            st.window[2 * (size_t)i + 1] = rec.last == F - 1 ? (float)F + 2.0f : (float)rec.last + 0.5f;
-            const SeedSplats& s = frames[rec.first];
-            std::copy_n(&s.means[3 * r], 3, &seed.means[3 * (size_t)i]);
-            std::copy_n(&s.quats[4 * r], 4, &seed.quats[4 * (size_t)i]);
-            std::copy_n(&s.scales[3 * r], 3, &seed.scales[3 * (size_t)i]);
-            seed.opacities[(size_t)i] = s.opacities[r];
-            std::copy_n(&s.features_dc[3 * r], 3, &seed.features_dc[3 * (size_t)i]);
-            std::copy_n(&s.features_sh[sh * r], sh, &seed.features_sh[sh * (size_t)i]);
+            // The peak alpha over a Gaussian life as wide as the segment: 0.88 of it at the ends.
+            st.opacity[(size_t)i] = peak;
+            st.mu[(size_t)i] = 0.5f * (float)(rec.first + rec.last);
+            st.log_sigma[(size_t)i] = std::log(std::clamp((float)(rec.last - rec.first + 1), 1.0f, (float)F));
+            copy_row(frames[rec.first], r, seed, (size_t)i, sh);
         }
     });
     for (size_t i = real; i < n; i++) {
-        std::fill_n(st.opacity.data() + i * kSpacetimeOpacity, kSpacetimeOpacity, -20.0f);
+        st.opacity[i] = -20.0f;
         seed.opacities[i] = -20.0f;
     }
     log("spacetime: " + std::to_string(real) + " records from " + std::to_string(R) + " rows of " +
@@ -231,21 +297,23 @@ void TrainerSession::save_spacetime(int step) {
     if (!list || !events) throw std::runtime_error("spacetime: cannot write the frame list or birth events");
 }
 
+// Relocation runs from 1/12 to 5/6 of the steps: records need a settled need score
+// before, and the last sixth polishes the copies without moving any more.
 void TrainerSession::spacetime_after_step(int step, const EngineStepConfig& sc) {
     const int max_steps = cfg.max_steps.value_or(cfg.num_iterations);
     engine_spacetime_after_step({sc.optim.lr_means, sc.optim.lr_quats, sc.optim.lr_features_dc,
-                                 sc.optim.lr_opacities, cfg.spacetime_window_lr, cfg.spacetime_batch,
-                                 sc.optim.mcmc_opacity_reg_weight,
+                                 sc.optim.lr_opacities, cfg.spacetime_window_lr, cfg.spacetime_window_lr,
+                                 cfg.spacetime_batch, sc.optim.mcmc_opacity_reg_weight,
                                  scheduled_lr(step, max_steps, _spacetime_scales_lr, _spacetime_scales_lr_final),
                                  scheduled_lr(step, max_steps, _spacetime_sh_lr),
                                  sc.optim.mcmc_scale_reg_weight, sc.optim.sh_reg_weight});
     if (cfg.spacetime_relocate <= 0.0f || cfg.spacetime_relocate_every <= 0 ||
         (step + 1) % cfg.spacetime_relocate_every != 0)
         return;
-    const int64_t budget =
-        (int64_t)(cfg.spacetime_relocate * (float)engine_spacetime_records().rows);
+    const bool open = step + 1 >= max_steps / 12 && 6 * (step + 1) <= 5 * max_steps;
+    const int64_t budget = open ? (int64_t)(cfg.spacetime_relocate * (float)engine_spacetime_records().rows) : 0;
     const int64_t moved = engine_spacetime_relocate(budget, cfg.min_opacity, (uint64_t)step);
-    log("spacetime: " + std::to_string(moved) + " of " + std::to_string(budget) + " records relocated");
+    if (open) log("spacetime: " + std::to_string(moved) + " of " + std::to_string(budget) + " records relocated");
 }
 
 }  // namespace spirula

@@ -1,0 +1,71 @@
+﻿diff --git a/src/config/TrainConfig.h "b/C:\\Users\\Victor\\AppData\\Local\\Temp\\claude\\a391eed6545ec1d3\\94f3fca3-18b7-436e-85cc-dace05fd9989\\scratchpad\\kf5_with/src/config/TrainConfig.h"
+index f465b965..ded36c95 100644
+--- a/src/config/TrainConfig.h
++++ "b/C:\\Users\\Victor\\AppData\\Local\\Temp\\claude\\a391eed6545ec1d3\\94f3fca3-18b7-436e-85cc-dace05fd9989\\scratchpad\\kf5_with/src/config/TrainConfig.h"
+@@ -229,6 +229,7 @@ inline bool train_choice_valid(const std::string& value, const char* choices) {
+     X(std::string, spacetime_init, "", "splats", "advanced", "none")         \
+     X(float, spacetime_window_lr, 0.005f, "splats", "expert", "")            \
+     X(int, spacetime_batch, 4, "splats", "expert", "")                       \
++    X(bool, spacetime_constant_color, false, "splats", "expert", "")         \
+     X(float, spacetime_relocate, 0.0f, "splats", "expert", "")               \
+     X(int, spacetime_relocate_every, 100, "splats", "expert", "")            \
+     X(float, spacetime_spare, 0.0f, "splats", "expert", "")                  \
+diff --git a/src/app/TrainerSpacetime.cpp "b/C:\\Users\\Victor\\AppData\\Local\\Temp\\claude\\a391eed6545ec1d3\\94f3fca3-18b7-436e-85cc-dace05fd9989\\scratchpad\\kf5_with/src/app/TrainerSpacetime.cpp"
+index 8df4c1b7..040f1bf8 100644
+--- a/src/app/TrainerSpacetime.cpp
++++ "b/C:\\Users\\Victor\\AppData\\Local\\Temp\\claude\\a391eed6545ec1d3\\94f3fca3-18b7-436e-85cc-dace05fd9989\\scratchpad\\kf5_with/src/app/TrainerSpacetime.cpp"
+@@ -306,7 +306,8 @@ void TrainerSession::spacetime_after_step(int step, const EngineStepConfig& sc)
+                                  cfg.spacetime_batch, sc.optim.mcmc_opacity_reg_weight,
+                                  scheduled_lr(step, max_steps, _spacetime_scales_lr, _spacetime_scales_lr_final),
+                                  scheduled_lr(step, max_steps, _spacetime_sh_lr),
+-                                 sc.optim.mcmc_scale_reg_weight, sc.optim.sh_reg_weight});
++                                 sc.optim.mcmc_scale_reg_weight, sc.optim.sh_reg_weight,
++                                 cfg.spacetime_constant_color});
+     if (cfg.spacetime_relocate <= 0.0f || cfg.spacetime_relocate_every <= 0 ||
+         (step + 1) % cfg.spacetime_relocate_every != 0)
+         return;
+diff --git a/src/engine/EngineSpacetime.cpp "b/C:\\Users\\Victor\\AppData\\Local\\Temp\\claude\\a391eed6545ec1d3\\94f3fca3-18b7-436e-85cc-dace05fd9989\\scratchpad\\kf5_with/src/engine/EngineSpacetime.cpp"
+index 92f3ddce..dc26161b 100644
+--- a/src/engine/EngineSpacetime.cpp
++++ "b/C:\\Users\\Victor\\AppData\\Local\\Temp\\claude\\a391eed6545ec1d3\\94f3fca3-18b7-436e-85cc-dace05fd9989\\scratchpad\\kf5_with/src/engine/EngineSpacetime.cpp"
+@@ -344,6 +344,12 @@ void engine_spacetime_after_step(const SpacetimeRates& lr) {
+             const float size = std::exp(std::max({ls[0], ls[1], ls[2]}));
+             st.apos.step(st.rec.pos.data(), g + kGradPos, (size_t)r, kSpacetimePos * 3, lr.pos * size, c2);
+             st.arot.step(st.rec.rot.data(), g + kGradRot, (size_t)r, kSpacetimeRot * 4, lr.rot, c2);
++            if (lr.constant_color)
++                for (int c = 0; c < 3; c++) {
++                    float sum = 0.0f;
++                    for (int j = 0; j < kSpacetimeColor; j++) sum += g[kGradColor + j * 3 + c];
++                    for (int j = 0; j < kSpacetimeColor; j++) g[kGradColor + j * 3 + c] = sum;
++                }
+             st.acolor.step(st.rec.color.data(), g + kGradColor, (size_t)r, kSpacetimeColor * 3, lr.color, c2);
+             // As the engine's Adam: base colour within [0, 1], where viewers clamp it;
+             // the spline is a convex blend, so every frame's colour stays there too.
+diff --git a/src/engine/EngineSpacetime.h "b/C:\\Users\\Victor\\AppData\\Local\\Temp\\claude\\a391eed6545ec1d3\\94f3fca3-18b7-436e-85cc-dace05fd9989\\scratchpad\\kf5_with/src/engine/EngineSpacetime.h"
+index 1236c55b..4ea93488 100644
+--- a/src/engine/EngineSpacetime.h
++++ "b/C:\\Users\\Victor\\AppData\\Local\\Temp\\claude\\a391eed6545ec1d3\\94f3fca3-18b7-436e-85cc-dace05fd9989\\scratchpad\\kf5_with/src/engine/EngineSpacetime.h"
+@@ -36,6 +36,9 @@ struct SpacetimeRates {
+     float opacity_reg = 0;
+     // Scale and SH, one per record over the chunk; their penalties as the engine's.
+     float scale = 0, sh = 0, scale_reg = 0, sh_reg = 0;
++    // Every colour control point gets the sum of their gradients: a constant seed
++    // colour stays constant over the chunk.
++    bool constant_color = false;
+ };
+ 
+ // Weights of the K control points of a clamped uniform cubic B-spline at frame
+diff --git a/src/i18n/catalog/TrainFields.h "b/C:\\Users\\Victor\\AppData\\Local\\Temp\\claude\\a391eed6545ec1d3\\94f3fca3-18b7-436e-85cc-dace05fd9989\\scratchpad\\kf5_with/src/i18n/catalog/TrainFields.h"
+index 5dda93db..f556c949 100644
+--- a/src/i18n/catalog/TrainFields.h
++++ "b/C:\\Users\\Victor\\AppData\\Local\\Temp\\claude\\a391eed6545ec1d3\\94f3fca3-18b7-436e-85cc-dace05fd9989\\scratchpad\\kf5_with/src/i18n/catalog/TrainFields.h"
+@@ -2587,6 +2587,9 @@ SS_MSG_EN(spacetime_batch, "Views per record step");
+ SS_MSG_EN(spacetime_batch_help,
+     "Views whose gradients one update of the records averages: one view a step is "
+     "too noisy for a record seen from every frame.");
++SS_MSG_EN(spacetime_constant_color, "Constant record colour");
++SS_MSG_EN(spacetime_constant_color_help,
++    "Each record keeps one base colour over the whole chunk instead of a colour curve.");
+ SS_MSG_EN(spacetime_relocate, "Spacetime relocation budget");
+ SS_MSG_EN(spacetime_relocate_help,
+     "Share of the records that may move every relocation interval: faded records become copies of needed ones. 0 turns it off.");
