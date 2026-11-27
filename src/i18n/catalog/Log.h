@@ -2543,46 +2543,19 @@ SS_MSG(ppisp_before_color_space_order,
     TR("{0}, {1} gerektirir: fotoğraf başına renk düzeltmesi her zaman sRGB'de "
        "uygulanır"));
 SS_MSG(learned_score_needs,
-    EN("--densify-learned-score requires: --use-revised-densification.\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
-    JA("--densify-learned-score には次が必要: --use-revised-densification.\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
-    ZH_HANS("--densify-learned-score 需要: --use-revised-densification.\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
-    ZH_HANT("--densify-learned-score 需要: --use-revised-densification.\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
-    KO("--densify-learned-score 에 필요: --use-revised-densification.\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
-    DE("--densify-learned-score benötigt: --use-revised-densification.\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
-    FR("--densify-learned-score requiert: --use-revised-densification.\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
-    ES("--densify-learned-score requiere: --use-revised-densification.\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
-    PT("--densify-learned-score exige: --use-revised-densification.\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
-    IT("--densify-learned-score richiede: --use-revised-densification.\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
-    NL("--densify-learned-score vereist: --use-revised-densification.\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
-    RU("--densify-learned-score требует: --use-revised-densification.\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
-    TR("--densify-learned-score gerektirir: --use-revised-densification.\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."));
-SS_MSG(dead_criterion_needs_revised,
-    EN("--dead-criterion {0} needs --use-revised-densification: the MCMC "
-       "relocation tests opacity only"),
-    JA("--dead-criterion {0} には --use-revised-densification が必要です。MCMC "
-       "の再配置は不透明度しか見ません"),
-    ZH_HANS("--dead-criterion {0} 需要开启 --use-revised-densification：MCMC "
-            "重定位只检查不透明度"),
-    ZH_HANT("--dead-criterion {0} 需要開啟 --use-revised-densification：MCMC "
-            "重定位只檢查不透明度"),
-    KO("--dead-criterion {0}에는 --use-revised-densification이 필요합니다. "
-       "MCMC 재배치는 불투명도만 봅니다"),
-    DE("--dead-criterion {0} setzt --use-revised-densification voraus: Die "
-       "MCMC-Umverteilung prüft nur die Deckkraft"),
-    FR("--dead-criterion {0} requiert --use-revised-densification : la "
-       "relocalisation MCMC ne teste que l'opacité"),
-    ES("--dead-criterion {0} requiere --use-revised-densification: la "
-       "reubicación MCMC solo comprueba la opacidad"),
-    PT("--dead-criterion {0} exige --use-revised-densification: a realocação "
-       "MCMC só testa a opacidade"),
-    IT("--dead-criterion {0} richiede --use-revised-densification: il "
-       "riposizionamento MCMC controlla solo l'opacità"),
-    NL("--dead-criterion {0} vereist --use-revised-densification: de "
-       "MCMC-herplaatsing test alleen de dekking"),
-    RU("--dead-criterion {0} требует --use-revised-densification: перемещение "
-       "MCMC проверяет только непрозрачность"),
-    TR("--dead-criterion {0}, --use-revised-densification gerektirir: MCMC "
-       "yeniden yerleştirmesi yalnızca saydamsızlığı sınar"));
+    EN("--densify-learned-score requires:\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
+    JA("--densify-learned-score には次が必要:\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
+    ZH_HANS("--densify-learned-score 需要:\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
+    ZH_HANT("--densify-learned-score 需要:\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
+    KO("--densify-learned-score 에 필요:\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
+    DE("--densify-learned-score benötigt:\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
+    FR("--densify-learned-score requiert:\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
+    ES("--densify-learned-score requiere:\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
+    PT("--densify-learned-score exige:\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
+    IT("--densify-learned-score richiede:\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
+    NL("--densify-learned-score vereist:\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
+    RU("--densify-learned-score требует:\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."),
+    TR("--densify-learned-score gerektirir:\n- --densify-loss-map-mode != none; --densify-score-blend-world-grad 0.\n- --densify-score-power > 0; --densify-loss-map-power > 0."));
 SS_MSG(bad_quantization_level,
     EN("quantization_level must be 0 or 1"),
     JA("quantization_level は 0 か 1 にしてください"),
@@ -2730,6 +2703,21 @@ SS_MSG(mesh_stage_loading,
     NL("Model laden"),
     RU("Загрузка модели"),
     TR("Model yükleniyor"));
+SS_MSG(mesh_stage_tsdf,
+    EN("Fusing the depth maps"),
+    JA("深度マップを統合しています"),
+    ZH_HANS("正在融合深度图"),
+    ZH_HANT("正在融合深度圖"),
+    KO("깊이 맵을 융합하는 중"),
+    DE("Tiefenkarten werden fusioniert"),
+    FR("Fusion des cartes de profondeur"),
+    ES("Fusionando los mapas de profundidad"),
+    PT("Fundindo os mapas de profundidade"),
+    IT("Fusione delle mappe di profondità"),
+    NL("Dieptekaarten samenvoegen"),
+    RU("Слияние карт глубины"),
+    TR("Derinlik haritaları birleştiriliyor"));
+
 SS_MSG(mesh_stage_point_cloud,
     EN("Sampling a point cloud"),
     JA("点群をサンプリングしています"),
@@ -3090,21 +3078,6 @@ SS_MSG(prog_count_total_rate,
     RU("  {0}: {1} / {2}  ({3})"),
     TR("  {0}: {1} / {2}  ({3})"));
 
-SS_MSG(prog_count_total_rate_eta,
-    EN("  {0}: {1} / {2}  ({3}, about {4} left)"),
-    JA("  {0}: {1} / {2}（{3}、残り約 {4}）"),
-    ZH_HANS("  {0}：{1} / {2}（{3}，大约还剩 {4}）"),
-    ZH_HANT("  {0}：{1} / {2}（{3}，大約還剩 {4}）"),
-    KO("  {0}: {1} / {2}({3}, 약 {4} 남음)"),
-    DE("  {0}: {1} / {2}  ({3}, noch etwa {4})"),
-    FR("  {0} : {1} / {2}  ({3}, encore {4} environ)"),
-    ES("  {0}: {1} / {2}  ({3}, quedan unos {4})"),
-    PT("  {0}: {1} / {2}  ({3}, faltam cerca de {4})"),
-    IT("  {0}: {1} / {2}  ({3}, mancano circa {4})"),
-    NL("  {0}: {1} / {2}  ({3}, nog ongeveer {4})"),
-    RU("  {0}: {1} / {2}  ({3}, осталось около {4})"),
-    TR("  {0}: {1} / {2}  ({3}, yaklaşık {4} kaldı)"));
-
 SS_MSG(rate_each,
     EN("{0} s each"),
     JA("1 件あたり {0} 秒"),
@@ -3134,21 +3107,6 @@ SS_MSG(rate_per_second,
     NL("{0} per seconde"),
     RU("{0} в секунду"),
     TR("saniyede {0}"));
-
-SS_MSG(dur_moment,
-    EN("a moment"),
-    JA("わずか"),
-    ZH_HANS("一会儿"),
-    ZH_HANT("一會兒"),
-    KO("잠깐"),
-    DE("einen Augenblick"),
-    FR("un instant"),
-    ES("un momento"),
-    PT("um instante"),
-    IT("un istante"),
-    NL("een ogenblik"),
-    RU("мгновение"),
-    TR("bir an"));
 
 SS_MSG(dur_seconds,
     EN("{0} s"),
@@ -3509,6 +3467,67 @@ SS_MSG(err_no_video_decoder,
        "('{1}'). Установите ffmpeg или укажите путь через --ffmpeg."),
     TR("Kareler burada süreç içinde çözülemiyor ({0}) ve ffmpeg bulunamadı ('{1}'). "
        "ffmpeg'i kurun ya da yolunu --ffmpeg ile verin."));
+
+SS_MSG(err_video_gpu_lost,
+    EN("The GPU stopped while extracting frames. Turn on \"Extract frames with "
+       "ffmpeg\" in Advanced (--decoder ffmpeg), or update the graphics driver."),
+    JA("切り出し中に GPU が停止しました。詳細設定の「フレームの切り出しに ffmpeg "
+       "を使う」（--decoder ffmpeg）か、ドライバの更新を試してください。"),
+    ZH_HANS("从视频抽取帧时 GPU 停止了响应。请在高级设置中打开“用 ffmpeg 抽取帧”"
+            "（--decoder ffmpeg），或更新显卡驱动。"),
+    ZH_HANT("從影片抽取影格時 GPU 停止了回應。請在進階設定中開啟「用 ffmpeg 抽取影"
+            "格」（--decoder ffmpeg），或更新顯示卡驅動程式。"),
+    KO("동영상에서 프레임을 추출하는 중에 GPU가 멈췄습니다. 고급에서 ‘ffmpeg으로 "
+       "프레임 추출’을 켜거나(--decoder ffmpeg) 그래픽 드라이버를 업데이트하세요."),
+    DE("Die GPU blieb beim Extrahieren stehen. Unter Erweitert „Bilder mit "
+       "ffmpeg extrahieren“ (--decoder ffmpeg) einschalten oder den Treiber "
+       "aktualisieren."),
+    FR("Le GPU s'est arrêté pendant l'extraction. Activez « Extraire les images "
+       "avec ffmpeg » dans Avancé (--decoder ffmpeg), ou mettez à jour le pilote."),
+    ES("La GPU se detuvo al extraer los fotogramas del vídeo. Activa «Extraer los "
+       "fotogramas con ffmpeg» en Avanzado (--decoder ffmpeg) o actualiza el "
+       "controlador gráfico."),
+    PT("A GPU parou ao extrair os quadros do vídeo. Ative “Extrair os quadros com "
+       "ffmpeg” em Avançado (--decoder ffmpeg) ou atualize o driver gráfico."),
+    IT("La GPU si è fermata durante l'estrazione dei fotogrammi dal video. Attiva "
+       "«Estrarre i fotogrammi con ffmpeg» in Avanzate (--decoder ffmpeg), oppure "
+       "aggiorna il driver grafico."),
+    NL("De GPU is gestopt tijdens het uithalen. Zet ‘Beelden met ffmpeg uithalen’ "
+       "aan bij Geavanceerd (--decoder ffmpeg), of werk het stuurprogramma bij."),
+    RU("GPU остановился при извлечении кадров из видео. Включите «Извлекать кадры "
+       "через ffmpeg» в расширенных настройках (--decoder ffmpeg) или обновите "
+       "графический драйвер."),
+    TR("Videodan kareler çıkarılırken GPU durdu. Gelişmiş’te “Kareleri ffmpeg ile "
+       "çıkar” seçeneğini açın (--decoder ffmpeg) veya grafik sürücüsünü "
+       "güncelleyin."));
+
+SS_MSG(vk_layer_turned_off,
+    EN("Turned off the Vulkan layer of {0}, which is known to crash this app. Set "
+       "SS_VK_KEEP_LAYERS=1 to keep it."),
+    JA("{0} の Vulkan レイヤーを無効にしました。このアプリをクラッシュさせることが"
+       "分かっています。残すには SS_VK_KEEP_LAYERS=1 を設定してください。"),
+    ZH_HANS("已关闭 {0} 的 Vulkan 层，已知它会使本应用崩溃。如需保留，请设置 "
+            "SS_VK_KEEP_LAYERS=1。"),
+    ZH_HANT("已關閉 {0} 的 Vulkan 層，已知它會使本應用程式當機。如需保留，請設定 "
+            "SS_VK_KEEP_LAYERS=1。"),
+    KO("{0}의 Vulkan 레이어를 껐습니다. 이 앱을 충돌시키는 것으로 알려져 있습니다. "
+       "유지하려면 SS_VK_KEEP_LAYERS=1 을 설정하세요."),
+    DE("Die Vulkan-Ebene von {0} wurde abgeschaltet; sie bringt diese App "
+       "bekanntermaßen zum Absturz. Mit SS_VK_KEEP_LAYERS=1 bleibt sie an."),
+    FR("La couche Vulkan de {0} a été désactivée : elle fait planter cette "
+       "application. Définissez SS_VK_KEEP_LAYERS=1 pour la garder."),
+    ES("Se desactivó la capa Vulkan de {0}, que hace fallar esta aplicación. "
+       "Define SS_VK_KEEP_LAYERS=1 para mantenerla."),
+    PT("A camada Vulkan de {0} foi desativada: ela faz este app travar. Defina "
+       "SS_VK_KEEP_LAYERS=1 para mantê-la."),
+    IT("Il layer Vulkan di {0} è stato disattivato: fa andare in crash questa "
+       "app. Imposta SS_VK_KEEP_LAYERS=1 per tenerlo."),
+    NL("De Vulkan-laag van {0} is uitgezet: die laat deze app vastlopen. Zet "
+       "SS_VK_KEEP_LAYERS=1 om hem te houden."),
+    RU("Слой Vulkan программы {0} отключён: известно, что он роняет это "
+       "приложение. Чтобы оставить его, задайте SS_VK_KEEP_LAYERS=1."),
+    TR("{0} uygulamasının Vulkan katmanı kapatıldı: bu uygulamayı çökerttiği "
+       "biliniyor. Açık kalması için SS_VK_KEEP_LAYERS=1 ayarlayın."));
 
 SS_MSG(err_ffmpeg_extract_failed,
     EN("ffmpeg could not extract the frames (see the log)."),

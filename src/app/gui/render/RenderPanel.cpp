@@ -31,9 +31,6 @@ namespace gui::render {
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
-const ImVec4 kErr(1.0f, 0.45f, 0.45f, 1.0f);
-const ImVec4 kOk(0.35f, 0.85f, 0.45f, 1.0f);    // GuiApp's, for a job done
-const ImVec4 kDim(0.62f, 0.64f, 0.68f, 1.0f);
 
 struct Resolution { int w, h; const Msg* name; };
 const Resolution kResolutions[] = {
@@ -64,7 +61,8 @@ const Msg* const kCodecs[kNumCodecs] = {&msg::codec_h264, &msg::codec_h265, &msg
 const int kCodecOrder[kNumCodecs] = {0, 1, 2, 4, 3};
 // The splat primitives a model can be rendered as: the automatic choice,
 // then ViewportPanel's names.
-const char* const kPrimitives[4] = {"", "3dgs", "mip", "3dgut"};
+constexpr int kNumPrimitives = 5;
+const char* const kPrimitives[kNumPrimitives] = {"", "3dgs", "mip", "3dgut", "2dgs"};
 
 // Keys the whole panel answers to, beside the viewport's own. A key is an
 // identifier, so it never gets translated.
@@ -1109,13 +1107,13 @@ void RenderSession::draw_effects_section(float full) {
             // Automatic unless one is chosen; only that choice is a word, the
             // rest are identifiers.
             int prim = 0;
-            for (int k = 1; k < 4; k++)
+            for (int k = 1; k < kNumPrimitives; k++)
                 if (y.primitive == kPrimitives[k]) prim = k;
             std::vector<std::string> names = {msg::primitive_auto.get()};
-            for (int k = 1; k < 4; k++) names.push_back(kPrimitives[k]);
+            for (int k = 1; k < kNumPrimitives; k++) names.push_back(kPrimitives[k]);
             ImGui::SetNextItemWidth(w);
             if (ui::BeginComboRaw("##prim", names[(size_t)prim].c_str())) {
-                for (int k = 0; k < 4; k++)
+                for (int k = 0; k < kNumPrimitives; k++)
                     if (ui::SelectableRaw(names[(size_t)k], k == prim)) {
                         y.primitive = kPrimitives[k];
                         project_changed();
@@ -1219,7 +1217,7 @@ void RenderSession::draw_effects_section(float full) {
         if (s.transition != Transition::Cut) {
             ImGui::SameLine();
             float d = (float)s.duration;
-            ImGui::SetNextItemWidth(px(120.0f));
+            ImGui::SetNextItemWidth(px(kCompactFieldW));
             if (ui::SliderFloatRaw("##dur", &d, 0.1f, 6.0f, "%.1f s")) {
                 s.duration = d;
                 project_changed();
@@ -1585,11 +1583,10 @@ void RenderSession::draw_output_section(float full) {
             ui::TextDisabled(msg::out_summary, {seconds(T), (long long)frame_count()});
     } else {
         const double now = progress_now();
-        if (!_job_clock.started() || _job.frame == 0) _job_clock.start(now);
         if (_job.frames > 0) _job_clock.work(now, (double)_job.frame / (double)_job.frames);
-        ui::ProgressBar(_job_clock.fraction(), ImVec2(full, 0), msg::render_progress,
-                        {(long long)_job.frame, (long long)_job.frames});
-        progress_time_line(_job_clock);
+        const std::string caption = spirula::i18n::format(
+            msg::render_progress, {(long long)_job.frame, (long long)_job.frames});
+        timed_progress_bar(_job_clock, caption.c_str(), full);
         if (ui::Button(msg::render_cancel, ImVec2(full, 0))) cancel_export();
     }
 }

@@ -135,8 +135,10 @@ inline bool train_choice_valid(const std::string& value, const char* choices) {
     X(std::string, data_format, "", "dataset", "basic", "colmap|nerfstudio|metashape|none") \
     X(std::string, image_dir, "images", "dataset", "basic", "<data>/<folder>") \
     X(std::string, mask_dir, "masks", "dataset", "basic", "<data>/<folder>") \
+    X(std::string, mask_mode, "auto", "dataset", "basic", "auto|ignore|segment|segment_and_ignore|off") \
     X(bool, load_masks, true, "dataset", "basic", "")                        \
     X(std::optional<bool>, apply_loss_for_mask, std::nullopt, "dataset", "basic", "") \
+    X(std::optional<bool>, preserve_background, std::nullopt, "dataset", "basic", "") \
     X(bool, flip_mask, false, "dataset", "basic", "")                        \
     X(float, mask_boundary_offset, 0.0f, "dataset", "advanced", "")          \
     X(std::string, depth_dir, "depths", "dataset", "basic", "<data>/<folder>") \
@@ -189,13 +191,14 @@ inline bool train_choice_valid(const std::string& value, const char* choices) {
     X(std::optional<float>, relative_scale, std::nullopt, "scene", "expert", "") \
                                                                              \
     /* ==== splats -- what a splat is and how the splats start out ==== */   \
-    X(std::string, primitive, "3dgs", "splats", "basic", "3dgs|mip|3dgut")   \
+    X(std::string, primitive, "3dgs", "splats", "basic", "3dgs|mip|3dgut|2dgs")   \
     X(int, sh_degree, 3, "splats", "basic", "")                              \
     X(int, sb_lobes, 0, "splats", "basic", "")                               \
     X(int, sh_degree_warmup_every, 0, "splats", "expert", "")             \
-    X(std::string, background_mode, "color", "splats", "basic", "color|noise|pseudorandom|random|sh") \
+    X(std::string, background_mode, "black", "splats", "basic", "black|color|skybox") \
     X(TrainVec3f, background_color, train_v3f(0.0f, 0.0f, 0.0f), "splats", "basic", "") \
-    X(int, background_sh_degree, 4, "splats", "basic", "")                   \
+    X(std::string, background_transparency_suppression, "none", "splats", "basic", "none|noise|pseudorandom|random") \
+    X(int, background_sh_degree, 4, "splats", "advanced", "")                \
     X(int, background_export_height, 512, "splats", "basic", "")          \
     X(int, background_noise_warmup, 2000, "splats", "expert", "")            \
     X(float, background_noise_pre_warmup, 0.25f, "splats", "expert", "")     \
@@ -229,7 +232,6 @@ inline bool train_choice_valid(const std::string& value, const char* choices) {
     X(float, noise_lr, 160.0f, "detail", "expert", "")                        \
     X(float, noise_lr_final, 1.6f, "detail", "expert", "")                   \
     X(bool, noise_gate_peak_weight, false, "detail", "expert", "")           \
-    X(bool, use_revised_densification, true, "detail", "expert", "")         \
     X(std::string, densify_score_mode, "mean", "detail", "basic", "mean|max|median|geom") \
     X(float, densify_score_blend_world_grad, 0.0f, "detail", "advanced", "") \
     X(std::string, densify_loss_map_mode, "auto", "detail", "basic", "auto|none|loss_full|ssim_full|ssim_cs|ssim_structure|s_cielab|flip|flip_feature|edge_aware|robust_edge_aware|loss_full_nms|ssim_full_nms|ssim_cs_nms|ssim_structure_nms|s_cielab_nms|flip_nms|flip_feature_nms") \
@@ -280,21 +282,21 @@ inline bool train_choice_valid(const std::string& value, const char* choices) {
     X(float, depth_distortion_reg, 0.0f, "geometry", "basic", "")            \
     X(float, normal_distortion_reg, 0.0f, "geometry", "basic", "")           \
     X(float, rgb_distortion_reg, 0.0f, "geometry", "basic", "")              \
-    X(int, distortion_reg_warmup, 6000, "geometry", "basic", "")             \
-    X(float, normal_reg_weight, 0.04f, "geometry", "basic", "")              \
-    X(int, normal_reg_warmup, 6000, "geometry", "advanced", "")              \
+    X(int, distortion_reg_warmup, 8000, "geometry", "basic", "")             \
+    X(std::string, distortion_reg_warmup_schedule, "quartic", "geometry", "advanced", "linear|cosine|quadratic|quartic|step") \
+    X(float, normal_reg_weight, 0.0f, "geometry", "basic", "")               \
     X(float, alpha_reg_weight, 0.0f, "geometry", "basic", "")                \
     X(int, alpha_reg_warmup, 12000, "geometry", "advanced", "")              \
-    X(int, reg_warmup_length, 0, "geometry", "advanced", "")                 \
+    X(std::string, alpha_reg_warmup_schedule, "linear", "geometry", "advanced", "linear|cosine|quadratic|quartic|step") \
     X(float, depth_supervision_weight, 0.0f, "geometry", "basic", "")        \
     X(float, normal_supervision_weight, 0.01f, "geometry", "basic", "")      \
     X(std::optional<bool>, input_depth_is_ray_depth, std::nullopt, "geometry", "basic", "") \
-    X(int, supervision_warmup, 0, "geometry", "expert", "")                  \
     X(float, mean_median_depth_weight, 0.0f, "geometry", "advanced", "")     \
     X(float, median_depth_normal_reg_weight, 0.0f, "geometry", "expert", "") \
     X(float, median_normal_supervision_weight, 0.0f, "geometry", "expert", "") \
     X(float, median_render_normal_reg_weight, 0.0f, "geometry", "expert", "")\
-    X(int, median_warmup, 6000, "geometry", "expert", "")                    \
+    X(int, median_warmup, 8000, "geometry", "expert", "")                    \
+    X(std::string, median_warmup_schedule, "quartic", "geometry", "expert", "linear|cosine|quadratic|quartic|step") \
     X(int, pca_reg_neighbors, 0, "geometry", "advanced", "")                 \
     X(std::string, pca_reg_knn, "morton-best", "geometry", "advanced", "exact|exact-cached|morton|morton-cached|morton-best|morton-best-cached") \
     X(int, pca_reg_window, 0, "geometry", "expert", "")                      \
@@ -320,7 +322,11 @@ inline bool train_choice_valid(const std::string& value, const char* choices) {
     X(std::optional<float>, opacity_decay, std::nullopt, "shape", "basic", "")\
     X(std::optional<float>, scale_decay, std::nullopt, "shape", "basic", "") \
     X(float, erank_reg, 0.001f, "shape", "basic", "")                        \
+    X(int, erank_reg_warmup, 0, "shape", "advanced", "")                     \
+    X(std::string, erank_reg_warmup_schedule, "linear", "shape", "advanced", "linear|cosine|quadratic|quartic|step") \
     X(float, erank_reg_s3, 0.0f, "shape", "advanced", "")                    \
+    X(int, erank_reg_s3_warmup, 8000, "shape", "advanced", "")               \
+    X(std::string, erank_reg_s3_warmup_schedule, "quadratic", "shape", "advanced", "linear|cosine|quadratic|quartic|step") \
     X(float, scale_regularization_weight, 0.0f, "shape", "advanced", "")     \
     X(float, max_gauss_ratio, 10.0f, "shape", "advanced", "")                \
     X(float, dc_reg, 0.001f, "shape", "basic", "")                           \
@@ -463,12 +469,9 @@ struct TrainConfig {
 // `spirula train <preset>`. "3dgs" is the base config and applies nothing.
 // ===========================================================================
 
-// Just the names, which are what the command line and the checkpoints spell.
-// The label and the sentence explaining each one are in
-// i18n/catalog/Train.h: this header is included nearly everywhere and has no
-// business dragging a translation catalog behind it. Both consumers
-// (app/cli/main.cpp, app/gui/GuiApp.cpp) static_assert that the two lists are
-// the same length.
+// Just the names the command line and checkpoints spell; labels and help are in
+// i18n/catalog/Train.h, kept out of this widely included header. app/cli/main.cpp
+// and app/gui/PresetPickers.cpp static_assert that the two lists match in length.
 struct TrainPresetInfo { const char* name; };
 inline constexpr TrainPresetInfo kTrainPresets[] = {
     {"3dgs"},
@@ -478,7 +481,6 @@ inline constexpr TrainPresetInfo kTrainPresets[] = {
     {"hdr"},
     {"synthetic"},
     {"meshing"},
-    // {"academic-baseline"},  // hidden by default, uncomment to enable
 };
 
 inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
@@ -514,9 +516,9 @@ inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
         c.cap_max = 200000;
         c.apply_loss_for_mask = true;
         c.center_method = "focus";
-        c.background_mode = "sh";
+        c.background_mode = "skybox";
         c.depth_distortion_reg = 0.01f;
-        c.rgb_distortion_reg = 0.01f;
+        // c.rgb_distortion_reg = 0.01f;
         c.erank_reg = 0.05f;
         return true;
     }
@@ -529,7 +531,7 @@ inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
         // c.apply_ppisp_before_color_space = true;
         // c.ppisp_adagrad_lr = 0.25f;
         c.ppisp_exposure_from_exif = true;
-        c.background_mode = "random";
+        c.background_transparency_suppression = "random";
         c.background_match_luminance = true;
         // c.depth_distortion_reg = 0.01f;
         c.loss_saturation_threshold = 0.98f;
@@ -552,77 +554,24 @@ inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
         return true;
     }
     if (name == "meshing") {
-        c.primitive = "mip";
+        // c.primitive = "mip";
+        c.primitive = "3dgut";
         c.sh_degree = 0;
         c.dc_reg = 10.0f;
         // c.sh_reg = 10.0f;
         c.overexposure_reg = 10.0f;
-        c.background_mode = "noise";
+        c.background_transparency_suppression = "noise";
         // c.depth_distortion_reg = 0.01f;
         c.floater_suppression = "strong";
         c.normal_distortion_reg = 0.01f;
+        c.normal_reg_weight = 0.04f;
         c.mean_median_depth_weight = 0.01f;
         c.median_depth_normal_reg_weight = 0.01f;
-        c.normal_supervision_weight = 0.01f;
+        // c.normal_supervision_weight = 0.01f;
         c.median_normal_supervision_weight = 0.01f;
         c.median_render_normal_reg_weight = 0.01f;
         c.erank_reg = 0.01f;
         c.erank_reg_s3 = 0.01f;
-        return true;
-    }
-    if (name == "academic-baseline") {
-        c.eval_mode = "interval";
-        c.eval_interval = 8;
-        c.center_method = "gsplat";
-        c.orientation_method = "gsplat";
-        c.max_batch_per_epoch = 387420489;
-        c.load_depths = false;
-        c.load_normals = false;
-        c.primitive = "3dgs";
-        c.relative_scale = 1.0f;
-        c.use_bilateral_grid = false;
-        c.use_bilateral_grid_for_geometry = false;
-        c.use_ppisp = false;
-        c.calib_correction = "off";
-        c.use_revised_densification = false;
-        c.reg_rendered_only = false;
-        c.dead_after_epochs = 0.0f;
-        c.split_weight_by_renders = false;
-        c.max_split_fraction = 1.0f;
-        c.densify_loss_map_mode = "none";
-        c.use_long_axis_split = false;
-        c.use_fused_proj_bwd_optim = false;
-        c.quantization_level = 0;
-        c.max_screen_size = kTrainInf;
-        c.max_world_size = kTrainInf;
-        c.suppress_initial_scales = false;
-        c.scale_init = 0.1f;
-        c.opacity_init = 0.5f;
-        c.depth_distortion_reg = 0.0f;
-        c.normal_reg_weight = 0.0f;
-        c.alpha_reg_weight = 0.0f;
-        c.alpha_loss_weight = 0.0f;
-        c.alpha_loss_weight_under = 0.0f;
-        c.erank_reg = 0.0f;
-        c.erank_reg_s3 = 0.0f;
-        c.quat_norm_reg = 0.0f;
-        c.dc_reg = 0.0f;
-        c.sh_reg = 0.0f;
-        c.normal_supervision_weight = 0.0f;
-        c.opacity_reg = 0.01f;
-        c.scale_reg = 0.01f;
-        c.max_steps = 30000;
-        c.use_scale_agnostic_mean = false;
-        c.projective_depth_lr = 0.0f;
-        c.use_per_splat_bias_correction = false;
-        c.means_lr = 0.00016f;
-        c.means_lr_final = 1.6e-06f;
-        c.scales_lr = 0.005f;
-        c.scales_lr_final = std::nullopt;
-        c.quats_lr = 0.001f;
-        c.opacities_lr = 0.05f;
-        c.features_dc_lr = 0.0025f;
-        c.features_sh_lr = 0.000125f;
         return true;
     }
     (void)c;
@@ -756,6 +705,57 @@ inline void train_resolve_macros(TrainConfig& c,
     }
 }
 
+enum class ResolvedMaskMode { Off, Ignore, Segment, SegmentAndIgnore };
+
+// When mask_mode == "auto", preserve load_masks / apply_loss_for_mask behavior.
+inline ResolvedMaskMode resolve_train_mask_mode(const TrainConfig& c) {
+    if (c.mask_mode == "off") return ResolvedMaskMode::Off;
+    if (c.mask_mode == "ignore") return ResolvedMaskMode::Ignore;
+    if (c.mask_mode == "segment") return ResolvedMaskMode::Segment;
+    if (c.mask_mode == "segment_and_ignore") return ResolvedMaskMode::SegmentAndIgnore;
+    if (!c.load_masks) return ResolvedMaskMode::Off;
+    return c.apply_loss_for_mask.value_or(false)
+        ? ResolvedMaskMode::Segment
+        : ResolvedMaskMode::Ignore;
+}
+
+inline bool train_mask_enabled(const TrainConfig& c) {
+    return resolve_train_mask_mode(c) != ResolvedMaskMode::Off;
+}
+
+inline bool train_mask_applies_alpha_loss(const TrainConfig& c) {
+    ResolvedMaskMode m = resolve_train_mask_mode(c);
+    return m == ResolvedMaskMode::Segment || m == ResolvedMaskMode::SegmentAndIgnore;
+}
+
+inline bool train_mask_is_segment_and_ignore(const TrainConfig& c) {
+    return resolve_train_mask_mode(c) == ResolvedMaskMode::SegmentAndIgnore;
+}
+
+// Whether segmented pixels keep their RGB loss, so the background trains there.
+// A skybox under a transparency draw shows only on segments: without this it
+// would never train, so `segment` defaults on for it.
+inline bool train_mask_preserves_background(const TrainConfig& c) {
+    switch (resolve_train_mask_mode(c)) {
+    case ResolvedMaskMode::Segment:
+        return c.preserve_background.value_or(c.background_mode == "skybox" &&
+                                              c.background_transparency_suppression != "none");
+    case ResolvedMaskMode::SegmentAndIgnore: return c.preserve_background.value_or(true);
+    default: return false;
+    }
+}
+
+// background_mode once also held the suppression draws, and `sh` for skybox.
+inline void train_upgrade_background_mode(TrainConfig& c) {
+    std::string& m = c.background_mode;
+    if (m == "sh") m = "skybox";
+    if (m == "noise" || m == "pseudorandom" || m == "random") {
+        if (c.background_transparency_suppression == "none")
+            c.background_transparency_suppression = m;
+        m = "black";
+    }
+}
+
 // Positions in the schedule move; rates, ratios and budgets do not. Applied
 // ONCE, to the run's own copy, and clears the factor: the front ends
 // re-resolve their config every frame, and one that compounded would run away.
@@ -778,11 +778,10 @@ inline void train_apply_steps_scaler(TrainConfig& c) {
     c.sh_degree_warmup_every    = sc(c.sh_degree_warmup_every);
     c.background_noise_warmup   = sc(c.background_noise_warmup);
     c.distortion_reg_warmup     = sc(c.distortion_reg_warmup);
-    c.normal_reg_warmup         = sc(c.normal_reg_warmup);
     c.alpha_reg_warmup          = sc(c.alpha_reg_warmup);
-    c.reg_warmup_length         = sc(c.reg_warmup_length);
-    c.supervision_warmup        = sc(c.supervision_warmup);
     c.median_warmup             = sc(c.median_warmup);
+    c.erank_reg_warmup          = sc(c.erank_reg_warmup);
+    c.erank_reg_s3_warmup       = sc(c.erank_reg_s3_warmup);
     // These four are scheduled_lr's warmup, and its decay half already runs
     // on step/max_steps. Scaling one half and not the other would leave a
     // single schedule measuring its two ends against different clocks.

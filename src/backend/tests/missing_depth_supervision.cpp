@@ -78,7 +78,7 @@ Outcome run(int64_t h, int64_t w, int scales, bool masked,
         losses = compute_multi_scale_per_pixel_losses(scales, rgb, rgb, depth, gt,
             absent(), absent(), absent(), transmittance, absent(), absent(), absent(),
             absent(), absent(), alpha, masked, weights, 0.0f, 0, -1.0f, v_losses, needs,
-            1, absent(), absent(), static_cast<int>(DensifyLossMapMode::None), 0.75f, 0.0f, grads);
+            1, absent(), absent(), static_cast<int>(DensifyLossMapMode::None), 0.75f, 0.0f, grads, false);
         backend::device_synchronize();
     }
     Outcome result{losses.depth_sup, std::vector<float>(count)};
@@ -96,7 +96,7 @@ bool valid_supervision(const Outcome& result, int64_t w, bool masked) {
     bool nonzero = false;
     for (size_t i = 0; i < result.gradient.size(); ++i) {
         const float value = result.gradient[i];
-        if (!std::isfinite(value) || (masked && i % w < w / 2 && value != 0.0f)) return false;
+        if (!std::isfinite(value) || (masked && (int64_t)(i % w) < w / 2 && value != 0.0f)) return false;
         nonzero |= value != 0.0f;
     }
     return std::isfinite(result.loss) && result.loss > 0.0f && nonzero;

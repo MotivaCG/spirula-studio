@@ -88,7 +88,7 @@ void engine_copy_render_to_host(
         // A training step's loss may have put v_rgb in the float32 raw render.
         const bool half = engine().fwd.raw_rgb16.data_ptr() != nullptr;
         pre = half ? engine().fwd.raw_rgb16 : engine().fwd.raw_rgb;
-        if (app.params.bg != AppearanceBg::None || half) {
+        if (appearance_has_bg(app.params) || half) {
             AppearanceChainParams p = app.params;
             p.cs_enabled = 0;
             p.ppisp = AppearancePpisp::Off;
@@ -288,6 +288,18 @@ void engine_copy_render_depth_normal_to_host(TorchTensorView out) {
                          backend::MemcpyKind::DeviceToHost);
 }
 
+void engine_copy_render_normal_to_host(TorchTensorView out) {
+    auto& normal = std::get<2>(engine().fwd.renders);
+    if (normal.data_ptr() == nullptr || std::get<0>(out) == 0) return;
+    backend::memcpy_sync((void*)std::get<0>(out), normal.data_ptr(),
+                         normal.numel() * sizeof(float3),
+                         backend::MemcpyKind::DeviceToHost);
+}
+
+bool engine_primitive_renders_normal(const std::string& primitive) {
+    return RenderOutput::has_normal(engine_primitive_pixel_type(primitive, true));
+}
+
 
 bool engine_blit_render(int view_camera_model, std::string distortion,
                         TorchTensorView view_intrins, TorchTensorView view_viewmat,
@@ -335,10 +347,8 @@ std::vector<std::tuple<std::string, size_t, size_t>> engine_get_pool_breakdown()
     return DevicePool::global().getBreakdown();
 }
 
-// Same buffers as engine_get_pool_breakdown(), but each row also carries its
-// VRAM category as a string ("splat", "splat x img", "image", "appearance",
-// "viewer", "other") sourced from the pool-slot metadata table -- so Python
-// buckets by an authoritative tag instead of guessing from the key prefix.
+// Same buffers as engine_get_pool_breakdown(), each with its VRAM category's
+// tag from the pool-slot table (to_string in core/PoolSlots.h).
 std::vector<std::tuple<std::string, std::string, size_t, size_t>>
 engine_get_pool_breakdown_categorized() {
     auto raw = DevicePool::global().getBreakdownCategorized();

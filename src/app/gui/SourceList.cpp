@@ -1,5 +1,6 @@
 // SourceList.cpp -- see SourceList.h.
 
+#include "data/ImageDiscovery.h"
 #include "app/gui/SourceList.h"
 #include "app/LogLuts.h"
 #include "app/gui/RigGuess.h"
@@ -157,8 +158,10 @@ void probe_sources(std::vector<PrepInput>& sources,
         if ((kandao || is_packed_lens_path(s.path)) && source_pixel_size(s, ffmpeg_exe, w, h))
             set_packed_lenses(s, w, h, kandao && app::kandao_unstitched(s.path, w, h));
     }
-    for (PrepInput& s : sources)
+    for (PrepInput& s : sources) {
         if (s.is_video) s.lut_detected = app::detect_log_lut(s.path);
+        else s.detected_color = probe_photo_color(s.path, never);
+    }
     normalize_source_luts(sources);
 }
 
@@ -243,6 +246,7 @@ void guess_source_rigs(std::vector<PrepInput>& sources, bool force) {
         // nested, and matching is by path relative to it, as the rig's is.
         for (fs::recursive_directory_iterator it(dir, opts, ec), end;
              !ec && it != end; it.increment(ec)) {
+            if (image_discovery::skip_cache(it)) continue;
             if (g.sub >= 0) it.disable_recursion_pending();
             if (!it->is_regular_file(ec) || !is_image_file(it->path())) continue;
             fs::path rel = it->path().lexically_relative(dir);
@@ -402,22 +406,12 @@ void normalize_source_lenses(std::vector<PrepInput>& sources,
 
 
 void normalize_source_fps(std::vector<PrepInput>& sources, float& video_fps) {
-    float above = 0.0f;
-    bool first = true;
     for (PrepInput& s : sources) {
         if (!s.is_video) continue;
-        const float rate = std::max(s.fps, 0.0f);
-        if (first) {
-            if (s.fps != 0.0f) video_fps = rate;
-            if (!(video_fps >= 0.0f)) video_fps = 2.0f;
-            s.fps = 0.0f;
-            above = video_fps;
-            first = false;
-        } else if (s.fps != 0.0f && rate == above) {
-            s.fps = 0.0f;
-        } else if (s.fps != 0.0f) {
-            above = rate;
-        }
+        if (s.fps != 0.0f) video_fps = std::max(s.fps, 0.0f);
+        if (!(video_fps >= 0.0f)) video_fps = 2.0f;
+        s.fps = 0.0f;
+        break;
     }
 }
 
@@ -474,12 +468,10 @@ void apply_pano_lens(std::vector<PrepInput>& sources, SfmJob& sfm,
 }
 
 
-void apply_capture_order(const std::vector<PrepInput>& sources, SfmJob& sfm,
-                         ColmapJob& colmap) {
+void apply_capture_order(const std::vector<PrepInput>& sources, ColmapJob& colmap) {
     if (sources.empty()) return;
     const PrepInput& head = sources[0];
     const bool ordered = head.is_video && head.sequential;
-    if (sfm.data_type != 2) sfm.data_type = ordered ? 1 : 0;
     // NOT sequential for a dual-lens video or a 360 file's views: temporal
     // neighbours miss every cross-lens pair -- 68/118 registered on an X5
     // capture against 116/118 for automatic, which is content-based.
@@ -493,8 +485,8 @@ void apply_capture_defaults(std::vector<PrepInput>& sources, SfmJob& sfm,
     normalize_source_fps(sources, sfm.prep.video_fps);
     if (sources.empty()) return;
     const bool dual = is_dual_lens(sources[0]);
-    sfm.pairs = 0;               // automatic
-    apply_capture_order(sources, sfm, colmap);
+    sfm.pairs = kPairsPrefilter;
+    apply_capture_order(sources, colmap);
     colmap.seq_loop_closure = true;   // if switched to sequential
     if (has_fisheye_lens(sources[0])) {
         colmap.camera_model = "THIN_PRISM_FISHEYE";

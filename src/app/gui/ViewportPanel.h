@@ -9,6 +9,7 @@
 #include "data/DatasetParser.h"
 #include "app/gui/NavCamera.h"
 #include "app/gui/PreviewRenderer.h"
+#include "app/gui/HardwareSplatRenderer.h"
 #include "app/gui/ViewportInput.h"
 
 #include <array>
@@ -28,8 +29,8 @@ struct ViewBookmarkSet;
 
 // What the viewer's primitive combo offers, in order. These are the
 // `forward_3dgs` primitive names, so they are identifiers, not words.
-inline const char* kViewerPrimitives[] = {"3dgs", "mip", "3dgut"};
-inline constexpr int kNumViewerPrimitives = 3;
+inline const char* kViewerPrimitives[] = {"3dgs", "mip", "3dgut", "2dgs"};
+inline constexpr int kNumViewerPrimitives = 4;
 
 // Color gamuts the render can be converted FROM, in combo order. "" is
 // Rec.709 (no conversion); the rest are gamut_to_rec709's names, which are
@@ -83,24 +84,33 @@ public:
         std::function<void(const char* gamut, int transfer, bool linear)>
             apply_color_space,
         std::function<void()> on_primitive_changed);
+    void attach_hardware(const ViewerRenderConfig& cfg, const std::string& path,
+                         const std::string& key, const float center[3], float unit);
+    void attach_splat_preview(const spirula::SplatCloud& sample, const std::string& key,
+                             const float center[3], float unit);
     void detach();
     // A saved placement can change the frame without changing element counts.
     void invalidate_framing() { _framed_key.clear(); }
+    bool allocation_failed() const { return _last_error.find("GPU allocation failed:") != std::string::npos ||
+        _last_error.find("out of GPU memory:") != std::string::npos ||
+        _last_error.find("out of memory") != std::string::npos ||
+        _last_error.find("OUT_OF_DEVICE_MEMORY") != std::string::npos; }
     bool attached() const { return _mode == Mode::Engine; }
+    bool hardware_active() const { return _mode == Mode::Hardware; }
 
-    // Hide the controls the view link makes shared -- navigation, camera
-    // model, field of view, reset -- so a row of linked panels shows them
-    // once, drawn by draw_nav_controls() wherever the owner wants them.
-    void show_nav_controls(bool on) { _nav_controls = on; }
-    void draw_nav_controls();
+    // The navigation mode and speed, which a row of linked panels shares:
+    // nav_edits() counts the changes made from this panel's own controls.
+    int nav_edits() const { return _nav_edits; }
+    void copy_nav_settings(const ViewportPanel& src) {
+        _cam.mode = src._cam.mode;
+        _cam.speed_exp = src._cam.speed_exp;
+        _auto_nav_mode = false;
+    }
 
-    // How tall the last draw()'s control rows were, and extra height to leave
-    // under them. A row of panels whose controls wrap differently would
-    // otherwise render at different sizes, which is not a comparison.
-    float controls_height() const { return _controls_h; }
-    void set_controls_pad(float px) { _controls_pad = px; }
-    // The image this wide, left-aligned under controls that keep the whole
-    // width; the owner draws beside it. 0 = all of it.
+    // The point or triangle count on the control row; off where the owner
+    // already shows it.
+    void show_counts(bool on) { _show_counts = on; }
+    // The image this wide, left-aligned; the owner draws beside it. 0 = all of it.
     void set_image_width(float w) { _image_w = w; }
 
     // An editing tool over this viewport. While one is installed it owns the
@@ -145,6 +155,8 @@ public:
     int view_model() const { return _cam_model; }
     // The primitive the scene options render with; empty without them.
     std::string primitive() const;
+    // A stochastic render of a still view is still converging.
+    bool refining() const { return _refining; }
     float view_fov() const { return _fov_deg[_cam_model]; }
     void set_view_lens(int model, float fov_deg);
     // The point under a fraction of the image (0..1 each way), found on the
@@ -222,6 +234,8 @@ public:
     // training iteration that has just finished (< 0 when unknown), which is
     // what paces the refresh while nobody is steering the camera.
     void draw(bool training, int step = -1);
+    // For a job monitor sharing the GPU: budget framebuffer pixels.
+    void limit_preview_pixels(int pixels);
 
     // Free GL resources. Call while the GL context is still current
     // (before ImGui/GLFW shutdown).
@@ -252,7 +266,6 @@ private:
     std::function<void(ViewResult&&)> _shot_done;
     int _shot_w = 0, _shot_h = 0;
     bool _shot_inflight = false;
-    float views_width() const;
     void draw_view_buttons();
     void handle_view_keys();
     void animate_glide(double now);
@@ -266,7 +279,7 @@ private:
     double _glide_t0 = 0.0;
     NavCamera _glide_from, _glide_to, _glide_last;
 
-    enum class Mode { None, Preview, Engine };
+    enum class Mode { None, Preview, Engine, Hardware };
 
     void compute_framing(const spirula::TrainerSession& session);
     // The client-frame default pose (web viewer cam.reset() + orbit(0,-250)),
@@ -320,11 +333,18 @@ private:
     void build_request(ViewRequest& q, int W, int H) const;
     void view_matrix(float out[16]) const;   // row-major world-to-view
     void upload(const ViewResult& res);
-    void draw_controls(bool engine);
+    void draw_controls(bool engine, const ImVec2& avail);
+    // The Options panel's sections: navigation, lens, overlays, rendering --
+    // and in the last, a viewer's primitive, SH and colour.
+    void draw_options(bool engine);
+    void draw_scene_options();
     void handle_input(float item_h);         // mouse/keys/gamepad on last item
     void draw_engine(bool training, const ImVec2& avail, int step);
     void pump_engine(bool training, const ImVec2& avail, int step);
+    int preview_display_size(float extent) const;
+    float preview_scale(int w, int h) const;
     unsigned pump_preview(const ImVec2& avail, int& W, int& H);
+    unsigned pump_hardware(int W, int H);
     void draw_preview(const ImVec2& avail);
     void draw_wipe(const ImVec2& tl, const ImVec2& size) const;
     bool wipe_input(const ImVec2& tl, const ImVec2& size);
@@ -333,8 +353,16 @@ private:
     int _wipe_drag = -1;
     float _last_avail_w = 0.0f, _last_avail_h = 0.0f;
     unsigned _preview_tex = 0;
+    int _preview_limit = 0, _preview_max_side = 0, _preview_display_w = 0, _preview_display_h = 0;
+    bool _preview_grid = false;   // what _preview_tex was drawn with
 
     Mode _mode = Mode::None;
+    HardwareSplatRenderer _hardware;
+    unsigned _hardware_tex = 0;
+    std::string _hardware_path;
+    float _hardware_center[3]{};
+    float _hardware_unit = 1;
+    ViewerRenderConfig _hardware_cfg;   // what its buffer list follows
     RenderWorker _worker;
     PreviewRenderer _preview;
     std::array<float, 16> _preview_frame{};   // ParsedDataset::train_to_normalized
@@ -397,7 +425,7 @@ private:
     float _scene_scale = 1.0f;
     // The grid's cell in model units, from the same rule both backends use.
     float grid_cell() const;
-    void draw_grid_overlay(float x, float y, int line) const;
+    std::string grid_legend() const;
     // The navigation gizmo in the image's corner: drag to orbit, click an
     // axis to look along it. True while it has the pointer.
     bool gizmo_input(bool hovered_image);
@@ -432,9 +460,11 @@ private:
     // The image rectangle of the last draw, which is the frame a tool's
     // pointer coordinates and its overlay are both in.
     float _img_x = 0, _img_y = 0, _img_w = 0, _img_h = 0;
-    bool _nav_controls = true;
-    float _controls_h = 0.0f;
-    float _controls_pad = 0.0f;
+    int _nav_edits = 0;
+    bool _show_counts = true;
+    // The Options panel, and whether the pointer was on it or its button on
+    // the last frame: a click anywhere else closes a panel that is not pinned.
+    bool _options_open = false, _options_hovered = false, _options_button_hovered = false;
     float _image_w = 0.0f;
 
     // ---- render options a VIEWER may change (a training session may not:
@@ -460,6 +490,8 @@ private:
     // Render options.
     int _buffer_idx = 0;
     std::vector<std::string> _buffer_keys;
+    // The worker's keys for the primitive rendered now, keeping the selection.
+    void refresh_buffer_keys();
     bool _show_cams = false;
     bool _show_roi = true;
     std::shared_ptr<const spirula::RegionOverlay> _roi_engine, _roi_preview;
@@ -490,6 +522,7 @@ private:
     uint64_t _pending = 0;
     double _last_submit = 0.0;
     bool _dirty = true;
+    bool _refining = false;
     unsigned int _tex = 0;
     int _tex_w = 0, _tex_h = 0;
     std::string _last_error;

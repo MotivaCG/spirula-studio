@@ -4,6 +4,8 @@
 // from the process that runs it (MeshRunner.h) so that a preset, a batch row
 // and a test can reason about a job without dragging a child process behind.
 
+#include "app/gui/MeshNumericFields.h"
+
 #include <string>
 #include <vector>
 
@@ -38,6 +40,7 @@ struct MeshJob {
     bool formats[kNumMeshFormats] = {true, false, false, false, false};
 
     int max_cameras = 0;               // 0 = every camera
+    bool tsdf = false;                 // --method tsdf; needs use_data
     int texture_size = 0;              // 0 = auto (texture mode only)
 
     // Canonical UUID for native children; empty uses shared precedence and prevents
@@ -46,14 +49,14 @@ struct MeshJob {
     // CUDA children receive the separately frozen ordinal; never a Vulkan UUID.
     int cuda_device = -1;
 
-    // ---- advanced ----
-    float iso = 0.0f;                  // 0 = the child's default for the path
-    int bisection_iters = 3;
+    std::string data_format;
+    bool quiet = false;
+#define SS_MESH_DECLARE(type, name, flag, initial, group, tier, help, visible) type name = initial;
+    SS_MESH_NUMERIC_FIELDS(SS_MESH_DECLARE)
+#undef SS_MESH_DECLARE
     float merge_factor = 1.0f;
-    int quality_iters = 3;
     int floater_min_faces = 10;
     bool cull_unseen = true;
-    int carve_k = 1;
     std::string extra_args;            // appended verbatim
 
     // The file the preview should open when the run finishes: the richest of

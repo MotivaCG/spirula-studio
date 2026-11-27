@@ -114,9 +114,10 @@ struct Reconstruction::Impl {
 
     Impl(const std::string& dir, const std::vector<View>& v, const DenseConfig& c, const std::atomic<bool>* stop,
          const std::string& live_dir)
-        : work(dir), views(v), config(c), cancel(stop), preview_dir(live_dir),
+        : work(dir), views(v), config(c), cancel(stop),
           width(c.match.high_width ? c.match.high_width : c.match.low_width),
-          height(c.match.high_height ? c.match.high_height : c.match.low_height) {
+          height(c.match.high_height ? c.match.high_height : c.match.low_height),
+          preview_dir(live_dir) {
         config.validate();
         config.image_cache_bytes = c.resolved_image_cache_bytes();
         config.geometry = c.resolved_geometry();
@@ -178,9 +179,10 @@ struct Reconstruction::Impl {
     void flush() {
         for (auto& [key, records] : pending) {
             if (records.empty()) continue;
-            std::ofstream stream(tile(key.first, key.second), std::ios::binary | std::ios::app);
+            const auto path = tile(key.first, key.second);
+            std::ofstream stream(path, std::ios::binary | std::ios::app);
             stream.write(reinterpret_cast<const char*>(records.data()), (std::streamsize)(records.size() * sizeof(Record)));
-            if (!stream) throw std::runtime_error("cannot write dense observation tile");
+            if (!stream) throw std::runtime_error("cannot write dense observation tile " + quoted_path(path) + ": " + io_error_text());
         }
         pending.clear();
         pending_bytes = 0;

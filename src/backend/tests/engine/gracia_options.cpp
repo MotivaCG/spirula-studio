@@ -86,7 +86,7 @@ int main() {
         backend::memcpy_sync(engine().ppisp.params.data_ptr(), fit.data(), fit.size() * sizeof(float),
                              backend::MemcpyKind::HostToDevice);
         engine_save_checkpoint(root.string(), true, 7, 16, "filtered");
-        engine_save_checkpoint(root.string(), true, 7, 16, "teacher", false, true);
+        engine_save_checkpoint(root.string(), true, 7, 16, "teacher", false, "", true);
         require(vertices(root / "filtered.ply") == 1 && vertices(root / "teacher.ply") == 3,
                 "keep-all export changed filtering of finite or non-finite splats");
         std::vector<float> restored(fit.size(), 0.0f);

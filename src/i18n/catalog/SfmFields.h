@@ -113,45 +113,20 @@ SS_MSG(quality_help,
     RU("Рабочее разрешение, бюджет признаков и широта отбора пар"),
     TR("Çalışma çözünürlüğü, öznitelik bütçesi ve çift seçiminin genişliği"));
 
-SS_MSG(data_type_help,
-    EN("What the capture is: individual photos, video frames, or an unordered "
-       "internet collection"),
-    JA("撮影の種類: 個別の写真、動画のフレーム、または順序のないインターネット"
-       "収集"),
-    ZH_HANS("拍摄的性质：独立照片、视频帧，或来自互联网的无序集合"),
-    ZH_HANT("拍攝的性質：獨立照片、影片影格，或來自網際網路的無序集合"),
-    KO("촬영의 성격: 개별 사진, 동영상 프레임, 또는 순서 없는 인터넷 모음"),
-    DE("Was die Aufnahme ist: einzelne Fotos, Videobilder oder eine ungeordnete "
-       "Internetsammlung"),
-    FR("Ce qu'est la prise de vue : photos individuelles, images de vidéo, ou "
-       "collection internet sans ordre"),
-    ES("Qué es la captura: fotos sueltas, fotogramas de vídeo, o una colección "
-       "de internet sin orden"),
-    PT("O que é a captura: fotos avulsas, quadros de vídeo, ou uma coleção da "
-       "internet sem ordem"),
-    IT("Che cos'è la ripresa: foto singole, fotogrammi di un video, o una "
-       "raccolta internet senza ordine"),
-    NL("Wat de opname is: losse foto's, videobeelden, of een ongeordende "
-       "internetverzameling"),
-    RU("Что представляет собой съёмка: отдельные фотографии, кадры видео или "
-       "неупорядоченная интернет-подборка"),
-    TR("Çekimin ne olduğu: tek tek fotoğraflar, video kareleri ya da sırasız "
-       "bir internet derlemesi"));
-
 SS_MSG(pairs_help,
-    EN("Which image pairs are matched; auto is GPU pair selection at 100 images or more, sequential (plus loop closure) for video below that, and exhaustive otherwise"),
-    JA("どの画像ペアをマッチングするか。auto は画像 100 枚以上なら GPU によるペア選択、それ未満の動画なら sequential（ループ閉じ込みつき）、それ以外は exhaustive"),
-    ZH_HANS("匹配哪些图像对；auto 表示图像达到 100 张以上时用 GPU 筛选像对，低于此数的视频用 sequential（并做回环闭合），其余情况用 exhaustive"),
-    ZH_HANT("匹配哪些影像對；auto 表示影像達到 100 張以上時用 GPU 篩選影像對，低於此數的影片用 sequential（並做迴環閉合），其餘情況用 exhaustive"),
-    KO("어떤 이미지 쌍을 매칭할지. auto 는 이미지가 100장 이상이면 GPU 쌍 선택, 그보다 적은 동영상이면 sequential(루프 클로저 포함), 그 밖에는 exhaustive"),
-    DE("Welche Bildpaare zugeordnet werden; auto heißt GPU-Paarauswahl ab 100 Bildern, sequential (mit Schleifenschluss) für Video darunter, sonst exhaustive"),
-    FR("auto : sélection GPU à partir de 100 images ; en dessous, sequential avec fermeture de boucle pour la vidéo, exhaustive sinon."),
-    ES("auto: selección GPU desde 100 imágenes; por debajo, sequential con cierre de bucle para vídeo, exhaustive en otro caso."),
-    PT("auto: seleção GPU a partir de 100 imagens; abaixo, sequential com fecho de laço para vídeo, exhaustive nos outros casos."),
-    IT("auto: selezione GPU da 100 immagini; sotto, sequential con chiusura d’anello per video, altrimenti exhaustive."),
-    NL("Welke beeldparen gematcht worden; auto is paarselectie op de GPU vanaf 100 beelden, sequential (met lussluiting) voor video daaronder, en anders exhaustive"),
-    RU("Какие пары изображений сопоставляются; auto -- это отбор пар на GPU от 100 изображений, sequential (с замыканием петли) для видео ниже этого числа и exhaustive в остальных случаях"),
-    TR("auto: 100 görüntüden itibaren GPU seçimi; altında videoda döngü kapatmalı sequential, diğerlerinde exhaustive."));
+    EN("Which image pairs are matched: prefilter (each image's best partners by a GPU score), sequential (file-order neighbours plus loop closure) or exhaustive"),
+    JA("どの画像ペアをマッチングするか。prefilter は各画像の高スコアの相手（GPU によるペア選択）、sequential はファイル順の隣接とループ閉じ込み、exhaustive はすべてのペア"),
+    ZH_HANS("匹配哪些图像对：prefilter 为每张图像保留得分最高的伙伴（GPU 筛选像对），sequential 取文件顺序上的相邻图像并做回环闭合，exhaustive 取所有像对"),
+    ZH_HANT("匹配哪些影像對：prefilter 為每張影像保留得分最高的夥伴（GPU 篩選影像對），sequential 取檔案順序上的相鄰影像並做迴環閉合，exhaustive 取所有影像對"),
+    KO("어떤 이미지 쌍을 매칭할지. prefilter 는 각 이미지의 점수가 높은 상대(GPU 쌍 선택), sequential 은 파일 순서의 이웃과 루프 클로저, exhaustive 는 모든 쌍"),
+    DE("Zugeordnete Bildpaare: prefilter (beste Partner je Bild per GPU-Bewertung), sequential (Nachbarn in Dateireihenfolge mit Schleifenschluss) oder exhaustive"),
+    FR("Paires appariées : prefilter (meilleurs partenaires de chaque image, score GPU), sequential (voisines par ordre de fichier, avec fermeture de boucle) ou exhaustive"),
+    ES("Pares emparejados: prefilter (mejores compañeras de cada imagen, puntuación GPU), sequential (vecinas en orden de archivo, con cierre de bucle) o exhaustive"),
+    PT("Pares emparelhados: prefilter (melhores parceiras de cada imagem, pontuação GPU), sequential (vizinhas por ordem de ficheiro, com fecho de laço) ou exhaustive"),
+    IT("Coppie abbinate: prefilter (partner migliori di ogni immagine, punteggio GPU), sequential (vicine in ordine di file, con chiusura d'anello) o exhaustive"),
+    NL("Gematchte beeldparen: prefilter (beste partners per beeld volgens GPU-score), sequential (buren in bestandsvolgorde met lussluiting) of exhaustive"),
+    RU("Сопоставляемые пары: prefilter (лучшие партнёры каждого изображения по оценке GPU), sequential (соседи по порядку файлов с замыканием петли) или exhaustive"),
+    TR("Eşleştirilen çiftler: prefilter (her görüntünün GPU puanına göre en iyi eşleri), sequential (dosya sırasındaki komşular, döngü kapatmayla) veya exhaustive"));
 
 SS_MSG(overlap_help,
     EN("Neighbours each image is paired with under --pairs sequential and along a --sequence, and how far apart two images of a sequence still count as neighbours in mapping"),
@@ -214,21 +189,6 @@ SS_MSG(quadratic_overlap_help,
        "как в COLMAP"),
     TR("Sıralı pencere her görüntüyü dosya sırasında 16, 32, 64 ... uzaktaki "
        "görüntülerle de eşleştirir; COLMAP gibi 2^(overlap-1)'e kadar"));
-
-SS_MSG(prefilter_sequential_help,
-    EN("Also matches file-order neighbors within each folder during GPU pair selection, using --overlap and --quadratic-overlap. Preserves weak sequence links."),
-    JA("GPUペア選択時に、各フォルダのファイル順でも近傍を照合します。--overlap と --quadratic-overlap を使い、弱い連続リンクを補います。"),
-    ZH_HANS("GPU 像对筛选时，也按各文件夹中的文件顺序匹配邻居，使用 --overlap 和 --quadratic-overlap，保留较弱的序列连接。"),
-    ZH_HANT("GPU 影像對篩選時，也按各資料夾中的檔案順序比對鄰居，使用 --overlap 和 --quadratic-overlap，保留較弱的序列連接。"),
-    KO("GPU 쌍 선택 시 폴더별 파일 순서 이웃도 매칭합니다. --overlap과 --quadratic-overlap으로 약한 순차 연결을 보존합니다."),
-    DE("Matcht bei GPU-Paarauswahl auch Dateinachbarn je Ordner mit --overlap und --quadratic-overlap, um schwache Sequenzverbindungen zu erhalten."),
-    FR("Lors de la sélection GPU, apparie aussi les voisins par ordre de fichier avec --overlap et --quadratic-overlap pour garder les liens faibles."),
-    ES("En selección GPU, empareja también vecinos por orden de archivo con --overlap y --quadratic-overlap para conservar enlaces débiles."),
-    PT("Na seleção GPU, combina também vizinhos por ordem de ficheiro com --overlap e --quadratic-overlap para manter ligações fracas."),
-    IT("Nella selezione GPU abbina anche i vicini per ordine di file con --overlap e --quadratic-overlap, mantenendo i legami deboli."),
-    NL("Matcht bij GPU-paarselectie ook bestandsburen per map met --overlap en --quadratic-overlap om zwakke reeksverbindingen te behouden."),
-    RU("При GPU-отборе пар также сопоставляет соседние файлы в папке через --overlap и --quadratic-overlap, сохраняя слабые связи последовательности."),
-    TR("GPU çift seçiminde klasör içi dosya komşularını da --overlap ve --quadratic-overlap ile eşleştirerek zayıf sıralı bağlantıları korur."));
 
 SS_MSG(rig_pairs_help,
     EN("Also match the other lenses of each verified dual-fisheye pair.\n- cam0 to cam0 adds cam1 to cam1 for those frames.\n- cam0 to cam1 adds the reversed cam1 to cam0 pair."),
@@ -392,20 +352,20 @@ SS_MSG(flip_mask_help,
     TR("Her maskede korunanla yok sayılanı yer değiştirir; korunacak alan yerine "
        "KALDIRILACAK alanı boyayan dışa aktarma araçları için"));
 
-SS_MSG(feature_masks_help,
-    EN("Extra mask folder for reconstruction only. Intersects --masks: both must be nonzero to keep a keypoint. Never inverted; training is unaffected."),
-    JA("再構成専用の追加マスクフォルダです。--masks と両方が非ゼロの位置だけ特徴点を残します。反転せず、学習には影響しません。"),
-    ZH_HANS("仅用于重建的额外蒙版文件夹。与 --masks 取交集：两者均非零才保留特征点。不反转，不影响训练。"),
-    ZH_HANT("僅用於重建的額外遮罩資料夾。與 --masks 取交集：兩者均非零才保留特徵點。不反轉，不影響訓練。"),
-    KO("재구성 전용 추가 마스크 폴더입니다. --masks와 둘 다 0이 아닌 곳만 특징점을 유지합니다. 반전되지 않으며 학습에는 영향이 없습니다."),
-    DE("Zusätzlicher Maskenordner nur für Rekonstruktion. Schnitt mit --masks: beide müssen ungleich null sein. Nie invertiert; Training unverändert."),
-    FR("Masques supplémentaires pour la reconstruction seule. Intersection avec --masks : les deux doivent être non nuls. Jamais inversés ; entraînement inchangé."),
-    ES("Máscaras extra solo para reconstrucción. Interseca --masks: ambas deben ser no nulas. Nunca se invierten; no afectan al entrenamiento."),
-    PT("Máscaras extra só para reconstrução. Interseta --masks: ambas devem ser não nulas. Nunca invertidas; treino inalterado."),
-    IT("Maschere extra solo per ricostruzione. Interseca --masks: entrambe non nulle per tenere i punti. Mai invertite; addestramento invariato."),
-    NL("Extra maskermap alleen voor reconstructie. Doorsnede met --masks: beide moeten niet nul zijn. Nooit omgekeerd; training blijft gelijk."),
-    RU("Дополнительные маски только для реконструкции. Пересечение с --masks: обе ненулевые для сохранения точки. Без инверсии; обучение не меняется."),
-    TR("Yalnız yeniden yapım için ek maske klasörü. --masks ile kesişir: noktayı tutmak için ikisi de sıfır dışı olmalı. Ters çevrilmez; eğitimi etkilemez."));
+SS_MSG(mask_segment_only_help,
+    EN("Keypoints are dropped only on the masks' 128 band (sky), not on their black. For masks that hide people from training only."),
+    JA("マスクの128帯（空）だけで特徴点を除き、黒は残します。人物を学習からだけ除くマスク用です。"),
+    ZH_HANS("只在蒙版的 128 灰带（天空）处丢弃特征点，黑色区域保留。用于只把行人排除出训练的蒙版。"),
+    ZH_HANT("只在遮罩的 128 灰帶（天空）處捨棄特徵點，黑色區域保留。用於只把行人排除出訓練的遮罩。"),
+    KO("마스크의 128 대역(하늘)에서만 특징점을 버리고 검은색은 유지합니다. 사람을 학습에서만 제외하는 마스크용입니다."),
+    DE("Merkmale fallen nur im 128er-Band der Masken (Himmel) weg, nicht im Schwarz. Für Masken, die Personen nur aus dem Training nehmen."),
+    FR("Points supprimés seulement sur la bande 128 des masques (ciel), pas sur le noir. Pour des masques qui retirent les gens de l’entraînement seul."),
+    ES("Solo se descartan puntos en la banda 128 de las máscaras (cielo), no en el negro. Para máscaras que quitan personas solo del entrenamiento."),
+    PT("Só descarta pontos na banda 128 das máscaras (céu), não no preto. Para máscaras que tiram pessoas apenas do treino."),
+    IT("Scarta i punti solo nella banda 128 delle maschere (cielo), non nel nero. Per maschere che tolgono persone solo dal training."),
+    NL("Kenmerken vallen alleen weg op de 128-band van de maskers (lucht), niet op zwart. Voor maskers die mensen alleen uit training halen."),
+    RU("Точки отбрасываются только в полосе 128 масок (небо), не в чёрном. Для масок, убирающих людей только из обучения."),
+    TR("Noktalar yalnız maskelerin 128 bandında (gökyüzü) atılır, siyahta değil. İnsanları yalnız eğitimden çıkaran maskeler için."));
 
 SS_MSG(mask_dir_help,
     EN("Alias of --masks"),

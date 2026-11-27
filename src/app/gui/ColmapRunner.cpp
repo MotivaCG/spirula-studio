@@ -2,6 +2,7 @@
 // reference/scripts/run_colmap.bash (COLMAP >= 4.x; use_gpu-style flags are
 // gone).
 
+#include "data/ImageDiscovery.h"
 #include "app/gui/ColmapRunner.h"
 
 
@@ -173,6 +174,7 @@ void write_unregistered_list(const fs::path& ws, const std::string& images_dir) 
     std::error_code ec;
     for (fs::recursive_directory_iterator it(images_dir, ec), end;
          !ec && it != end; it.increment(ec)) {
+        if (image_discovery::skip_cache(it)) continue;
         if (!it->is_regular_file()) continue;
         std::string ext = it->path().extension().string();
         for (char& c : ext) c = char(std::tolower((unsigned char)c));
@@ -515,7 +517,7 @@ void ColmapRunner::run(ColmapJob job) {
         const DatasetRecord rec = read_plan_record(ws.string(), pj);
         const PlanRequest req = job.request;
         DatasetPlan plan = plan_dataset(plan_job(job, pj), prior, rec, req);
-        if (!req.redo_frames && !plan[Step::Frames].can_keep)
+        if (!req.redo_frames && plan[Step::Frames].ask && !plan[Step::Frames].can_keep)
             return fail(spirula::i18n::msg::dataset::rerun_section_help.get());
         StepRecorder record(ws.string(), rec);
         auto say = [&](Step s) {
@@ -661,22 +663,18 @@ void ColmapRunner::run(ColmapJob job) {
                 shared.push_back("--SiftExtraction.estimate_affine_shape");
                 shared.push_back("1");
             }
-            // COLMAP reads one mask tree, so the feature-only masks are
-            // intersected into a copy when training's are wanted there too.
+            // COLMAP keeps any nonzero pixel, so masks carrying the sky's 128
+            // band go in as a binary copy; without the checkbox, of the sky alone.
             std::string colmap_masks = have_masks && job.mask_features ? prep.mask_dir : "";
             const fs::path both = ws / ".colmap_masks";
             remove_tree(both);
-            if (!prep.feature_mask_dir.empty()) {
-                if (colmap_masks.empty()) {
-                    colmap_masks = prep.feature_mask_dir;
-                } else {
-                    std::string err;
-                    if (app::intersect_mask_trees(images, colmap_masks, prep.mask_dir_flipped,
-                                                  prep.feature_mask_dir, both.string(),
-                                                  &_cancel, err) < 0)
-                        return fail("could not write " + err);
-                    colmap_masks = both.string();
-                }
+            if (have_masks && prep.masks_segment) {
+                std::string err;
+                if (app::binary_mask_tree(images, prep.mask_dir, prep.mask_dir_flipped,
+                                          !job.mask_features, both.string(), &_cancel,
+                                          err) < 0)
+                    return fail("could not write " + err);
+                colmap_masks = both.string();
             }
             if (!colmap_masks.empty()) {
                 shared.push_back("--ImageReader.mask_path");
@@ -993,6 +991,7 @@ void ColmapRunner::run(ColmapJob job) {
         if (!reuse_model) record.finish(Step::Model);
 
         take_dense(job);
+        job.dense.config.image_colors = source_colors(pj);
         plan = plan_dataset(plan_job(job, pj), prior, rec, req, &plan, Step::Dense);
         verify_dense_reuse(plan,ws.string(),_cancel);
         say(Step::Dense);
@@ -1010,6 +1009,7 @@ void ColmapRunner::run(ColmapJob job) {
 
         // ---- depth and normals ---------------------------------------------
         take_geometry(job);
+        job.geometry.image_colors = source_colors(pj);
         plan = plan_dataset(plan_job(job, pj), prior, rec, req, &plan, Step::Geometry);
         say(Step::Geometry);
         if (makes(plan[Step::Geometry].act)) {

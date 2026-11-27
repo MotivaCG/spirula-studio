@@ -112,6 +112,7 @@ HEADER_SOURCES = dict([
     _fam("kernels/raster", "RasterizationBwd", "RasterizationBwd.cu"),
     _fam("kernels/raster", "RasterizationEval3DFwd", "RasterizationEval3DFwd.cu"),
     _fam("kernels/raster", "RasterizationEval3DBwd", "RasterizationEval3DBwd.cu"),
+    _fam("kernels/raster", "RasterizationStochastic", "RasterizationStochastic.cu"),
 
     _fam("kernels/optim", "ProjectiveDepth", "ProjectiveDepth.cu"),
 
@@ -132,7 +133,8 @@ HEADER_SOURCES = dict([
          "DensifySampling.cu",     # quantile/median, indexing, scatter, sampling
          "DensifyScoring.cu",      # covariance scale init, param update
          "Relocation.cu",
-         "McmcRelocation.cu",      # MCMC relocation + noise
+         "DensifyNoise.cu",        # exploration noise
+         "SplatDecay.cu",          # per-refine opacity/scale decay
          "DensifySplitFilter.cu",  # long-axis split, image edge filters
          "RegionWeight.cu"),       # the region test that gates the draw
 ])

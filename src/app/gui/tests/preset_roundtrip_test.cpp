@@ -9,12 +9,25 @@
 
 #include "app/gui/DatasetPreset.h"
 #include "app/gui/MeshPreset.h"
+#include "app/gui/PresetFile.h"
 #include "core/SourcePath.h"
 #include "dense/ConfigFields.h"
 
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <cerrno>
+#include <csignal>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -82,7 +95,7 @@ static void test_dataset_preset() {
     s.sfm.image_gamut = "Display P3";
     s.sfm.image_is_linear = true;
     s.sfm.image_exposure = "auto";
-    s.sfm.point_color_in_image_space = true;
+    s.sfm.point_color = {"Rec.2020", false};
 
     s.sfm.prep.mask_enable = true;
     s.sfm.mask_features = false;
@@ -135,7 +148,7 @@ static void test_dataset_preset() {
     s.sfm.geometry.overwrite = true;
 
     s.sfm.quality = 1;
-    s.sfm.data_type = 2;
+    s.videos_in_order = true;
     s.sfm.camera_model = "opencv-fisheye";
     s.sfm.camera_mode = 2;
     s.sfm.pairs = 3;
@@ -146,8 +159,8 @@ static void test_dataset_preset() {
     s.sfm.distortion_refine = 2;
     s.sfm.final_per_image_intrinsics = true;
     s.sfm.final_free_rig = true;
-    s.sfm.max_features = 8192;
-    s.sfm.max_image_size = 2000;
+    s.sfm.options = {{"loma-max-features", "6000"}, {"max-image-size", "2000"},
+                     {"cross-check", "off"}};
     s.sfm.mapper = 1;
     s.sfm.features = (int)std::size(gui::kSfmFeatures) - 1;
     s.sfm.matcher = 1;
@@ -226,7 +239,8 @@ static void test_dataset_preset() {
     CHECK_EQ(b.sfm.image_gamut, s.sfm.image_gamut);
     CHECK(b.sfm.image_is_linear == s.sfm.image_is_linear);
     CHECK(b.sfm.image_exposure == s.sfm.image_exposure);
-    CHECK_EQ(b.sfm.point_color_in_image_space, s.sfm.point_color_in_image_space);
+    CHECK_EQ(b.sfm.point_color.gamut, s.sfm.point_color.gamut);
+    CHECK_EQ(b.sfm.point_color.linear, s.sfm.point_color.linear);
 
     CHECK_EQ(b.sfm.prep.mask_enable, s.sfm.prep.mask_enable);
     CHECK_EQ(b.sfm.mask_features, s.sfm.mask_features);
@@ -262,7 +276,7 @@ static void test_dataset_preset() {
     CHECK_EQ(b.sfm.geometry.overwrite, s.sfm.geometry.overwrite);
 
     CHECK_EQ(b.sfm.quality, s.sfm.quality);
-    CHECK_EQ(b.sfm.data_type, s.sfm.data_type);
+    CHECK_EQ(b.videos_in_order, s.videos_in_order);
     CHECK_EQ(b.sfm.camera_model, s.sfm.camera_model);
     CHECK_EQ(b.sfm.camera_mode, s.sfm.camera_mode);
     CHECK_EQ(b.sfm.pairs, s.sfm.pairs);
@@ -273,8 +287,7 @@ static void test_dataset_preset() {
     CHECK_EQ(b.sfm.distortion_refine, s.sfm.distortion_refine);
     CHECK_EQ(b.sfm.final_per_image_intrinsics, s.sfm.final_per_image_intrinsics);
     CHECK_EQ(b.sfm.final_free_rig, s.sfm.final_free_rig);
-    CHECK_EQ(b.sfm.max_features, s.sfm.max_features);
-    CHECK_EQ(b.sfm.max_image_size, s.sfm.max_image_size);
+    CHECK(b.sfm.options == s.sfm.options);
     CHECK_EQ(b.sfm.mapper, s.sfm.mapper);
     CHECK_EQ(b.sfm.features, s.sfm.features);
     CHECK_EQ(b.sfm.matcher, s.sfm.matcher);
@@ -331,9 +344,13 @@ static void test_mesh_preset() {
     p.job.bisection_iters = 5;
     p.job.merge_factor = 2.5f;
     p.job.quality_iters = 6;
+    p.job.tsdf_voxel = 0.025f;
+    p.job.num_threads = 4;
+    p.job.data_format = "colmap";
+    p.job.quiet = true;
     p.job.floater_min_faces = 50;
     p.job.cull_unseen = false;
-    p.job.carve_k = 3;
+    p.job.tsdf = true;
     p.job.extra_args = "--verbose";
     // What the preset must NOT carry.
     p.job.checkpoint = "C:/runs/one";
@@ -359,11 +376,36 @@ static void test_mesh_preset() {
     CHECK_EQ(back.job.quality_iters, p.job.quality_iters);
     CHECK_EQ(back.job.floater_min_faces, p.job.floater_min_faces);
     CHECK_EQ(back.job.cull_unseen, p.job.cull_unseen);
-    CHECK_EQ(back.job.carve_k, p.job.carve_k);
+    CHECK_EQ(back.job.tsdf_voxel, p.job.tsdf_voxel);
+    CHECK_EQ(back.job.num_threads, p.job.num_threads);
+    CHECK_EQ(back.job.data_format, p.job.data_format);
+    CHECK_EQ(back.job.quiet, p.job.quiet);
+    CHECK_EQ(back.job.tsdf, p.job.tsdf);
     CHECK_EQ(back.job.extra_args, p.job.extra_args);
     CHECK(back.job.checkpoint.empty());
     CHECK(back.job.data_dir.empty());
     CHECK(back.job.output.empty());
+}
+
+// A file from before the capture type, the automatic pairing and the two
+// "0 = auto" boxes were replaced.
+static void test_retired_keys() {
+    gui::DatasetSettings s;
+    gui::read_dataset_settings_json(
+        json_parse("{\"sfm_data_type\": 1, \"sfm_pairs\": 0, \"sfm_features\": 2, "
+                   "\"sfm_max_features\": 3000, \"sfm_max_image_size\": 0}"),
+        s);
+    CHECK(s.videos_in_order);
+    CHECK_EQ(s.sfm.pairs, gui::kPairsPrefilter);
+    CHECK_EQ(s.sfm.options.count("aliked-max-features"), (size_t)1);
+    CHECK_EQ(s.sfm.options.count("max-image-size"), (size_t)0);
+
+    // The frame cap every file carried while it was on by default is off.
+    CHECK_EQ(s.sfm.prep.max_frames, 0);
+    gui::read_dataset_settings_json(json_parse("{\"max_frames\": 100000}"), s);
+    CHECK_EQ(s.sfm.prep.max_frames, 0);
+    gui::read_dataset_settings_json(json_parse("{\"max_frames\": 500}"), s);
+    CHECK_EQ(s.sfm.prep.max_frames, 500);
 }
 
 // A file a user has edited by hand must not reach a runner with a value
@@ -499,13 +541,114 @@ static void test_dense_draft_restore() {
     }
 }
 
+static std::string file_bytes(const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+static bool preset_write_failed(const fs::path& path, const std::string& text) {
+    try {
+        gui::write_preset_file(path.string(), text);
+        return false;
+    } catch (const std::exception&) {
+        return true;
+    }
+}
+
+static void test_preset_symlinks() {
+    const auto dir = scratch() / "links";
+    fs::remove_all(dir);
+    fs::create_directory(dir);
+    const auto target = dir / "target.json";
+    const auto link = dir / "preset.json";
+    std::ofstream(target) << R"({"old":true})";
+    std::error_code ec;
+    fs::create_symlink(target.filename(), link, ec);
+#ifdef _WIN32
+    if (ec == std::errc::permission_denied || ec.value() == ERROR_PRIVILEGE_NOT_HELD) {
+        std::printf("SKIP preset symlinks: %s\n", ec.message().c_str());
+        fs::remove_all(dir);
+        return;
+    }
+#endif
+    CHECK(!ec);
+    if (!ec) {
+        const std::string updated = R"({"new":true})";
+        gui::write_preset_file(link.string(), updated);
+        CHECK(fs::is_symlink(link) && file_bytes(target) == updated);
+        fs::remove(target);
+        CHECK(preset_write_failed(link, updated));
+        CHECK(fs::is_symlink(link) && !fs::exists(target));
+        fs::remove(link);
+        fs::create_symlink(link.filename(), link);
+        CHECK(preset_write_failed(link, updated));
+        CHECK(fs::read_symlink(link) == link.filename());
+    }
+    fs::remove_all(dir);
+}
+
+static void test_torn_overwrite() {
+    const auto path = scratch() / "torn_overwrite.json";
+    const std::string old_json = R"({"spirula_preset":1,"kind":"dataset","name":"previous preset"})";
+    for (const size_t size : {64u, 65536u}) {
+        const std::string new_json = R"({"spirula_preset":1,"kind":"dataset","name":")" +
+                                     std::string(size, 'x') + "\"}";
+        bool reported_failure = false;
+#ifdef _WIN32
+        const HANDLE locked = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, CREATE_ALWAYS, 0, nullptr);
+        DWORD seeded = 0;
+        OVERLAPPED all{};
+        const bool injected = locked != INVALID_HANDLE_VALUE &&
+            WriteFile(locked, old_json.data(), static_cast<DWORD>(old_json.size()), &seeded, nullptr) &&
+            seeded == old_json.size() &&
+            LockFileEx(locked, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                       0, MAXDWORD, MAXDWORD, &all);
+        // Also deny rename; the byte lock alone would let an atomic save succeed.
+        const HANDLE hold = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_EXISTING, 0, nullptr);
+        CHECK(injected && hold != INVALID_HANDLE_VALUE);
+        if (injected && hold != INVALID_HANDLE_VALUE)
+            reported_failure = preset_write_failed(path, new_json);
+        if (hold != INVALID_HANDLE_VALUE) CloseHandle(hold);
+        if (locked != INVALID_HANDLE_VALUE) CloseHandle(locked);
+#else
+        std::ofstream(path, std::ios::binary) << old_json;
+        const pid_t child = fork();
+        CHECK(child >= 0);
+        if (child == 0) {
+            alarm(5);
+            rlimit limit{};
+            if (std::signal(SIGXFSZ, SIG_IGN) == SIG_ERR ||
+                getrlimit(RLIMIT_FSIZE, &limit) != 0) _exit(2);
+            limit.rlim_cur = 16;
+            if (setrlimit(RLIMIT_FSIZE, &limit) != 0) _exit(2);
+            _exit(preset_write_failed(path, new_json) ? 0 : 1);
+        }
+        if (child > 0) {
+            int status = 0;
+            pid_t done;
+            do { done = waitpid(child, &status, 0); } while (done == -1 && errno == EINTR);
+            reported_failure = done == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        }
+#endif
+        CHECK(file_bytes(path) == old_json);
+        CHECK(reported_failure);
+        fs::remove(path);
+    }
+    std::printf("preset torn overwrite: %s\n", failures ? "failed" : "OK");
+}
+
 int main() {
+    test_torn_overwrite();
     test_dataset_preset();
     test_mesh_preset();
+    test_retired_keys();
     test_sanitize();
     test_unknown_key_ignored();
     test_dense_draft_restore();
     test_kinds_do_not_cross();
+    test_preset_symlinks();
     if (failures) {
         std::printf("preset_roundtrip_test: %d failure(s)\n", failures);
         return 1;

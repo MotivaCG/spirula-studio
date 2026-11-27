@@ -1,5 +1,6 @@
 // FrameMask.cpp -- see FrameMask.h.
 
+#include "data/ImageDiscovery.h"
 #include "app/FrameMask.h"
 
 #include "app/FrameLook.h"
@@ -10,6 +11,7 @@
 #include "external/stb_image.h"
 #include "external/stb_image_write.h"
 #include "nn/core/Parallel.h"
+#include "sfm/core/Mask.h"
 
 #include <algorithm>
 #include <atomic>
@@ -528,17 +530,6 @@ MaskShape to_shape(const Circle& c, float shrink, int w, int h) {
     return shrink_border(s, shrink);
 }
 
-float kept_fraction(const MaskShape& s, int w, int h) {
-    FrameMask m;
-    m.shapes.push_back(s);
-    std::vector<uint8_t> px;
-    std::string err;
-    if (!rasterize_frame_mask(m, w, h, px, err)) return 1.0f;
-    size_t keep = 0;
-    for (uint8_t v : px) keep += v ? 1 : 0;
-    return (float)keep / (float)std::max<size_t>(px.size(), 1);
-}
-
 // A round-capped polyline as the union of capsules, measured in units of the
 // stroke's half-width on each axis: the brush becomes a unit circle.
 void fill_stroke(const MaskShape& s, int W, int H, uint8_t* out) {
@@ -574,6 +565,17 @@ MaskShape shrink_border(MaskShape shape, float shrink) {
     shape.rx *= scale;
     shape.ry *= scale;
     return shape;
+}
+
+float kept_fraction(const MaskShape& s, int w, int h) {
+    FrameMask m;
+    m.shapes.push_back(s);
+    std::vector<uint8_t> px;
+    std::string err;
+    if (!rasterize_frame_mask(m, w, h, px, err)) return 1.0f;
+    size_t keep = 0;
+    for (uint8_t v : px) keep += v ? 1 : 0;
+    return (float)keep / (float)std::max<size_t>(px.size(), 1);
 }
 
 bool edit_detected_border(CameraStencil& stencil, const BorderDetect& border) {
@@ -775,7 +777,8 @@ bool load_stencil(const std::string& path, int& width, int& height,
     width = g.w;
     height = g.h;
     out.resize(g.px.size());
-    for (size_t i = 0; i < g.px.size(); i++) out[i] = g.px[i] > 127 ? 255 : 0;
+    for (size_t i = 0; i < g.px.size(); i++)
+        out[i] = g.px[i] <= 127 ? 0 : sfm::isSegmentByte(g.px[i]) ? kMaskSegment : 255;
     return true;
 }
 
@@ -1000,20 +1003,26 @@ BorderDetect BorderAccumulator::finish(const BorderDetectOptions& o) const {
 
 BorderDetect detect_fisheye_border(const std::vector<std::string>& files,
                                    const BorderDetectOptions& o) {
-    if (files.empty()) return BorderDetect{};
+    return detect_fisheye_border(std::vector<std::vector<std::string>>{files}, o);
+}
+
+BorderDetect detect_fisheye_border(const std::vector<std::vector<std::string>>& captures,
+                                   const BorderDetectOptions& o) {
     const int want = std::max(2, o.samples);
-    std::vector<size_t> pick;
-    if ((int)files.size() <= want) {
-        for (size_t i = 0; i < files.size(); i++) pick.push_back(i);
-    } else {
-        for (int i = 0; i < want; i++)
-            pick.push_back((size_t)((double)i * (files.size() - 1) / (want - 1) + 0.5));
-        pick.erase(std::unique(pick.begin(), pick.end()), pick.end());
-    }
     BorderAccumulator acc;
-    for (size_t i : pick) {
-        Gray f = load_gray(files[i]);
-        if (!f.px.empty()) acc.add(f.px.data(), f.w, f.h, 1);
+    for (const std::vector<std::string>& files : captures) {
+        std::vector<size_t> pick;
+        if ((int)files.size() <= want) {
+            for (size_t i = 0; i < files.size(); i++) pick.push_back(i);
+        } else {
+            for (int i = 0; i < want; i++)
+                pick.push_back((size_t)((double)i * (files.size() - 1) / (want - 1) + 0.5));
+            pick.erase(std::unique(pick.begin(), pick.end()), pick.end());
+        }
+        for (size_t i : pick) {
+            Gray f = load_gray(files[i]);
+            if (!f.px.empty()) acc.add(f.px.data(), f.w, f.h, 1);
+        }
     }
     return acc.finish(o);
 }
@@ -1027,6 +1036,7 @@ namespace {
 namespace fs = std::filesystem;
 
 bool is_image_file(const fs::path& p) {
+    if (image_discovery::generated_cache(p)) return false;
     std::string e = p.extension().string();
     for (char& c : e) c = (char)std::tolower((unsigned char)c);
     return e == ".png" || e == ".jpg" || e == ".jpeg" || e == ".bmp" ||
@@ -1042,7 +1052,10 @@ void intersect_with_file(std::vector<uint8_t>& px, int w, int h,
         const int sy = mh == h ? y : std::min(mh - 1, (int)((float)y / h * mh));
         for (int x = 0; x < w; x++) {
             const int sx = mw == w ? x : std::min(mw - 1, (int)((float)x / w * mw));
-            if ((m[(size_t)sy * mw + sx] != 0) == flip) px[(size_t)y * w + x] = 0;
+            const uint8_t v = m[(size_t)sy * mw + sx];
+            uint8_t& o = px[(size_t)y * w + x];
+            if ((v != 0) == flip) o = 0;
+            else if (!flip && sfm::isSegmentByte(v) && o) o = kMaskSegment;
         }
     }
 }
@@ -1071,6 +1084,7 @@ std::map<std::string, std::vector<std::string>> group_frames_by_camera(
              root, fs::directory_options::skip_permission_denied |
                        fs::directory_options::follow_directory_symlink, ec), end;
          !ec && it != end; it.increment(ec)) {
+        if (image_discovery::skip_cache(it)) continue;
         if (!it->is_regular_file(ec) || !is_image_file(it->path())) continue;
         const std::string at = it->path().lexically_normal().generic_string();
         if (std::any_of(skips.begin(), skips.end(),
@@ -1230,22 +1244,37 @@ int64_t apply_frame_stencil(const FrameStencilRun& run,
     return written;
 }
 
-int64_t intersect_mask_trees(const std::string& image_dir, const std::string& a,
-                             bool flip_a, const std::string& b,
-                             const std::string& out, const std::atomic<bool>* cancel,
-                             std::string& error) {
-    struct Item { std::string dst, a, b; int w = 0, h = 0; };
+void fold_segment(std::vector<uint8_t>& mask, int w, int h, const std::vector<uint8_t>& match,
+                  int mw, int mh) {
+    if (match.empty() || mw <= 0 || mh <= 0) return;
+    for (int y = 0; y < h; y++) {
+        const int sy = mh == h ? y : std::min(mh - 1, (int)((float)y / h * mh));
+        for (int x = 0; x < w; x++) {
+            const int sx = mw == w ? x : std::min(mw - 1, (int)((float)x / w * mw));
+            uint8_t& o = mask[(size_t)y * w + x];
+            if (o && match[(size_t)sy * mw + sx] == 0) o = kMaskSegment;
+        }
+    }
+}
+
+std::vector<uint8_t> read_mask_classes(const std::string& path, int w, int h, bool flip) {
+    std::vector<uint8_t> px((size_t)w * h, kMaskKeep);
+    intersect_with_file(px, w, h, path, flip);
+    return px;
+}
+
+int64_t binary_mask_tree(const std::string& image_dir, const std::string& masks, bool flip,
+                         bool segment_only, const std::string& out,
+                         const std::atomic<bool>* cancel, std::string& error) {
+    struct Item { std::string dst, src; int w = 0, h = 0; };
     std::vector<Item> items;
     std::error_code ec;
     for (const auto& [rel, files] : group_frames_by_camera(image_dir)) {
         for (const std::string& f : files) {
             const fs::path name = fs::path(rel) / (fs::path(f).stem().string() + ".png");
             Item it;
-            if (!a.empty() && fs::exists(fs::path(a) / name, ec))
-                it.a = (fs::path(a) / name).string();
-            if (!b.empty() && fs::exists(fs::path(b) / name, ec))
-                it.b = (fs::path(b) / name).string();
-            if ((it.a.empty() && it.b.empty()) || !image_size(f, it.w, it.h)) continue;
+            if (!fs::exists(fs::path(masks) / name, ec) || !image_size(f, it.w, it.h)) continue;
+            it.src = (fs::path(masks) / name).string();
             it.dst = (fs::path(out) / name).string();
             fs::create_directories(fs::path(it.dst).parent_path(), ec);
             items.push_back(std::move(it));
@@ -1257,9 +1286,9 @@ int64_t intersect_mask_trees(const std::string& image_dir, const std::string& a,
         for (int64_t k = lo; k < hi; k++) {
             if (failed.load() || (cancel && cancel->load())) return;
             const Item& it = items[(size_t)k];
-            std::vector<uint8_t> px((size_t)it.w * it.h, 255);
-            if (!it.a.empty()) intersect_with_file(px, it.w, it.h, it.a, flip_a);
-            if (!it.b.empty()) intersect_with_file(px, it.w, it.h, it.b, false);
+            std::vector<uint8_t> px = read_mask_classes(it.src, it.w, it.h, flip);
+            for (uint8_t& v : px)
+                v = v == kMaskKeep || (segment_only && v == kMaskIgnore) ? 255 : 0;
             if (!stbi_write_png(it.dst.c_str(), it.w, it.h, 1, px.data(), it.w)) {
                 std::lock_guard<std::mutex> lk(mu);
                 error = it.dst;

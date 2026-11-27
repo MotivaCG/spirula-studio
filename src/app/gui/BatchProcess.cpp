@@ -3,12 +3,14 @@
 #include "app/gui/BatchProcess.h"
 
 #include "app/gui/StencilPreset.h"
+#include "app/gui/StencilRows.h"
 
 #include "app/AppPaths.h"
 #include "app/TrainerCore.h"
 #include "app/gui/SourceList.h"
 #include "app/gui/TrainPreset.h"
 #include "checkpoint/SplatPly.h"
+#include "core/AtomicFile.h"
 #include "data/Json.h"
 #include "data/JsonWrite.h"
 #include "data/RoiDocument.h"
@@ -17,7 +19,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <cstdio>
 #include <filesystem>
 #include <set>
 #include <stdexcept>
@@ -295,7 +296,7 @@ std::vector<BatchTask> batch_plan(const std::vector<BatchRow>& rows) {
 
 
 BatchProgress batch_progress(const std::vector<BatchTask>& tasks, int current,
-                             double frac, double elapsed) {
+                             double frac, double elapsed, double runner_remaining) {
     BatchProgress p;
     p.total = (int)tasks.size();
     // What a finished task of each stage took, which is the only honest thing
@@ -323,15 +324,14 @@ BatchProgress batch_progress(const std::vector<BatchTask>& tasks, int current,
     for (int i = 0; i < (int)tasks.size(); i++) {
         const BatchTask& t = tasks[(size_t)i];
         if (i == current) {
-            // Its own runner knows best, except a dataset run, whose fraction
-            // counts steps rather than time: there a finished one's length wins.
-            // A task cannot be estimated to finish before now.
-            double rem = -1.0;
-            const double g = guess(t.stage);
-            if (t.stage == BatchStage::Dataset && stage_n[(int)t.stage] > 0)
-                rem = std::max(g - elapsed, 0.0);
-            else if (frac > 0.02 && frac < 1.0) rem = elapsed * (1.0 - frac) / frac;
-            else if (g > 0.0) rem = std::max(g - elapsed, 0.0);
+            double rem = runner_remaining;
+            if (rem < 0.0) {
+                const double g = guess(t.stage);
+                if (t.stage == BatchStage::Dataset && stage_n[(int)t.stage] > 0)
+                    rem = std::max(g - elapsed, 0.0);
+                else if (frac > 0.02 && frac < 1.0) rem = elapsed * (1.0 - frac) / frac;
+                else if (g > 0.0) rem = std::max(g - elapsed, 0.0);
+            }
             p.task_remaining = rem;
             if (rem < 0.0) known = false;
             else total += rem;
@@ -468,7 +468,7 @@ void check_dataset_stage(const BatchRow& row, const BatchCapabilities& caps,
     // A preset that pairs frames in video order, pointed at photographs: it
     // still runs, and it picks the wrong pairing strategy. The other way round
     // is ordinary -- a video's order is off unless asked for.
-    if (!row.sources.empty() && !row.dataset_preset.path.empty() && s.sfm.data_type == 1) {
+    if (!row.sources.empty() && !row.dataset_preset.path.empty() && s.videos_in_order) {
         bool any_video = false;
         for (const std::string& p : row.sources)
             any_video = any_video || (!fs::is_directory(p, ec) && is_video_path(p));
@@ -758,12 +758,24 @@ bool batch_build_dataset_job(const BatchRow& row, const std::string& ffmpeg_exe,
         }
     }
     // A row has no Sequential switch to tick: a preset captured as video is it.
-    for (PrepInput& in : sources) in.sequential = in.is_video && settings.sfm.data_type == 1;
+    for (PrepInput& in : sources) in.sequential = in.is_video && settings.videos_in_order;
     resolve_source_lenses(sources, settings.sfm, settings.colmap);
     assign_source_subdirs(sources);
     refresh_subcameras(sources);
     guess_source_rigs(sources, /*force=*/false);
     normalize_source_lenses(sources, settings.sfm.camera_model);
+    // No table meets these rows, so each dual lens's shared circle starts here.
+    if (settings.border_enable) {
+        std::vector<std::vector<std::string>> keys;
+        std::vector<std::string> setups;
+        for (const PrepInput& in : sources) {
+            keys.push_back(stencil_cameras(settings.sfm.prep, in));
+            int w = 0, h = 0;
+            if (is_dual_lens(in)) source_pixel_size(in, ffmpeg_exe, w, h);
+            setups.push_back(lens_setup(in, w, h));
+        }
+        settle_follow(sources, stencil_rows(keys), setups);
+    }
 
     workspace = batch_dataset_workspace(row);
     if (workspace.empty()) {
@@ -969,8 +981,7 @@ std::vector<BatchRow> load_batch_list() {
             }
         }
     } catch (const std::exception&) {
-        // No list yet, or one a crash left half-written. Starting empty is the
-        // only useful answer either way.
+        // A missing or unreadable list starts empty.
     }
     return out;
 }
@@ -1027,11 +1038,32 @@ void save_batch_list(const std::vector<BatchRow>& rows) {
     w.end();
     w.end();
 
-    FILE* f = std::fopen(batch_list_path().c_str(), "wb");
-    if (!f) return;
     const std::string text = w.str();
-    std::fwrite(text.data(), 1, text.size(), f);
-    std::fclose(f);
+    const auto path = batch_list_path();
+    try {
+        spirula::AtomicOutputFile file(spirula::resolve_output_symlink(path), 0);
+        file.stream().write(text.data(), static_cast<std::streamsize>(text.size()));
+        file.close_checked();
+        file.commit();
+    } catch (const std::exception& e) {
+        throw std::runtime_error(path + ": " + e.what());
+    }
+}
+
+bool BatchSaveState::save(const std::vector<BatchRow>& rows) noexcept {
+    try {
+        save_batch_list(rows);
+        error_.clear();
+        state_ = State::Clean;
+        return true;
+    } catch (const std::exception& e) {
+        try { error_ = e.what(); }
+        catch (...) { error_.clear(); }
+    } catch (...) {
+        error_.clear();
+    }
+    state_ = State::Failed;
+    return false;
 }
 
 }  // namespace gui

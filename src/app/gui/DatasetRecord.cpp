@@ -1,5 +1,6 @@
 #include "app/gui/DatasetRecord.h"
 
+#include "core/RelativePath.h"
 #include "data/JsonWrite.h"
 
 #include <chrono>
@@ -108,7 +109,7 @@ Step settings_step(const std::string& key) {
     if (starts("geometry_")) return Step::Geometry;
     if (starts("dense_")) return Step::Dense;
     if (starts("sfm_") || starts("colmap_") || starts("image_") || key == "engine_colmap" ||
-        key == "point_color_in_image_space")
+        starts("point_color_"))
         return Step::Model;
     return Step::Frames;
 }
@@ -259,13 +260,14 @@ void write_step_record(const std::string& workspace, Step step,
     write_root(workspace, root);
 }
 
-std::string encode_record_inputs(const RecordInputs& in) {
+std::string encode_record_inputs(const RecordInputs& in,
+                                 const std::string& workspace) {
     JsonWriter w;
     w.object();
     w.key("rows").array();
     for (const PrepInput& s : in.rows) {
         w.object();
-        w.field("path", s.path);
+        w.field("path", spirula::relative_to_dir(s.path, workspace));
         w.field("is_video", s.is_video);
         w.field("subdir", s.subdir);
         w.field("fps", s.fps);
@@ -275,6 +277,10 @@ std::string encode_record_inputs(const RecordInputs& in) {
         }
         if (s.active_lens >= 0) w.field("active_lens", s.active_lens);
         w.field("lut", s.lut);
+        if (s.color) {
+            w.key("color");
+            spirula::write_image_color(w, *s.color);
+        }
         w.field("sequential", s.sequential);
         w.field("imu", s.use_imu);
         w.field("gps", s.use_gps);
@@ -305,7 +311,7 @@ std::string encode_record_inputs(const RecordInputs& in) {
         w.field("object", c.object);
         w.field("frame", (long long)c.frame);
         w.field("position", c.position);
-        w.field("source", c.source);
+        w.field("source", spirula::relative_to_dir(c.source, workspace));
         w.field("camera", c.camera);
         w.end();
     }
@@ -314,12 +320,14 @@ std::string encode_record_inputs(const RecordInputs& in) {
     return w.str();
 }
 
-RecordInputs decode_record_inputs(const JsonValue& v) {
+RecordInputs decode_record_inputs(const JsonValue& v,
+                                  const std::string& workspace) {
     RecordInputs out;
     if (const JsonValue* rows = v.find("rows"); rows && rows->is_array())
         for (const JsonValue& r : rows->arr) {
             PrepInput s;
-            s.path = text(r, "path");
+            s.path = spirula::resolve_from_dir(text(r, "path"), workspace,
+                                              /*fallback_sibling_filename=*/true);
             s.is_video = r.find("is_video") && r.find("is_video")->as_bool();
             s.subdir = text(r, "subdir");
             s.fps = (float)r.get_double("fps", 0.0);
@@ -327,6 +335,11 @@ RecordInputs decode_record_inputs(const JsonValue& v) {
             s.clip_end = r.get_double("clip_end", 0.0);
             s.active_lens = (int)r.get_double("active_lens", -1.0);
             s.lut = text(r, "lut");
+            if (const auto* color = r.find("color"); color && color->is_object()) {
+                s.color = spirula::ImageColor{text(*color, "gamut"), std::nullopt};
+                if (const auto* linear = color->find("linear"); linear && linear->type == JsonValue::Type::Bool)
+                    s.color->linear = linear->b;
+            }
             s.sequential = r.find("sequential") && r.find("sequential")->as_bool();
             s.use_imu = !r.find("imu") || r.find("imu")->as_bool();
             s.use_gps = !r.find("gps") || r.find("gps")->as_bool();
@@ -357,7 +370,8 @@ RecordInputs decode_record_inputs(const JsonValue& v) {
             k.object = (int)c.get_double("object", 0.0);
             k.frame = (long long)c.get_double("frame", 0.0);
             k.position = (float)c.get_double("position", 0.0);
-            k.source = text(c, "source");
+            k.source = spirula::resolve_from_dir(text(c, "source"), workspace,
+                                                 /*fallback_sibling_filename=*/true);
             k.camera = text(c, "camera");
             out.clicks.push_back(std::move(k));
         }

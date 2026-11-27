@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "core/RelativePath.h"
 #include "sfm/SfmConfig.h"
 #include "sfm/core/Features.h"
 #include "sfm/core/Resume.h"
@@ -102,6 +103,30 @@ static void testSignatures(int& fails) {
         c.finalize(CMD_AUTO);
         check(stageSignature(c, CMD_EXTRACT) == ext0, "mapper flags leave extraction", fails);
         check(stageSignature(c, CMD_MATCH) == mat0, "mapper flags leave matching", fails);
+    }
+    // Moving a workspace keeps extraction signatures identical when masks live inside it.
+    {
+        check(stageSignature(base, CMD_EXTRACT, "/tmp/old/dataset") == ext0 &&
+                  stageSignature(base, CMD_EXTRACT, "/mnt/nas/moved/dataset") == ext0,
+              "empty masks keep extract signature invariant across moves", fails);
+        SfmConfig a = base, b = base;
+        a.mask_dir = "/tmp/old/dataset/masks";
+        b.mask_dir = "/mnt/nas/moved/dataset/masks";
+        check(stageSignature(a, CMD_EXTRACT, "/tmp/old/dataset") ==
+                  stageSignature(b, CMD_EXTRACT, "/mnt/nas/moved/dataset"),
+              "workspace-relative masks keep extract signature invariant across moves", fails);
+        check(spirula::relative_to_dir("/tmp/old/dataset/images/", "/tmp/old/dataset") == "images",
+              "relative_to_dir strips trailing slash", fails);
+        check(spirula::relative_to_dir("/tmp/old/video.OSV", "/tmp/old/dataset") == "../video.OSV",
+              "relative_to_dir writes sibling file with ../", fails);
+        check(spirula::relative_to_dir("/tmp/old/videos/a.OSV", "/tmp/old/dataset") ==
+                  "../videos/a.OSV",
+              "relative_to_dir keeps a file under the dataset's parent relative", fails);
+        const fs::path root = fs::temp_directory_path();
+        const fs::path video = root / "videos" / "a.OSV";
+        check(spirula::relative_to_dir(video.u8string(), (root / "old" / "dataset").u8string()) ==
+                  fs::absolute(video).lexically_normal().u8string(),
+              "relative_to_dir keeps a file further away absolute", fails);
     }
 }
 

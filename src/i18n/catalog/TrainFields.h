@@ -798,6 +798,29 @@ SS_MSG(mask_dir_help,
     TR("Görüntü maskelerini içeren alt klasör; COLMAP ve Metashape veri kümeleri "
        "için. Maskenin ne anlama geldiğini apply_loss_for_mask belirler."));
 
+SS_MSG(mask_mode,
+    EN("Mask mode"), JA("マスクモード"),
+    ZH_HANS("蒙版模式"), ZH_HANT("遮罩模式"),
+    KO("마스크 모드"), DE("Maskenmodus"),
+    FR("Mode de masque"), ES("Modo de máscara"),
+    PT("Modo de máscara"), IT("Modalità maschera"),
+    NL("Maskermodus"), RU("Режим маски"),
+    TR("Maske kipi"));
+SS_MSG(mask_mode_help,
+    EN("How image masks control the loss.\n- auto — uses load_masks and apply_loss_for_mask.\n- ignore / segment — binary keep vs. ignore or empty.\n- segment_and_ignore — 0-127 ignore, 128-250 empty, 251-255 keep."),
+    JA("マスクの損失への適用方法です。\n- auto — load_masks と apply_loss_for_mask に従います。\n- ignore / segment — 除外または空として学習します。\n- segment_and_ignore — 0-127無視、128-250空、251-255保持。"),
+    ZH_HANS("图像蒙版如何控制损失。\n- auto — 沿用 load_masks 与 apply_loss_for_mask。\n- ignore / segment — 二值忽略或训练为空。\n- segment_and_ignore — 0-127忽略，128-250空，251-255保留。"),
+    ZH_HANT("影像遮罩如何控制損失。\n- auto — 沿用 load_masks 與 apply_loss_for_mask。\n- ignore / segment — 二值忽略或訓練為空。\n- segment_and_ignore — 0-127忽略，128-250空，251-255保留。"),
+    KO("마스크의 손실 적용 방식입니다.\n- auto — load_masks 및 apply_loss_for_mask를 따릅니다.\n- ignore / segment — 무시 또는 빈 공간으로 학습합니다.\n- segment_and_ignore — 0-127 무시, 128-250 빈 공간, 251-255 유지."),
+    DE("Steuert die Maskenwirkung im Loss.\n- auto — nutzt load_masks und apply_loss_for_mask.\n- ignore / segment — auslassen oder als leer trainieren.\n- segment_and_ignore — 0-127 ignorieren, 128-250 leer, 251-255 behalten."),
+    FR("Contrôle l’effet des masques sur la perte.\n- auto — suit load_masks et apply_loss_for_mask.\n- ignore / segment — exclure ou entraîner comme vide.\n- segment_and_ignore — 0-127 ignorer, 128-250 vide, 251-255 garder."),
+    ES("Controla el efecto de las máscaras en la pérdida.\n- auto — usa load_masks y apply_loss_for_mask.\n- ignore / segment — omitir o entrenar como vacío.\n- segment_and_ignore — 0-127 ignorar, 128-250 vacío, 251-255 conservar."),
+    PT("Controla o efeito das máscaras na perda.\n- auto — usa load_masks e apply_loss_for_mask.\n- ignore / segment — omitir ou treinar como vazio.\n- segment_and_ignore — 0-127 ignorar, 128-250 vazio, 251-255 manter."),
+    IT("Controlla l’effetto delle maschere sulla perdita.\n- auto — usa load_masks e apply_loss_for_mask.\n- ignore / segment — esclude o addestra come vuoto.\n- segment_and_ignore — 0-127 ignora, 128-250 vuoto, 251-255 mantieni."),
+    NL("Bepaalt hoe maskers het verlies sturen.\n- auto — volgt load_masks en apply_loss_for_mask.\n- ignore / segment — overslaan of als leeg trainen.\n- segment_and_ignore — 0-127 negeren, 128-250 leeg, 251-255 behouden."),
+    RU("Определяет действие масок в функции потерь.\n- auto — использует load_masks и apply_loss_for_mask.\n- ignore / segment — исключить или обучать как пустоту.\n- segment_and_ignore — 0-127 игнор, 128-250 пусто, 251-255 сохранить."),
+    TR("Maskelerin kayba etkisini belirler.\n- auto — load_masks ve apply_loss_for_mask ayarını izler.\n- ignore / segment — yok say veya boş olarak eğit.\n- segment_and_ignore — 0-127 yok say, 128-250 boş, 251-255 tut."));
+
 SS_MSG(load_masks,
     EN("Use dataset masks"), JA("データセットのマスクを使う"),
     ZH_HANS("使用数据集的蒙版"), ZH_HANT("使用資料集的遮罩"),
@@ -851,6 +874,35 @@ SS_MSG(apply_loss_for_mask_help,
     NL("Oningesteld alleen aan bij uitsluitend alfamaskers.\n- Uit — gemaskeerde pixels tellen niet mee in het verlies.\n- Aan — leert gemaskeerde pixels als lege ruimte."),
     RU("Если не задано, включено только для масок из альфа-канала.\n- Выкл. — исключает пиксели маски из потерь.\n- Вкл. — обучает пиксели маски как пустые."),
     TR("Ayarlanmazsa yalnız alfa maskeleri için açıktır.\n- Kapalı — maskeli pikselleri kayıptan çıkarır.\n- Açık — maskeli pikselleri boş alan olarak eğitir."));
+
+SS_MSG(preserve_background,
+    EN("Train the background behind segments"),
+    JA("セグメントの背後の背景も学習"),
+    ZH_HANS("在分割区域训练背景"),
+    ZH_HANT("在分割區域訓練背景"),
+    KO("분할 영역의 배경도 학습"),
+    DE("Hintergrund hinter Segmenten trainieren"),
+    FR("Entraîner l’arrière-plan derrière les segments"),
+    ES("Entrenar el fondo tras los segmentos"),
+    PT("Treinar o fundo atrás dos segmentos"),
+    IT("Addestrare lo sfondo dietro i segmenti"),
+    NL("Achtergrond achter segmenten trainen"),
+    RU("Обучать фон за сегментами"),
+    TR("Bölütlerin arkasındaki arka planı eğit"));
+SS_MSG(preserve_background_help,
+    EN("Segments keep their color loss, so a skybox learns there. Unset: on, except `segment` without a skybox under transparency suppression."),
+    JA("セグメントにも色の損失を残し、そこでスカイボックスを学習します。未設定ならオン。ただし透明度抑制下のスカイボックスがない `segment` ではオフ。"),
+    ZH_HANS("分割区域保留颜色损失，让天空盒在此学习。未设置时开启；但 `segment` 没有透明抑制下的天空盒时关闭。"),
+    ZH_HANT("分割區域保留顏色損失，讓天空盒在此學習。未設定時開啟；但 `segment` 沒有透明抑制下的天空盒時關閉。"),
+    KO("분할 영역에 색 손실을 남겨 스카이박스가 그곳에서 학습합니다. 미설정이면 켜짐. 단, 투명도 억제 중 스카이박스가 없는 `segment`는 꺼짐."),
+    DE("Segmente behalten ihren Farbverlust, damit dort eine Skybox lernt. Ohne Wert an, außer bei `segment` ohne Skybox unter Transparenzunterdrückung."),
+    FR("Les segments gardent leur perte de couleur : un skybox y apprend. Par défaut actif, sauf `segment` sans skybox sous suppression de transparence."),
+    ES("Los segmentos conservan la pérdida de color y un skybox aprende ahí. Sin ajuste, activo salvo `segment` sin skybox con supresión de transparencia."),
+    PT("Os segmentos mantêm a perda de cor e um skybox aprende ali. Sem definição, ativo, exceto `segment` sem skybox com supressão de transparência."),
+    IT("I segmenti mantengono la perdita di colore e lì uno skybox impara. Senza valore attivo, tranne `segment` senza skybox con soppressione trasparenza."),
+    NL("Segmenten houden hun kleurverlies, zodat een skybox daar leert. Oningesteld aan, behalve `segment` zonder skybox onder transparantieonderdrukking."),
+    RU("Сегменты сохраняют потерю цвета, и там обучается скайбокс. Не задано: вкл., кроме `segment` без скайбокса при подавлении прозрачности."),
+    TR("Bölütler renk kaybını korur; gökyüzü kutusu orada öğrenir. Ayarlanmazsa açık; saydamlık bastırmalı gökyüzü kutusu olmayan `segment` hariç."));
 
 SS_MSG(flip_mask,
     EN("Flip masks"), JA("マスクを反転"),
@@ -1622,19 +1674,19 @@ SS_MSG(cache_downscaled_images,
     RU("Кэшировать уменьшенные изображения"),
     TR("Küçültülmüş görüntüleri önbelleğe al"));
 SS_MSG(cache_downscaled_images_help,
-    EN("Caches reduced JPEG/PNG files for integer training divisors in images_2, images_4, etc.\n- Later runs reuse matching-size files to avoid decoding large images.\n- Existing files are never overwritten."),
-    JA("整数の学習用除数で縮小したJPEG/PNGを images_2、images_4 などに保存します。\n- 次回以降はサイズが一致するファイルを再利用し、大きな画像の復号を省きます。\n- 既存ファイルは上書きしません。"),
-    ZH_HANS("整数训练除数下，将缩小的 JPEG/PNG 缓存到 images_2、images_4 等目录。\n- 后续运行复用尺寸匹配的文件，避免解码大图像。\n- 从不覆盖现有文件。"),
-    ZH_HANT("整數訓練除數下，將縮小的 JPEG/PNG 快取到 images_2、images_4 等目錄。\n- 後續執行重用尺寸匹配的檔案，避免解碼大影像。\n- 從不覆寫現有檔案。"),
-    KO("정수 학습 나눗값의 축소 JPEG/PNG를 images_2, images_4 등에 저장합니다.\n- 이후 실행은 크기가 맞는 파일을 재사용해 큰 이미지 디코딩을 피합니다.\n- 기존 파일은 덮어쓰지 않습니다."),
-    DE("Speichert verkleinerte JPEG/PNG bei ganzzahligen Teilern in images_2, images_4 usw.\n- Folgeläufe nutzen passende Dateien statt große Bilder neu zu dekodieren.\n- Bestehende Dateien werden nie überschrieben."),
-    FR("Cache les JPEG/PNG réduits pour diviseurs entiers dans images_2, images_4, etc.\n- Réutilise ensuite les fichiers de taille adaptée au lieu de décoder de grandes images.\n- N’écrase jamais les fichiers existants."),
-    ES("Guarda JPEG/PNG reducidos para divisores enteros en images_2, images_4, etc.\n- Las siguientes ejecuciones reutilizan tamaños coincidentes para evitar decodificar imágenes grandes.\n- Nunca sobrescribe archivos existentes."),
-    PT("Guarda JPEG/PNG reduzidos para divisores inteiros em images_2, images_4 etc.\n- Próximas execuções reusam arquivos de tamanho igual, evitando decodificar imagens grandes.\n- Nunca sobrescreve arquivos existentes."),
-    IT("Salva JPEG/PNG ridotti per divisori interi in images_2, images_4 ecc.\n- Le sessioni successive riusano file di dimensioni adatte, evitando di decodificare immagini grandi.\n- Non sovrascrive mai i file esistenti."),
-    NL("Bewaart verkleinde JPEG/PNG voor gehele delers in images_2, images_4 enz.\n- Latere runs hergebruiken passende bestanden om grote beelden niet opnieuw te decoderen.\n- Bestaande bestanden worden nooit overschreven."),
-    RU("Кэширует уменьшенные JPEG/PNG при целых делителях в images_2, images_4 и т.д.\n- Следующие запуски используют файлы нужного размера без декодирования больших кадров.\n- Существующие файлы не перезаписываются."),
-    TR("Tam sayı bölenlerde küçük JPEG/PNG’leri images_2, images_4 vb. içine önbellekler.\n- Sonraki çalıştırmalar büyük görüntüleri çözmek yerine uygun boyutlu dosyaları kullanır.\n- Var olan dosyaları asla üzerine yazmaz."));
+    EN("Caches reduced JPEG/PNG images, including progressive stages.\nReuses existing files without overwriting."),
+    JA("段階的解像度を含む縮小JPEG/PNGをディスクに保存します。\n既存ファイルは上書きせず再利用します。"),
+    ZH_HANS("在磁盘上缓存缩小的 JPEG/PNG，包括渐进分辨率阶段。\n复用现有文件，不覆盖。"),
+    ZH_HANT("在磁碟上快取縮小的 JPEG/PNG，包括漸進解析度階段。\n重用現有檔案，不覆寫。"),
+    KO("점진적 해상도 단계의 축소 JPEG/PNG도 디스크에 저장합니다.\n기존 파일은 덮어쓰지 않고 재사용합니다."),
+    DE("Speichert verkleinerte JPEG/PNG, auch für progressive Stufen.\nVorhandene Dateien werden ohne Überschreiben wiederverwendet."),
+    FR("Cache les JPEG/PNG réduits, y compris les étapes progressives.\nRéutilise les fichiers existants sans les écraser."),
+    ES("Guarda JPEG/PNG reducidos, incluidas las etapas progresivas.\nReutiliza archivos existentes sin sobrescribirlos."),
+    PT("Guarda JPEG/PNG reduzidos, incluindo etapas progressivas.\nReutiliza arquivos existentes sem sobrescrever."),
+    IT("Salva JPEG/PNG ridotti, anche nelle fasi progressive.\nRiusa i file esistenti senza sovrascriverli."),
+    NL("Bewaart verkleinde JPEG/PNG, ook voor progressieve stappen.\nHergebruikt bestaande bestanden zonder te overschrijven."),
+    RU("Кэширует уменьшенные JPEG/PNG, включая прогрессивные этапы.\nИспользует существующие файлы без перезаписи."),
+    TR("Aşamalı çözünürlük dahil küçük JPEG/PNG’leri önbellekler.\nMevcut dosyaları üzerine yazmadan yeniden kullanır."));
 
 SS_MSG(eval_mode,
     EN("Evaluation split"), JA("評価用の分け方"), ZH_HANS("评估集划分方式"),
@@ -2075,19 +2127,19 @@ SS_MSG(primitive,
     PT("Forma dos splats"), IT("Forma degli splat"), NL("Splatvorm"),
     RU("Форма сплатов"), TR("Splat biçimi"));
 SS_MSG(primitive_help,
-    EN("- 3dgs: standard Gaussians, widest viewer compatibility.\n- mip: less aliasing across different distances or resolutions.\n- 3dgut: more accurate wide/distorted lenses and cleaner mesh geometry."),
-    JA("- 3dgs：標準ガウス。ビューアとの互換性が最も高い方式。\n- mip：距離や解像度の差によるエイリアシングを軽減。\n- 3dgut：広角・歪みのあるレンズを正確に扱い、メッシュ形状を改善。"),
-    ZH_HANS("- 3dgs：标准高斯，查看器兼容性最广。\n- mip：减少不同距离或分辨率之间的锯齿。\n- 3dgut：更准确处理广角及畸变镜头，生成更干净的网格几何。"),
-    ZH_HANT("- 3dgs：標準高斯，檢視器相容性最廣。\n- mip：減少不同距離或解析度之間的鋸齒。\n- 3dgut：更準確處理廣角及畸變鏡頭，產生更乾淨的網格幾何。"),
-    KO("- 3dgs: 표준 가우시안으로 뷰어 호환성이 가장 넓습니다.\n- mip: 거리나 해상도 차이에 따른 앨리어싱을 줄입니다.\n- 3dgut: 광각/왜곡 렌즈를 정확하게 다루고 메시 형상을 개선합니다."),
-    DE("- 3dgs: Standardgauß, breiteste Viewer-Kompatibilität.\n- mip: weniger Aliasing bei verschiedenen Entfernungen oder Auflösungen.\n- 3dgut: genauere Weitwinkel-/Verzerrungslinsen und sauberere Mesh-Geometrie."),
-    FR("- 3dgs : gaussiennes standard, compatibilité maximale avec les visionneuses.\n- mip : moins d’aliasing selon la distance ou la résolution.\n- 3dgut : grand-angle et distorsion plus précis, géométrie de maillage plus propre."),
-    ES("- 3dgs: gaussianas estándar, máxima compatibilidad con visores.\n- mip: menos aliasing al cambiar distancia o resolución.\n- 3dgut: lentes anchas/distorsionadas más precisas y geometría de malla más limpia."),
-    PT("- 3dgs: gaussianas padrão, maior compatibilidade com visores.\n- mip: menos aliasing em distâncias ou resoluções diferentes.\n- 3dgut: lentes amplas/distorcidas mais precisas e geometria de malha mais limpa."),
-    IT("- 3dgs: gaussiane standard, massima compatibilità con i visualizzatori.\n- mip: meno aliasing a distanze o risoluzioni diverse.\n- 3dgut: più preciso per lenti larghe/distorte e geometria mesh più pulita."),
-    NL("- 3dgs: standaard Gauss, breedste viewercompatibiliteit.\n- mip: minder aliasing bij andere afstanden of resoluties.\n- 3dgut: nauwkeuriger voor groothoek/vervormde lenzen en schonere mesh-geometrie."),
-    RU("- 3dgs: стандартные гауссианы, самая широкая совместимость с просмотрщиками.\n- mip: меньше алиасинга при смене расстояния или разрешения.\n- 3dgut: точнее для широких/искажённых линз, чище геометрия сетки."),
-    TR("- 3dgs: standart Gauss, en geniş görüntüleyici uyumluluğu.\n- mip: farklı uzaklık veya çözünürlükte daha az örtüşme.\n- 3dgut: geniş/bozuk lenslerde daha doğru, ağ geometrisi daha temiz."));
+    EN("- 3dgs: standard Gaussians, widest viewer compatibility.\n- mip: less aliasing across different distances or resolutions.\n- 3dgut: more accurate wide/distorted lenses and cleaner mesh geometry.\n- 2dgs: flat discs; sharper surfaces, normals and meshes."),
+    JA("- 3dgs：標準ガウス。ビューアとの互換性が最も高い方式。\n- mip：距離や解像度の差によるエイリアシングを軽減。\n- 3dgut：広角・歪みのあるレンズを正確に扱い、メッシュ形状を改善。\n- 2dgs：平らな円盤。表面・法線・メッシュがより鮮明。"),
+    ZH_HANS("- 3dgs：标准高斯，查看器兼容性最广。\n- mip：减少不同距离或分辨率之间的锯齿。\n- 3dgut：更准确处理广角及畸变镜头，生成更干净的网格几何。\n- 2dgs：扁平圆盘，表面、法线与网格更清晰。"),
+    ZH_HANT("- 3dgs：標準高斯，檢視器相容性最廣。\n- mip：減少不同距離或解析度之間的鋸齒。\n- 3dgut：更準確處理廣角及畸變鏡頭，產生更乾淨的網格幾何。\n- 2dgs：扁平圓盤，表面、法線與網格更清晰。"),
+    KO("- 3dgs: 표준 가우시안으로 뷰어 호환성이 가장 넓습니다.\n- mip: 거리나 해상도 차이에 따른 앨리어싱을 줄입니다.\n- 3dgut: 광각/왜곡 렌즈를 정확하게 다루고 메시 형상을 개선합니다.\n- 2dgs: 평평한 원반으로 표면, 법선, 메시가 더 선명합니다."),
+    DE("- 3dgs: Standardgauß, breiteste Viewer-Kompatibilität.\n- mip: weniger Aliasing bei verschiedenen Entfernungen oder Auflösungen.\n- 3dgut: genauere Weitwinkel-/Verzerrungslinsen und sauberere Mesh-Geometrie.\n- 2dgs: flache Scheiben, schärfere Oberflächen, Normalen und Meshes."),
+    FR("- 3dgs : gaussiennes standard, compatibilité maximale avec les visionneuses.\n- mip : moins d’aliasing selon la distance ou la résolution.\n- 3dgut : grand-angle et distorsion plus précis, géométrie de maillage plus propre.\n- 2dgs : disques plats, surfaces, normales et maillages plus nets."),
+    ES("- 3dgs: gaussianas estándar, máxima compatibilidad con visores.\n- mip: menos aliasing al cambiar distancia o resolución.\n- 3dgut: lentes anchas/distorsionadas más precisas y geometría de malla más limpia.\n- 2dgs: discos planos; superficies, normales y mallas más nítidas."),
+    PT("- 3dgs: gaussianas padrão, maior compatibilidade com visores.\n- mip: menos aliasing em distâncias ou resoluções diferentes.\n- 3dgut: lentes amplas/distorcidas mais precisas e geometria de malha mais limpa.\n- 2dgs: discos planos; superfícies, normais e malhas mais nítidas."),
+    IT("- 3dgs: gaussiane standard, massima compatibilità con i visualizzatori.\n- mip: meno aliasing a distanze o risoluzioni diverse.\n- 3dgut: più preciso per lenti larghe/distorte e geometria mesh più pulita.\n- 2dgs: dischi piatti; superfici, normali e mesh più nitide."),
+    NL("- 3dgs: standaard Gauss, breedste viewercompatibiliteit.\n- mip: minder aliasing bij andere afstanden of resoluties.\n- 3dgut: nauwkeuriger voor groothoek/vervormde lenzen en schonere mesh-geometrie.\n- 2dgs: platte schijven; scherpere oppervlakken, normalen en meshes."),
+    RU("- 3dgs: стандартные гауссианы, самая широкая совместимость с просмотрщиками.\n- mip: меньше алиасинга при смене расстояния или разрешения.\n- 3dgut: точнее для широких/искажённых линз, чище геометрия сетки.\n- 2dgs: плоские диски; чётче поверхности, нормали и сетки."),
+    TR("- 3dgs: standart Gauss, en geniş görüntüleyici uyumluluğu.\n- mip: farklı uzaklık veya çözünürlükte daha az örtüşme.\n- 3dgut: geniş/bozuk lenslerde daha doğru, ağ geometrisi daha temiz.\n- 2dgs: düz diskler; daha net yüzeyler, normaller ve ağlar."));
 
 SS_MSG(sh_degree,
     EN("Color detail (SH)"), JA("色の細かさ（SH）"),
@@ -2165,19 +2217,19 @@ SS_MSG(background_mode,
     KO("배경"), DE("Hintergrund"), FR("Arrière-plan"), ES("Fondo"),
     PT("Fundo"), IT("Sfondo"), NL("Achtergrond"), RU("Фон"), TR("Arka plan"));
 SS_MSG(background_mode_help,
-    EN("Fill pixels that splats do not cover.\n- color uses one chosen color. Black adds no cost.\n- noise, pseudorandom and random change pixels, tiles or the whole frame each step to discourage translucency.\n- sh learns a skybox for distant background."),
-    JA("スプラットが覆わない画素を何で埋めるかです。 `color` が通常の選択で、選んだ一つの色を使います。\n- 黒なら何の処理もしません。 `noise` と `pseudorandom` と `random` はどれも、覆われていない画素の色が毎ステップ変わるようにして半透明な面を抑えます。色のまとまりの大きさが違い、画素ごと、鮮やかなタイル、画面全体と大きくなります。\n- 大きいほど損失に平均化されず効き目が強くなります。 `sh` は空を学習し、遠くの背景を無視せず表現します。"),
-    ZH_HANS("用什么填充没有泼溅覆盖的像素。 `color` 是通常的选择，用你指定的一种颜色；黑色则完全不做处理。\n- `noise`、`pseudorandom` 和 `random` 都通过让未覆盖像素的颜色每步都变来抑制半透明表面；\n- 区别在于色块的大小，从逐像素到鲜艳的色块再到整帧一色，越大损失越难把它平均掉，压得也越狠。\n- `sh` 会学习一个天空盒，让远处背景被表示而不是被忽略。"),
-    ZH_HANT("用什麼填充沒有潑濺覆蓋的像素。 `color` 是通常的選擇，用你指定的一種顏色；黑色則完全不做處理。\n- `noise`、`pseudorandom` 和 `random` 都透過讓未覆蓋像素的顏色每步都變來抑制半透明表面；\n- 區別在於色塊的大小，從逐像素到鮮豔的色塊再到整幀一色，越大損失越難把它平均掉，壓得也越狠。\n- `sh` 會學習一個天空盒，讓遠處背景被表示而不是被忽略。"),
-    KO("스플랫이 덮지 않은 픽셀을 무엇으로 채울지입니다. `color`가 보통의 선택으로, 직접 고른 한 가지 색을 씁니다. 검정이면 아무 처리도 하지 않습니다.\n- `noise`와 `pseudorandom`과 `random`은 모두 덮이지 않은 픽셀의 색이 매 스텝 바뀌게 해서 반투명한 표면을 억제합니다.\n- 색 덩어리의 크기가 다른데, 픽셀 단위에서 선명한 타일, 화면 전체 한 색으로 커집니다.\n- 클수록 손실이 평균으로 지워 버리지 못해 더 세게 누릅니다.\n- `sh`는 스카이박스를 학습해 먼 배경을 무시하지 않고 표현합니다."),
-    DE("Was Pixel füllt, die kein Splat bedeckt. `color` ist die übliche Wahl: eine Farbe nach Wahl, und Schwarz kostet gar nichts. `noise`, `pseudorandom` und `random` entmutigen alle halbdurchsichtige Flächen, indem ein unbedecktes Pixel auf einer Farbe landet, die sich jeden Schritt ändert;\n- sie unterscheiden sich in der Fleckengröße -- pro Pixel, kräftige Kacheln oder eine Farbe für das ganze Bild -- und je größer, desto weniger kann der Verlust sie wegmitteln.\n- `sh` lernt eine Skybox, damit ferner Hintergrund dargestellt statt ignoriert wird."),
-    FR("Ce qui remplit les pixels qu'aucun splat ne couvre. `color` est le choix habituel : une couleur de votre choix, et le noir ne coûte rien.\n- `noise`, `pseudorandom` et `random` découragent tous les surfaces à demi transparentes en faisant tomber un pixel non couvert sur une couleur qui change à chaque étape ;\n- ils diffèrent par la taille des taches -- par pixel, tuiles vives, ou une seule couleur pour toute l'image -- et plus elles sont grandes, moins la perte peut les moyenner.\n- `sh` apprend une skybox pour que l'arrière-plan lointain soit représenté au lieu d'être ignoré."),
-    ES("Qué rellena los píxeles que ningún splat cubre. `color` es la elección habitual: un color que eliges, y el negro no cuesta nada.\n- `noise`, `pseudorandom` y `random` desincentivan las superficies semitransparentes haciendo que un píxel sin cubrir caiga sobre un color que cambia en cada paso;\n- se diferencian en el tamaño de las manchas -- por píxel, baldosas vivas o un solo color para todo el fotograma -- y cuanto mayores, menos puede promediarlas la pérdida.\n- `sh` aprende un cielo para que el fondo lejano quede representado en vez de ignorado."),
-    PT("O que preenche os pixels que nenhum splat cobre. `color` é a escolha habitual: uma cor à sua escolha, e o preto não custa nada. `noise`, `pseudorandom` e `random` desencorajam superfícies semitransparentes fazendo um pixel descoberto cair sobre uma cor que muda a cada passo;\n- diferem no tamanho das manchas -- por pixel, ladrilhos vivos ou uma só cor para o quadro inteiro -- e quanto maiores, menos a perda consegue mediá-las.\n- `sh` aprende um céu para que o fundo distante seja representado em vez de ignorado."),
-    IT("Che cosa riempie i pixel che nessuno splat copre. `color` è la scelta abituale: un colore a tua scelta, e il nero non costa nulla. `noise`, `pseudorandom` e `random` scoraggiano le superfici semitrasparenti facendo cadere un pixel scoperto su un colore che cambia a ogni passo;\n- differiscono per la dimensione delle chiazze -- per pixel, piastrelle vivaci o un solo colore per l'intero fotogramma -- e più sono grandi, meno la perdita può mediarle.\n- `sh` impara un cielo perché lo sfondo lontano sia rappresentato invece che ignorato."),
-    NL("Wat pixels vult die geen splat bedekt. `color` is de gebruikelijke keuze: een kleur naar keuze, en zwart kost helemaal niets.\n- `noise`, `pseudorandom` en `random` ontmoedigen allemaal halfdoorzichtige oppervlakken doordat een onbedekte pixel op een kleur valt die elke stap verandert;\n- ze verschillen in de grootte van de vlekken -- per pixel, felle tegels of één kleur voor het hele beeld -- en hoe groter, hoe minder het verlies ze kan wegmiddelen.\n- `sh` leert een skybox zodat verre achtergrond wordt weergegeven in plaats van genegeerd."),
-    RU("Чем заполняются пиксели, которые не покрыл ни один сплат. `color` — обычный выбор: любой заданный вами цвет, а чёрный не стоит ничего. `noise`, `pseudorandom` и `random` мешают полупрозрачным поверхностям: непокрытый пиксель попадает на цвет, меняющийся каждый шаг; они отличаются размером пятен — на пиксель, яркие плитки или один цвет на весь кадр — и чем крупнее, тем хуже функция потерь их усредняет.\n`sh` обучает скайбокс, чтобы дальний фон был представлен, а не проигнорирован."),
-    TR("Hiçbir splat'ın kaplamadığı pikselleri neyin dolduracağı. `color` alışılmış seçimdir: seçtiğiniz bir renk, siyah ise hiçbir şeye mal olmaz. `noise`, `pseudorandom` ve `random` yarı saydam yüzeyleri caydırır:\n- kaplanmamış bir piksel her adımda değişen bir renge düşer;\n- benek boyutlarıyla ayrılırlar -- piksel başına, canlı karolar ya da tüm kare için tek renk -- ve büyüdükçe kayıp bunları ortalamayla silemez. `sh` bir gökyüzü öğrenir, böylece uzak arka plan yok sayılmak yerine temsil edilir."));
+    EN("What fills pixels no splat covers.\n- `black` adds no cost.\n- `color` uses the color set below.\n- `skybox` learns an SH sky for distant background."),
+    JA("スプラットが覆わない画素を何で埋めるかです。\n- `black` は処理を追加しません。\n- `color` は下で選ぶ色を使います。\n- `skybox` は遠景用に SH の空を学習します。"),
+    ZH_HANS("用什么填充没有泼溅覆盖的像素。\n- `black` 不增加开销。\n- `color` 使用下方设置的颜色。\n- `skybox` 为远景学习一个 SH 天空。"),
+    ZH_HANT("用什麼填充沒有潑濺覆蓋的像素。\n- `black` 不增加開銷。\n- `color` 使用下方設定的顏色。\n- `skybox` 為遠景學習一個 SH 天空。"),
+    KO("스플랫이 덮지 않은 픽셀을 무엇으로 채울지입니다.\n- `black`은 비용이 없습니다.\n- `color`는 아래에서 고른 색을 씁니다.\n- `skybox`는 먼 배경용 SH 하늘을 학습합니다."),
+    DE("Was Pixel füllt, die kein Splat bedeckt.\n- `black` kostet nichts.\n- `color` nutzt die darunter gewählte Farbe.\n- `skybox` lernt einen SH-Himmel für fernen Hintergrund."),
+    FR("Ce qui remplit les pixels qu'aucun splat ne couvre.\n- `black` ne coûte rien.\n- `color` utilise la couleur choisie dessous.\n- `skybox` apprend un ciel SH pour l'arrière-plan lointain."),
+    ES("Qué rellena los píxeles que ningún splat cubre.\n- `black` no cuesta nada.\n- `color` usa el color elegido debajo.\n- `skybox` aprende un cielo SH para el fondo lejano."),
+    PT("O que preenche os pixels que nenhum splat cobre.\n- `black` não custa nada.\n- `color` usa a cor escolhida abaixo.\n- `skybox` aprende um céu SH para o fundo distante."),
+    IT("Che cosa riempie i pixel che nessuno splat copre.\n- `black` non costa nulla.\n- `color` usa il colore scelto sotto.\n- `skybox` impara un cielo SH per lo sfondo lontano."),
+    NL("Wat pixels vult die geen splat bedekt.\n- `black` kost niets.\n- `color` gebruikt de kleur hieronder.\n- `skybox` leert een SH-lucht voor verre achtergrond."),
+    RU("Чем заполняются пиксели, не покрытые сплатами.\n- `black` ничего не стоит.\n- `color` использует цвет, выбранный ниже.\n- `skybox` обучает SH-небо для дальнего фона."),
+    TR("Hiçbir splat'ın kaplamadığı pikselleri neyin dolduracağı.\n- `black` ek maliyet getirmez.\n- `color` aşağıda seçilen rengi kullanır.\n- `skybox` uzak arka plan için bir SH gökyüzü öğrenir."));
 
 SS_MSG(background_color,
     EN("Background color"), JA("背景色"), ZH_HANS("背景颜色"),
@@ -2221,6 +2273,35 @@ SS_MSG(background_color_help,
        "bedavadır: harmanlamayı tümüyle atlar. Yalnızca "
        "`color` arka planıyla kullanılır."));
 
+SS_MSG(background_transparency_suppression,
+    EN("Transparency suppression"),
+    JA("半透明の抑制"),
+    ZH_HANS("抑制半透明"),
+    ZH_HANT("抑制半透明"),
+    KO("반투명 억제"),
+    DE("Transparenz unterdrücken"),
+    FR("Suppression de la transparence"),
+    ES("Supresión de transparencia"),
+    PT("Supressão de transparência"),
+    IT("Soppressione della trasparenza"),
+    NL("Transparantie onderdrukken"),
+    RU("Подавление прозрачности"),
+    TR("Saydamlık bastırma"));
+SS_MSG(background_transparency_suppression_help,
+    EN("A background that changes every step, so half-transparent splats cost more. Not drawn on segments.\n- `noise`: per pixel\n- `pseudorandom`: bright tiles, stronger than `noise`\n- `random`: one color per frame, gentler than `noise`"),
+    JA("毎ステップ変わる背景で、半透明なスプラットの損失を大きくします。セグメントには描きません。\n- `noise`：画素ごと\n- `pseudorandom`：鮮やかなタイル。`noise` より強く抑制\n- `random`：フレーム全体で一色。`noise` より穏やか"),
+    ZH_HANS("每步变化的背景，使半透明泼溅代价更大。分割区域不绘制。\n- `noise`：逐像素\n- `pseudorandom`：鲜艳色块，比 `noise` 抑制更强\n- `random`：整帧一色，比 `noise` 更温和"),
+    ZH_HANT("每步變化的背景，使半透明潑濺代價更大。分割區域不繪製。\n- `noise`：逐像素\n- `pseudorandom`：鮮豔色塊，比 `noise` 抑制更強\n- `random`：整幀一色，比 `noise` 更溫和"),
+    KO("매 스텝 바뀌는 배경으로 반투명 스플랫의 손실을 키웁니다. 분할 영역에는 그리지 않습니다.\n- `noise`: 픽셀 단위\n- `pseudorandom`: 선명한 타일, `noise`보다 강함\n- `random`: 프레임 전체 한 색, `noise`보다 약함"),
+    DE("Ein Hintergrund, der sich jeden Schritt ändert, damit halbtransparente Splats mehr kosten. Nicht auf Segmenten.\n- `noise`: pro Pixel\n- `pseudorandom`: kräftige Kacheln, stärker als `noise`\n- `random`: eine Farbe pro Bild, sanfter als `noise`"),
+    FR("Un fond qui change à chaque étape, pour pénaliser les splats semi-transparents. Absent des segments.\n- `noise` : par pixel\n- `pseudorandom` : tuiles vives, plus fort que `noise`\n- `random` : une couleur par image, plus doux que `noise`"),
+    ES("Un fondo que cambia en cada paso para que los splats semitransparentes cuesten más. No en los segmentos.\n- `noise`: por píxel\n- `pseudorandom`: baldosas vivas, más fuerte que `noise`\n- `random`: un color por fotograma, más suave que `noise`"),
+    PT("Um fundo que muda a cada passo encarece splats semitransparentes. Ausente dos segmentos.\n- `noise`: por pixel\n- `pseudorandom`: ladrilhos vivos, mais forte que `noise`\n- `random`: uma cor por quadro, mais suave que `noise`"),
+    IT("Uno sfondo che cambia a ogni passo, così gli splat semitrasparenti costano di più. Non sui segmenti.\n- `noise`: per pixel\n- `pseudorandom`: tessere vivaci, più forte di `noise`\n- `random`: un colore per fotogramma, più mite di `noise`"),
+    NL("Een achtergrond die elke stap verandert, zodat halfdoorzichtige splats meer kosten. Niet op segmenten.\n- `noise`: per pixel\n- `pseudorandom`: felle tegels, sterker dan `noise`\n- `random`: één kleur per beeld, milder dan `noise`"),
+    RU("Фон, меняющийся каждый шаг, чтобы полупрозрачные сплаты обходились дороже. Не рисуется на сегментах.\n- `noise`: по пикселям\n- `pseudorandom`: яркие плитки, сильнее `noise`\n- `random`: один цвет на кадр, мягче `noise`"),
+    TR("Her adımda değişen bir arka plan; yarı saydam splatların bedeli artar. Bölütlere çizilmez.\n- `noise`: piksel başına\n- `pseudorandom`: canlı karolar, `noise`'dan güçlü\n- `random`: kare başına tek renk, `noise`'dan yumuşak"));
+
 SS_MSG(background_export_height,
     EN("Background export height"), JA("背景の出力高さ"), ZH_HANS("背景导出高度"),
     ZH_HANT("背景匯出高度"), KO("배경 내보내기 높이"), DE("Höhe des Hintergrundexports"),
@@ -2251,31 +2332,31 @@ SS_MSG(background_sh_degree,
     TR("Gökyüzü kutusu ayrıntısı"));
 SS_MSG(background_sh_degree_help,
     EN("How detailed the learned skybox may be. Higher captures finer sky and "
-       "distant scenery. Only used with the `sh` background."),
+       "distant scenery. Only used with the `skybox` background."),
     JA("学習するスカイボックスをどこまで細かくするかです。高いほど空や遠景を細"
-       "かく捉えます。背景が `sh` のときだけ使われます。"),
+       "かく捉えます。背景が `skybox` のときだけ使われます。"),
     ZH_HANS("学习到的天空盒可以有多细。数值越高，天空和远景越细腻。仅在背景为"
-            " `sh` 时使用。"),
+            " `skybox` 时使用。"),
     ZH_HANT("學習到的天空盒可以有多細。數值越高，天空和遠景越細緻。僅在背景為"
-            " `sh` 時使用。"),
+            " `skybox` 時使用。"),
     KO("학습한 스카이박스가 얼마나 세밀할 수 있는지입니다. 값이 클수록 하늘과"
-       " 먼 풍경을 더 곱게 담습니다. 배경이 `sh`일 때만 쓰입니다."),
+       " 먼 풍경을 더 곱게 담습니다. 배경이 `skybox`일 때만 쓰입니다."),
     DE("Wie fein die gelernte Skybox sein darf. Höher erfasst Himmel und ferne "
-       "Kulisse feiner. Wird nur mit dem Hintergrund `sh` verwendet."),
+       "Kulisse feiner. Wird nur mit dem Hintergrund `skybox` verwendet."),
     FR("Niveau de détail du skybox appris. Plus haut capte un ciel et des lointains "
-       "plus fins. Utilisé uniquement avec l'arrière-plan `sh`."),
+       "plus fins. Utilisé uniquement avec l'arrière-plan `skybox`."),
     ES("Cuánto detalle puede tener el skybox aprendido. Más alto capta un cielo "
-       "y un paisaje lejano más finos. Solo se usa con el fondo `sh`."),
+       "y un paisaje lejano más finos. Solo se usa con el fondo `skybox`."),
     PT("Quanto detalhe o skybox aprendido pode ter. Mais alto capta um céu e "
-       "um cenário distante mais finos. Só é usado com o fundo `sh`."),
+       "um cenário distante mais finos. Só é usado com o fundo `skybox`."),
     IT("Quanto può essere dettagliato lo skybox appreso. Più alto cattura cielo "
-       "e paesaggio lontano più fini. Usato solo con lo sfondo `sh`."),
+       "e paesaggio lontano più fini. Usato solo con lo sfondo `skybox`."),
     NL("Hoe gedetailleerd de geleerde skybox mag zijn. Hoger legt fijnere lucht "
-       "en verre omgeving vast. Wordt alleen bij achtergrond `sh` gebruikt."),
+       "en verre omgeving vast. Wordt alleen bij achtergrond `skybox` gebruikt."),
     RU("Насколько подробным может быть обученный скайбокс. Больше — тоньше передаётся "
-       "небо и дальний план. Используется только с фоном `sh`."),
+       "небо и дальний план. Используется только с фоном `skybox`."),
     TR("Öğrenilen gökyüzü kutusunun ne kadar ayrıntılı olabileceği. Yüksek değerler "
-       "gökyüzünü ve uzak manzarayı daha ince yakalar. Yalnızca `sh` arka planıyla "
+       "gökyüzünü ve uzak manzarayı daha ince yakalar. Yalnızca `skybox` arka planıyla "
        "kullanılır."));
 
 SS_MSG(background_noise_warmup,
@@ -2287,34 +2368,19 @@ SS_MSG(background_noise_warmup,
     NL("Opbouw van de achtergrondruis"), RU("Разгон фонового шума"),
     TR("Arka plan gürültüsü ısınması"));
 SS_MSG(background_noise_warmup_help,
-    EN("How many steps the background noise takes to reach full strength. Only "
-       "used with the `noise` / `pseudorandom` / `random` backgrounds."),
-    JA("背景ノイズが最大の強さになるまでのステップ数です。背景が `noise` / "
-       "`pseudorandom` / `random` のときだけ使われます。"),
-    ZH_HANS("背景噪声达到最大强度所需的步数。仅在背景为 `noise` / "
-            "`pseudorandom` / `random` 时使用。"),
-    ZH_HANT("背景雜訊達到最大強度所需的步數。僅在背景為 `noise` / "
-            "`pseudorandom` / `random` 時使用。"),
-    KO("배경 노이즈가 최대 세기에 이르기까지의 스텝 수입니다. 배경이 `noise` /"
-       " `pseudorandom` / `random`일 때만 쓰입니다."),
-    DE("Wie viele Schritte das Hintergrundrauschen braucht, um volle Stärke zu "
-       "erreichen. Wird nur mit den Hintergründen `noise` / `pseudorandom` / "
-       "`random` verwendet."),
-    FR("Combien d'étapes le bruit de fond met à atteindre sa pleine force. Utilisé "
-       "uniquement avec les arrière-plans `noise` / `pseudorandom` / `random`."),
-    ES("Cuántos pasos tarda el ruido de fondo en alcanzar toda su fuerza. Solo "
-       "se usa con los fondos `noise` / `pseudorandom` / `random`."),
-    PT("Quantos passos o ruído de fundo leva para atingir força total. Só é usado "
-       "com os fundos `noise` / `pseudorandom` / `random`."),
-    IT("Quanti passi impiega il rumore di fondo a raggiungere la piena forza. "
-       "Usato solo con gli sfondi `noise` / `pseudorandom` / `random`."),
-    NL("Hoeveel stappen de achtergrondruis nodig heeft om op volle sterkte te "
-       "komen. Wordt alleen bij de achtergronden `noise` / `pseudorandom` / "
-       "`random` gebruikt."),
-    RU("За сколько шагов фоновый шум набирает полную силу. Используется только "
-       "с фонами `noise` / `pseudorandom` / `random`."),
-    TR("Arka plan gürültüsünün tam güce ulaşması için gereken adım sayısı. Yalnızca "
-       "`noise` / `pseudorandom` / `random` arka planlarıyla kullanılır."));
+    EN("How many steps the background noise takes to reach full strength. Only used with transparency suppression on."),
+    JA("背景ノイズが最大の強さになるまでのステップ数です。半透明の抑制がオンのときだけ使われます。"),
+    ZH_HANS("背景噪声达到最大强度所需的步数。仅在开启抑制半透明时使用。"),
+    ZH_HANT("背景雜訊達到最大強度所需的步數。僅在開啟抑制半透明時使用。"),
+    KO("배경 노이즈가 최대 세기에 이르기까지의 스텝 수입니다. 반투명 억제가 켜져 있을 때만 쓰입니다."),
+    DE("Wie viele Schritte das Hintergrundrauschen braucht, um volle Stärke zu erreichen. Nur bei aktiver Transparenzunterdrückung."),
+    FR("Combien d'étapes le bruit de fond met à atteindre sa pleine force. Utilisé uniquement avec la suppression de la transparence."),
+    ES("Cuántos pasos tarda el ruido de fondo en alcanzar toda su fuerza. Solo se usa con la supresión de transparencia activa."),
+    PT("Quantos passos o ruído de fundo leva para atingir força total. Só é usado com a supressão de transparência ativa."),
+    IT("Quanti passi impiega il rumore di fondo a raggiungere la piena forza. Usato solo con la soppressione della trasparenza attiva."),
+    NL("Hoeveel stappen de achtergrondruis nodig heeft om op volle sterkte te komen. Alleen gebruikt als transparantie onderdrukt wordt."),
+    RU("За сколько шагов фоновый шум набирает полную силу. Используется только при включённом подавлении прозрачности."),
+    TR("Arka plan gürültüsünün tam güce ulaşması için gereken adım sayısı. Yalnızca saydamlık bastırma açıkken kullanılır."));
 
 SS_MSG(background_match_luminance,
     EN("Match background to image brightness"), JA("背景を画像の明るさに合わせる"),
@@ -2328,19 +2394,19 @@ SS_MSG(background_match_luminance,
     RU("Подогнать фон под яркость снимка"),
     TR("Arka planı görüntü parlaklığına uydur"));
 SS_MSG(background_match_luminance_help,
-    EN("Matches random background brightness to each photo’s exposure-corrected mean, reducing haze. Applies only to noise, pseudorandom and random backgrounds."),
-    JA("ランダム背景の明るさを写真ごとの露出補正済み平均に合わせ、かすみを抑えます。noise、pseudorandom、random の背景だけに適用します。"),
-    ZH_HANS("将随机背景亮度匹配到各照片经曝光校正后的平均值，减少雾状伪影。仅用于 noise、pseudorandom 和 random 背景。"),
-    ZH_HANT("將隨機背景亮度匹配到各照片經曝光校正後的平均值，減少霧狀偽影。僅用於 noise、pseudorandom 和 random 背景。"),
-    KO("무작위 배경 밝기를 각 사진의 노출 보정된 평균에 맞춰 안개를 줄입니다. noise, pseudorandom, random 배경에만 적용됩니다."),
-    DE("Passt die Helligkeit zufälliger Hintergründe an den belichtungskorrigierten Fotomittelwert an, gegen Dunst. Nur für noise, pseudorandom und random."),
-    FR("Adapte le fond aléatoire à la luminosité moyenne corrigée d’exposition de chaque photo pour réduire la brume. Fonds noise, pseudorandom et random seulement."),
-    ES("Ajusta el brillo del fondo aleatorio a la media corregida por exposición de cada foto para reducir neblina. Solo noise, pseudorandom y random."),
-    PT("Ajusta o brilho do fundo aleatório à média corrigida pela exposição de cada foto para reduzir névoa. Só noise, pseudorandom e random."),
-    IT("Adatta il fondo casuale alla luminosità media corretta per esposizione di ogni foto, riducendo la foschia. Solo noise, pseudorandom e random."),
-    NL("Stemt willekeurig achtergrondlicht af op de belichtingsgecorrigeerde fotogemiddelden, tegen nevel. Alleen bij noise, pseudorandom en random."),
-    RU("Согласует яркость случайного фона со средней яркостью фото с учётом экспозиции, уменьшая дымку. Только для noise, pseudorandom и random."),
-    TR("Rastgele arka plan parlaklığını fotoğrafın pozlama düzeltilmiş ortalamasına uydurarak sisi azaltır. Yalnız noise, pseudorandom ve random için."));
+    EN("Matches random background brightness to each photo’s exposure-corrected mean, reducing haze. Applies only with transparency suppression on."),
+    JA("ランダム背景の明るさを写真ごとの露出補正済み平均に合わせ、かすみを抑えます。半透明の抑制がオンのときだけ適用します。"),
+    ZH_HANS("将随机背景亮度匹配到各照片经曝光校正后的平均值，减少雾状伪影。仅在开启抑制半透明时使用。"),
+    ZH_HANT("將隨機背景亮度匹配到各照片經曝光校正後的平均值，減少霧狀偽影。僅在開啟抑制半透明時使用。"),
+    KO("무작위 배경 밝기를 각 사진의 노출 보정된 평균에 맞춰 안개를 줄입니다. 반투명 억제가 켜져 있을 때만 적용됩니다."),
+    DE("Passt die Helligkeit zufälliger Hintergründe an den belichtungskorrigierten Fotomittelwert an, gegen Dunst. Nur bei aktiver Transparenzunterdrückung."),
+    FR("Adapte le fond aléatoire à la luminosité moyenne corrigée d’exposition de chaque photo pour réduire la brume. Seulement avec la suppression de la transparence."),
+    ES("Ajusta el brillo del fondo aleatorio a la media corregida por exposición de cada foto para reducir neblina. Solo con la supresión de transparencia."),
+    PT("Ajusta o brilho do fundo aleatório à média corrigida pela exposição de cada foto para reduzir névoa. Só com a supressão de transparência."),
+    IT("Adatta il fondo casuale alla luminosità media corretta per esposizione di ogni foto, riducendo la foschia. Solo con la soppressione della trasparenza."),
+    NL("Stemt willekeurig achtergrondlicht af op de belichtingsgecorrigeerde fotogemiddelden, tegen nevel. Alleen als transparantie onderdrukt wordt."),
+    RU("Согласует яркость случайного фона со средней яркостью фото с учётом экспозиции, уменьшая дымку. Только при подавлении прозрачности."),
+    TR("Rastgele arka plan parlaklığını fotoğrafın pozlama düzeltilmiş ortalamasına uydurarak sisi azaltır. Yalnız saydamlık bastırma açıkken."));
 SS_MSG(noise_gate_peak_weight,
     EN("Hidden splats explore"), JA("隠れたスプラットも探索"),
     ZH_HANS("被遮挡的泼溅也探索"), ZH_HANT("被遮擋的潑濺也探索"),
@@ -3459,53 +3525,6 @@ SS_MSG(noise_lr_final_help,
     TR("Eğitimin sonunda ne kadar konum titreşimi kaldığı. Düşük değerler son "
        "adımlarda ayrıntının oturup keskinleşmesini sağlar."));
 
-SS_MSG(use_revised_densification,
-    EN("Revised densification rule"), JA("改良版の増やし方を使う"),
-    ZH_HANS("使用改进的加密规则"), ZH_HANT("使用改良的加密規則"),
-    KO("개선된 밀집화 규칙 사용"), DE("Überarbeitete Verdichtungsregel"),
-    FR("Règle de densification révisée"),
-    ES("Regla de densificación revisada"),
-    PT("Regra de densificação revisada"),
-    IT("Regola di densificazione rivista"), NL("Herziene verdichtingsregel"),
-    RU("Уточнённое правило уплотнения"),
-    TR("Gözden geçirilmiş yoğunlaştırma kuralı"));
-SS_MSG(use_revised_densification_help,
-    EN("Use the improved rule for deciding where new splats go. It usually recovers "
-       "missing detail faster; turn off to match the original method."),
-    JA("新しいスプラットの置き場所を決める、改良された規則を使います。ふつうは"
-       "足りない細部を早く取り戻せます。オリジナルの方法に合わせたいときはオフ"
-       "にしてください。"),
-    ZH_HANS("采用改进的规则来决定新泼溅放在哪里。通常能更快补回缺失的细节；想"
-            "复现原始方法就关闭它。"),
-    ZH_HANT("採用改良的規則來決定新潑濺放在哪裡。通常能更快補回缺失的細節；想"
-            "重現原始方法就關閉它。"),
-    KO("새 스플랫을 어디에 놓을지 정하는 개선된 규칙을 씁니다. 보통 부족한 디"
-       "테일을 더 빨리 되찾습니다. 원래 방식과 맞추려면 끄십시오."),
-    DE("Die verbesserte Regel dafür verwenden, wohin neue Splats kommen. Sie "
-       "holt fehlendes Detail meist schneller zurück; abschalten, um dem ursprünglichen "
-       "Verfahren zu entsprechen."),
-    FR("Utiliser la règle améliorée qui décide où vont les nouveaux splats. Elle "
-       "récupère en général plus vite le détail manquant ; décocher pour retrouver "
-       "la méthode d'origine."),
-    ES("Usar la regla mejorada que decide dónde van los splats nuevos. Suele "
-       "recuperar antes el detalle que falta; desactívela para igualar el método "
-       "original."),
-    PT("Usar a regra melhorada que decide para onde vão os splats novos. Costuma "
-       "recuperar mais depressa o detalhe que falta; desligue para igualar o "
-       "método original."),
-    IT("Usare la regola migliorata che decide dove vanno i nuovi splat. Di solito "
-       "recupera più in fretta il dettaglio mancante; disattivare per riprodurre "
-       "il metodo originale."),
-    NL("De verbeterde regel gebruiken die bepaalt waar nieuwe splats komen. Die "
-       "haalt ontbrekend detail meestal sneller terug; zet uit om de oorspronkelijke "
-       "methode te evenaren."),
-    RU("Использовать улучшенное правило выбора мест для новых сплатов. Обычно "
-       "оно быстрее возвращает недостающие детали; выключите, чтобы совпасть "
-       "с исходным методом."),
-    TR("Yeni splat'ların nereye gideceğine karar veren geliştirilmiş kuralı kullanır. "
-       "Eksik ayrıntıyı genelde daha çabuk geri getirir; özgün yöntemle eşleşmek "
-       "için kapatın."));
-
 SS_MSG(densify_score_mode,
     EN("Detail score mode"), JA("詳細スコアの取り方"),
     ZH_HANS("细节评分方式"), ZH_HANT("細節評分方式"), KO("디테일 점수 방식"),
@@ -3829,19 +3848,19 @@ SS_MSG(densify_learned_score,
     RU("Обучаемые оценки сплатов"),
     TR("Öğrenilen splat puanları"));
 SS_MSG(densify_learned_score_help,
-    EN("Fit one score per splat so the blended scores reproduce the detail error map.\n- Assigns error to splats that explain the pixel, on the same scale as averaged scores.\n- Requires revised densification and a detail error measure."),
-    JA("各スプラットが覆う誤差を平均する代わりに、点数を色と同じように重ねたものが誤差マップを再現するように、スプラットごとの点数を学習します。\n- 画素の誤差はそれを説明できるスプラットに割り当てられるので、再現の悪い境目に接しているだけの大きなスプラットは、その境目の誤差を負わなくなります。\n- 点数の大きさは平均したものと同じです。改良版の増やし方と誤差の測り方が必要です。"),
-    ZH_HANS("不再对每个泼溅覆盖范围内的误差取平均，而是为每个泼溅学习一个分数，使这些分数像颜色一样混合后能重现误差图。\n- 像素的误差因此会分给能够解释它的泼溅：只是挨着一处重建很差的边缘的大泼溅，不再为那条边缘的误差负责。\n- 分数的大小与取平均时相同。需要开启改进的加密规则和误差度量方式。"),
-    ZH_HANT("不再對每個潑濺覆蓋範圍內的誤差取平均，而是為每個潑濺學習一個分數，使這些分數像顏色一樣混合後能重現誤差圖。\n- 像素的誤差因此會分給能夠解釋它的潑濺：只是挨著一處重建很差的邊緣的大潑濺，不再為那條邊緣的誤差負責。\n- 分數的大小與取平均時相同。需要開啟改良的加密規則和誤差度量方式。"),
-    KO("각 스플랫이 덮은 오차를 평균하는 대신, 점수를 색처럼 섞었을 때 오차 맵이 재현되도록 스플랫마다 점수를 학습합니다.\n- 화소의 오차는 그것을 설명할 수 있는 스플랫에 돌아가므로, 잘못 재구성된 경계에 맞닿아 있을 뿐인 큰 스플랫은 그 경계의 오차를 떠안지 않게 됩니다.\n- 점수의 크기는 평균할 때와 같습니다. 개선된 밀집화 규칙과 오차 측정 방식이 필요합니다."),
-    DE("Statt den Fehler unter jedem Splat zu mitteln, je Splat eine Punktzahl lernen, sodass die wie Farben überblendeten Punktzahlen die Fehlerkarte nachbilden. Der Fehler eines Pixels geht dann an die Splats, die ihn erklären können:\n- Ein großer Splat, der nur an eine schlecht rekonstruierte Kante grenzt, trägt deren Fehler nicht mehr.\n- Die Punktzahlen behalten den Maßstab der gemittelten.\n- Setzt die überarbeitete Verdichtungsregel und ein Fehlermaß voraus."),
-    FR("Au lieu de moyenner l'erreur sous chaque splat, apprendre une note par splat de sorte que les notes, mélangées comme les couleurs, reproduisent la carte d'erreur.\n- L'erreur d'un pixel revient alors aux splats capables de l'expliquer : un gros splat qui ne fait que border une arête mal reconstruite n'en porte plus l'erreur.\n- Les notes gardent l'échelle des notes moyennées. Requiert la règle de densification révisée et une mesure d'erreur."),
-    ES("En lugar de promediar el error bajo cada splat, aprender una puntuación por splat de modo que las puntuaciones, mezcladas como los colores, reproduzcan el mapa de error.\n- El error de un píxel va entonces a los splats que pueden explicarlo: un splat grande que solo bordea una arista mal reconstruida deja de cargar con su error.\n- Las puntuaciones conservan la escala de las promediadas.\n- Requiere la regla de densificación revisada y una medida de error."),
-    PT("Em vez de calcular a média do erro sob cada splat, aprender uma pontuação por splat de modo que as pontuações, misturadas como as cores, reproduzam o mapa de erro.\n- O erro de um pixel vai então para os splats que o podem explicar: um splat grande que apenas faz fronteira com uma aresta mal reconstruída deixa de carregar o seu erro.\n- As pontuações mantêm a escala das calculadas pela média. Exige a regra de densificação revisada e uma medida de erro."),
-    IT("Invece di fare la media dell'errore sotto ogni splat, apprendere un punteggio per splat in modo che i punteggi, miscelati come i colori, riproducano la mappa d'errore.\n- L'errore di un pixel va allora agli splat che possono spiegarlo: uno splat grande che confina soltanto con un bordo ricostruito male smette di prenderne l'errore.\n- I punteggi mantengono la scala di quelli mediati.\n- Richiede la regola di densificazione rivista e una misura dell'errore."),
-    NL("In plaats van de fout onder elke splat te middelen, per splat een score leren zodat de scores, gemengd zoals kleuren, de foutkaart nabootsen. De fout van een pixel gaat dan naar de splats die hem kunnen verklaren:\n- een grote splat die alleen grenst aan een slecht gereconstrueerde rand krijgt die fout niet meer.\n- De scores houden de schaal van de gemiddelde. Vereist de herziene verdichtingsregel en een foutmaat."),
-    RU("Вместо усреднения ошибки под каждым сплатом обучать для каждого сплата оценку так, чтобы оценки, смешанные как цвета, воспроизводили карту ошибки.\n- Ошибка пикселя тогда достаётся сплатам, которые могут её объяснить: крупный сплат, лишь граничащий с плохо восстановленным краем, перестаёт брать на себя его ошибку.\n- Оценки сохраняют масштаб усреднённых. Требует уточнённого правила уплотнения и меры ошибки."),
-    TR("Her splat'ın altındaki hatanın ortalamasını almak yerine, puanlar renkler gibi karıştırıldığında hata haritasını yeniden üretecek şekilde splat başına bir puan öğrenir.\n- Bir pikselin hatası böylece onu açıklayabilen splat'lara gider: kötü yeniden kurulmuş bir kenara yalnızca komşu olan büyük bir splat artık o kenarın hatasını üstlenmez.\n- Puanlar, ortalaması alınanlarla aynı ölçeği korur.\n- Gözden geçirilmiş yoğunlaştırma kuralını ve bir hata ölçüsünü gerektirir."));
+    EN("Fit one score per splat so the blended scores reproduce the detail error map.\n- Assigns error to splats that explain the pixel, on the same scale as averaged scores.\n- Requires a detail error measure."),
+    JA("各スプラットが覆う誤差を平均する代わりに、点数を色と同じように重ねたものが誤差マップを再現するように、スプラットごとの点数を学習します。\n- 画素の誤差はそれを説明できるスプラットに割り当てられるので、再現の悪い境目に接しているだけの大きなスプラットは、その境目の誤差を負わなくなります。\n- 点数の大きさは平均したものと同じです。誤差の測り方が必要です。"),
+    ZH_HANS("不再对每个泼溅覆盖范围内的误差取平均，而是为每个泼溅学习一个分数，使这些分数像颜色一样混合后能重现误差图。\n- 像素的误差因此会分给能够解释它的泼溅：只是挨着一处重建很差的边缘的大泼溅，不再为那条边缘的误差负责。\n- 分数的大小与取平均时相同。需要一种误差度量方式。"),
+    ZH_HANT("不再對每個潑濺覆蓋範圍內的誤差取平均，而是為每個潑濺學習一個分數，使這些分數像顏色一樣混合後能重現誤差圖。\n- 像素的誤差因此會分給能夠解釋它的潑濺：只是挨著一處重建很差的邊緣的大潑濺，不再為那條邊緣的誤差負責。\n- 分數的大小與取平均時相同。需要一種誤差度量方式。"),
+    KO("각 스플랫이 덮은 오차를 평균하는 대신, 점수를 색처럼 섞었을 때 오차 맵이 재현되도록 스플랫마다 점수를 학습합니다.\n- 화소의 오차는 그것을 설명할 수 있는 스플랫에 돌아가므로, 잘못 재구성된 경계에 맞닿아 있을 뿐인 큰 스플랫은 그 경계의 오차를 떠안지 않게 됩니다.\n- 점수의 크기는 평균할 때와 같습니다. 오차 측정 방식이 필요합니다."),
+    DE("Statt den Fehler unter jedem Splat zu mitteln, je Splat eine Punktzahl lernen, sodass die wie Farben überblendeten Punktzahlen die Fehlerkarte nachbilden. Der Fehler eines Pixels geht dann an die Splats, die ihn erklären können:\n- Ein großer Splat, der nur an eine schlecht rekonstruierte Kante grenzt, trägt deren Fehler nicht mehr.\n- Die Punktzahlen behalten den Maßstab der gemittelten.\n- Setzt ein Fehlermaß voraus."),
+    FR("Au lieu de moyenner l'erreur sous chaque splat, apprendre une note par splat de sorte que les notes, mélangées comme les couleurs, reproduisent la carte d'erreur.\n- L'erreur d'un pixel revient alors aux splats capables de l'expliquer : un gros splat qui ne fait que border une arête mal reconstruite n'en porte plus l'erreur.\n- Les notes gardent l'échelle des notes moyennées. Requiert une mesure d'erreur."),
+    ES("En lugar de promediar el error bajo cada splat, aprender una puntuación por splat de modo que las puntuaciones, mezcladas como los colores, reproduzcan el mapa de error.\n- El error de un píxel va entonces a los splats que pueden explicarlo: un splat grande que solo bordea una arista mal reconstruida deja de cargar con su error.\n- Las puntuaciones conservan la escala de las promediadas.\n- Requiere una medida de error."),
+    PT("Em vez de calcular a média do erro sob cada splat, aprender uma pontuação por splat de modo que as pontuações, misturadas como as cores, reproduzam o mapa de erro.\n- O erro de um pixel vai então para os splats que o podem explicar: um splat grande que apenas faz fronteira com uma aresta mal reconstruída deixa de carregar o seu erro.\n- As pontuações mantêm a escala das calculadas pela média. Exige uma medida de erro."),
+    IT("Invece di fare la media dell'errore sotto ogni splat, apprendere un punteggio per splat in modo che i punteggi, miscelati come i colori, riproducano la mappa d'errore.\n- L'errore di un pixel va allora agli splat che possono spiegarlo: uno splat grande che confina soltanto con un bordo ricostruito male smette di prenderne l'errore.\n- I punteggi mantengono la scala di quelli mediati.\n- Richiede una misura dell'errore."),
+    NL("In plaats van de fout onder elke splat te middelen, per splat een score leren zodat de scores, gemengd zoals kleuren, de foutkaart nabootsen. De fout van een pixel gaat dan naar de splats die hem kunnen verklaren:\n- een grote splat die alleen grenst aan een slecht gereconstrueerde rand krijgt die fout niet meer.\n- De scores houden de schaal van de gemiddelde. Vereist een foutmaat."),
+    RU("Вместо усреднения ошибки под каждым сплатом обучать для каждого сплата оценку так, чтобы оценки, смешанные как цвета, воспроизводили карту ошибки.\n- Ошибка пикселя тогда достаётся сплатам, которые могут её объяснить: крупный сплат, лишь граничащий с плохо восстановленным краем, перестаёт брать на себя его ошибку.\n- Оценки сохраняют масштаб усреднённых. Требует меры ошибки."),
+    TR("Her splat'ın altındaki hatanın ortalamasını almak yerine, puanlar renkler gibi karıştırıldığında hata haritasını yeniden üretecek şekilde splat başına bir puan öğrenir.\n- Bir pikselin hatası böylece onu açıklayabilen splat'lara gider: kötü yeniden kurulmuş bir kenara yalnızca komşu olan büyük bir splat artık o kenarın hatasını üstlenmez.\n- Puanlar, ortalaması alınanlarla aynı ölçeği korur.\n- Bir hata ölçüsü gerektirir."));
 SS_MSG(densify_oversize_split_fraction,
     EN("Split share for oversized splats"),
     JA("大きすぎるスプラットに回す分割の割合"),
@@ -4796,6 +4815,35 @@ SS_MSG(distortion_reg_warmup_help,
     RU("За сколько шагов штрафы согласованности набирают полную силу.\nПостепенное включение даёт сложиться грубой структуре, прежде чем геометрию затянут."),
     TR("Tutarlılık cezalarının tam güce ulaşması için gereken adım sayısı.\nKademeli devreye girmek, geometri sıkılmadan önce kaba yapının oluşmasını sağlar."));
 
+SS_MSG(distortion_reg_warmup_schedule,
+    EN("Consistency warm-up curve"),
+    JA("一貫性ペナルティの立ち上がり方"),
+    ZH_HANS("一致性惩罚预热曲线"),
+    ZH_HANT("一致性懲罰預熱曲線"),
+    KO("일관성 페널티 워밍업 곡선"),
+    DE("Anlaufkurve der Konsistenzstrafen"),
+    FR("Courbe de montée des pénalités de cohérence"),
+    ES("Curva de arranque de las penalizaciones de coherencia"),
+    PT("Curva de aquecimento das penalidades de coerência"),
+    IT("Curva di avvio delle penalità di coerenza"),
+    NL("Opbouwcurve van de consistentiestraffen"),
+    RU("Кривая разгона штрафов согласованности"),
+    TR("Tutarlılık cezaları ısınma eğrisi"));
+SS_MSG(distortion_reg_warmup_schedule_help,
+    EN("`cosine` eases into full strength; `quadratic` and `quartic` start slow and end steep; `step` waits, then switches on."),
+    JA("`cosine` は最後になめらかに最大へ、`quadratic` と `quartic` は始めがゆっくりで終わりが急、`step` は待ってから一度に効かせます。"),
+    ZH_HANS("`cosine` 在末尾平滑地达到最大；`quadratic` 和 `quartic` 开始慢、结尾快；`step` 先等待，再一次开启。"),
+    ZH_HANT("`cosine` 在末尾平滑地達到最大；`quadratic` 和 `quartic` 開始慢、結尾快；`step` 先等待，再一次開啟。"),
+    KO("`cosine`은 끝에서 부드럽게 최대에 이르고, `quadratic`과 `quartic`은 처음엔 느리고 끝이 가파르며, `step`은 기다렸다가 한 번에 켜집니다."),
+    DE("`cosine` läuft sanft in die volle Stärke, `quadratic` und `quartic` beginnen langsam und enden steil, `step` wartet und schaltet dann ein."),
+    FR("`cosine` atteint la pleine force en douceur ; `quadratic` et `quartic` démarrent lentement et finissent raides ; `step` attend puis s'active."),
+    ES("`cosine` llega con suavidad a toda su fuerza; `quadratic` y `quartic` empiezan lento y acaban rápido; `step` espera y luego se activa."),
+    PT("`cosine` chega suavemente à força total; `quadratic` e `quartic` começam devagar e terminam íngremes; `step` espera e então liga."),
+    IT("`cosine` arriva dolcemente alla piena forza; `quadratic` e `quartic` partono lenti e finiscono ripidi; `step` attende e poi si attiva."),
+    NL("`cosine` loopt zacht op naar volle sterkte; `quadratic` en `quartic` beginnen langzaam en eindigen steil; `step` wacht en schakelt dan in."),
+    RU("`cosine` плавно выходит на полную силу; `quadratic` и `quartic` начинают медленно и заканчивают круто; `step` ждёт, затем включается сразу."),
+    TR("`cosine` tam güce yumuşakça ulaşır; `quadratic` ve `quartic` yavaş başlar, dik biter; `step` bekler, sonra birden devreye girer."));
+
 SS_MSG(normal_reg_weight,
     EN("Flatten splats onto surfaces"), JA("スプラットを面に沿わせる"),
     ZH_HANS("让泼溅贴合表面"), ZH_HANT("讓潑濺貼合表面"),
@@ -4842,39 +4890,6 @@ SS_MSG(normal_reg_weight_help,
     TR("Splat'ları temsil ettikleri yüzeyler boyunca yatmaya teşvik eder. Yüksek "
        "değerler daha temiz geometri ve daha iyi ağ verir; aşırısı ince ayrıntıyı "
        "düzleştirir."));
-
-SS_MSG(normal_reg_warmup,
-    EN("Surface alignment warm-up"), JA("面沿わせの立ち上がり"),
-    ZH_HANS("表面对齐预热"), ZH_HANT("表面對齊預熱"), KO("표면 정렬 워밍업"),
-    DE("Anlauf der Oberflächenausrichtung"),
-    FR("Montée de l'alignement aux surfaces"),
-    ES("Arranque de la alineación con las superficies"),
-    PT("Aquecimento do alinhamento às superfícies"),
-    IT("Avvio dell'allineamento alle superfici"),
-    NL("Opbouw van de oppervlakte-uitlijning"),
-    RU("Разгон выравнивания по поверхности"),
-    TR("Yüzeye hizalamanın ısınması"));
-SS_MSG(normal_reg_warmup_help,
-    EN("How many steps the surface-alignment penalty takes to reach full strength."),
-    JA("面沿わせのペナルティが最大になるまでのステップ数です。"),
-    ZH_HANS("表面对齐惩罚达到最大强度所需的步数。"),
-    ZH_HANT("表面對齊懲罰達到最大強度所需的步數。"),
-    KO("표면 정렬 페널티가 최대 강도에 이르기까지의 스텝 수입니다."),
-    DE("Wie viele Schritte die Oberflächenausrichtungsstrafe braucht, um volle "
-       "Stärke zu erreichen."),
-    FR("Combien d'étapes la pénalité d'alignement aux surfaces met à atteindre "
-       "sa pleine force."),
-    ES("Cuántos pasos tarda la penalización de alineación con las superficies "
-       "en alcanzar toda su fuerza."),
-    PT("Quantos passos a penalidade de alinhamento às superfícies leva para atingir "
-       "força total."),
-    IT("Quanti passi impiega la penalità di allineamento alle superfici a raggiungere "
-       "la piena forza."),
-    NL("Hoeveel stappen de straf voor oppervlakte-uitlijning nodig heeft om op "
-       "volle sterkte te komen."),
-    RU("За сколько шагов штраф за выравнивание по поверхности набирает полную "
-       "силу."),
-    TR("Yüzeye hizalama cezasının tam güce ulaşması için gereken adım sayısı."));
 
 SS_MSG(alpha_reg_weight,
     EN("Solid-or-empty coverage"), JA("被覆を不透明か空かに寄せる"),
@@ -4927,51 +4942,34 @@ SS_MSG(alpha_reg_warmup_help,
     RU("За сколько шагов штраф за покрытие набирает полную силу."),
     TR("Kaplama cezasının tam güce ulaşması için gereken adım sayısı."));
 
-SS_MSG(reg_warmup_length,
-    EN("Geometry penalty delay"), JA("ジオメトリのペナルティを遅らせる長さ"),
-    ZH_HANS("几何惩罚延迟步数"), ZH_HANT("幾何懲罰延遲步數"),
-    KO("지오메트리 페널티 지연"), DE("Verzögerung der Geometriestrafen"),
-    FR("Retard des pénalités de géométrie"),
-    ES("Retraso de las penalizaciones de geometría"),
-    PT("Atraso das penalidades de geometria"),
-    IT("Ritardo delle penalità di geometria"),
-    NL("Vertraging van de geometriestraffen"),
-    RU("Задержка геометрических штрафов"),
-    TR("Geometri cezalarının gecikmesi"));
-SS_MSG(reg_warmup_length_help,
-    EN("Hold the depth, normal and coverage penalties off for this many steps. "
-       "Lets the scene take shape before geometry constraints start pulling on "
-       "it."),
-    JA("深度・法線・被覆のペナルティを、このステップ数のあいだ効かせません。ジ"
-       "オメトリの制約が引っ張り始める前に、シーンの形ができあがります。"),
-    ZH_HANS("在这么多步内先不施加深度、法线和覆盖惩罚。让场景先成形，几何约束"
-            "再开始拉扯。"),
-    ZH_HANT("在這麼多步內先不施加深度、法線和覆蓋懲罰。讓場景先成形，幾何約束"
-            "再開始拉扯。"),
-    KO("깊이·노멀·커버리지 페널티를 이 스텝 수 동안 걸지 않습니다. 지오메트리"
-       " 제약이 잡아당기기 전에 장면이 먼저 모양을 갖춥니다."),
-    DE("Die Tiefen-, Normalen- und Deckungsstrafen für so viele Schritte aussetzen. "
-       "So nimmt die Szene Gestalt an, bevor Geometriebeschränkungen an ihr ziehen."),
-    FR("Suspendre les pénalités de profondeur, de normales et de couverture pendant "
-       "ce nombre d'étapes. La scène prend forme avant que les contraintes de "
-       "géométrie ne tirent dessus."),
-    ES("Suspender las penalizaciones de profundidad, normales y cobertura durante "
-       "este número de pasos. La escena toma forma antes de que las restricciones "
-       "de geometría tiren de ella."),
-    PT("Suspender as penalidades de profundidade, normais e cobertura durante "
-       "este número de passos. A cena toma forma antes que as restrições de geometria "
-       "puxem por ela."),
-    IT("Sospendere le penalità di profondità, normali e copertura per questo "
-       "numero di passi. La scena prende forma prima che i vincoli di geometria "
-       "comincino a tirarla."),
-    NL("De diepte-, normalen- en dekkingsstraffen dit aantal stappen uitstellen. "
-       "Zo krijgt de scène vorm voordat geometriebeperkingen eraan gaan trekken."),
-    RU("Не включать штрафы по глубине, нормалям и покрытию столько шагов. Сцена "
-       "успевает обрести форму, прежде чем геометрические ограничения начнут "
-       "её тянуть."),
-    TR("Derinlik, normal ve kaplama cezalarını bu kadar adım boyunca devre dışı "
-       "bırakır. Böylece geometri kısıtları çekiştirmeye başlamadan önce sahne "
-       "biçimlenir."));
+SS_MSG(alpha_reg_warmup_schedule,
+    EN("Coverage warm-up curve"),
+    JA("被覆ペナルティの立ち上がり方"),
+    ZH_HANS("覆盖惩罚预热曲线"),
+    ZH_HANT("覆蓋懲罰預熱曲線"),
+    KO("커버리지 페널티 워밍업 곡선"),
+    DE("Anlaufkurve der Deckungsstrafe"),
+    FR("Courbe de montée de la pénalité de couverture"),
+    ES("Curva de arranque de la penalización de cobertura"),
+    PT("Curva de aquecimento da penalidade de cobertura"),
+    IT("Curva di avvio della penalità di copertura"),
+    NL("Opbouwcurve van de dekkingsstraf"),
+    RU("Кривая разгона штрафа за покрытие"),
+    TR("Kaplama cezası ısınma eğrisi"));
+SS_MSG(alpha_reg_warmup_schedule_help,
+    EN("`cosine` eases into full strength; `quadratic` and `quartic` start slow and end steep; `step` waits, then switches on."),
+    JA("`cosine` は最後になめらかに最大へ、`quadratic` と `quartic` は始めがゆっくりで終わりが急、`step` は待ってから一度に効かせます。"),
+    ZH_HANS("`cosine` 在末尾平滑地达到最大；`quadratic` 和 `quartic` 开始慢、结尾快；`step` 先等待，再一次开启。"),
+    ZH_HANT("`cosine` 在末尾平滑地達到最大；`quadratic` 和 `quartic` 開始慢、結尾快；`step` 先等待，再一次開啟。"),
+    KO("`cosine`은 끝에서 부드럽게 최대에 이르고, `quadratic`과 `quartic`은 처음엔 느리고 끝이 가파르며, `step`은 기다렸다가 한 번에 켜집니다."),
+    DE("`cosine` läuft sanft in die volle Stärke, `quadratic` und `quartic` beginnen langsam und enden steil, `step` wartet und schaltet dann ein."),
+    FR("`cosine` atteint la pleine force en douceur ; `quadratic` et `quartic` démarrent lentement et finissent raides ; `step` attend puis s'active."),
+    ES("`cosine` llega con suavidad a toda su fuerza; `quadratic` y `quartic` empiezan lento y acaban rápido; `step` espera y luego se activa."),
+    PT("`cosine` chega suavemente à força total; `quadratic` e `quartic` começam devagar e terminam íngremes; `step` espera e então liga."),
+    IT("`cosine` arriva dolcemente alla piena forza; `quadratic` e `quartic` partono lenti e finiscono ripidi; `step` attende e poi si attiva."),
+    NL("`cosine` loopt zacht op naar volle sterkte; `quadratic` en `quartic` beginnen langzaam en eindigen steil; `step` wacht en schakelt dan in."),
+    RU("`cosine` плавно выходит на полную силу; `quadratic` и `quartic` начинают медленно и заканчивают круто; `step` ждёт, затем включается сразу."),
+    TR("`cosine` tam güce yumuşakça ulaşır; `quadratic` ve `quartic` yavaş başlar, dik biter; `step` bekler, sonra birden devreye girer."));
 
 SS_MSG(depth_supervision_weight,
     EN("Predicted depth guidance"), JA("推定深度による誘導"),
@@ -5082,48 +5080,6 @@ SS_MSG(input_depth_is_ray_depth_help,
     NL("Diepte langs de camerastraal in plaats van recht vooruit. Leeg: straaldiepte bij door spirula geometry gesplitste groothoeken, anders vooruitdiepte."),
     RU("Глубина вдоль луча, а не прямо вперёд. Не задано: вдоль луча для широких линз, разделённых spirula geometry, иначе вперёд."),
     TR("Derinlik ileri yönde değil kamera ışını boyuncadır. Boşsa: spirula geometry’nin böldüğü geniş lenslerde ışın derinliği, diğerlerinde ileri derinlik."));
-
-SS_MSG(supervision_warmup,
-    EN("Predicted-geometry guidance start"), JA("推定ジオメトリの誘導開始"),
-    ZH_HANS("预测几何引导起始步"), ZH_HANT("預測幾何引導起始步"),
-    KO("예측 지오메트리 안내 시작"),
-    DE("Beginn der Führung durch geschätzte Geometrie"),
-    FR("Début du guidage par la géométrie estimée"),
-    ES("Inicio de la guía por la geometría estimada"),
-    PT("Início da orientação pela geometria estimada"),
-    IT("Inizio della guida dalla geometria stimata"),
-    NL("Start van de sturing door de voorspelde geometrie"),
-    RU("Начало направления по предсказанной геометрии"),
-    TR("Tahmini geometri rehberliğinin başlangıcı"));
-SS_MSG(supervision_warmup_help,
-    EN("Step at which AI-predicted depth and normals start guiding training. "
-       "Waiting lets photometric detail establish itself first."),
-    JA("AI が推定した深度と法線が学習を導き始めるステップです。待つことで、ま"
-       "ず写真から得られる細部が定着します。"),
-    ZH_HANS("AI 预测的深度和法线开始引导训练的步数。先等一等，可以让来自照片本"
-            "身的细节先立住。"),
-    ZH_HANT("AI 預測的深度和法線開始引導訓練的步數。先等一等，可以讓來自照片本"
-            "身的細節先立住。"),
-    KO("AI가 예측한 깊이와 노멀이 학습을 이끌기 시작하는 스텝입니다. 기다리면"
-       " 사진에서 얻는 디테일이 먼저 자리를 잡습니다."),
-    DE("Schritt, ab dem KI-geschätzte Tiefe und Normalen das Training führen. "
-       "Zu warten lässt zuerst das photometrische Detail Fuß fassen."),
-    FR("Étape à partir de laquelle la profondeur et les normales estimées par "
-       "l'IA guident l'entraînement. Attendre laisse d'abord le détail photométrique "
-       "s'installer."),
-    ES("Paso a partir del cual la profundidad y las normales estimadas por la "
-       "IA guían el entrenamiento. Esperar deja que primero se afiance el detalle "
-       "fotométrico."),
-    PT("Passo a partir do qual a profundidade e as normais estimadas pela IA "
-       "guiam o treinamento. Esperar deixa o detalhe fotométrico se firmar primeiro."),
-    IT("Passo dal quale profondità e normali stimate dall'IA guidano l'addestramento. "
-       "Aspettare lascia prima consolidarsi il dettaglio fotometrico."),
-    NL("Stap vanaf welke door AI voorspelde diepte en normalen de training sturen. "
-       "Wachten laat eerst het fotometrische detail zich vestigen."),
-    RU("Шаг, с которого предсказанные ИИ глубина и нормали начинают направлять "
-       "обучение. Ожидание даёт сначала закрепиться фотометрическим деталям."),
-    TR("Yapay zekânın kestirdiği derinlik ve normallerin eğitimi yönlendirmeye "
-       "başladığı adım. Beklemek, önce fotometrik ayrıntının yerleşmesini sağlar."));
 
 SS_MSG(mean_median_depth_weight,
     EN("Average-to-solid depth agreement"), JA("平均深度と最密深度の一致"),
@@ -5301,6 +5257,35 @@ SS_MSG(median_warmup_help,
        "полную силу."),
     TR("En dolu derinlikle ilgili dört cezanın tam güce ulaşması için gereken "
        "adım sayısı."));
+
+SS_MSG(median_warmup_schedule,
+    EN("Solid-depth warm-up curve"),
+    JA("最密深度ペナルティの立ち上がり方"),
+    ZH_HANS("最实深度惩罚预热曲线"),
+    ZH_HANT("最實深度懲罰預熱曲線"),
+    KO("최밀 깊이 페널티 워밍업 곡선"),
+    DE("Anlaufkurve der Strafen an der dichtesten Tiefe"),
+    FR("Courbe de montée des pénalités à la profondeur pleine"),
+    ES("Curva de arranque de la profundidad sólida"),
+    PT("Curva de aquecimento da profundidade sólida"),
+    IT("Curva di avvio delle penalità alla profondità piena"),
+    NL("Opbouwcurve van de straffen op de dichtste diepte"),
+    RU("Кривая разгона штрафов на плотной глубине"),
+    TR("En dolu derinlik cezaları ısınma eğrisi"));
+SS_MSG(median_warmup_schedule_help,
+    EN("`cosine` eases into full strength; `quadratic` and `quartic` start slow and end steep; `step` waits, then switches on."),
+    JA("`cosine` は最後になめらかに最大へ、`quadratic` と `quartic` は始めがゆっくりで終わりが急、`step` は待ってから一度に効かせます。"),
+    ZH_HANS("`cosine` 在末尾平滑地达到最大；`quadratic` 和 `quartic` 开始慢、结尾快；`step` 先等待，再一次开启。"),
+    ZH_HANT("`cosine` 在末尾平滑地達到最大；`quadratic` 和 `quartic` 開始慢、結尾快；`step` 先等待，再一次開啟。"),
+    KO("`cosine`은 끝에서 부드럽게 최대에 이르고, `quadratic`과 `quartic`은 처음엔 느리고 끝이 가파르며, `step`은 기다렸다가 한 번에 켜집니다."),
+    DE("`cosine` läuft sanft in die volle Stärke, `quadratic` und `quartic` beginnen langsam und enden steil, `step` wartet und schaltet dann ein."),
+    FR("`cosine` atteint la pleine force en douceur ; `quadratic` et `quartic` démarrent lentement et finissent raides ; `step` attend puis s'active."),
+    ES("`cosine` llega con suavidad a toda su fuerza; `quadratic` y `quartic` empiezan lento y acaban rápido; `step` espera y luego se activa."),
+    PT("`cosine` chega suavemente à força total; `quadratic` e `quartic` começam devagar e terminam íngremes; `step` espera e então liga."),
+    IT("`cosine` arriva dolcemente alla piena forza; `quadratic` e `quartic` partono lenti e finiscono ripidi; `step` attende e poi si attiva."),
+    NL("`cosine` loopt zacht op naar volle sterkte; `quadratic` en `quartic` beginnen langzaam en eindigen steil; `step` wacht en schakelt dan in."),
+    RU("`cosine` плавно выходит на полную силу; `quadratic` и `quartic` начинают медленно и заканчивают круто; `step` ждёт, затем включается сразу."),
+    TR("`cosine` tam güce yumuşakça ulaşır; `quadratic` ve `quartic` yavaş başlar, dik biter; `step` bekler, sonra birden devreye girer."));
 
 SS_MSG(pca_reg_neighbors,
     EN("Local-PCA neighbours"),
@@ -5703,19 +5688,19 @@ SS_MSG(pca_reg_erank_weight,
     IT("Peso del rango della covarianza locale"), NL("Gewicht lokale covariantierang"),
     RU("Вес ранга локальной ковариации"), TR("Yerel kovaryans rank ağırlığı"));
 SS_MSG(pca_reg_erank_weight_help,
-    EN("Weight of max(erank(C)-2, 0)², using covariance eigenvalue entropy independently of scene scale. Starts at pca_reg_start_iter; 0 disables."),
-    JA("シーン尺度に依存しない共分散固有値エントロピーによる max(erank(C)-2, 0)² の重み。pca_reg_start_iter から有効。0で無効です。"),
-    ZH_HANS("max(erank(C)-2, 0)² 的权重，使用与场景尺度无关的协方差特征值熵。从 pca_reg_start_iter 启用；0 关闭。"),
-    ZH_HANT("max(erank(C)-2, 0)² 的權重，使用與場景尺度無關的共變異數特徵值熵。從 pca_reg_start_iter 啟用；0 關閉。"),
-    KO("장면 배율과 무관한 공분산 고윳값 엔트로피 기반 max(erank(C)-2, 0)²의 가중치입니다. pca_reg_start_iter부터 적용하며 0은 끄기입니다."),
-    DE("Gewicht von max(erank(C)-2, 0)² über Kovarianz-Eigenwertentropie, unabhängig vom Szenenmaßstab. Ab pca_reg_start_iter; 0 schaltet ab."),
-    FR("Poids de max(erank(C)-2, 0)² via l’entropie des valeurs propres, sans effet d’échelle. Actif dès pca_reg_start_iter ; 0 désactive."),
-    ES("Peso de max(erank(C)-2, 0)² mediante entropía de autovalores, independiente de escala. Desde pca_reg_start_iter; 0 desactiva."),
-    PT("Peso de max(erank(C)-2, 0)² por entropia dos autovalores, independente da escala. A partir de pca_reg_start_iter; 0 desativa."),
-    IT("Peso di max(erank(C)-2, 0)² tramite entropia degli autovalori, indipendente dalla scala. Da pca_reg_start_iter; 0 disattiva."),
-    NL("Gewicht van max(erank(C)-2, 0)² via entropie van eigenwaarden, onafhankelijk van schaal. Vanaf pca_reg_start_iter; 0 schakelt uit."),
-    RU("Вес max(erank(C)-2, 0)² по энтропии собственных значений ковариации, без влияния масштаба. С pca_reg_start_iter; 0 отключает."),
-    TR("Ölçekten bağımsız kovaryans özdeğer entropisiyle max(erank(C)-2, 0)² ağırlığı. pca_reg_start_iter’de başlar; 0 kapatır."));
+    EN("Weight on the squared share of the smallest local covariance eigenvalue, flattening neighborhoods into planes. Scale-independent. Starts at pca_reg_start_iter; 0 disables."),
+    JA("局所共分散の最小固有値の割合の二乗に対する重み。近傍を平面に近づけます。シーン尺度に依存しません。pca_reg_start_iter から有効。0で無効です。"),
+    ZH_HANS("局部协方差最小特征值占比平方的权重，使邻域趋于平面。与场景尺度无关。从 pca_reg_start_iter 启用；0 关闭。"),
+    ZH_HANT("局部共變異數最小特徵值占比平方的權重，使鄰域趨於平面。與場景尺度無關。從 pca_reg_start_iter 啟用；0 關閉。"),
+    KO("로컬 공분산의 최소 고윳값 비율 제곱에 대한 가중치로, 이웃을 평면으로 만듭니다. 장면 배율과 무관합니다. pca_reg_start_iter부터 적용하며 0은 끄기입니다."),
+    DE("Gewicht des quadrierten Anteils des kleinsten lokalen Kovarianz-Eigenwerts; flacht Nachbarschaften zu Ebenen ab. Maßstabsunabhängig. Ab pca_reg_start_iter; 0 schaltet ab."),
+    FR("Poids du carré de la part de la plus petite valeur propre de la covariance locale ; aplatit les voisinages en plans. Sans effet d’échelle. Actif dès pca_reg_start_iter ; 0 désactive."),
+    ES("Peso del cuadrado de la fracción del menor autovalor de la covarianza local; aplana los vecindarios. Independiente de escala. Desde pca_reg_start_iter; 0 desactiva."),
+    PT("Peso do quadrado da fração do menor autovalor da covariância local; achata as vizinhanças em planos. Independente da escala. A partir de pca_reg_start_iter; 0 desativa."),
+    IT("Peso del quadrato della quota del minimo autovalore della covarianza locale; appiattisce gli intorni. Indipendente dalla scala. Da pca_reg_start_iter; 0 disattiva."),
+    NL("Gewicht op het kwadraat van het aandeel van de kleinste lokale eigenwaarde; vlakt buurten af. Schaalonafhankelijk. Vanaf pca_reg_start_iter; 0 schakelt uit."),
+    RU("Вес квадрата доли наименьшего собственного значения локальной ковариации; сплющивает окрестности в плоскости. Не зависит от масштаба. С pca_reg_start_iter; 0 отключает."),
+    TR("Yerel kovaryansın en küçük özdeğer payının karesine verilen ağırlık; komşulukları düzleme yassılaştırır. Ölçekten bağımsızdır. pca_reg_start_iter’de başlar; 0 kapatır."));
 SS_MSG(pca_reg_transparency_weight,
     EN("Normal transparency weight"), JA("法線方向の透明度の重み"),
     ZH_HANS("法线方向透明度权重"), ZH_HANT("法線方向透明度權重"), KO("법선 방향 투명도 가중치"),
@@ -6026,6 +6011,63 @@ SS_MSG(erank_reg_help,
     TR("İğne gibi splat'ları caydırıp daha yuvarlak olanları destekler. Sivri "
        "bozulmaları ve kamera hareket ederken oluşan titremeyi azaltır."));
 
+SS_MSG(erank_reg_warmup,
+    EN("Roundness warm-up"),
+    JA("丸さペナルティの立ち上がり"),
+    ZH_HANS("圆度惩罚预热"),
+    ZH_HANT("圓度懲罰預熱"),
+    KO("둥글기 페널티 워밍업"),
+    DE("Anlauf der Rundheitsstrafe"),
+    FR("Montée de la pénalité de rondeur"),
+    ES("Arranque de la penalización de redondez"),
+    PT("Aquecimento da penalidade de arredondamento"),
+    IT("Avvio della penalità di rotondità"),
+    NL("Opbouw van de rondheidsstraf"),
+    RU("Разгон штрафа за округлость"),
+    TR("Yuvarlaklık cezasının ısınması"));
+SS_MSG(erank_reg_warmup_help,
+    EN("How many steps the roundness penalty takes to reach full strength. 0 applies it from the first step."),
+    JA("丸さのペナルティが最大になるまでのステップ数です。0 なら最初から効かせます。"),
+    ZH_HANS("圆度惩罚达到最大强度所需的步数。0 表示从第一步起就施加。"),
+    ZH_HANT("圓度懲罰達到最大強度所需的步數。0 表示從第一步起就施加。"),
+    KO("둥글기 페널티가 최대 강도에 이르기까지의 스텝 수입니다. 0이면 처음부터 적용합니다."),
+    DE("Wie viele Schritte die Rundheitsstrafe braucht, um volle Stärke zu erreichen. 0 wendet sie ab dem ersten Schritt an."),
+    FR("Combien d'étapes la pénalité de rondeur met à atteindre sa pleine force. 0 l'applique dès la première étape."),
+    ES("Cuántos pasos tarda la penalización de redondez en alcanzar toda su fuerza. 0 la aplica desde el primer paso."),
+    PT("Quantos passos a penalidade de arredondamento leva para atingir força total. 0 a aplica desde o primeiro passo."),
+    IT("Quanti passi impiega la penalità di rotondità a raggiungere la piena forza. 0 la applica dal primo passo."),
+    NL("Hoeveel stappen de rondheidsstraf nodig heeft om op volle sterkte te komen. 0 past hem vanaf de eerste stap toe."),
+    RU("За сколько шагов штраф за округлость набирает полную силу. 0 — действует с первого шага."),
+    TR("Yuvarlaklık cezasının tam güce ulaşması için gereken adım sayısı. 0 ilk adımdan uygular."));
+SS_MSG(erank_reg_warmup_schedule,
+    EN("Roundness warm-up curve"),
+    JA("丸さペナルティの立ち上がり方"),
+    ZH_HANS("圆度惩罚预热曲线"),
+    ZH_HANT("圓度懲罰預熱曲線"),
+    KO("둥글기 페널티 워밍업 곡선"),
+    DE("Anlaufkurve der Rundheitsstrafe"),
+    FR("Courbe de montée de la pénalité de rondeur"),
+    ES("Curva de arranque de la penalización de redondez"),
+    PT("Curva de aquecimento da penalidade de arredondamento"),
+    IT("Curva di avvio della penalità di rotondità"),
+    NL("Opbouwcurve van de rondheidsstraf"),
+    RU("Кривая разгона штрафа за округлость"),
+    TR("Yuvarlaklık cezası ısınma eğrisi"));
+SS_MSG(erank_reg_warmup_schedule_help,
+    EN("`cosine` eases into full strength; `quadratic` and `quartic` start slow and end steep; `step` waits, then switches on."),
+    JA("`cosine` は最後になめらかに最大へ、`quadratic` と `quartic` は始めがゆっくりで終わりが急、`step` は待ってから一度に効かせます。"),
+    ZH_HANS("`cosine` 在末尾平滑地达到最大；`quadratic` 和 `quartic` 开始慢、结尾快；`step` 先等待，再一次开启。"),
+    ZH_HANT("`cosine` 在末尾平滑地達到最大；`quadratic` 和 `quartic` 開始慢、結尾快；`step` 先等待，再一次開啟。"),
+    KO("`cosine`은 끝에서 부드럽게 최대에 이르고, `quadratic`과 `quartic`은 처음엔 느리고 끝이 가파르며, `step`은 기다렸다가 한 번에 켜집니다."),
+    DE("`cosine` läuft sanft in die volle Stärke, `quadratic` und `quartic` beginnen langsam und enden steil, `step` wartet und schaltet dann ein."),
+    FR("`cosine` atteint la pleine force en douceur ; `quadratic` et `quartic` démarrent lentement et finissent raides ; `step` attend puis s'active."),
+    ES("`cosine` llega con suavidad a toda su fuerza; `quadratic` y `quartic` empiezan lento y acaban rápido; `step` espera y luego se activa."),
+    PT("`cosine` chega suavemente à força total; `quadratic` e `quartic` começam devagar e terminam íngremes; `step` espera e então liga."),
+    IT("`cosine` arriva dolcemente alla piena forza; `quadratic` e `quartic` partono lenti e finiscono ripidi; `step` attende e poi si attiva."),
+    NL("`cosine` loopt zacht op naar volle sterkte; `quadratic` en `quartic` beginnen langzaam en eindigen steil; `step` wacht en schakelt dan in."),
+    RU("`cosine` плавно выходит на полную силу; `quadratic` и `quartic` начинают медленно и заканчивают круто; `step` ждёт, затем включается сразу."),
+    TR("`cosine` tam güce yumuşakça ulaşır; `quadratic` ve `quartic` yavaş başlar, dik biter; `step` bekler, sonra birden devreye girer."));
+
 SS_MSG(erank_reg_s3,
     EN("Flatness (erank)"), JA("平坦さ（erank）"), ZH_HANS("扁平度（erank）"),
     ZH_HANT("扁平度（erank）"), KO("납작함(erank)"), DE("Flachheit (erank)"),
@@ -6057,6 +6099,63 @@ SS_MSG(erank_reg_s3_help,
        "ложились на поверхности."),
     TR("Splat'ları düz levhalara çökmeye özendirir, böylece yüzeylere daha "
        "iyi otururlar."));
+
+SS_MSG(erank_reg_s3_warmup,
+    EN("Flatness warm-up"),
+    JA("平坦さペナルティの立ち上がり"),
+    ZH_HANS("扁平度惩罚预热"),
+    ZH_HANT("扁平度懲罰預熱"),
+    KO("납작함 페널티 워밍업"),
+    DE("Anlauf der Flachheitsstrafe"),
+    FR("Montée de la pénalité d'aplatissement"),
+    ES("Arranque de la penalización de aplanamiento"),
+    PT("Aquecimento da penalidade de achatamento"),
+    IT("Avvio della penalità di appiattimento"),
+    NL("Opbouw van de vlakheidsstraf"),
+    RU("Разгон штрафа за плоскостность"),
+    TR("Yassılık cezasının ısınması"));
+SS_MSG(erank_reg_s3_warmup_help,
+    EN("How many steps the flatness penalty takes to reach full strength. 0 applies it from the first step."),
+    JA("平坦さのペナルティが最大になるまでのステップ数です。0 なら最初から効かせます。"),
+    ZH_HANS("扁平度惩罚达到最大强度所需的步数。0 表示从第一步起就施加。"),
+    ZH_HANT("扁平度懲罰達到最大強度所需的步數。0 表示從第一步起就施加。"),
+    KO("납작함 페널티가 최대 강도에 이르기까지의 스텝 수입니다. 0이면 처음부터 적용합니다."),
+    DE("Wie viele Schritte die Flachheitsstrafe braucht, um volle Stärke zu erreichen. 0 wendet sie ab dem ersten Schritt an."),
+    FR("Combien d'étapes la pénalité d'aplatissement met à atteindre sa pleine force. 0 l'applique dès la première étape."),
+    ES("Cuántos pasos tarda la penalización de aplanamiento en alcanzar toda su fuerza. 0 la aplica desde el primer paso."),
+    PT("Quantos passos a penalidade de achatamento leva para atingir força total. 0 a aplica desde o primeiro passo."),
+    IT("Quanti passi impiega la penalità di appiattimento a raggiungere la piena forza. 0 la applica dal primo passo."),
+    NL("Hoeveel stappen de vlakheidsstraf nodig heeft om op volle sterkte te komen. 0 past hem vanaf de eerste stap toe."),
+    RU("За сколько шагов штраф за плоскостность набирает полную силу. 0 — действует с первого шага."),
+    TR("Yassılık cezasının tam güce ulaşması için gereken adım sayısı. 0 ilk adımdan uygular."));
+SS_MSG(erank_reg_s3_warmup_schedule,
+    EN("Flatness warm-up curve"),
+    JA("平坦さペナルティの立ち上がり方"),
+    ZH_HANS("扁平度惩罚预热曲线"),
+    ZH_HANT("扁平度懲罰預熱曲線"),
+    KO("납작함 페널티 워밍업 곡선"),
+    DE("Anlaufkurve der Flachheitsstrafe"),
+    FR("Courbe de montée de la pénalité d'aplatissement"),
+    ES("Curva de arranque de la penalización de aplanamiento"),
+    PT("Curva de aquecimento da penalidade de achatamento"),
+    IT("Curva di avvio della penalità di appiattimento"),
+    NL("Opbouwcurve van de vlakheidsstraf"),
+    RU("Кривая разгона штрафа за плоскостность"),
+    TR("Yassılık cezası ısınma eğrisi"));
+SS_MSG(erank_reg_s3_warmup_schedule_help,
+    EN("`cosine` eases into full strength; `quadratic` and `quartic` start slow and end steep; `step` waits, then switches on."),
+    JA("`cosine` は最後になめらかに最大へ、`quadratic` と `quartic` は始めがゆっくりで終わりが急、`step` は待ってから一度に効かせます。"),
+    ZH_HANS("`cosine` 在末尾平滑地达到最大；`quadratic` 和 `quartic` 开始慢、结尾快；`step` 先等待，再一次开启。"),
+    ZH_HANT("`cosine` 在末尾平滑地達到最大；`quadratic` 和 `quartic` 開始慢、結尾快；`step` 先等待，再一次開啟。"),
+    KO("`cosine`은 끝에서 부드럽게 최대에 이르고, `quadratic`과 `quartic`은 처음엔 느리고 끝이 가파르며, `step`은 기다렸다가 한 번에 켜집니다."),
+    DE("`cosine` läuft sanft in die volle Stärke, `quadratic` und `quartic` beginnen langsam und enden steil, `step` wartet und schaltet dann ein."),
+    FR("`cosine` atteint la pleine force en douceur ; `quadratic` et `quartic` démarrent lentement et finissent raides ; `step` attend puis s'active."),
+    ES("`cosine` llega con suavidad a toda su fuerza; `quadratic` y `quartic` empiezan lento y acaban rápido; `step` espera y luego se activa."),
+    PT("`cosine` chega suavemente à força total; `quadratic` e `quartic` começam devagar e terminam íngremes; `step` espera e então liga."),
+    IT("`cosine` arriva dolcemente alla piena forza; `quadratic` e `quartic` partono lenti e finiscono ripidi; `step` attende e poi si attiva."),
+    NL("`cosine` loopt zacht op naar volle sterkte; `quadratic` en `quartic` beginnen langzaam en eindigen steil; `step` wacht en schakelt dan in."),
+    RU("`cosine` плавно выходит на полную силу; `quadratic` и `quartic` начинают медленно и заканчивают круто; `step` ждёт, затем включается сразу."),
+    TR("`cosine` tam güce yumuşakça ulaşır; `quadratic` ve `quartic` yavaş başlar, dik biter; `step` bekler, sonra birden devreye girer."));
 
 SS_MSG(scale_regularization_weight,
     EN("Stretched splat penalty"), JA("細長いスプラットのペナルティ"),
@@ -8967,6 +9066,96 @@ SS_MSG(choice_none,
     PT("nenhum"),        IT("nessuno"),      NL("geen"),         RU("нет"),
     TR("yok"));
 
+SS_MSG(choice_black,
+    EN("black"),
+    JA("黒"),
+    ZH_HANS("黑色"),
+    ZH_HANT("黑色"),
+    KO("검정"),
+    DE("schwarz"),
+    FR("noir"),
+    ES("negro"),
+    PT("preto"),
+    IT("nero"),
+    NL("zwart"),
+    RU("чёрный"),
+    TR("siyah"));
+
+SS_MSG(choice_color,
+    EN("color"),
+    JA("単色"),
+    ZH_HANS("纯色"),
+    ZH_HANT("純色"),
+    KO("단색"),
+    DE("Farbe"),
+    FR("couleur"),
+    ES("color"),
+    PT("cor"),
+    IT("colore"),
+    NL("kleur"),
+    RU("цвет"),
+    TR("renk"));
+
+SS_MSG(choice_skybox,
+    EN("skybox"),
+    JA("スカイボックス"),
+    ZH_HANS("天空盒"),
+    ZH_HANT("天空盒"),
+    KO("스카이박스"),
+    DE("Skybox"),
+    FR("skybox"),
+    ES("skybox"),
+    PT("skybox"),
+    IT("skybox"),
+    NL("skybox"),
+    RU("скайбокс"),
+    TR("gökyüzü kutusu"));
+
+SS_MSG(choice_per_pixel,
+    EN("per pixel"),
+    JA("画素ごと"),
+    ZH_HANS("逐像素"),
+    ZH_HANT("逐像素"),
+    KO("픽셀 단위"),
+    DE("pro Pixel"),
+    FR("par pixel"),
+    ES("por píxel"),
+    PT("por pixel"),
+    IT("per pixel"),
+    NL("per pixel"),
+    RU("по пикселям"),
+    TR("piksel başına"));
+
+SS_MSG(choice_tiles,
+    EN("tiles"),
+    JA("タイル"),
+    ZH_HANS("色块"),
+    ZH_HANT("色塊"),
+    KO("타일"),
+    DE("Kacheln"),
+    FR("tuiles"),
+    ES("baldosas"),
+    PT("ladrilhos"),
+    IT("tessere"),
+    NL("tegels"),
+    RU("плитки"),
+    TR("karolar"));
+
+SS_MSG(choice_whole_frame,
+    EN("whole frame"),
+    JA("画面全体"),
+    ZH_HANS("整帧"),
+    ZH_HANT("整幀"),
+    KO("화면 전체"),
+    DE("ganzes Bild"),
+    FR("image entière"),
+    ES("fotograma entero"),
+    PT("quadro inteiro"),
+    IT("fotogramma intero"),
+    NL("heel beeld"),
+    RU("весь кадр"),
+    TR("tüm kare"));
+
 SS_MSG(choice_point_median,
     EN("point cloud median"), JA("点群の中央値"), ZH_HANS("点云中位数"),
     ZH_HANT("點雲中位數"), KO("점군 중앙값"), DE("Median der Punktwolke"),
@@ -9205,6 +9394,15 @@ inline constexpr ChoiceText kChoiceText[] = {
     {"quality", "medium", &choice_medium},
     {"quality", "high",   &choice_high},
     {"quality", "ultra",  &choice_ultra},
+
+    {"background_mode", "black",  &choice_black},
+    {"background_mode", "color",  &choice_color},
+    {"background_mode", "skybox", &choice_skybox},
+
+    {"background_transparency_suppression", "none",         &choice_none},
+    {"background_transparency_suppression", "noise",        &choice_per_pixel},
+    {"background_transparency_suppression", "pseudorandom", &choice_tiles},
+    {"background_transparency_suppression", "random",       &choice_whole_frame},
 
     {"floater_suppression", "off",    &choice_off},
     {"floater_suppression", "mild",   &choice_mild},

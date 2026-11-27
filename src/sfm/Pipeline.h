@@ -241,7 +241,8 @@ void splitCamerasBySize(std::vector<Reconstruction>& models,
                         const std::vector<FeatureSet>& feats);
 void writeModels(std::vector<Reconstruction>& models,
                  const std::filesystem::path& dir, bool verbose,
-                 const std::vector<ModelGauge>& gauge = {}, const RigTable* rigs = nullptr);
+                 const std::vector<ModelGauge>& gauge = {}, const RigTable* rigs = nullptr,
+                 const std::optional<spirula::ImageColor>& point_color = std::nullopt);
 void writeRigs(const std::filesystem::path& dir, const Reconstruction& m, const RigTable* rigs);
 // The rigs.txt writeRigs left beside a model, as a table over its image names
 // with each member's calibration in `m.rigs`. Empty when there is no file.
@@ -343,6 +344,7 @@ struct AutoRequest {
 //
 // Presets fill in first, then the manifest, then finalize(): an explicit
 // setting beats the file and the file beats a preset's guess.
-std::string parse_auto_args(const std::vector<std::string>& args, AutoRequest& out);
+std::string parse_auto_args(const std::vector<std::string>& args, AutoRequest& out,
+                            std::string* finish_command = nullptr);
 
 }  // namespace sfm
